@@ -1,0 +1,56 @@
+schema_version = 1
+name = "sample-cli"
+image = "debian:bookworm-slim"
+observe = ["/home/theseus", "/usr/local/bin"]
+
+[artifacts]
+base = "base"
+target = "target"
+
+[profiles.user.steps.install_base]
+script = "sh /inputs/base/install.sh user"
+[profiles.user.steps.install_target]
+script = "sh /inputs/target/install.sh user"
+[profiles.user.steps.configure]
+script = "sample-cli configure"
+[profiles.user.steps.upgrade]
+script = "sh /inputs/target/install.sh user"
+[profiles.user.steps.exercise]
+script = "sample-cli smoke"
+[profiles.user.steps.uninstall]
+script = "sh /inputs/target/uninstall.sh user"
+
+[[profiles.user.checks]]
+id = "target-version"
+checkpoint = "target_installed"
+kind = "executable"
+name = "sample-cli"
+resolved_path = "/home/theseus/.local/bin/sample-cli"
+args = ["--version"]
+expected_exit = 0
+stdout_contains = "sample-cli 2.0.0"
+
+[[profiles.user.checks]]
+id = "binary-removed"
+checkpoint = "uninstalled"
+kind = "absent"
+path = "/home/theseus/.local/bin/sample-cli"
+
+[profiles.system.steps.install_base]
+script = "sh /inputs/base/install.sh system"
+[profiles.system.steps.install_target]
+script = "sh /inputs/target/install.sh system"
+[profiles.system.steps.configure]
+script = "sample-cli configure"
+[profiles.system.steps.upgrade]
+script = "sh /inputs/target/install.sh system"
+[profiles.system.steps.exercise]
+script = "sample-cli smoke"
+[profiles.system.steps.uninstall]
+script = "sh /inputs/target/uninstall.sh system"
+
+[[profiles.system.checks]]
+id = "binary-removed"
+checkpoint = "uninstalled"
+kind = "absent"
+path = "/usr/local/bin/sample-cli"
