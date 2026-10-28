@@ -1,0 +1,5 @@
+/target/
+/.theseus-runs/
+/.worktrees/
+docs/superpowers/
+/.superpowers/
