@@ -231,3 +231,58 @@ fn selected_matrix_entries_cannot_disappear_from_a_success_report() {
     run.recompute_outcome();
     assert_eq!(run.outcome, RunOutcome::Incomplete);
 }
+
+fn load_metadata_from_real_current_directory(test_name: &str, journal: bool) {
+    use std::{ffi::OsStr, path::Path, process::Command};
+    // Changing the harness cwd would race unrelated parallel tests. A child runs
+    // this same test in the real run directory, with only this exact test selected.
+    if std::env::var_os("THESEUS_METADATA_CWD_TEST").as_deref() == Some(OsStr::new(test_name)) {
+        if journal {
+            assert_eq!(
+                report::load_journal(Path::new("journal.json"))
+                    .unwrap()
+                    .run_id,
+                "cwd-fixture"
+            );
+        } else {
+            assert_eq!(
+                report::load(Path::new("report.json")).unwrap().run_id,
+                "cwd-fixture"
+            );
+        }
+        return;
+    }
+    let parent = tempfile::tempdir().unwrap();
+    let store = report::create(&parent.path().join("run")).unwrap();
+    store.save(&RunReport::new("cwd-fixture")).unwrap();
+    store
+        .save_journal(&RunJournal {
+            schema_version: 1,
+            run_id: "cwd-fixture".into(),
+            resources: vec![],
+            cleanup_errors: vec![],
+        })
+        .unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture"])
+        .env("THESEUS_METADATA_CWD_TEST", test_name)
+        .current_dir(store.root())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn loads_bare_relative_report_filename() {
+    load_metadata_from_real_current_directory("loads_bare_relative_report_filename", false);
+}
+
+#[test]
+fn loads_bare_relative_journal_filename() {
+    load_metadata_from_real_current_directory("loads_bare_relative_journal_filename", true);
+}

@@ -212,3 +212,88 @@ fn command_and_executable_expectations_compare_literal_evidence() {
         CheckOutcome::Failed
     );
 }
+
+#[test]
+fn paths_below_symlink_or_file_ancestors_are_unobserved() {
+    for snapshot in [
+        snapshot(
+            Tar::new()
+                .root()
+                .entry("bin/link", b'2', b"", 0o777, 0, 0, "/outside"),
+        ),
+        snapshot(Tar::new().root().file("bin/link", b"not a directory")),
+    ] {
+        let snapshots = [snapshot];
+        for expectation in [
+            Expectation::Absent {
+                path: "/usr/local/bin/link/child".into(),
+            },
+            Expectation::Present {
+                path: "/usr/local/bin/link/child".into(),
+                expected_kind: None,
+            },
+            Expectation::Preserved {
+                path: "/usr/local/bin/link/child".into(),
+            },
+        ] {
+            assert_eq!(
+                evaluate_filesystem(&check(expectation), &snapshots, Some(&snapshots)).outcome,
+                CheckOutcome::Incomplete,
+            );
+        }
+    }
+}
+
+#[test]
+fn symlink_observed_root_does_not_establish_its_descendants() {
+    let snapshots = [snapshot(
+        Tar::new().entry("bin", b'2', b"", 0o777, 0, 0, "/outside"),
+    )];
+    for expectation in [
+        Expectation::Absent {
+            path: "/usr/local/bin/child".into(),
+        },
+        Expectation::Present {
+            path: "/usr/local/bin/child".into(),
+            expected_kind: None,
+        },
+        Expectation::Preserved {
+            path: "/usr/local/bin/child".into(),
+        },
+    ] {
+        assert_eq!(
+            evaluate_filesystem(&check(expectation), &snapshots, Some(&snapshots)).outcome,
+            CheckOutcome::Incomplete,
+        );
+    }
+    let root = check(Expectation::Present {
+        path: "/usr/local/bin".into(),
+        expected_kind: Some(FileKind::Symlink),
+    });
+    assert_eq!(
+        evaluate_filesystem(&root, &snapshots, None).outcome,
+        CheckOutcome::Passed
+    );
+}
+
+#[test]
+fn preservation_requires_observed_configured_ancestors() {
+    let current = [snapshot(
+        Tar::new()
+            .root()
+            .entry("bin/link", b'5', b"", 0o755, 0, 0, "")
+            .file("bin/link/child", b"new"),
+    )];
+    let configured = [snapshot(
+        Tar::new()
+            .root()
+            .entry("bin/link", b'2', b"", 0o777, 0, 0, "/outside"),
+    )];
+    let c = check(Expectation::Preserved {
+        path: "/usr/local/bin/link/child".into(),
+    });
+    assert_eq!(
+        evaluate_filesystem(&c, &current, Some(&configured)).outcome,
+        CheckOutcome::Incomplete
+    );
+}

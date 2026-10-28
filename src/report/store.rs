@@ -276,7 +276,11 @@ fn report_root(path: &Path, filename: &str) -> Result<PathBuf> {
         return Ok(path.into());
     }
     if path.file_name().is_some_and(|n| n == filename) {
-        return Ok(path.parent().unwrap_or(Path::new(".")).into());
+        return Ok(path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .into());
     }
     bail!("expected run directory or {filename}")
 }

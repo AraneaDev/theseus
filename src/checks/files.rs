@@ -1,7 +1,7 @@
 use super::result;
 use crate::recipe::validate::contained;
 use crate::{
-    model::{CheckOutcome, CheckResult, Checkpoint, Finding, FindingKind},
+    model::{CheckOutcome, CheckResult, Checkpoint, FileKind, Finding, FindingKind},
     recipe::{Check, Expectation},
     snapshot::{FileEntry, ObservationStatus, Snapshot},
 };
@@ -17,7 +17,24 @@ fn observed<'a>(path: &str, snapshots: &'a [Snapshot]) -> Result<Option<&'a File
         return Err(format!("ambiguous overlapping observations cover {path}"));
     }
     match &snapshot.completeness {
-        ObservationStatus::Complete => Ok(snapshot.entries.get(path)),
+        ObservationStatus::Complete => {
+            // A no-follow snapshot proves the link entry, not anything reached
+            // through it. The same uncertainty applies to non-directory parents.
+            // Inspect proper ancestors only, so checking the link itself stays valid.
+            for (index, _) in path.match_indices('/').skip(1) {
+                let ancestor = &path[..index];
+                if snapshot
+                    .entries
+                    .get(ancestor)
+                    .is_some_and(|entry| entry.kind != FileKind::Directory)
+                {
+                    return Err(format!(
+                        "cannot observe {path} through non-directory ancestor {ancestor}"
+                    ));
+                }
+            }
+            Ok(snapshot.entries.get(path))
+        }
         ObservationStatus::Missing => Ok(None),
         ObservationStatus::Incomplete { reason } => Err(format!(
             "observation of {} is incomplete: {reason}",
