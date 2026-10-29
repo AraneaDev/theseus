@@ -22,7 +22,24 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(super) enum SupervisionEvent {
+    Poll,
+    Abort,
+}
+pub(super) enum SupervisionDecision {
+    Continue,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "The planned interruption consumer is introduced in Task 2"
+        )
+    )]
+    Stop,
+}
+
 pub(super) struct Output {
+    pub supervised_stop: bool,
     pub status: Option<i32>,
     pub timed_out: bool,
     pub cancelled: bool,
@@ -86,6 +103,7 @@ struct Completion {
     status: Option<ExitStatus>,
     timed_out: bool,
     cancelled: bool,
+    supervised_stop: bool,
     error: Option<String>,
     duration_ms: u64,
 }
@@ -151,11 +169,13 @@ impl HostProcess {
         cancel: &CancellationToken,
         readers_done: impl Fn() -> bool,
         failed_reader: impl Fn() -> bool,
-        mut abort: impl FnMut() -> Result<()>,
+        mut control: impl FnMut(SupervisionEvent) -> Result<SupervisionDecision>,
     ) -> Completion {
         let mut exited = false;
         let mut timed_out;
         let mut cancelled;
+        let mut supervised_stop = false;
+        let mut last_poll: Option<Instant> = None;
         let mut error = None;
         loop {
             if !exited {
@@ -166,17 +186,42 @@ impl HostProcess {
             }
             cancelled = cancel.is_cancelled();
             timed_out = self.started.elapsed() >= timeout;
+            if !cancelled && !timed_out && error.is_none() {
+                // Parser rejection stops only acquisition, preserving the container.
+                if failed_reader() || (exited && readers_done()) {
+                    break;
+                }
+                // Never turn an already-exited child into an intentional stop.
+                // Slow control calls space their successors from completion too.
+                if !exited && last_poll.is_none_or(|at| at.elapsed() >= Duration::from_millis(50)) {
+                    let decision = control(SupervisionEvent::Poll);
+                    last_poll = Some(Instant::now());
+                    cancelled = cancel.is_cancelled();
+                    timed_out = self.started.elapsed() >= timeout;
+                    match decision {
+                        Err(failure) => {
+                            error = Some(format!("supervise owned environment: {failure:#}"))
+                        }
+                        Ok(SupervisionDecision::Stop) if !cancelled && !timed_out => {
+                            supervised_stop = true;
+                            break;
+                        }
+                        Ok(_) => {}
+                    }
+                }
+            }
             if cancelled || timed_out || error.is_some() {
                 self.stop.store(true, Ordering::SeqCst);
                 // The exited leader stays unreaped throughout container abort,
                 // so even its control-operation deadlines cannot expose reuse.
-                if let Err(failure) = abort() {
-                    error = Some(format!("abort owned environment: {failure:#}"));
+                if let Err(failure) = control(SupervisionEvent::Abort) {
+                    let abort_error = format!("abort owned environment: {failure:#}");
+                    error = Some(error.map_or(abort_error.clone(), |prior| {
+                        format!("{prior}; {abort_error}")
+                    }));
                 }
-                break;
-            }
-            // Parser rejection stops only acquisition, preserving the container.
-            if failed_reader() || (exited && readers_done()) {
+                cancelled |= cancel.is_cancelled();
+                timed_out |= self.started.elapsed() >= timeout;
                 break;
             }
             thread::sleep(Duration::from_millis(5));
@@ -197,6 +242,7 @@ impl HostProcess {
             status,
             timed_out,
             cancelled,
+            supervised_stop: supervised_stop && error.is_none(),
             error,
             duration_ms: self.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
         }
@@ -250,9 +296,35 @@ pub(super) fn run(
     limit: usize,
     mut abort: impl FnMut() -> Result<()>,
 ) -> Result<Output> {
+    run_supervised(
+        command,
+        timeout,
+        cancel,
+        files,
+        limit,
+        |event| match event {
+            SupervisionEvent::Poll => Ok(SupervisionDecision::Continue),
+            SupervisionEvent::Abort => abort().map(|()| SupervisionDecision::Continue),
+        },
+    )
+}
+
+/// Control callbacks must honor their own bounded deadlines; the monitor checks
+/// cancellation and its execution deadline both before and after each callback.
+pub(super) fn run_supervised(
+    command: &mut Command,
+    timeout: Duration,
+    cancel: &CancellationToken,
+    files: Option<(File, File)>,
+    limit: usize,
+    mut control: impl FnMut(SupervisionEvent) -> Result<SupervisionDecision>,
+) -> Result<Output> {
     if cancel.is_cancelled() {
-        let error = abort().err().map(|error| format!("{error:#}"));
+        let error = control(SupervisionEvent::Abort)
+            .err()
+            .map(|error| format!("{error:#}"));
         return Ok(Output {
+            supervised_stop: false,
             status: None,
             timed_out: false,
             cancelled: true,
@@ -273,7 +345,7 @@ pub(super) fn run(
         cancel,
         || stdout.is_finished() && stderr.is_finished(),
         || false,
-        abort,
+        control,
     );
     // Monitor either established completion or interrupted the nonblocking pipe
     // readers. Join both even when one fails; no reader thread is detached.
@@ -282,6 +354,7 @@ pub(super) fn run(
     let stdout = stdout.map_err(|_| anyhow!("stdout drain panicked"))??;
     let stderr = stderr.map_err(|_| anyhow!("stderr drain panicked"))??;
     Ok(Output {
+        supervised_stop: completion.supervised_stop,
         status: completion.status.and_then(|s| s.code()),
         timed_out: completion.timed_out,
         cancelled: completion.cancelled,
@@ -327,7 +400,10 @@ pub(super) fn archive(
         cancel,
         || parser.is_finished() && stderr.is_finished(),
         || failed.load(Ordering::SeqCst),
-        abort,
+        |event| match event {
+            SupervisionEvent::Poll => Ok(SupervisionDecision::Continue),
+            SupervisionEvent::Abort => abort().map(|()| SupervisionDecision::Continue),
+        },
     );
     let parsed = parser.join();
     let stderr = stderr.join();
@@ -379,6 +455,194 @@ pub(super) fn utility(command: &mut Command, cancel: &CancellationToken) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    // These regressions catch ignored Stop, error-as-success, and safety checks
+    // skipped after a callback. The child signals only after filling both pipes.
+    fn held_child(ready: &std::path::Path) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "head -c 131072 /dev/zero; head -c 131072 /dev/zero >&2; sleep 10 & printf '%s %s\\n' \"$$\" \"$!\" > \"$1\"; wait", "supervised-child"]).arg(ready);
+        command
+    }
+    #[test]
+    fn supervision_stops_held_child_and_joins_bounded_drains() {
+        let temp = tempfile::tempdir().unwrap();
+        let ready = temp.path().join("ready");
+        let mut polls = vec![];
+        let mut aborted = false;
+        let output = run_supervised(
+            &mut held_child(&ready),
+            Duration::from_secs(1),
+            &CancellationToken::default(),
+            None,
+            128,
+            |event| match event {
+                SupervisionEvent::Poll => {
+                    polls.push(Instant::now());
+                    Ok(if ready.exists() {
+                        SupervisionDecision::Stop
+                    } else {
+                        SupervisionDecision::Continue
+                    })
+                }
+                SupervisionEvent::Abort => {
+                    aborted = true;
+                    Ok(SupervisionDecision::Continue)
+                }
+            },
+        )
+        .unwrap();
+        assert!(output.supervised_stop);
+        assert!(!output.timed_out);
+        assert!(!output.cancelled);
+        assert!(output.error.is_none());
+        assert!(!aborted, "intentional stop is distinct from safety abort");
+        assert_eq!(output.stdout.bytes.len(), 128);
+        assert_eq!(output.stderr.bytes.len(), 128);
+        assert!(output.stdout.truncated && output.stderr.truncated);
+        assert!(
+            polls
+                .windows(2)
+                .all(|pair| pair[1].duration_since(pair[0]) >= Duration::from_millis(50))
+        );
+        let ids = std::fs::read_to_string(&ready).unwrap();
+        let ids: Vec<_> = ids.split_whitespace().collect();
+        assert!(
+            !std::path::Path::new(&format!("/proc/{}", ids[0])).exists(),
+            "leader was not reaped"
+        );
+        let child = std::fs::read_to_string(format!("/proc/{}/stat", ids[1]));
+        assert!(
+            child.is_err()
+                || child
+                    .unwrap()
+                    .rsplit_once(')')
+                    .unwrap()
+                    .1
+                    .trim_start()
+                    .starts_with(['Z', 'X']),
+            "descriptor holder survived group cleanup"
+        );
+        assert!(output.duration_ms < 1000);
+    }
+    #[test]
+    fn supervision_error_aborts_without_claiming_intentional_stop() {
+        let temp = tempfile::tempdir().unwrap();
+        let ready = temp.path().join("ready");
+        let mut aborted = false;
+        let output = run_supervised(
+            &mut held_child(&ready),
+            Duration::from_secs(1),
+            &CancellationToken::default(),
+            None,
+            128,
+            |event| match event {
+                SupervisionEvent::Poll if ready.exists() => {
+                    anyhow::bail!("readiness verification failed")
+                }
+                SupervisionEvent::Poll => Ok(SupervisionDecision::Continue),
+                SupervisionEvent::Abort => {
+                    aborted = true;
+                    Ok(SupervisionDecision::Continue)
+                }
+            },
+        )
+        .unwrap();
+        assert!(aborted);
+        assert!(!output.supervised_stop);
+        assert!(!output.timed_out && !output.cancelled);
+        assert!(
+            output
+                .error
+                .unwrap()
+                .contains("readiness verification failed")
+        );
+    }
+    #[test]
+    fn cancellation_during_stop_callback_wins_and_aborts() {
+        let temp = tempfile::tempdir().unwrap();
+        let ready = temp.path().join("ready");
+        let cancel = CancellationToken::default();
+        let mut aborted = false;
+        let output = run_supervised(
+            &mut held_child(&ready),
+            Duration::from_secs(1),
+            &cancel,
+            None,
+            128,
+            |event| match event {
+                SupervisionEvent::Poll if ready.exists() => {
+                    cancel.cancel();
+                    Ok(SupervisionDecision::Stop)
+                }
+                SupervisionEvent::Poll => Ok(SupervisionDecision::Continue),
+                SupervisionEvent::Abort => {
+                    aborted = true;
+                    Ok(SupervisionDecision::Continue)
+                }
+            },
+        )
+        .unwrap();
+        assert!(output.cancelled && aborted);
+        assert!(!output.supervised_stop);
+        assert!(!output.timed_out);
+    }
+    #[test]
+    fn deadline_during_stop_callback_wins_and_aborts() {
+        let temp = tempfile::tempdir().unwrap();
+        let ready = temp.path().join("ready");
+        let mut aborted = false;
+        let mut reached_barrier = false;
+        let output = run_supervised(
+            &mut held_child(&ready),
+            Duration::from_millis(150),
+            &CancellationToken::default(),
+            None,
+            128,
+            |event| match event {
+                SupervisionEvent::Poll if ready.exists() => {
+                    reached_barrier = true;
+                    thread::sleep(Duration::from_millis(160));
+                    Ok(SupervisionDecision::Stop)
+                }
+                SupervisionEvent::Poll => Ok(SupervisionDecision::Continue),
+                SupervisionEvent::Abort => {
+                    aborted = true;
+                    Ok(SupervisionDecision::Continue)
+                }
+            },
+        )
+        .unwrap();
+        assert!(
+            reached_barrier,
+            "deadline must occur inside the stop callback"
+        );
+        assert!(output.timed_out && aborted);
+        assert!(!output.supervised_stop);
+        assert!(!output.cancelled);
+    }
+    #[test]
+    fn normal_exit_before_readiness_is_not_supervised_success() {
+        let mut polls = 0;
+        let output = run_supervised(
+            Command::new("/bin/sh").args(["-c", "exit 0"]),
+            Duration::from_secs(1),
+            &CancellationToken::default(),
+            None,
+            128,
+            |event| match event {
+                SupervisionEvent::Poll => {
+                    polls += 1;
+                    Ok(SupervisionDecision::Continue)
+                }
+                SupervisionEvent::Abort => panic!("normal exit must not abort"),
+            },
+        )
+        .unwrap();
+        assert_eq!(output.status, Some(0));
+        assert!(!output.supervised_stop);
+        assert!(!output.timed_out && !output.cancelled);
+        assert!(output.error.is_none());
+        assert!(polls <= 1);
+    }
     #[test]
     fn exited_leader_stays_reserved_until_deferred_group_cleanup_then_is_reaped() {
         let temp = tempfile::tempdir().unwrap();
