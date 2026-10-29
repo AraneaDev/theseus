@@ -443,6 +443,23 @@ mod tests {
         let mut tiny = Terminal::new(TestBackend::new(12, 5)).unwrap();
         tiny.draw(|frame| draw(frame, usize::MAX, Direction::Exit))
             .unwrap();
+        let clipped: Vec<String> = tiny
+            .backend()
+            .buffer()
+            .content()
+            .chunks(12)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        assert_eq!(
+            clipped,
+            [
+                "            ",
+                "            ",
+                "   +--------",
+                "   |     |  ",
+                "   | ----|--"
+            ]
+        );
     }
 
     #[test]

@@ -38,7 +38,7 @@ executed_cases = []
 
 
 class Session:
-    def __init__(self, name, rows=24, columns=80, term='xterm-256color', args=(), active=False, error=False, draw_error=False):
+    def __init__(self, name, rows=24, columns=80, term='xterm-256color', args=(), active=False, error=False, draw_error=False, cached_error=False):
         self.name = name
         self.tmp = tempfile.TemporaryDirectory(prefix='theseus-animation-')
         self.root = pathlib.Path(self.tmp.name)
@@ -55,6 +55,20 @@ class Session:
             shutil.copyfile(args[1], saved / 'report.json')
             args = ('report', str(saved), *args[2:])
         environment = {**os.environ, 'TERM': term}
+        if cached_error:
+            # Hold prepare at a FIFO until Started is actually visible. This
+            # creates a worker persistence failure after the UI cached evidence,
+            # with no Docker daemon or timing-dependent sleeps.
+            self.gate = self.root / 'prepare-gate'
+            os.mkfifo(self.gate)
+            executable = self.root / 'bin' / 'docker'
+            executable.parent.mkdir()
+            executable.write_text("#!/usr/bin/python3\nimport os, pathlib\n"
+                                  "pathlib.Path('prepare-ready').touch()\n"
+                                  "with open('prepare-gate', 'rb') as gate: gate.read(1)\n"
+                                  "raise SystemExit(1)\n")
+            executable.chmod(0o755)
+            environment['PATH'] = str(executable.parent) + os.pathsep + os.environ['PATH']
         if draw_error:
             # Fail exactly the first scene write, then permit Guard's restoration
             # writes. The production binary and actual PTY remain unchanged.
@@ -284,6 +298,25 @@ def worker_error(s):
     assert b'Following the thread home' not in s.captions
 
 
+def cached_worker_error(s):
+    s.preview()
+    s.key(b'r')
+    s.until(lambda: (s.root / 'prepare-ready').exists() and s.visible('Running Started'))
+    saved = next(s.root.glob('.theseus-runs/*/report.json'))
+    saved.rename(saved.with_name('cached-report.json'))
+    saved.mkdir()  # Make the final atomic report rename fail after cached Started.
+    with s.gate.open('wb') as gate:
+        gate.write(b'x')
+    s.until(lambda: s.visible('Engine error'))
+    s.key(b'q')
+    s.finish(code=2)
+    restored = bytes(s.data).rsplit(b'\x1b[?1049l', 1)[1]
+    for expected in [b'Engine error:', b'Saved report:', str(saved).encode(),
+                     b'Recovery: theseus cleanup', str(saved.parent).encode()]:
+        assert expected in restored, (s.name, 'missing restored-terminal diagnostic', expected, restored)
+    assert b'Following the thread home' not in s.captions
+
+
 def active_cancel(s, action):
     s.intro()
     s.key(b' ')
@@ -341,6 +374,9 @@ else:
         for name, action in [('ctrl-c',b'\x03'),('sigint',signal.SIGINT),('sigterm',signal.SIGTERM)]:
             run(phase+'-'+name, lambda s, p=phase, a=action: terminate(s,p,a))
     run('worker-error', worker_error, error=True)
+    run('cached-worker-error-disabled', cached_worker_error, cached_error=True, args=('--no-animation',))
+    run('cached-worker-error-dumb', cached_worker_error, cached_error=True, term='dumb')
+    run('cached-worker-error-small', cached_worker_error, cached_error=True, rows=17, columns=39)
     run('draw-error', draw_failure, draw_error=True)
 
 assert executed_cases, f'unknown or unavailable --case: {selected_case!r}'
