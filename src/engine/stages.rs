@@ -414,7 +414,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
             let policy = self.report.scenarios[self.index].rollback.as_ref().unwrap();
             {
                 let derived = super::rollback_checks::derived(
-                    policy,
+                    &policy.recovery,
                     checkpoint,
                     state.before_upgrade.as_deref().unwrap_or_default(),
                     &stage.snapshots,
@@ -615,7 +615,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                     && self.report.scenarios[self.index]
                         .rollback
                         .as_ref()
-                        .is_some_and(|p| p.binary_checks.contains(&check.id))
+                        .is_some_and(|p| p.recovery.binary_checks.contains(&check.id))
                     && state.before_upgrade.as_ref().is_some_and(|snapshots| {
                         snapshots.iter().any(|s| {
                             s.entries.get(path).is_some_and(|e| {

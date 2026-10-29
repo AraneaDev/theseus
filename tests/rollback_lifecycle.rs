@@ -82,6 +82,7 @@ fn run(
             p.rollback
                 .as_mut()
                 .unwrap()
+                .recovery
                 .binary_checks
                 .push("directory-binary".into());
             p.checks.push(recipe::Check {

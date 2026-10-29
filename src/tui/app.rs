@@ -188,12 +188,12 @@ impl App {
                             "Expected failure: attempt_upgrade exit={} marker={:?}\nChanged checks: {:?}; binary checks: {:?}; runtime checks: {:?}; data readers: {:?}\n",
                             policy.failure.expected_exit,
                             policy.failure.stdout_contains,
-                            policy.change_checks,
-                            policy.binary_checks,
-                            policy.runtime_checks,
-                            policy.data_checks
+                            policy.recovery.change_checks,
+                            policy.recovery.binary_checks,
+                            policy.recovery.runtime_checks,
+                            policy.recovery.data_checks
                         );
-                        match &policy.restoration {
+                        match &policy.recovery.restoration {
                             crate::recipe::RestorationPolicy::BinaryOnly => {
                                 text += "Policy: binary_only; known-good runtime must read retained data.\n"
                             }
@@ -364,7 +364,7 @@ impl App {
                     && scenario.scenario == ScenarioKind::Rollback
                     && scenario.outcome == RunOutcome::Passed
                 {
-                    items.push(match scenario.rollback.as_ref().map(|p| &p.restoration) {
+                    items.push(match scenario.rollback.as_ref().map(|p| &p.recovery.restoration) {
                         Some(crate::recipe::RestorationPolicy::RestoreData { .. }) => "Rollback verified: known-good binary, restored scopes and data readers passed",
                         _ => "Rollback verified: known-good binary and retained-data readers passed",
                     }.into());

@@ -2,7 +2,7 @@
 use crate::{
     checks,
     model::*,
-    recipe::{Check, Expectation, RestorationPolicy, RollbackContract},
+    recipe::{Check, Expectation, RestorationPolicy, RollbackRecoveryContract},
     snapshot::Snapshot,
 };
 
@@ -55,7 +55,7 @@ pub(super) fn root_absent(
     r
 }
 pub(super) fn derived(
-    policy: &RollbackContract,
+    policy: &RollbackRecoveryContract,
     checkpoint: Checkpoint,
     before: &[Snapshot],
     after: &[Snapshot],

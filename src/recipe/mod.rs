@@ -1,13 +1,17 @@
 //! Typed recipes and offline validation. Environment forwarding is a run-preflight concern.
 mod downgrade;
+mod interrupted_rollback;
 mod rollback;
 mod types;
 pub(crate) mod validate;
 pub use downgrade::{DowngradeContract, validate_downgrade_contract};
+pub use interrupted_rollback::{
+    InterruptedRollbackContract, validate_interrupted_rollback_contract,
+};
 pub use types::*;
 pub use validate::{ValidatedRecipe, load, normalize_container_path};
 
 pub use rollback::{
     BackupScope, ExpectedFailureContract, RestorationPolicy, RollbackContract,
-    validate_rollback_contract,
+    RollbackRecoveryContract, validate_rollback_contract, validate_rollback_recovery,
 };

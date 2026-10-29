@@ -33,7 +33,7 @@ pub(super) fn run<E: Environment, F: FnMut(EngineEvent)>(
     c.step_named(state, StepName::Exercise, "exercise_before_upgrade")?;
     c.checkpoint(state, Checkpoint::KnownGood, false)?;
     state.before_upgrade = Some(reference(c, state, "before_upgrade")?);
-    if let RestorationPolicy::RestoreData { backup_root, .. } = &policy.restoration {
+    if let RestorationPolicy::RestoreData { backup_root, .. } = &policy.recovery.restoration {
         let mut stage = StageReport::new("backup");
         stage.step = Some(StepName::Backup);
         if state.forward && state.availability == Availability::Running && !c.cancel.is_cancelled()
@@ -115,7 +115,7 @@ pub(super) fn run<E: Environment, F: FnMut(EngineEvent)>(
     c.capture(state, &mut ready);
     {
         ready.checks = super::rollback_checks::derived(
-            &policy,
+            &policy.recovery,
             Checkpoint::UpgradeFailed,
             state.before_upgrade.as_deref().unwrap_or_default(),
             &ready.snapshots,
@@ -138,7 +138,10 @@ pub(super) fn run<E: Environment, F: FnMut(EngineEvent)>(
     c.step(state, StepName::Rollback)?;
     c.checkpoint(state, Checkpoint::RolledBack, false)?;
     c.step(state, StepName::ExerciseRolledBack)?;
-    if matches!(policy.restoration, RestorationPolicy::RestoreData { .. }) {
+    if matches!(
+        policy.recovery.restoration,
+        RestorationPolicy::RestoreData { .. }
+    ) {
         c.step(state, StepName::CleanupBackup)?;
         c.checkpoint(state, Checkpoint::BackupRemoved, false)?;
     }

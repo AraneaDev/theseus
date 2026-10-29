@@ -4,7 +4,7 @@ use theseus::{
     model::CheckOutcome,
     recipe::{
         BackupScope, ExpectedFailureContract, RestorationPolicy, RollbackContract,
-        validate_rollback_contract,
+        RollbackRecoveryContract, validate_rollback_contract,
     },
 };
 
@@ -14,17 +14,19 @@ fn contract() -> RollbackContract {
             expected_exit: 9,
             stdout_contains: "upgrade failed after migration".into(),
         },
-        change_checks: vec!["changed".into()],
-        binary_checks: vec!["binary".into()],
-        runtime_checks: vec!["runtime".into()],
-        data_checks: vec!["reader".into()],
-        restoration: RestorationPolicy::RestoreData {
-            backup_root: "/workspace/backup".into(),
-            scopes: vec![BackupScope {
-                id: "data".into(),
-                source: "/home/theseus/data".into(),
-                stored: "data".into(),
-            }],
+        recovery: RollbackRecoveryContract {
+            change_checks: vec!["changed".into()],
+            binary_checks: vec!["binary".into()],
+            runtime_checks: vec!["runtime".into()],
+            data_checks: vec!["reader".into()],
+            restoration: RestorationPolicy::RestoreData {
+                backup_root: "/workspace/backup".into(),
+                scopes: vec![BackupScope {
+                    id: "data".into(),
+                    source: "/home/theseus/data".into(),
+                    stored: "data".into(),
+                }],
+            },
         },
     }
 }
@@ -53,10 +55,10 @@ fn policy_roundtrips_and_accepts_inclusive_bounds() {
         );
     }
     let mut c = contract();
-    c.restoration = RestorationPolicy::BinaryOnly;
+    c.recovery.restoration = RestorationPolicy::BinaryOnly;
     validate_rollback_contract(&c).unwrap();
     assert_eq!(
-        serde_json::to_value(c.restoration).unwrap(),
+        serde_json::to_value(c.recovery.restoration).unwrap(),
         json!({"mode":"binary_only"})
     );
 }
@@ -141,14 +143,14 @@ fn every_nested_policy_type_rejects_unknown_fields_including_binary_only() {
 fn restore_data_requires_bounded_valid_unique_scope_ids() {
     for id in ["", "bad id", "../x", "é", &"x".repeat(65)] {
         let mut c = contract();
-        if let RestorationPolicy::RestoreData { scopes, .. } = &mut c.restoration {
+        if let RestorationPolicy::RestoreData { scopes, .. } = &mut c.recovery.restoration {
             scopes[0].id = id.into();
         }
         assert!(validate_rollback_contract(&c).is_err(), "{id}");
     }
     for count in [0, 1, 64, 65] {
         let mut c = contract();
-        if let RestorationPolicy::RestoreData { scopes, .. } = &mut c.restoration {
+        if let RestorationPolicy::RestoreData { scopes, .. } = &mut c.recovery.restoration {
             *scopes = (0..count)
                 .map(|i| BackupScope {
                     id: format!("scope_{i}-A"),
@@ -164,7 +166,7 @@ fn restore_data_requires_bounded_valid_unique_scope_ids() {
         );
     }
     let mut c = contract();
-    if let RestorationPolicy::RestoreData { scopes, .. } = &mut c.restoration {
+    if let RestorationPolicy::RestoreData { scopes, .. } = &mut c.recovery.restoration {
         scopes.push(BackupScope {
             id: "data".into(),
             source: "/other".into(),
@@ -187,7 +189,7 @@ fn restore_paths_are_normalized_and_storage_is_separate_and_safe() {
         "/home/\0data",
     ] {
         let mut c = contract();
-        if let RestorationPolicy::RestoreData { scopes, .. } = &mut c.restoration {
+        if let RestorationPolicy::RestoreData { scopes, .. } = &mut c.recovery.restoration {
             scopes[0].source = path.into();
         }
         assert!(validate_rollback_contract(&c).is_err(), "source {path:?}");
@@ -210,7 +212,7 @@ fn restore_paths_are_normalized_and_storage_is_separate_and_safe() {
         "/home/theseus/data/copy",
     ] {
         let mut c = contract();
-        if let RestorationPolicy::RestoreData { backup_root, .. } = &mut c.restoration {
+        if let RestorationPolicy::RestoreData { backup_root, .. } = &mut c.recovery.restoration {
             *backup_root = root.into();
         }
         assert!(validate_rollback_contract(&c).is_err(), "root {root:?}");
@@ -228,7 +230,7 @@ fn restore_paths_are_normalized_and_storage_is_separate_and_safe() {
         "data/\0copy",
     ] {
         let mut c = contract();
-        if let RestorationPolicy::RestoreData { scopes, .. } = &mut c.restoration {
+        if let RestorationPolicy::RestoreData { scopes, .. } = &mut c.recovery.restoration {
             scopes[0].stored = path.into();
         }
         assert!(validate_rollback_contract(&c).is_err(), "stored {path:?}");
@@ -241,7 +243,7 @@ fn restore_paths_are_normalized_and_storage_is_separate_and_safe() {
         ("/other", "data/child"),
     ] {
         let mut c = contract();
-        if let RestorationPolicy::RestoreData { scopes, .. } = &mut c.restoration {
+        if let RestorationPolicy::RestoreData { scopes, .. } = &mut c.recovery.restoration {
             scopes.push(BackupScope {
                 id: "other".into(),
                 source: source.into(),
@@ -251,7 +253,7 @@ fn restore_paths_are_normalized_and_storage_is_separate_and_safe() {
         assert!(validate_rollback_contract(&c).is_err(), "{source}/{stored}");
     }
     let mut c = contract();
-    if let RestorationPolicy::RestoreData { scopes, .. } = &mut c.restoration {
+    if let RestorationPolicy::RestoreData { scopes, .. } = &mut c.recovery.restoration {
         scopes.push(BackupScope {
             id: "other".into(),
             source: "/home/theseus/database".into(),
@@ -445,11 +447,11 @@ fn policy_decode_rejects_missing_fields_unknown_modes_and_wrong_types() {
 fn validators_preserve_literal_markers_ids_and_component_boundaries() {
     let mut c = contract();
     c.failure.stdout_contains = " failed.*\n".into();
-    c.change_checks = vec![" change ".into()];
+    c.recovery.change_checks = vec![" change ".into()];
     if let RestorationPolicy::RestoreData {
         backup_root,
         scopes,
-    } = &mut c.restoration
+    } = &mut c.recovery.restoration
     {
         *backup_root = "/inputsevil/backup".into();
         scopes[0].id = "x".repeat(64);

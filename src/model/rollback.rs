@@ -1,6 +1,6 @@
 //! Rollback policy/proof validation shared by live aggregation and offline loading.
 use super::*;
-use crate::recipe::{RestorationPolicy, RollbackContract};
+use crate::recipe::{RestorationPolicy, RollbackContract, RollbackRecoveryContract};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,7 +133,7 @@ impl ScenarioReport {
             }
             for check in &stage.checks {
                 if check.id.starts_with("__theseus_rollback_")
-                    && !generated_context(policy, stage, check)
+                    && !generated_context(&policy.recovery, stage, check)
                 {
                     return true;
                 }
@@ -154,7 +154,10 @@ impl ScenarioReport {
         completed_success && !self.complete_rollback(policy)
     }
     fn complete_rollback(&self, policy: &RollbackContract) -> bool {
-        let restore = matches!(policy.restoration, RestorationPolicy::RestoreData { .. });
+        let restore = matches!(
+            policy.recovery.restoration,
+            RestorationPolicy::RestoreData { .. }
+        );
         let mut names = vec![
             "baseline",
             "install_base",
@@ -261,14 +264,14 @@ impl ScenarioReport {
                     return false;
                 }
             }
-            for required in required_generated(policy, &stage.name) {
+            for required in required_generated(&policy.recovery, &stage.name) {
                 if stage
                     .checks
                     .iter()
                     .filter(|c| {
                         c.id == required
                             && c.outcome == CheckOutcome::Passed
-                            && generated_context(policy, stage, c)
+                            && generated_context(&policy.recovery, stage, c)
                     })
                     .count()
                     != 1
@@ -330,10 +333,10 @@ impl ScenarioReport {
             }
         }
         for (cp, ids) in [
-            (Checkpoint::UpgradeFailed, &policy.change_checks),
-            (Checkpoint::RolledBack, &policy.binary_checks),
-            (Checkpoint::RolledBack, &policy.data_checks),
-            (Checkpoint::RolledBack, &policy.runtime_checks),
+            (Checkpoint::UpgradeFailed, &policy.recovery.change_checks),
+            (Checkpoint::RolledBack, &policy.recovery.binary_checks),
+            (Checkpoint::RolledBack, &policy.recovery.data_checks),
+            (Checkpoint::RolledBack, &policy.recovery.runtime_checks),
         ] {
             for id in ids {
                 let found = self
@@ -349,9 +352,11 @@ impl ScenarioReport {
                     return false;
                 }
                 let check = found[0];
-                if policy.data_checks.contains(id) || policy.runtime_checks.contains(id) {
+                if policy.recovery.data_checks.contains(id)
+                    || policy.recovery.runtime_checks.contains(id)
+                {
                     if check.command_ids.is_empty()
-                        || (policy.data_checks.contains(id)
+                        || (policy.recovery.data_checks.contains(id)
                             && !reader_evidence(
                                 self.stages
                                     .iter()
@@ -407,7 +412,7 @@ impl ScenarioReport {
         if let RestorationPolicy::RestoreData {
             backup_root,
             scopes,
-        } = &policy.restoration
+        } = &policy.recovery.restoration
         {
             let before = &self
                 .stages
@@ -524,14 +529,14 @@ impl ScenarioReport {
                 }
                 Some((resolve.argv.clone(), run.argv.clone()))
             };
-        policy.runtime_checks.iter().all(|id| {
+        policy.recovery.runtime_checks.iter().all(|id| {
             let Some(check) = restored.checks.iter().find(|c| &c.id == id) else {
                 return false;
             };
             let Some((resolve, run)) = executable(restored, check) else {
                 return false;
             };
-            policy.binary_checks.iter().any(|id| {
+            policy.recovery.binary_checks.iter().any(|id| {
                 restored
                     .checks
                     .iter()
@@ -579,7 +584,7 @@ fn reader_evidence(stage: &StageReport, check: &CheckResult) -> bool {
                 && c.outcome == CommandOutcome::Succeeded
         })
 }
-fn required_generated(policy: &RollbackContract, name: &str) -> Vec<String> {
+fn required_generated(policy: &RollbackRecoveryContract, name: &str) -> Vec<String> {
     let RestorationPolicy::RestoreData { scopes, .. } = &policy.restoration else {
         return vec![];
     };
@@ -601,7 +606,11 @@ fn required_generated(policy: &RollbackContract, name: &str) -> Vec<String> {
         })
         .collect()
 }
-fn generated_context(policy: &RollbackContract, stage: &StageReport, check: &CheckResult) -> bool {
+fn generated_context(
+    policy: &RollbackRecoveryContract,
+    stage: &StageReport,
+    check: &CheckResult,
+) -> bool {
     let RestorationPolicy::RestoreData {
         backup_root,
         scopes,

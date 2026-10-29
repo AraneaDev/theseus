@@ -10,13 +10,45 @@ pub struct ExpectedFailureContract {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RollbackContract {
-    pub failure: ExpectedFailureContract,
+pub struct RollbackRecoveryContract {
     pub change_checks: Vec<String>,
     pub binary_checks: Vec<String>,
     pub runtime_checks: Vec<String>,
     pub data_checks: Vec<String>,
     pub restoration: RestorationPolicy,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RollbackContract {
+    pub failure: ExpectedFailureContract,
+    #[serde(flatten)]
+    pub recovery: RollbackRecoveryContract,
+}
+impl<'de> Deserialize<'de> for RollbackContract {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        // Keep schema-5 keys flat and strict: flatten with deny_unknown_fields
+        // cannot reliably distinguish the failure field from recovery fields.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireContract {
+            failure: ExpectedFailureContract,
+            change_checks: Vec<String>,
+            binary_checks: Vec<String>,
+            runtime_checks: Vec<String>,
+            data_checks: Vec<String>,
+            restoration: RestorationPolicy,
+        }
+        let wire = WireContract::deserialize(deserializer)?;
+        Ok(Self {
+            failure: wire.failure,
+            recovery: RollbackRecoveryContract {
+                change_checks: wire.change_checks,
+                binary_checks: wire.binary_checks,
+                runtime_checks: wire.runtime_checks,
+                data_checks: wire.data_checks,
+                restoration: wire.restoration,
+            },
+        })
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
@@ -72,6 +104,11 @@ pub fn validate_rollback_contract(contract: &RollbackContract) -> Result<()> {
         !contract.failure.stdout_contains.trim().is_empty(),
         "rollback requires nonempty stdout_contains"
     );
+    validate_rollback_recovery(&contract.recovery)
+}
+
+/// Validate shared recovery values without profile, checkpoint or runtime context.
+pub fn validate_rollback_recovery(contract: &RollbackRecoveryContract) -> Result<()> {
     let mut references = BTreeSet::new();
     for ids in [
         &contract.change_checks,
@@ -227,7 +264,7 @@ pub(super) fn validate_profile(profile: &super::Profile, observe: &[String]) -> 
             .find(|c| &c.id == id)
             .ok_or_else(|| anyhow::anyhow!("unknown rollback check {id}"))
     };
-    for id in &policy.change_checks {
+    for id in &policy.recovery.change_checks {
         let c = resolve(id)?;
         ensure!(
             c.checkpoint == Checkpoint::UpgradeFailed
@@ -235,7 +272,7 @@ pub(super) fn validate_profile(profile: &super::Profile, observe: &[String]) -> 
             "rollback change_checks require Changed at UpgradeFailed"
         );
     }
-    for id in &policy.binary_checks {
+    for id in &policy.recovery.binary_checks {
         let c = resolve(id)?;
         ensure!(
             c.checkpoint == Checkpoint::RolledBack
@@ -243,7 +280,7 @@ pub(super) fn validate_profile(profile: &super::Profile, observe: &[String]) -> 
             "rollback binary_checks require Unchanged at RolledBack"
         );
     }
-    for id in &policy.runtime_checks {
+    for id in &policy.recovery.runtime_checks {
         let c = resolve(id)?;
         let Expectation::Executable {
             name,
@@ -264,12 +301,12 @@ pub(super) fn validate_profile(profile: &super::Profile, observe: &[String]) -> 
         );
         ensure!(profile.checks.iter().any(|base| base.checkpoint == Checkpoint::BaseInstalled && matches!(&base.expectation, Expectation::Executable { name: n, resolved_path: p, args: a, expected_exit: 0, stdout_contains: Some(m), .. } if n == name && p == resolved_path && a == args && m == marker)), "rollback runtime must match known-good Executable name/path/args/marker");
         ensure!(
-            policy.binary_checks.iter().any(|id| resolve(id)
+            policy.recovery.binary_checks.iter().any(|id| resolve(id)
                 .is_ok_and(|b| b.expectation.path() == Some(resolved_path.as_str()))),
             "rollback runtime path must equal a binary Unchanged path"
         );
     }
-    for id in &policy.data_checks {
+    for id in &policy.recovery.data_checks {
         let c = resolve(id)?;
         ensure!(
             c.checkpoint == Checkpoint::RolledBack
@@ -277,7 +314,7 @@ pub(super) fn validate_profile(profile: &super::Profile, observe: &[String]) -> 
             "rollback data_checks require Command reader at RolledBack"
         );
     }
-    match &policy.restoration {
+    match &policy.recovery.restoration {
         RestorationPolicy::BinaryOnly => {
             ensure!(
                 !profile.checks.iter().any(|c| matches!(
@@ -307,7 +344,7 @@ pub(super) fn validate_profile(profile: &super::Profile, observe: &[String]) -> 
                     "rollback scope outside observed roots"
                 );
             }
-            for id in &policy.binary_checks {
+            for id in &policy.recovery.binary_checks {
                 let path = resolve(id)?.expectation.path().unwrap();
                 for scope in scopes {
                     ensure!(
