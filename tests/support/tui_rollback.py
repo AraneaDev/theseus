@@ -39,7 +39,7 @@ def cleanup(saved):
         require_container_absent(resource['container_id'], result)
 
 
-def session(root, policy=None, saved=None, legacy=False, unverified=False):
+def session(root, policy=None, saved=None, legacy=False, unverified=False, negative=False):
     live = saved is None
     master, slave = pty.openpty()
     before = termios.tcgetattr(slave)
@@ -102,6 +102,26 @@ def session(root, policy=None, saved=None, legacy=False, unverified=False):
             saved = next(root.glob('.theseus-runs/*/report.json'))
         if legacy:
             until(lambda: b'clean' in data or b'reinstall' in data)
+        elif negative:
+            value = json.loads(saved.read_text())
+            assert value['outcome'] in ['failed', 'incomplete']
+            until(lambda: value['outcome'].encode() in rendered())
+            scenario = value['scenarios'][0]
+            index = next(i for i, stage in enumerate(scenario['stages']) if stage['name'] == 'rolled_back')
+            proof = next(c for c in scenario['stages'][index]['checks'] if c['id'] == '__theseus_rollback_restored_data')
+            assert proof['outcome'] in ['failed', 'skipped']
+            os.write(master, b'\t' + b'j' * index)
+            resize(60, 130)
+            until(lambda: b'> rolled_back ' in rendered()
+                  and ('__theseus_rollback_restored_data ' + proof['outcome']).encode() in rendered())
+            assert b'Rollback verified:' not in rendered()
+            resize(32, 50)
+            os.write(master, b'k')
+            until(lambda: b'> rollback ' in rendered())
+            assert b'Rollback verified:' not in rendered()
+            os.write(master, b'j')
+            until(lambda: b'> rolled_back ' in rendered())
+            assert b'Rollback verified:' not in rendered()
         elif unverified:
             until(lambda: b'incomplete' in rendered())
             value = json.loads(saved.read_text())
@@ -160,13 +180,17 @@ def session(root, policy=None, saved=None, legacy=False, unverified=False):
         os.write(master, b'q')
         # Process exit can precede draining the last terminal-restoration bytes.
         until(lambda: proc.poll() is not None and b'\x1b[?1049l' in transcript)
-        assert proc.returncode == (2 if unverified else 0), proc.returncode
+        expected_exit = {'failed': 1, 'incomplete': 2}[value['outcome']] if negative else 2 if unverified else 0
+        assert proc.returncode == expected_exit, proc.returncode
         assert termios.tcgetattr(slave) == before, 'terminal mode not restored'
         assert b'\x1b[?1049l' in transcript, 'alternate screen not restored'
-        (root / ('pty-legacy-' + saved.stem + '.log' if legacy else f'pty-{policy}-{"unverified" if unverified else "live" if live else "offline"}.log')).write_bytes(transcript)
+        (root / ('pty-legacy-' + saved.stem + '.log' if legacy else f'pty-{policy}-{"negative" if negative else "unverified" if unverified else "live" if live else "offline"}.log')).write_bytes(transcript)
         if not legacy and not unverified:
             cleanup(saved)
-        print(f'PTY {policy or saved.stem} {"live" if live else "offline"}: selection/policy/status/data/comparison/narrow/restoration accepted')
+        if negative:
+            print(f'PTY {saved}: negative restoration proof/status/navigation/terminal restoration accepted')
+        else:
+            print(f'PTY {policy or saved.stem} {"live" if live else "offline"}: selection/policy/status/data/comparison/narrow/restoration accepted')
         return saved
     finally:
         if proc.poll() is None:
@@ -176,6 +200,22 @@ def session(root, policy=None, saved=None, legacy=False, unverified=False):
             subprocess.run([binary, 'cleanup', str(journal.parent)], capture_output=True, env=docker_environment)
         os.close(master)
         os.close(slave)
+
+
+# Run only saved negative reports when healthy public sessions already passed.
+# Uses the same screen, navigation, terminal guard and strict absence workflow.
+if len(sys.argv) > 2 and sys.argv[2] == '--negative':
+    assert len(sys.argv) > 3, 'negative PTY mode requires at least one saved report'
+    with tempfile.TemporaryDirectory(prefix='theseus-rollback-negative-pty-') as tmp:
+        parent = pathlib.Path(tmp)
+        for index, report_path in enumerate(sys.argv[3:]):
+            root = parent / str(index)
+            root.mkdir()
+            session(root, 'restore-data', saved=pathlib.Path(report_path).resolve(), negative=True)
+        destination = os.environ.get('THESEUS_ACCEPTANCE_EVIDENCE')
+        if destination:
+            shutil.copytree(parent, pathlib.Path(destination) / 'negative-pty', dirs_exist_ok=True)
+    sys.exit(0)
 
 
 with tempfile.TemporaryDirectory(prefix='theseus-rollback-pty-') as tmp:

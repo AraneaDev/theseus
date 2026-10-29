@@ -4,7 +4,8 @@ Know what your tool leaves behind.
 
 Theseus rehearses CLI installation, configuration, upgrade, reinstall,
 interrupted installation/upgrade, forward recovery, declared downgrade compatibility
-or rejection, runtime checks, and uninstall in disposable Linux containers.
+or rejection, rollback after a declared failed upgrade, runtime checks, and uninstall
+in disposable Linux containers.
 A Ratatui workbench and headless CLI use one scenario engine. Evidence includes commands, private logs, file fingerprints,
 declared check outcomes, and remaining files that need review.
 
@@ -94,6 +95,25 @@ They use only shell tools in the declared Ubuntu image, without credentials or
 external application binaries. A passing recipe establishes its selected contracts
 and observed scopes, not compatibility with arbitrary data or versions.
 
+Schema 5 adds rollback after an ordinary declared failed upgrade. Both policies
+are self-contained and run for user and system profiles:
+
+```sh
+theseus validate --recipe examples/rollback/binary-only.toml
+theseus validate --recipe examples/rollback/restore-data.toml
+theseus run --headless --recipe examples/rollback/binary-only.toml
+theseus run --headless --recipe examples/rollback/restore-data.toml
+theseus run --recipe examples/rollback/restore-data.toml  # preview, then r
+```
+
+The candidate changes the installed executable and migrates real data, prints the
+declared failure marker, and exits 9. Explicit rollback restores the known-good
+binary. `binary_only` retains migrated data and proves the old tool can read it;
+`restore_data` additionally verifies a mapped in-container backup and restoration
+of the entire declared data subtree. See the [rollback walkthrough](examples/rollback/README.md)
+for timing, generated checks, failure evidence and limits. Rollback after an
+interrupted upgrade remains the required next milestone.
+
 Create your own starter with `theseus init`. It refuses to overwrite an existing
 recipe. Replace the failing placeholder commands **and** the `.` artifact paths
 before running it. `theseus validate --recipe PATH` validates without Docker.
@@ -131,8 +151,9 @@ without them, use headless or JSON output.
 See the [standalone](examples/standalone/theseus.toml),
 [reinstall](examples/reinstall/theseus.toml),
 [interruption](examples/interruption/theseus.toml),
-[compatible downgrade](examples/downgrade/compatible.toml) and
-[rejection](examples/downgrade/rejection.toml) recipes and their installers.
+[compatible downgrade](examples/downgrade/compatible.toml),
+[rejection](examples/downgrade/rejection.toml), and
+[rollback policies](examples/rollback/README.md) and their installers.
 Recipes reject unknown fields and define a name, image, network (`none` by default
 or explicit `bridge`), artifacts, profiles, and nonoverlapping absolute observation
 roots. Inputs resolve inside the recipe project, are materialized and hashed, then copied into
@@ -180,10 +201,26 @@ directory checks include added/removed children. Overlapping binary/data scopes
 are rejected. A newer-version executable check is required before either attempt
 and after rejection. All checkpoint checks must pass, including additional ones.
 
+Schema 5 adds `rollback`, explicit `attempt_upgrade`, `rollback`, and
+`exercise_rolled_back` steps, and the `known_good`, `backup_created`,
+`upgrade_failed`, `rolled_back`, and `backup_removed` checkpoints. Earlier schemas
+reject rollback features. Each profile declares `[profiles.NAME.rollback]` with
+an exact expected failure (status 1..125 and nonempty literal stdout marker),
+`change_checks` referencing `changed` at `upgrade_failed`, `binary_checks`
+referencing file/symlink `unchanged` at `rolled_back`, `runtime_checks` referencing
+successful old-version executable checks there, and `data_checks` referencing
+successful actual data readers there. Runtime checks must match a `base_installed`
+executable's name, resolved path, arguments and literal marker; that path must
+also be a selected binary check. `binary_only` declares no backup. `restore_data`
+requires explicit `backup`/`cleanup_backup` commands, a previously absent
+`backup_root`, and 1..64 nonoverlapping source-to-relative-storage mappings.
+Sources and storage must lie within observations and be separate from binaries.
+The `__theseus_rollback_` check ID prefix is reserved for generated checks.
+
 Both `user` and `system` profiles run configure/exercise/checks as UID/GID
-10001:10001. User installation/upgrade/reinstall/interruption/recovery/downgrade/uninstall
-uses that same identity; system installer commands use 0:0 **inside the disposable
-container**.
+10001:10001. User installation/upgrade/reinstall/interruption/recovery/downgrade,
+backup/rollback/cleanup and uninstall use that same identity; system mutation
+commands use 0:0 **inside the disposable container**.
 Steps are `/bin/sh -c` scripts with `/workspace` as working directory. Each step
 is a new shell: files persist, shell variables and working-directory changes do
 not. HOME, XDG directories and PATH are set explicitly. Runtime PATH defaults to
@@ -199,8 +236,8 @@ The image must supply `/bin/sh`, `/usr/bin/env`, `sleep`, `mkdir`, `chown`, `chm
 assignments. Interruption additionally requires GNU-compatible `mv -T` and
 `dd iflag=nofollow,nonblock` for atomic readiness and bounded no-follow reads;
 the example also uses `cmp`, `wc`, and `stat`. The downgrade examples also use
-`head` and `wc`. Unsupported tools fail closed as
-failed/incomplete evidence; Theseus installs no packages.
+`head` and `wc`; rollback examples also use `readlink` and `sed`. Unsupported
+tools fail closed as failed/incomplete evidence; Theseus installs no packages.
 Image-declared volumes are rejected. Ubuntu 24.04 is exercised by acceptance; other images must satisfy
 preflight and supported tar observations. Tests do not prove systemd, GUI, kernel,
 macOS, or Windows behavior.
@@ -253,6 +290,19 @@ installer retry, restart, backup or restore occurs. A failed attempt or checkpoi
 skips dependent runtime exercise; a running container still gets the ordinary
 uninstall/final/owned cleanup tail.
 
+Rollback executes install_base → base_installed checks → configure → configured
+checks → exercise_before_upgrade → known_good checks → before_upgrade reference →
+optional backup and backup_created checks → before_attempt reference →
+attempt_upgrade → upgrade_failed checks → before_rollback reference → explicit
+rollback → rolled_back checks → exercise_rolled_back → optional backup cleanup
+and backup_removed checks → uninstall → final → owned teardown. The known-good
+reference includes preceding runtime/check effects; `changed` compares the
+immediate before_attempt reference, after backup/check effects. Before rollback,
+fresh backup checks catch corruption caused by earlier checkpoint checks.
+Restoration and binary equality compare before_upgrade, while `preserved` keeps
+its configured reference. There is no second configure or automatic installer
+fallback. See [the walkthrough](examples/rollback/README.md) for generated checks.
+
 Checks have unique IDs and named checkpoints. `command` expects a shell exit and
 optional literal stdout substring. An application exit is evaluated only after a
 fresh in-container completion receipt is verified through a separate bounded
@@ -268,12 +318,16 @@ within observed roots. Hashes establish observed bytes, not arbitrary semantic c
 
 `unchanged` is valid at `reinstalled` in schema 2 declaring reinstall, and at
 `interrupted`/`recovered` in schema 3 declaring interruption scenarios, or at the
-selected `downgraded`/`downgrade_rejected` checkpoint in schema 4 declaring downgrade. A file
-compares its hash, size, kind, UID/GID, and mode; a directory compares its own
+selected `downgraded`/`downgrade_rejected` checkpoint in schema 4 declaring downgrade,
+or `rolled_back` in schema 5 declaring rollback. `changed` is valid only at
+rollback's `upgrade_failed`: observed additions, removals and content/type/metadata
+changes pass; equality or absence at both ends fails. Uncertain coverage or an
+unsafe ancestor remains incomplete. Unchanged compares a file’s hash, size, kind,
+UID/GID, and mode; a directory compares its own
 metadata and all observed descendants, including added/removed children. A
 symlink compares its observed link target and metadata without following it.
-The declared path must exist in both complete snapshots. Missing paths or changed
-entries fail; incomplete, ambiguous, overflowing, or unsafe observations remain
+For Unchanged, the declared path must exist in both complete snapshots. Missing
+paths or changed entries fail; incomplete, ambiguous, overflowing, or unsafe observations remain
 incomplete. Mtime, inode identity, ACLs, extended attributes, hidden remote effects,
 and state outside the declared observed scopes are outside this contract.
 Reports identify both comparison stages and retain changed-child evidence on the
@@ -313,7 +367,8 @@ This models an abrupt whole-container stop at one cooperative pause point. It
 does not establish host power-loss durability/fsync behavior, arbitrary installer
 interleavings or service-manager behavior. Recovery is an
 explicit forward application command; ordinary timeout/cancellation never retries
-or recovers automatically. Rollback remains required future work.
+or recovers automatically. Rollback after an interrupted upgrade remains required
+future work.
 
 Downgrade chooses its branch from the declared policy. A compatible attempt
 must return zero; a rejection policy must return its exact declared status with
@@ -326,8 +381,20 @@ Live and offline UI distinguishes “Compatible downgrade passed” from “Decl
 rejection checks passed” and shows actual status, marker verification, scopes and
 comparison stages. Safe rejection only establishes these observed scopes; it does
 not prove arbitrary installer safety. Downgrade does not implement rollback:
-restoring known-good runtime and data requires an explicit restoration contract
-and scoped backup/restore evidence in a future milestone.
+schema 5 supplies its separate explicit restoration contract.
+
+Rollback authorizes reversal only after the exact declared application failure is
+proved by a normal completion receipt, bounded complete stdout and a matching
+literal marker, plus all selected Changed checks. Unexpected exit 0, wrong status
+or marker fails. Missing receipt, transport errors or truncated stdout cannot
+authorize rollback; timeout/cancellation does not trigger it. An `expected_failure`
+command records the real nonzero status and marker proof. A scenario can pass
+only after all required binary/runtime/data checks, generated backup checks where
+applicable, backup cleanup, uninstall and owned teardown also pass. A zero-return
+rollback command alone cannot establish restored data. Theseus verifies observed
+bytes/metadata; application authors own quiescence and application-specific backup
+and restoration, including database consistency. No host backup/export, atomic
+snapshot or power-loss durability is claimed.
 
 Timeout/cancellation removes the owned scenario container, including descendants;
 it cannot promise application uninstall observations after that removal. If the
@@ -342,11 +409,12 @@ Acquisition errors, unsupported archives, symlinked observed-root ancestors and
 observation overflow remain incomplete rather than silently passing.
 
 Runs are saved under the recipe project's `.theseus-runs/<id>/`, using private
-0700 directories and 0600 files: atomic `report.json` (schema 4), `journal.json`
-(schema 1), and separate bounded logs. Readers accept report schemas 1, 2, 3 and 4; schema 1
+0700 directories and 0600 files: atomic `report.json` (schema 5), `journal.json`
+(schema 1), and separate bounded logs. Readers accept report schemas 1, 2, 3, 4 and 5; schema 1
 continues to represent clean/upgrade evidence, while reinstall/comparison evidence
 requires schema 2 or later. Interruption/proof/restart evidence requires schema 3.
-Downgrade policy, checkpoints and rejection proof require schema 4. Recovery
+Downgrade policy, checkpoints and rejection proof require schema 4. Rollback
+policy, failure proof, Changed checks and backup metadata require schema 5. Recovery
 journals and ownership labels remain version 1. No observed file contents are retained except explicit command output; metadata/hashes and diffs are stored.
 Reports can be large (load limit 64 MiB), and UI reloads parse saved metadata on progress notifications.
 
@@ -372,6 +440,7 @@ cargo build --locked --release
 cargo test --locked --test docker_lifecycle -- --ignored --test-threads=1
 cargo test --locked --test interruption_lifecycle -- --ignored --test-threads=1
 cargo test --locked --test downgrade_lifecycle -- --ignored --test-threads=1
+cargo test --locked --test rollback_lifecycle -- --ignored --test-threads=1
 ```
 
 Regular tests include wide/narrow TestBackend behavior and actual Unix PTY
@@ -389,7 +458,11 @@ Downgrade acceptance covers both profiles and policies, real old-data readers,
 silent reader omissions, lost records, changed binary/mode/link/configuration,
 added/removed data children, wrong status/marker, unexpected success, missing
 receipt/reference, transport failure, truncated output and timeout/cancellation.
-All three ignored Docker test binaries are explicitly required in CI. Actual PTYs exercise narrow live
+Rollback acceptance covers both profiles and restoration policies, exact failure
+and Changed evidence, complete mapped backup/restoration checks, runtime/readers,
+source/backup corruption, baseline-root protection, no-op/partial restoration,
+metadata/link/child changes, reference timing and timeout/cancellation.
+All four ignored Docker test binaries are explicitly required in CI. Actual PTYs exercise narrow live
 selection, new-report comparison visibility, offline viewing, and terminal recovery.
 
 A separate real Phrourion 0.8.1 → 0.8.2 rehearsal passed all four matrix entries
