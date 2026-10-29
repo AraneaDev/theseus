@@ -4,7 +4,7 @@ mod command;
 mod completion;
 mod failure;
 mod files;
-mod lookup;
+pub(crate) mod lookup;
 mod rejection;
 mod stability;
 use crate::{

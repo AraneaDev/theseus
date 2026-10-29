@@ -1,6 +1,7 @@
 //! Evidence foundation for the Theseus installation lifecycle workbench.
 pub mod checks;
 pub mod cli;
+pub mod comparison;
 pub mod engine;
 pub mod model;
 pub mod recipe;

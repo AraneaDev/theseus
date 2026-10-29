@@ -57,7 +57,7 @@ pub(super) fn observed_snapshot<'a>(
 }
 
 /// A recursive scope additionally rejects observations nested beneath it.
-pub(super) fn observed_scope<'a>(
+pub(crate) fn observed_scope<'a>(
     path: &str,
     snapshots: &'a [Snapshot],
 ) -> Result<&'a Snapshot, String> {
