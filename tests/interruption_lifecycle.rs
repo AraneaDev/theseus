@@ -1,25 +1,12 @@
+#[path = "support/docker_absence.rs"]
+mod docker_absence;
+use docker_absence::absent;
 use std::{path::Path, process::Command};
 use theseus::{
     engine::{self, CancellationToken, EventKind, RunOptions},
     model::*,
     recipe,
 };
-
-fn absent(id: &str) {
-    let output = Command::new("docker")
-        .args(["inspect", id])
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr)
-        .trim()
-        .to_lowercase();
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert!(
-        stderr == format!("error: no such object: {id}")
-            || stderr == format!("error response from daemon: no such container: {id}"),
-        "{output:?}"
-    );
-}
 
 fn run(
     fault: &str,

@@ -1,3 +1,6 @@
+#[path = "support/docker_absence.rs"]
+mod docker_absence;
+use docker_absence::{absent, container_is_absent};
 use theseus::{
     engine::{self, CancellationToken, EventKind, RunOptions},
     model::*,
@@ -68,15 +71,7 @@ fn run_custom(
             scenario.teardown
         );
         if let Some(id) = &scenario.container_id {
-            assert!(
-                !std::process::Command::new("docker")
-                    .args(["container", "inspect", id])
-                    .output()
-                    .unwrap()
-                    .status
-                    .success(),
-                "owned container survived terminal result"
-            );
+            absent(id);
         }
     }
     (temp, result)
@@ -548,18 +543,6 @@ fn real_pty_active_signals_cleanup_and_cancel_browsing() {
     println!("{}", String::from_utf8_lossy(&output.stdout));
 }
 
-fn container_is_absent(id: &str, output: &std::process::Output) -> bool {
-    let error = String::from_utf8_lossy(&output.stderr)
-        .trim()
-        .to_ascii_lowercase();
-    output.status.code() == Some(1)
-        && [
-            format!("error: no such object: {id}"),
-            format!("error response from daemon: no such container: {id}"),
-        ]
-        .contains(&error)
-}
-
 #[test]
 fn docker_absence_requires_missing_target_and_expected_exit() {
     use std::os::unix::process::ExitStatusExt;
@@ -668,23 +651,7 @@ fn run_reinstall(fault: &str) -> (tempfile::TempDir, engine::RunResult) {
     for s in &result.report.scenarios {
         assert_eq!(s.teardown, TeardownStatus::Complete);
         if let Some(id) = &s.container_id {
-            let output = std::process::Command::new("docker")
-                .args(["inspect", id])
-                .output()
-                .unwrap();
-            assert!(
-                container_is_absent(id, &output),
-                "Docker inspect did not prove {id} absent: status={:?}, stdout={:?}, stderr={:?}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stdout)
-                    .chars()
-                    .take(1024)
-                    .collect::<String>(),
-                String::from_utf8_lossy(&output.stderr)
-                    .chars()
-                    .take(1024)
-                    .collect::<String>(),
-            );
+            absent(id);
         }
     }
     (temp, result)
@@ -991,14 +958,7 @@ impl InterruptionBoundary {
         result.stdout
     }
     fn assert_absent(&self) {
-        let output = std::process::Command::new("docker")
-            .args(["inspect", &self.resource.container_id])
-            .output()
-            .unwrap();
-        assert!(
-            container_is_absent(&self.resource.container_id, &output),
-            "{output:?}"
-        );
+        absent(&self.resource.container_id);
     }
 }
 impl Drop for InterruptionBoundary {

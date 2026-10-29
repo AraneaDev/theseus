@@ -1,4 +1,7 @@
 //! Actual daemon acceptance: the tool, reader, receipts and filesystem evidence are real.
+#[path = "support/docker_absence.rs"]
+mod docker_absence;
+use docker_absence::absent;
 use std::{path::Path, process::Command};
 use theseus::{
     engine::{self, CancellationToken, EventKind, RunOptions},
@@ -10,21 +13,6 @@ const DATA: &str = "/home/theseus/.local/share/sample-cli";
 const RECORDS: &str = "/home/theseus/.local/share/sample-cli/records";
 const SETTINGS: &str = "/home/theseus/.config/sample-cli/settings";
 
-fn absent(id: &str) {
-    let output = Command::new("docker")
-        .args(["inspect", id])
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr)
-        .trim()
-        .to_lowercase();
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert!(
-        stderr == format!("error: no such object: {id}")
-            || stderr == format!("error response from daemon: no such container: {id}"),
-        "{output:?}"
-    );
-}
 fn stage<'a>(scenario: &'a ScenarioReport, name: &str) -> &'a StageReport {
     scenario.stages.iter().find(|s| s.name == name).unwrap()
 }
