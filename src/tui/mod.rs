@@ -51,20 +51,7 @@ pub fn run(mut app: App) -> Result<i32> {
             if let Some(receiver) = &mut result_rx {
                 match receiver.try_recv() {
                     Ok(result) => {
-                        app.active = false;
-                        match result {
-                            Ok(result) => {
-                                let root = result.report_path.parent().unwrap().to_path_buf();
-                                app.set_report(result.report, root);
-                                app.status = format!("Finished | {}", result.report_path.display());
-                            }
-                            Err(error) => {
-                                app.status = format!("Engine error: {error:#}");
-                                if app.report.is_none() {
-                                    return Err(error);
-                                }
-                            }
-                        }
+                        complete_run(&mut app, result)?;
                         result_rx = None;
                         app.refresh_logs();
                     }
@@ -83,7 +70,10 @@ pub fn run(mut app: App) -> Result<i32> {
             }
             if app.quit_requested {
                 if !app.active {
-                    return Ok(app.report.as_ref().map_or(0, |r| r.outcome.exit_code()));
+                    if let Some(error) = &app.terminal_error {
+                        return Err(anyhow!("{error}"));
+                    }
+                    return Ok(app.exit_code());
                 }
                 cancel.cancel();
                 let deadline =
@@ -180,6 +170,109 @@ impl Drop for Signals {
     fn drop(&mut self) {
         for id in self.0.drain(..) {
             signal_hook::low_level::unregister(id);
+        }
+    }
+}
+
+// Shared completion boundary, also exercised without a terminal in regressions.
+fn complete_run(app: &mut App, result: Result<RunResult>) -> Result<()> {
+    app.active = false;
+    match result {
+        Ok(result) => {
+            let root = result.report_path.parent().unwrap().to_path_buf();
+            app.set_report(result.report, root);
+            app.status = format!("Finished | {}", result.report_path.display());
+        }
+        Err(error) => {
+            let diagnostic = format!("Engine error: {error:#}");
+            app.terminal_error = Some(if app.root.as_os_str().is_empty() {
+                diagnostic.clone()
+            } else {
+                format!(
+                    "{diagnostic}\nSaved report: {}\nRecovery: theseus cleanup {}",
+                    app.root.join("report.json").display(),
+                    app.root.display()
+                )
+            });
+            app.status =
+                "Engine error; incomplete result — inspect evidence and recovery path".into();
+            app.evidence_index = 0;
+            app.scroll = 0;
+            app.refresh_logs();
+            if app.report.is_none() {
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{
+        ProfileName, RunOutcome, RunReport, ScenarioKind, ScenarioReport, StageOutcome,
+        StageReport, TeardownStatus,
+    };
+    use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn terminal_worker_error_overrides_cached_passed_and_failed_results() {
+        for cached in [RunOutcome::Passed, RunOutcome::Failed] {
+            let mut report = RunReport::new("cached-before-final-save");
+            report.outcome = cached;
+            let mut scenario =
+                ScenarioReport::new("user-clean", ProfileName::User, ScenarioKind::Clean);
+            scenario.outcome = cached;
+            scenario.teardown = TeardownStatus::Complete;
+            let mut stage = StageReport::new("final");
+            stage.outcome = if cached == RunOutcome::Passed {
+                StageOutcome::Passed
+            } else {
+                StageOutcome::Failed
+            };
+            scenario.stages.push(stage);
+            report.scenarios.push(scenario);
+            let mut app = App::offline(report, PathBuf::from("/tmp/recovery-run"));
+            app.active = true;
+            app.filter = "unrelated old filter".into();
+            complete_run(&mut app, Err(anyhow!("final persistence failed"))).unwrap();
+            assert!(!app.active);
+            input(
+                &mut app,
+                crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('q')),
+            );
+            assert!(app.quit_requested);
+            assert_eq!(
+                app.exit_code(),
+                2,
+                "cached {cached} must not mask worker failure"
+            );
+            assert_eq!(
+                app.report.as_ref().unwrap().outcome,
+                cached,
+                "retain the last saved evidence"
+            );
+            for tab in Tab::ALL {
+                app.tab = tab;
+                let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+                terminal.draw(|frame| render(frame, &app)).unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                for expected in [
+                    "cached-before-final-save | incomplete |",
+                    "final persistence failed",
+                    "/tmp/recovery-run/report.json",
+                    "theseus cleanup /tmp/recovery-run",
+                ] {
+                    assert!(text.contains(expected), "missing {expected}");
+                }
+            }
         }
     }
 }

@@ -274,3 +274,40 @@ fn narrow_summary_keeps_review_and_incomplete_counts_visible() {
     assert!(text.contains("review 1"));
     assert!(text.contains("incomplete 0"));
 }
+#[test]
+fn selection_stays_visible_after_word_wrapped_and_wide_records() {
+    let mut report = RunReport::new("wrapping-selection");
+    let mut scenario = ScenarioReport::new("user-clean", ProfileName::User, ScenarioKind::Clean);
+    let mut stage = StageReport::new("baseline");
+    for i in 0..40 {
+        stage
+            .errors
+            .push(format!("{i}: {}", vec!["a".repeat(45); 3].join(" ")));
+    }
+    stage.errors.push("SELECTED-END-EVIDENCE".into());
+    scenario.stages.push(stage);
+    report.scenarios.push(scenario);
+    let mut app = App::offline(report, "/tmp".into());
+    app.focus = Focus::Evidence;
+    app.evidence_index = 41;
+    for (width, height) in [(120, 30), (52, 24)] {
+        assert!(
+            screen(&app, width, height).contains("SELECTED-END-EVIDENCE"),
+            "selection disappeared at {width} columns"
+        );
+    }
+    for error in &mut app.report.as_mut().unwrap().scenarios[0].stages[0].errors[..40] {
+        *error = format!(
+            "{}\t{}\n{}",
+            "界".repeat(45),
+            "b ".repeat(45),
+            "e\u{301}".repeat(45)
+        );
+    }
+    for (width, height) in [(120, 30), (52, 24)] {
+        assert!(
+            screen(&app, width, height).contains("SELECTED-END-EVIDENCE"),
+            "Unicode selection disappeared at {width} columns"
+        );
+    }
+}

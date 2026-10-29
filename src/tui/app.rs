@@ -43,6 +43,8 @@ pub struct App {
     pub scroll: u16,
     pub log_text: String,
     pub status: String,
+    /// Authoritative worker failure, separate from the last persisted evidence.
+    pub terminal_error: Option<String>,
     pub active: bool,
     pub start_requested: bool,
     pub cancel_requested: bool,
@@ -65,6 +67,7 @@ impl App {
             scroll: 0,
             log_text: String::new(),
             status: "Offline report".into(),
+            terminal_error: None,
             active: false,
             start_requested: false,
             cancel_requested: false,
@@ -78,6 +81,18 @@ impl App {
         app.options = Some(options);
         app.status = "Preview — press r to start".into();
         app
+    }
+    pub fn outcome(&self) -> RunOutcome {
+        if self.terminal_error.is_some() {
+            RunOutcome::Incomplete
+        } else {
+            self.report
+                .as_ref()
+                .map_or(RunOutcome::Passed, |r| r.outcome)
+        }
+    }
+    pub fn exit_code(&self) -> i32 {
+        self.outcome().exit_code()
     }
     pub fn scenario(&self) -> Option<&ScenarioReport> {
         self.report.as_ref()?.scenarios.get(self.scenario_index)
@@ -148,11 +163,7 @@ impl App {
                 items.extend(scenario.errors.iter().cloned());
                 items.push(format!("Teardown: {:?}", scenario.teardown));
             }
-            return items
-                .into_iter()
-                .map(|s| safe_text(&s))
-                .filter(|s| s.to_lowercase().contains(&self.filter.to_lowercase()))
-                .collect();
+            return self.filter_items(items);
         };
         let mut items = Vec::new();
         match self.tab {
@@ -244,12 +255,20 @@ impl App {
                 }
             }
         }
+        self.filter_items(items)
+    }
+    fn filter_items(&self, items: Vec<String>) -> Vec<String> {
         let needle = self.filter.to_lowercase();
-        items
+        let mut items: Vec<_> = items
             .into_iter()
             .map(|s| safe_text(&s))
             .filter(|s| s.to_lowercase().contains(&needle))
-            .collect()
+            .collect();
+        // A stale evidence filter must never hide a terminal infrastructure error.
+        if let Some(error) = &self.terminal_error {
+            items.insert(0, safe_text(error));
+        }
+        items
     }
     pub fn refresh_logs(&mut self) {
         self.log_text.clear();

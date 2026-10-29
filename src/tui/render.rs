@@ -32,7 +32,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             if narrow {
                 return format!(
                     "{} | passed {} failed {} review {}\nincomplete {} skipped {}",
-                    r.outcome,
+                    app.outcome(),
                     c.passed_checks,
                     c.failed_checks,
                     c.review_findings,
@@ -43,7 +43,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             format!(
                 "{} | {} | passed {} failed {} review {} incomplete {} skipped {}",
                 r.run_id,
-                r.outcome,
+                app.outcome(),
                 c.passed_checks,
                 c.failed_checks,
                 c.review_findings,
@@ -161,7 +161,11 @@ fn evidence(frame: &mut Frame, app: &App, area: Rect) {
     );
     let items = app.items();
     let mut text = String::new();
+    let mut selected_start = 0;
     for (i, item) in items.iter().enumerate() {
+        if i == app.evidence_index {
+            selected_start = text.len();
+        }
         text += &format!(
             "{} {}\n",
             if i == app.evidence_index { ">" } else { " " },
@@ -180,33 +184,28 @@ fn evidence(frame: &mut Frame, app: &App, area: Rect) {
             app.log_text
         );
     }
-    // Keep selected records visible while retaining independent detail scrolling.
-    let before = items
-        .iter()
-        .take(app.evidence_index)
-        .map(|s| wrapped_lines(s, parts[1].width.saturating_sub(4) as usize))
-        .sum::<usize>();
-    let offset = if app.focus == Focus::Evidence && app.tab != Tab::Logs {
-        before.min(u16::MAX as usize) as u16
+    let evidence_block = block("Evidence", app.focus == Focus::Evidence);
+    // Measure the exact displayed prefix with Ratatui's own word/grapheme wrapping
+    // and the same inner width, prefix markers and Wrap used for rendering.
+    let before = if app.focus == Focus::Evidence && app.tab != Tab::Logs && selected_start > 0 {
+        Paragraph::new(&text[..selected_start])
+            .wrap(Wrap { trim: false })
+            .line_count(evidence_block.inner(parts[1]).width)
     } else {
         0
+    };
+    // Paragraph scroll is u16; for longer prefixes start directly at the selected
+    // record instead of silently clamping its position outside the viewport.
+    let (text, offset) = if before > u16::MAX as usize {
+        (&text[selected_start..], 0)
+    } else {
+        (text.as_str(), before as u16)
     };
     frame.render_widget(
         Paragraph::new(text)
             .wrap(Wrap { trim: false })
             .scroll((offset.saturating_add(app.scroll), 0))
-            .block(block("Evidence", app.focus == Focus::Evidence)),
+            .block(evidence_block),
         parts[1],
     );
-}
-fn wrapped_lines(text: &str, width: usize) -> usize {
-    text.lines()
-        .map(|l| {
-            l.chars()
-                .count()
-                .saturating_add(2)
-                .div_ceil(width.max(1))
-                .max(1)
-        })
-        .sum()
 }
