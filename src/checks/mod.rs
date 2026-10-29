@@ -1,4 +1,5 @@
 //! Pure expectation evaluation. Runtime adapters execute commands and provide evidence.
+mod backup;
 mod command;
 mod files;
 mod lookup;
@@ -8,6 +9,7 @@ use crate::{
     model::{CheckOutcome, CheckResult},
     recipe::Check,
 };
+pub use backup::{compare_changed, compare_mapped};
 pub use command::{CommandObservation, evaluate_command, evaluate_executable};
 pub use files::{evaluate_filesystem, review_findings};
 pub use rejection::{RejectionAssessment, assess_rejection};

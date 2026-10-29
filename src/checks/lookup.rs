@@ -55,3 +55,22 @@ pub(super) fn observed_snapshot<'a>(
         )),
     }
 }
+
+/// A recursive scope additionally rejects observations nested beneath it.
+pub(super) fn observed_scope<'a>(
+    path: &str,
+    snapshots: &'a [Snapshot],
+) -> Result<&'a Snapshot, String> {
+    let snapshot = observed_snapshot(path, snapshots)?;
+    // Exact lookup detects roots covering the path. A recursive scope must also
+    // reject extra observations nested beneath it, including incomplete ones.
+    if snapshots
+        .iter()
+        .any(|other| other.root != snapshot.root && contained(&other.root, path))
+    {
+        return Err(format!(
+            "ambiguous overlapping observations cover stable scope {path}"
+        ));
+    }
+    Ok(snapshot)
+}

@@ -1,4 +1,4 @@
-use super::lookup::observed_snapshot;
+use super::lookup::observed_scope;
 use crate::{
     model::CheckOutcome,
     recipe::validate::contained,
@@ -54,22 +54,7 @@ pub fn compare_unchanged(path: &str, before: &[Snapshot], after: &[Snapshot]) ->
     }
 }
 
-fn observed_scope<'a>(path: &str, snapshots: &'a [Snapshot]) -> Result<&'a Snapshot, String> {
-    let snapshot = observed_snapshot(path, snapshots)?;
-    // Exact lookup detects roots covering the path. A recursive scope must also
-    // reject extra observations nested beneath it, including incomplete ones.
-    if snapshots
-        .iter()
-        .any(|other| other.root != snapshot.root && contained(&other.root, path))
-    {
-        return Err(format!(
-            "ambiguous overlapping observations cover stable scope {path}"
-        ));
-    }
-    Ok(snapshot)
-}
-
-fn comparison(outcome: CheckOutcome, mut message: String) -> StabilityResult {
+pub(super) fn comparison(outcome: CheckOutcome, mut message: String) -> StabilityResult {
     // Detailed entries remain in stage evidence; even observer error text must
     // not turn a check summary into an unbounded report field.
     const MAX_MESSAGE_BYTES: usize = 1024;
