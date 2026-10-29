@@ -18,15 +18,22 @@ pub(super) struct ScenarioContext<'a, E, F> {
     pub journal: &'a mut RunJournal,
     pub emit: &'a mut F,
 }
-struct State {
-    resource: OwnedResource,
-    dead: bool,
-    forward: bool,
-    baseline: Vec<Snapshot>,
-    previous: Vec<Snapshot>,
-    configured: Option<Vec<Snapshot>>,
-    before_reinstall: Option<Vec<Snapshot>>,
-    sequence: usize,
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Availability {
+    Running,
+    Stopped,
+    Unavailable,
+}
+pub(super) struct State {
+    pub(super) resource: OwnedResource,
+    pub(super) availability: Availability,
+    pub(super) forward: bool,
+    pub(super) baseline: Vec<Snapshot>,
+    pub(super) previous: Vec<Snapshot>,
+    pub(super) configured: Option<Vec<Snapshot>>,
+    pub(super) before_reinstall: Option<Vec<Snapshot>>,
+    pub(super) before_interrupt: Option<Vec<Snapshot>>,
+    pub(super) sequence: usize,
 }
 pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
     mut context: ScenarioContext<'_, E, F>,
@@ -50,12 +57,13 @@ pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
     c.environment.setup(&resource, c.recipe, c.cancel)?;
     let mut state = State {
         resource,
-        dead: false,
+        availability: Availability::Running,
         forward: true,
         baseline: vec![],
         previous: vec![],
         configured: None,
         before_reinstall: None,
+        before_interrupt: None,
         sequence: 0,
     };
     let baseline = c.observation(&state);
@@ -65,32 +73,45 @@ pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
     stage.snapshots = baseline;
     c.finish(stage)?;
     let kind = c.report.scenarios[c.index].scenario;
-    let (first, first_cp) = match kind {
-        ScenarioKind::Clean | ScenarioKind::Reinstall => {
-            (StepName::InstallTarget, Checkpoint::TargetInstalled)
-        }
-        ScenarioKind::Upgrade => (StepName::InstallBase, Checkpoint::BaseInstalled),
-    };
-    c.step(&mut state, first)?;
-    c.checkpoint(&mut state, first_cp, false)?;
-    c.step(&mut state, StepName::Configure)?;
-    c.checkpoint(&mut state, Checkpoint::Configured, true)?;
     match kind {
-        ScenarioKind::Upgrade => {
-            c.step(&mut state, StepName::Upgrade)?;
-            c.checkpoint(&mut state, Checkpoint::TargetInstalled, false)?;
-            c.step(&mut state, StepName::Exercise)?;
+        ScenarioKind::InterruptedInstall | ScenarioKind::InterruptedUpgrade => {
+            super::interruption::run(c, &mut state, kind)?
         }
-        ScenarioKind::Clean => c.step(&mut state, StepName::Exercise)?,
-        ScenarioKind::Reinstall => {
-            c.step_named(&mut state, StepName::Exercise, "exercise_before_reinstall")?;
-            let mut reference = StageReport::new("before_reinstall");
-            c.capture(&mut state, &mut reference);
-            state.before_reinstall = Some(reference.snapshots.clone());
-            c.finish(reference)?;
-            c.step(&mut state, StepName::Reinstall)?;
-            c.checkpoint(&mut state, Checkpoint::Reinstalled, false)?;
-            c.step_named(&mut state, StepName::Exercise, "exercise_after_reinstall")?;
+        ScenarioKind::Clean | ScenarioKind::Upgrade | ScenarioKind::Reinstall => {
+            let (first, first_cp) = match kind {
+                ScenarioKind::Clean | ScenarioKind::Reinstall => {
+                    (StepName::InstallTarget, Checkpoint::TargetInstalled)
+                }
+                ScenarioKind::Upgrade => (StepName::InstallBase, Checkpoint::BaseInstalled),
+                ScenarioKind::InterruptedInstall | ScenarioKind::InterruptedUpgrade => {
+                    unreachable!("handled explicitly above")
+                }
+            };
+            c.step(&mut state, first)?;
+            c.checkpoint(&mut state, first_cp, false)?;
+            c.step(&mut state, StepName::Configure)?;
+            c.checkpoint(&mut state, Checkpoint::Configured, true)?;
+            match kind {
+                ScenarioKind::Upgrade => {
+                    c.step(&mut state, StepName::Upgrade)?;
+                    c.checkpoint(&mut state, Checkpoint::TargetInstalled, false)?;
+                    c.step(&mut state, StepName::Exercise)?;
+                }
+                ScenarioKind::Clean => c.step(&mut state, StepName::Exercise)?,
+                ScenarioKind::InterruptedInstall | ScenarioKind::InterruptedUpgrade => {
+                    unreachable!("handled explicitly above")
+                }
+                ScenarioKind::Reinstall => {
+                    c.step_named(&mut state, StepName::Exercise, "exercise_before_reinstall")?;
+                    let mut reference = StageReport::new("before_reinstall");
+                    c.capture(&mut state, &mut reference);
+                    state.before_reinstall = Some(reference.snapshots.clone());
+                    c.finish(reference)?;
+                    c.step(&mut state, StepName::Reinstall)?;
+                    c.checkpoint(&mut state, Checkpoint::Reinstalled, false)?;
+                    c.step_named(&mut state, StepName::Exercise, "exercise_after_reinstall")?;
+                }
+            }
         }
     }
     c.step(&mut state, StepName::Uninstall)?;
@@ -109,23 +130,26 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
         let sid = self.report.scenarios[self.index].id.clone();
         save_event(self.store, self.report, self.emit, kind, Some(sid), stage)
     }
-    fn start(&mut self, stage: &StageReport) -> Result<()> {
+    pub(super) fn start(&mut self, stage: &StageReport) -> Result<()> {
         let mut running = stage.clone();
         running.outcome = StageOutcome::Running;
         self.report.scenarios[self.index].stages.push(running);
         self.save(EventKind::StageStarted, Some(stage.name.clone()))
     }
-    fn update(&mut self, stage: &StageReport) -> Result<()> {
+    pub(super) fn update(&mut self, stage: &StageReport) -> Result<()> {
         *self.report.scenarios[self.index].stages.last_mut().unwrap() = stage.clone();
         self.save(EventKind::StageFinished, Some(stage.name.clone()))
     }
-    fn finish(&mut self, mut stage: StageReport) -> Result<()> {
+    pub(super) fn finish(&mut self, mut stage: StageReport) -> Result<()> {
         self.start(&stage)?;
         Self::outcome(&mut stage);
         self.update(&stage)
     }
-    fn outcome(stage: &mut StageReport) {
-        if stage.outcome == StageOutcome::Skipped {
+    pub(super) fn outcome(stage: &mut StageReport) {
+        if matches!(
+            stage.outcome,
+            StageOutcome::Skipped | StageOutcome::Cancelled
+        ) {
             return;
         }
         stage.outcome = StageOutcome::Passed;
@@ -137,7 +161,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
         };
     }
     fn observation(&mut self, state: &State) -> Vec<Snapshot> {
-        if state.dead {
+        if state.availability != Availability::Running || self.cancel.is_cancelled() {
             return self
                 .recipe
                 .recipe
@@ -167,7 +191,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                     .collect()
             })
     }
-    fn capture(&mut self, state: &mut State, stage: &mut StageReport) {
+    pub(super) fn capture(&mut self, state: &mut State, stage: &mut StageReport) {
         stage.snapshots = self.observation(state);
         for current in &stage.snapshots {
             if let Some(before) = state.baseline.iter().find(|b| b.root == current.root) {
@@ -179,7 +203,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
         }
         state.previous = stage.snapshots.clone();
     }
-    fn request(
+    pub(super) fn request(
         &self,
         state: &mut State,
         phase: String,
@@ -210,28 +234,41 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
         request: CommandRequest,
         stage: &mut StageReport,
     ) -> ExecutedCommand {
-        let mut executed = match self.environment.execute(
-            &state.resource,
-            request.clone(),
-            self.store,
-            self.cancel,
-        ) {
-            Ok(executed) => executed,
-            Err(error) => {
-                let mut record = CommandRecord::new(request.id, request.phase);
-                record.identity = request.identity;
-                record.argv = request.argv;
-                record.outcome = CommandOutcome::Error;
-                record.error = Some(format!("{error:#}"));
-                ExecutedCommand {
-                    record,
-                    stdout: String::new(),
-                    stdout_complete: false,
+        let mut executed = if self.cancel.is_cancelled() {
+            let mut record = CommandRecord::new(&request.id, &request.phase);
+            record.identity = request.identity.clone();
+            record.argv = request.argv.clone();
+            record.outcome = CommandOutcome::Cancelled;
+            record.cancelled = true;
+            ExecutedCommand {
+                record,
+                stdout: String::new(),
+                stdout_complete: false,
+            }
+        } else {
+            match self.environment.execute(
+                &state.resource,
+                request.clone(),
+                self.store,
+                self.cancel,
+            ) {
+                Ok(executed) => executed,
+                Err(error) => {
+                    let mut record = CommandRecord::new(request.id, request.phase);
+                    record.identity = request.identity;
+                    record.argv = request.argv;
+                    record.outcome = CommandOutcome::Error;
+                    record.error = Some(format!("{error:#}"));
+                    ExecutedCommand {
+                        record,
+                        stdout: String::new(),
+                        stdout_complete: false,
+                    }
                 }
             }
         };
         if executed.record.timed_out || executed.record.cancelled {
-            state.dead = true;
+            state.availability = Availability::Unavailable;
             if executed.record.cancelled {
                 self.cancel.cancel();
                 self.report.cancelled = true;
@@ -245,16 +282,27 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
         stage.commands.push(executed.record.clone());
         executed
     }
-    fn step(&mut self, state: &mut State, step: StepName) -> Result<()> {
+    pub(super) fn step(&mut self, state: &mut State, step: StepName) -> Result<()> {
         self.step_named(state, step, &step.to_string())
     }
-    fn step_named(&mut self, state: &mut State, step: StepName, name: &str) -> Result<()> {
+    pub(super) fn step_named(
+        &mut self,
+        state: &mut State,
+        step: StepName,
+        name: &str,
+    ) -> Result<()> {
         let mut stage = StageReport::new(name);
         stage.step = Some(step);
-        if state.dead || (!state.forward && step != StepName::Uninstall) {
+        if self.cancel.is_cancelled() {
+            state.availability = Availability::Unavailable;
+            self.report.cancelled = true;
+        }
+        if state.availability != Availability::Running
+            || (!state.forward && step != StepName::Uninstall)
+        {
             stage.outcome = StageOutcome::Skipped;
             stage.skip_reason = Some(
-                if state.dead {
+                if state.availability != Availability::Running {
                     "container stopped after timeout/cancellation"
                 } else {
                     "failed prerequisite"
@@ -273,6 +321,8 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                 | StepName::Upgrade
                 | StepName::Reinstall
                 | StepName::Uninstall
+                | StepName::RecoverInstall
+                | StepName::RecoverUpgrade
         );
         let identity = if installer && profile_name == ProfileName::System {
             ExecutionIdentity::root()
@@ -293,18 +343,24 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
         Self::outcome(&mut stage);
         self.update(&stage)
     }
-    fn checkpoint(
+    pub(super) fn checkpoint(
         &mut self,
         state: &mut State,
         checkpoint: Checkpoint,
         configured: bool,
     ) -> Result<()> {
+        if self.cancel.is_cancelled() {
+            state.availability = Availability::Unavailable;
+            self.report.cancelled = true;
+        }
+        let blocked =
+            !state.forward && matches!(checkpoint, Checkpoint::Interrupted | Checkpoint::Recovered);
         let mut stage = StageReport::new(checkpoint.to_string());
         stage.checkpoint = Some(checkpoint);
         self.start(&stage)?;
         self.capture(state, &mut stage);
         if configured
-            && !state.dead
+            && state.availability == Availability::Running
             && self.report.scenarios[self.index]
                 .stages
                 .iter()
@@ -328,8 +384,8 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                     && self.report.scenarios[self.index].stages.iter().any(|s| {
                         s.step == Some(StepName::Configure) && s.outcome == StageOutcome::Skipped
                     });
-            let mut result = if !state.dead
-                && (prerequisite_skipped || retention_without_configuration)
+            let mut result = if state.availability == Availability::Running
+                && (blocked || prerequisite_skipped || retention_without_configuration)
             {
                 CheckResult {
                     id: check.id.clone(),
@@ -340,7 +396,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                     command_ids: vec![],
                     comparison: None,
                 }
-            } else if state.dead {
+            } else if state.availability != Availability::Running {
                 CheckResult {
                     id: check.id.clone(),
                     checkpoint,
@@ -354,7 +410,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                 self.check(state, check, &mut stage)
             };
             if matches!(check.expectation, Expectation::Unchanged { .. }) {
-                result.comparison = Some(ComparisonReference::reinstall());
+                result.comparison = ComparisonReference::for_checkpoint(checkpoint);
             }
             state.forward &= result.outcome == CheckOutcome::Passed;
             stage.checks.push(result);
@@ -425,7 +481,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                 );
                 let resolution = self.execute(state, request, stage);
                 let resolved = resolution.stdout.trim().to_string();
-                if state.dead
+                if state.availability != Availability::Running
                     || resolution.record.error.is_some()
                     || !resolution.stdout_complete
                     || !resolved.starts_with('/')
@@ -451,7 +507,14 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
             Expectation::Unchanged { path } => {
                 let stability = checks::compare_unchanged(
                     path,
-                    state.before_reinstall.as_deref().unwrap_or_default(),
+                    match check.checkpoint {
+                        Checkpoint::Reinstalled => state.before_reinstall.as_deref(),
+                        Checkpoint::Interrupted | Checkpoint::Recovered => {
+                            state.before_interrupt.as_deref()
+                        }
+                        _ => None,
+                    }
+                    .unwrap_or_default(),
                     &stage.snapshots,
                 );
                 CheckResult {

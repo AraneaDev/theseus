@@ -140,6 +140,38 @@ impl App {
         for name in &options.profiles {
             if let Some(profile) = recipe.recipe.profiles.get(name) {
                 text += &format!("\n[{name}]\n");
+                if options.scenarios.iter().any(|kind| {
+                    matches!(
+                        kind,
+                        ScenarioKind::InterruptedInstall | ScenarioKind::InterruptedUpgrade
+                    )
+                }) {
+                    text += "Interruption: ContainerSigkill at synchronous THESEUS_INTERRUPT_BARRIER; abrupt whole-container stop, same-ID restart without setup or input copying.\nPartial interrupted checks run after restart and before explicit recovery.\nUnchanged compares before_interrupt (after first exercise) -> interrupted/recovered (before checks). Preserved uses configured.\n";
+                    for (kind, interrupt, recover) in [
+                        (
+                            ScenarioKind::InterruptedInstall,
+                            StepName::InterruptInstall,
+                            StepName::RecoverInstall,
+                        ),
+                        (
+                            ScenarioKind::InterruptedUpgrade,
+                            StepName::InterruptUpgrade,
+                            StepName::RecoverUpgrade,
+                        ),
+                    ] {
+                        if options.scenarios.contains(&kind) {
+                            if let Some(command) = profile.steps.get(&interrupt) {
+                                text += &format!(
+                                    "{kind} barrier/stop budget: {}s\n",
+                                    command.timeout_seconds
+                                );
+                            }
+                            if let Some(command) = profile.steps.get(&recover) {
+                                text += &format!("Explicit recovery command: {}\n", command.script);
+                            }
+                        }
+                    }
+                }
                 if options.scenarios.contains(&ScenarioKind::Reinstall) {
                     text += "Reinstall rehearsal: install_target, configure, exercise_before_reinstall, before_reinstall, reinstall, reinstalled, exercise_after_reinstall, uninstall.\nBoth exercise stages run the same exercise command as UID/GID 10001:10001.\n";
                     if let Some(command) = profile.steps.get(&StepName::Reinstall) {
@@ -189,6 +221,31 @@ impl App {
             return self.filter_items(items);
         };
         let mut items = Vec::new();
+        if matches!(self.tab, Tab::Stages | Tab::Commands) {
+            if let Some(proof) = &stage.restart {
+                items.push(format!(
+                    "Restart: {} running={}",
+                    proof.container_id, proof.running_verified
+                ));
+            }
+            for command in &stage.commands {
+                if let Some(proof) = &command.interruption {
+                    items.push(format!(
+                        "Interruption {:?}: readiness={} stopped={}",
+                        proof.mechanism, proof.readiness_verified, proof.stopped_verified
+                    ));
+                    if command.outcome == CommandOutcome::Failed
+                        && command.exit_status.is_some()
+                        && !proof.readiness_verified
+                    {
+                        items.push(format!(
+                            "Barrier not reached: ordinary completion exit {:?}",
+                            command.exit_status
+                        ));
+                    }
+                }
+            }
+        }
         match self.tab {
             Tab::Stages => {
                 items.push(format!("{}: {}", stage.name, stage.outcome));

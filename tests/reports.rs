@@ -591,3 +591,78 @@ fn frozen_schema_two_report_retains_reinstall_evidence_without_interruption_fiel
         .unwrap()
     );
 }
+
+#[test]
+fn interruption_variants_are_schema_three_only_and_proof_is_scoped() {
+    use theseus::model::*;
+    let temp = tempfile::tempdir().unwrap();
+    let store = theseus::report::create(&temp.path().join("run")).unwrap();
+    for version in [1, 2] {
+        let mut report = RunReport::new("old");
+        report.schema_version = version;
+        report.selected_scenarios = vec![ScenarioKind::InterruptedInstall];
+        assert!(
+            store.save(&report).is_err(),
+            "schema {version} accepted new selection"
+        );
+        report.selected_scenarios.clear();
+        let mut scenario = ScenarioReport::new("x", ProfileName::User, ScenarioKind::Clean);
+        let mut stage = StageReport::new("x");
+        stage.checkpoint = Some(Checkpoint::Recovered);
+        scenario.stages.push(stage);
+        report.scenarios.push(scenario);
+        assert!(
+            store.save(&report).is_err(),
+            "schema {version} accepted new checkpoint"
+        );
+    }
+    let mut stage = StageReport::new("interrupt_install");
+    stage.step = Some(StepName::InterruptInstall);
+    stage.outcome = StageOutcome::Passed;
+    let mut command = CommandRecord::new("x", "interrupt_install");
+    command.outcome = CommandOutcome::Interrupted;
+    command.interruption = Some(InterruptionEvidence {
+        mechanism: InterruptionMechanism::ContainerSigkill,
+        readiness_verified: true,
+        stopped_verified: true,
+    });
+    stage.commands.push(command);
+    assert_eq!(stage.aggregate_outcome(), RunOutcome::Passed);
+    for mutation in [
+        "phase", "exit", "step", "proof", "error", "timeout", "cancel",
+    ] {
+        let mut invalid = stage.clone();
+        match mutation {
+            "phase" => invalid.commands[0].phase = "other".into(),
+            "exit" => invalid.commands[0].exit_status = Some(137),
+            "step" => invalid.step = Some(StepName::InstallTarget),
+            "proof" => invalid.commands[0].interruption = None,
+            "error" => invalid.commands[0].error = Some("uncertain".into()),
+            "timeout" => invalid.commands[0].timed_out = true,
+            "cancel" => invalid.commands[0].cancelled = true,
+            _ => unreachable!(),
+        }
+        assert_ne!(
+            invalid.aggregate_outcome(),
+            RunOutcome::Passed,
+            "{mutation}"
+        );
+    }
+    let mut scenario =
+        ScenarioReport::new("x", ProfileName::User, ScenarioKind::InterruptedInstall);
+    scenario.container_id = Some("owned".into());
+    scenario.teardown = TeardownStatus::Complete;
+    let mut restart = StageReport::new("restart_after_interrupt");
+    restart.outcome = StageOutcome::Passed;
+    restart.restart = Some(RestartEvidence {
+        container_id: "owned".into(),
+        running_verified: true,
+    });
+    scenario.stages.push(restart);
+    scenario.recompute_outcome();
+    assert_eq!(
+        scenario.outcome,
+        RunOutcome::Incomplete,
+        "restart without matching verified stop"
+    );
+}

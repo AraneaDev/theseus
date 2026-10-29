@@ -461,3 +461,56 @@ fn reinstall_failed_directory_scope_and_comparison_references_are_browsable() {
     app.tab = Tab::Stages;
     assert!(screen(&app, 52, 24).contains("declared directory changed"));
 }
+
+#[test]
+fn interruption_preview_and_offline_proof_remain_explicit_and_narrow() {
+    let temp = tempfile::tempdir().unwrap();
+    for d in ["base", "target"] {
+        std::fs::create_dir(temp.path().join(d)).unwrap();
+    }
+    let path = temp.path().join("theseus.toml");
+    std::fs::write(&path, include_str!("fixtures/recipes/v3_interruption.toml")).unwrap();
+    let recipe = theseus::recipe::load(&path).unwrap();
+    let options = theseus::engine::RunOptions::all(&recipe);
+    let mut app = App::preview(recipe, options);
+    let preview = app.preview_text();
+    for text in [
+        "ContainerSigkill",
+        "THESEUS_INTERRUPT_BARRIER",
+        "9s",
+        "recover-install",
+        "before_interrupt",
+        "recovered",
+    ] {
+        assert!(preview.contains(text), "{text}: {preview}");
+    }
+    assert!(!app.start_requested);
+    key(&mut app, KeyCode::Char('s'));
+    assert_eq!(
+        app.options.as_ref().unwrap().scenarios,
+        [ScenarioKind::InterruptedInstall]
+    );
+    key(&mut app, KeyCode::Char('r'));
+    assert!(app.start_requested);
+    let mut report = RunReport::new("proof");
+    let mut scenario =
+        ScenarioReport::new("x", ProfileName::User, ScenarioKind::InterruptedInstall);
+    let mut stage = StageReport::new("interrupt_install");
+    let mut command = CommandRecord::new("x", "interrupt_install");
+    command.outcome = CommandOutcome::Interrupted;
+    command.interruption = Some(InterruptionEvidence {
+        mechanism: InterruptionMechanism::ContainerSigkill,
+        readiness_verified: true,
+        stopped_verified: true,
+    });
+    stage.commands.push(command);
+    scenario.stages.push(stage);
+    report.scenarios.push(scenario);
+    let mut app = App::offline(report, temp.path().into());
+    let items = app.items().join("\n");
+    assert!(items.contains("readiness=true"));
+    assert!(items.contains("stopped=true"));
+    assert!(screen(&app, 52, 24).contains("stopped=true"));
+    app.tab = Tab::Commands;
+    assert!(app.items().join("\n").contains("ContainerSigkill"));
+}

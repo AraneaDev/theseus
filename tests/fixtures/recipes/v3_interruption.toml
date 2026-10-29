@@ -1,0 +1,48 @@
+schema_version = 3
+scenarios = ["interrupted_install", "interrupted_upgrade"]
+name = "interruption-boundary"
+image = "ubuntu:24.04"
+observe = ["/home/theseus"]
+[artifacts]
+base = "base"
+target = "target"
+[profiles.user.steps.install_base]
+script = "install-base"
+[profiles.user.steps.interrupt_install]
+script = 'partial-install; /bin/sh "$THESEUS_INTERRUPT_BARRIER"'
+timeout_seconds = 9
+[profiles.user.steps.recover_install]
+script = "recover-install"
+[profiles.user.steps.interrupt_upgrade]
+script = 'partial-upgrade; /bin/sh "$THESEUS_INTERRUPT_BARRIER"'
+[profiles.user.steps.recover_upgrade]
+script = "recover-upgrade"
+[profiles.user.steps.configure]
+script = "configure"
+[profiles.user.steps.exercise]
+script = "exercise"
+[profiles.user.steps.uninstall]
+script = "uninstall"
+[[profiles.user.checks]]
+id = "partial"
+checkpoint = "interrupted"
+kind = "present"
+path = "/home/theseus/partial"
+[[profiles.user.checks]]
+id = "target"
+checkpoint = "recovered"
+kind = "executable"
+name = "sample-cli"
+resolved_path = "/home/theseus/bin"
+expected_exit = 0
+stdout_contains = "2.0"
+[[profiles.user.checks]]
+id = "data"
+checkpoint = "recovered"
+kind = "unchanged"
+path = "/home/theseus/data"
+[[profiles.user.checks]]
+id = "partial-removed"
+checkpoint = "recovered"
+kind = "absent"
+path = "/home/theseus/partial"

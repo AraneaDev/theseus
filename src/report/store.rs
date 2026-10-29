@@ -265,11 +265,35 @@ fn validate_report(report: &RunReport) -> Result<()> {
     }
     if report.schema_version < 3 {
         ensure!(
-            report
+            !report.selected_scenarios.iter().any(|kind| matches!(
+                kind,
+                ScenarioKind::InterruptedInstall | ScenarioKind::InterruptedUpgrade
+            )) && report.scenarios.iter().all(|scenario| !matches!(
+                scenario.scenario,
+                ScenarioKind::InterruptedInstall | ScenarioKind::InterruptedUpgrade
+            )) && report
                 .scenarios
                 .iter()
                 .all(|scenario| scenario.stages.iter().all(|stage| {
-                    stage.restart.is_none()
+                    !matches!(
+                        stage.step,
+                        Some(
+                            StepName::InterruptInstall
+                                | StepName::RecoverInstall
+                                | StepName::InterruptUpgrade
+                                | StepName::RecoverUpgrade
+                        )
+                    ) && !matches!(
+                        stage.checkpoint,
+                        Some(Checkpoint::Interrupted | Checkpoint::Recovered)
+                    ) && stage.checks.iter().all(|check| {
+                        !matches!(
+                            check.checkpoint,
+                            Checkpoint::Interrupted | Checkpoint::Recovered
+                        ) && check.comparison.as_ref().is_none_or(|reference| {
+                            reference == &crate::model::ComparisonReference::reinstall()
+                        })
+                    }) && stage.restart.is_none()
                         && stage.commands.iter().all(|command| {
                             command.interruption.is_none()
                                 && command.outcome != crate::model::CommandOutcome::Interrupted

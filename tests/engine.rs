@@ -962,3 +962,519 @@ fn environment_default_interruption_and_restart_fail_closed() {
     );
     assert!(environment.restart(&resource, &cancel).is_err());
 }
+
+#[derive(Default)]
+struct InterruptionEnvironment {
+    inner: ReinstallEnvironment,
+    fault: &'static str,
+    stopped: bool,
+    setups: usize,
+    restarts: usize,
+    calls: Vec<(String, String)>,
+}
+impl Environment for InterruptionEnvironment {
+    fn prepare(
+        &mut self,
+        r: &ValidatedRecipe,
+        p: bool,
+        c: &CancellationToken,
+    ) -> Result<PreparedEnvironment> {
+        self.inner.prepare(r, p, c)
+    }
+    fn create(&mut self, run: &str, sid: &str, r: &ValidatedRecipe) -> Result<OwnedResource> {
+        let resource = self.inner.create(run, sid, r)?;
+        self.inner
+            .files
+            .get_mut(&resource.container_id)
+            .unwrap()
+            .insert(
+                "/home/theseus/data".into(),
+                entry(FileKind::File, "baseline-data"),
+            );
+        Ok(resource)
+    }
+    fn setup(
+        &mut self,
+        _: &OwnedResource,
+        _: &ValidatedRecipe,
+        _: &CancellationToken,
+    ) -> Result<()> {
+        self.setups += 1;
+        Ok(())
+    }
+    fn execute(
+        &mut self,
+        r: &OwnedResource,
+        q: CommandRequest,
+        _: &ReportStore,
+        cancel: &CancellationToken,
+    ) -> Result<ExecutedCommand> {
+        assert!(!cancel.is_cancelled(), "no command after cancellation");
+        assert!(!self.stopped, "execute requires running container");
+        self.calls.push((r.container_id.clone(), q.phase.clone()));
+        let f = self.inner.files.get_mut(&r.container_id).unwrap();
+        let mut record = CommandRecord::new(q.id, &q.phase);
+        record.identity = q.identity;
+        record.argv = q.argv;
+        record.outcome = CommandOutcome::Succeeded;
+        record.exit_status = Some(0);
+        match q.phase.as_str() {
+            "install_base" => {
+                f.insert("/home/theseus/bin".into(), entry(FileKind::File, "base"));
+            }
+            "configure" => {
+                f.insert(
+                    "/home/theseus/data".into(),
+                    entry(FileKind::File, "configured"),
+                );
+            }
+            "exercise_before_interrupt" => {
+                f.insert(
+                    "/home/theseus/data".into(),
+                    entry(FileKind::File, "exercised"),
+                );
+            }
+            "recover_install" | "recover_upgrade" => {
+                if self.fault == "recovery" {
+                    record.outcome = CommandOutcome::Failed;
+                    record.exit_status = Some(7);
+                } else {
+                    f.remove("/home/theseus/partial");
+                    f.insert("/home/theseus/bin".into(), entry(FileKind::File, "target"));
+                }
+            }
+            "check:partial-writer" => {
+                f.insert(
+                    "/home/theseus/data".into(),
+                    entry(FileKind::File, "partial-check"),
+                );
+            }
+            "uninstall" => {
+                f.remove("/home/theseus/bin");
+                f.remove("/home/theseus/partial");
+            }
+            _ => {}
+        }
+        let stdout = if q.phase.starts_with("resolve:") {
+            "/home/theseus/bin"
+        } else {
+            "2.0"
+        };
+        Ok(ExecutedCommand {
+            record,
+            stdout: stdout.into(),
+            stdout_complete: true,
+        })
+    }
+    fn execute_interrupted(
+        &mut self,
+        r: &OwnedResource,
+        q: CommandRequest,
+        _: &ReportStore,
+        c: &CancellationToken,
+    ) -> Result<ExecutedCommand> {
+        assert!(!c.is_cancelled(), "no interruption after cancellation");
+        assert!(!self.stopped);
+        self.calls.push((r.container_id.clone(), q.phase.clone()));
+        if self.fault != "partial" {
+            self.inner.files.get_mut(&r.container_id).unwrap().insert(
+                "/home/theseus/partial".into(),
+                entry(FileKind::File, "partial-only"),
+            );
+        }
+        let mut record = CommandRecord::new(q.id, &q.phase);
+        record.identity = q.identity;
+        record.argv = q.argv;
+        record.outcome = CommandOutcome::Interrupted;
+        record.interruption = Some(InterruptionEvidence {
+            mechanism: InterruptionMechanism::ContainerSigkill,
+            readiness_verified: true,
+            stopped_verified: true,
+        });
+        self.stopped = true;
+        if self.fault == "early" {
+            self.stopped = false;
+            record.outcome = CommandOutcome::Failed;
+            record.exit_status = Some(0);
+            record.interruption.as_mut().unwrap().stopped_verified = false;
+            record.interruption.as_mut().unwrap().readiness_verified = false;
+        }
+        if self.fault == "proof" {
+            record.interruption = None;
+        }
+        if self.fault == "cancel-stop" {
+            c.cancel();
+        }
+        Ok(ExecutedCommand {
+            record,
+            stdout: String::new(),
+            stdout_complete: false,
+        })
+    }
+    fn restart(&mut self, r: &OwnedResource, c: &CancellationToken) -> Result<RestartEvidence> {
+        assert!(self.stopped);
+        assert!(!c.is_cancelled());
+        self.restarts += 1;
+        if self.fault == "restart" {
+            anyhow::bail!("restart unavailable")
+        }
+        self.stopped = false;
+        if self.fault == "cancel-restart" {
+            c.cancel();
+        }
+        Ok(RestartEvidence {
+            container_id: if self.fault == "wrong-id" {
+                "other".into()
+            } else {
+                r.container_id.clone()
+            },
+            running_verified: true,
+        })
+    }
+    fn observe(
+        &mut self,
+        r: &OwnedResource,
+        _: &[String],
+        _: Limits,
+        _: &CancellationToken,
+    ) -> Result<Vec<Snapshot>> {
+        assert!(!self.stopped, "never observe stopped container");
+        if self.fault == "incomplete" && self.restarts > 0 {
+            return Ok(vec![Snapshot::incomplete(
+                "/home/theseus",
+                "partial observation unavailable",
+            )]);
+        }
+        Ok(vec![Snapshot {
+            root: "/home/theseus".into(),
+            completeness: theseus::snapshot::ObservationStatus::Complete,
+            entries: self.inner.files[&r.container_id].clone(),
+        }])
+    }
+    fn stop(&mut self, _: &OwnedResource) -> Result<()> {
+        self.stopped = false;
+        Ok(())
+    }
+    fn remove(&mut self, _: &OwnedResource) -> Result<()> {
+        self.stopped = false;
+        Ok(())
+    }
+}
+fn interruption_recipe() -> (tempfile::TempDir, ValidatedRecipe) {
+    let temp = tempfile::tempdir().unwrap();
+    for d in ["base", "target"] {
+        std::fs::create_dir(temp.path().join(d)).unwrap();
+    }
+    let user = include_str!("fixtures/recipes/v3_interruption.toml");
+    let system = user[user.find("[profiles.user.steps").unwrap()..]
+        .replace("profiles.user", "profiles.system");
+    let path = temp.path().join("theseus.toml");
+    std::fs::write(&path, format!("{user}\n{system}")).unwrap();
+    (temp, load(&path).unwrap())
+}
+fn run_interruption(
+    fault: &'static str,
+) -> (
+    tempfile::TempDir,
+    engine::RunResult,
+    InterruptionEnvironment,
+) {
+    let (temp, recipe) = interruption_recipe();
+    let mut env = InterruptionEnvironment {
+        fault,
+        ..Default::default()
+    };
+    let options = RunOptions {
+        output_root: temp.path().join("runs"),
+        ..RunOptions::all(&recipe)
+    };
+    let result = engine::run_with(
+        &recipe,
+        options,
+        CancellationToken::default(),
+        &mut env,
+        |_| {},
+    )
+    .unwrap();
+    (temp, result, env)
+}
+#[test]
+fn interruption_real_orchestration_order_references_identity_and_same_container() {
+    let (_temp, result, env) = run_interruption("");
+    assert_eq!(result.report.outcome, RunOutcome::Passed);
+    assert_eq!(env.setups, 4);
+    assert_eq!(env.restarts, 4);
+    let install = [
+        "baseline",
+        "before_interrupt",
+        "interrupt_install",
+        "restart_after_interrupt",
+        "interrupted",
+        "interrupted:after_checks",
+        "recover_install",
+        "recovered",
+        "recovered:after_checks",
+        "configure",
+        "configured",
+        "configured:after_checks",
+        "exercise_after_recovery",
+        "uninstall",
+        "uninstalled",
+        "uninstalled:after_checks",
+        "final",
+    ];
+    let upgrade = [
+        "baseline",
+        "install_base",
+        "base_installed",
+        "base_installed:after_checks",
+        "configure",
+        "configured",
+        "configured:after_checks",
+        "exercise_before_interrupt",
+        "before_interrupt",
+        "interrupt_upgrade",
+        "restart_after_interrupt",
+        "interrupted",
+        "interrupted:after_checks",
+        "recover_upgrade",
+        "recovered",
+        "recovered:after_checks",
+        "exercise_after_recovery",
+        "uninstall",
+        "uninstalled",
+        "uninstalled:after_checks",
+        "final",
+    ];
+    let ids: std::collections::BTreeSet<_> = result
+        .report
+        .scenarios
+        .iter()
+        .map(|s| s.container_id.clone())
+        .collect();
+    assert_eq!(ids.len(), 4);
+    for s in &result.report.scenarios {
+        let is_install = s.scenario.to_string() == "interrupted_install";
+        assert_eq!(
+            s.stages.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            if is_install {
+                install.to_vec()
+            } else {
+                upgrade.to_vec()
+            }
+        );
+        let interrupted = stage(
+            s,
+            if is_install {
+                "interrupt_install"
+            } else {
+                "interrupt_upgrade"
+            },
+        );
+        assert!(interrupted.snapshots.is_empty());
+        assert!(stage(s, "restart_after_interrupt").snapshots.is_empty());
+        assert_eq!(
+            stage(s, "restart_after_interrupt")
+                .restart
+                .as_ref()
+                .unwrap()
+                .container_id,
+            s.container_id.clone().unwrap()
+        );
+        assert!(
+            stage(s, "interrupted").snapshots[0]
+                .entries
+                .contains_key("/home/theseus/partial")
+        );
+        assert!(
+            !stage(s, "recovered").snapshots[0]
+                .entries
+                .contains_key("/home/theseus/partial")
+        );
+        let data = stage(s, "recovered")
+            .checks
+            .iter()
+            .find(|c| c.id == "data")
+            .unwrap();
+        assert_eq!(
+            data.comparison.as_ref().unwrap().before_stage,
+            "before_interrupt"
+        );
+        for c in s.stages.iter().flat_map(|s| &s.commands) {
+            let root = s.profile == ProfileName::System
+                && [
+                    "install_base",
+                    "interrupt_install",
+                    "interrupt_upgrade",
+                    "recover_install",
+                    "recover_upgrade",
+                    "uninstall",
+                ]
+                .contains(&c.phase.as_str());
+            assert_eq!(c.identity.uid, if root { 0 } else { 10001 });
+        }
+        assert!(
+            env.calls
+                .iter()
+                .filter(|(id, _)| Some(id) == s.container_id.as_ref())
+                .any(|(_, p)| p == "uninstall")
+        );
+    }
+    assert_eq!(
+        theseus::report::load(&result.report_path).unwrap().outcome,
+        RunOutcome::Passed
+    );
+}
+#[test]
+fn interruption_faults_gate_recovery_restart_and_uninstall() {
+    for (fault, outcome, restart, recover, uninstall) in [
+        ("partial", RunOutcome::Failed, true, false, true),
+        ("recovery", RunOutcome::Failed, true, true, true),
+        ("early", RunOutcome::Failed, false, false, true),
+        ("proof", RunOutcome::Incomplete, false, false, false),
+        ("restart", RunOutcome::Incomplete, true, false, false),
+        ("wrong-id", RunOutcome::Incomplete, true, false, false),
+        ("cancel-stop", RunOutcome::Cancelled, false, false, false),
+        ("cancel-restart", RunOutcome::Cancelled, true, false, false),
+        ("incomplete", RunOutcome::Incomplete, true, false, true),
+    ] {
+        let (_temp, result, env) = run_interruption(fault);
+        assert_eq!(result.report.outcome, outcome, "{fault}");
+        assert_eq!(env.restarts > 0, restart, "{fault}");
+        assert_eq!(
+            env.calls.iter().any(|(_, p)| p.starts_with("recover_")),
+            recover,
+            "{fault}"
+        );
+        assert_eq!(
+            env.calls.iter().any(|(_, p)| p == "uninstall"),
+            uninstall,
+            "{fault}"
+        );
+        assert!(
+            result
+                .report
+                .scenarios
+                .iter()
+                .all(|s| matches!(s.teardown, TeardownStatus::Complete))
+        );
+    }
+}
+#[test]
+fn interruption_cancellation_at_event_boundaries_never_mutates_after_cancel() {
+    // Exact stage names are independently asserted in the lifecycle-order test.
+    let (_reference_temp, reference, _) = run_interruption("");
+    for scenario in &reference.report.scenarios[..2] {
+        for kind in [
+            engine::EventKind::StageStarted,
+            engine::EventKind::StageFinished,
+        ] {
+            for name in scenario.stages.iter().map(|stage| stage.name.as_str()) {
+                let (temp, recipe) = interruption_recipe();
+                let mut env = InterruptionEnvironment::default();
+                let cancel = CancellationToken::default();
+                let trigger = cancel.clone();
+                let options = RunOptions {
+                    profiles: vec![ProfileName::User],
+                    scenarios: vec![scenario.scenario],
+                    output_root: temp.path().join("runs"),
+                    ..RunOptions::all(&recipe)
+                };
+                let result = engine::run_with(&recipe, options, cancel, &mut env, |event| {
+                    if event.kind == kind && event.stage.as_deref() == Some(name) {
+                        trigger.cancel()
+                    }
+                })
+                .unwrap();
+                assert_eq!(
+                    result.report.outcome,
+                    RunOutcome::Cancelled,
+                    "{kind:?} {name}"
+                );
+                assert!(matches!(
+                    result.report.scenarios[0].teardown,
+                    TeardownStatus::Complete
+                ));
+            }
+        }
+    }
+}
+#[test]
+fn interruption_checks_and_exercise_do_not_rebase_comparison_or_configuration() {
+    for preserved in [false, true] {
+        let (temp, mut recipe) = interruption_recipe();
+        let profile = recipe.recipe.profiles.get_mut(&ProfileName::User).unwrap();
+        profile.checks.push(Check {
+            id: "partial-writer".into(),
+            checkpoint: Checkpoint::Interrupted,
+            expectation: Expectation::Command {
+                script: "mutate data".into(),
+                timeout_seconds: 10,
+                env: BTreeMap::new(),
+                pass_env: vec![],
+                expected_exit: 0,
+                stdout_contains: None,
+            },
+        });
+        if preserved {
+            profile.checks.push(Check {
+                id: "configured-data".into(),
+                checkpoint: Checkpoint::Interrupted,
+                expectation: Expectation::Preserved {
+                    path: "/home/theseus/data".into(),
+                },
+            });
+        }
+        let options = RunOptions {
+            profiles: vec![ProfileName::User],
+            scenarios: vec![ScenarioKind::InterruptedUpgrade],
+            output_root: temp.path().join("runs"),
+            ..RunOptions::all(&recipe)
+        };
+        let result = engine::run_with(
+            &recipe,
+            options,
+            CancellationToken::default(),
+            &mut InterruptionEnvironment::default(),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(result.report.outcome, RunOutcome::Failed);
+        let s = &result.report.scenarios[0];
+        let hash = |name: &str| {
+            stage(s, name).snapshots[0].entries["/home/theseus/data"]
+                .sha256
+                .clone()
+        };
+        assert_eq!(hash("configured"), Some("configured".into()));
+        assert_eq!(hash("before_interrupt"), Some("exercised".into()));
+        assert_eq!(hash("interrupted"), Some("exercised".into()));
+        assert_eq!(
+            hash("interrupted:after_checks"),
+            Some("partial-check".into())
+        );
+        if preserved {
+            assert_eq!(
+                stage(s, "interrupted")
+                    .checks
+                    .iter()
+                    .find(|c| c.id == "configured-data")
+                    .unwrap()
+                    .outcome,
+                CheckOutcome::Failed
+            );
+            assert!(stage(s, "recover_upgrade").commands.is_empty());
+        } else {
+            let check = stage(s, "recovered")
+                .checks
+                .iter()
+                .find(|c| c.id == "data")
+                .unwrap();
+            assert_eq!(check.outcome, CheckOutcome::Failed);
+            assert_eq!(
+                check.comparison,
+                ComparisonReference::for_checkpoint(Checkpoint::Recovered)
+            );
+        }
+    }
+}

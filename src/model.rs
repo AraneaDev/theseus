@@ -15,9 +15,28 @@ macro_rules! named_enum {
     };
 }
 named_enum!(ProfileName { User => "user", System => "system" });
-named_enum!(ScenarioKind { Clean => "clean", Upgrade => "upgrade", Reinstall => "reinstall" });
-named_enum!(StepName { InstallBase => "install_base", InstallTarget => "install_target", Configure => "configure", Upgrade => "upgrade", Exercise => "exercise", Reinstall => "reinstall", Uninstall => "uninstall" });
-named_enum!(Checkpoint { BaseInstalled => "base_installed", Configured => "configured", TargetInstalled => "target_installed", Uninstalled => "uninstalled", Reinstalled => "reinstalled" });
+named_enum!(ScenarioKind { Clean => "clean", Upgrade => "upgrade", Reinstall => "reinstall", InterruptedInstall => "interrupted_install", InterruptedUpgrade => "interrupted_upgrade" });
+named_enum!(StepName { InstallBase => "install_base", InstallTarget => "install_target", Configure => "configure", Upgrade => "upgrade", Exercise => "exercise", Reinstall => "reinstall", Uninstall => "uninstall", InterruptInstall => "interrupt_install", RecoverInstall => "recover_install", InterruptUpgrade => "interrupt_upgrade", RecoverUpgrade => "recover_upgrade" });
+named_enum!(Checkpoint { BaseInstalled => "base_installed", Configured => "configured", TargetInstalled => "target_installed", Uninstalled => "uninstalled", Reinstalled => "reinstalled", Interrupted => "interrupted", Recovered => "recovered" });
+/// One applicability map for selection, orchestration and unperformed evidence.
+pub fn checkpoint_applies(scenario: ScenarioKind, checkpoint: Checkpoint) -> bool {
+    match checkpoint {
+        Checkpoint::BaseInstalled => matches!(
+            scenario,
+            ScenarioKind::Upgrade | ScenarioKind::InterruptedUpgrade
+        ),
+        Checkpoint::TargetInstalled => matches!(
+            scenario,
+            ScenarioKind::Clean | ScenarioKind::Upgrade | ScenarioKind::Reinstall
+        ),
+        Checkpoint::Reinstalled => scenario == ScenarioKind::Reinstall,
+        Checkpoint::Interrupted | Checkpoint::Recovered => matches!(
+            scenario,
+            ScenarioKind::InterruptedInstall | ScenarioKind::InterruptedUpgrade
+        ),
+        Checkpoint::Configured | Checkpoint::Uninstalled => true,
+    }
+}
 named_enum!(FileKind { File => "file", Directory => "directory", Symlink => "symlink" });
 named_enum!(CheckOutcome { Passed => "passed", Failed => "failed", Incomplete => "incomplete", Skipped => "skipped" });
 named_enum!(FindingKind { Leftover => "leftover", BaselineDeletion => "baseline_deletion", ChangedBaseline => "changed_baseline", ObservationIncomplete => "observation_incomplete" });
@@ -38,6 +57,16 @@ pub struct ComparisonReference {
     pub after_stage: String,
 }
 impl ComparisonReference {
+    pub fn for_checkpoint(checkpoint: Checkpoint) -> Option<Self> {
+        match checkpoint {
+            Checkpoint::Reinstalled => Some(Self::reinstall()),
+            Checkpoint::Interrupted | Checkpoint::Recovered => Some(Self {
+                before_stage: "before_interrupt".into(),
+                after_stage: checkpoint.to_string(),
+            }),
+            _ => None,
+        }
+    }
     pub fn reinstall() -> Self {
         Self {
             before_stage: "before_reinstall".into(),
@@ -211,6 +240,26 @@ impl StageReport {
             restart: None,
         }
     }
+    pub fn verified_interruption(&self) -> bool {
+        matches!(
+            self.step,
+            Some(StepName::InterruptInstall | StepName::InterruptUpgrade)
+        ) && self.step.is_some_and(|step| self.name == step.to_string())
+            && self.commands.len() == 1
+            && self.errors.is_empty()
+            && self.commands.iter().all(|command| {
+                command.phase == self.name
+                    && command.outcome == CommandOutcome::Interrupted
+                    && command.exit_status.is_none()
+                    && command.error.is_none()
+                    && !command.timed_out
+                    && !command.cancelled
+                    && command
+                        .interruption
+                        .as_ref()
+                        .is_some_and(|proof| proof.readiness_verified && proof.stopped_verified)
+            })
+    }
     pub fn aggregate_outcome(&self) -> RunOutcome {
         let initial = match self.outcome {
             StageOutcome::Passed | StageOutcome::Skipped => RunOutcome::Passed,
@@ -219,10 +268,13 @@ impl StageReport {
             _ => RunOutcome::Incomplete,
         };
         let mut outcomes = vec![initial];
-        if self
-            .restart
-            .as_ref()
-            .is_some_and(|proof| !proof.running_verified)
+        if self.restart.as_ref().is_some_and(|proof| {
+            !proof.running_verified
+                || self.name != "restart_after_interrupt"
+                || proof.container_id.is_empty()
+        }) || (self.name == "restart_after_interrupt"
+            && self.outcome != StageOutcome::Skipped
+            && self.restart.is_none())
             || !self.errors.is_empty()
             || self.snapshots.iter().any(|s| {
                 matches!(
@@ -250,7 +302,9 @@ impl StageReport {
                     CommandOutcome::Succeeded | CommandOutcome::Skipped => RunOutcome::Passed,
                     CommandOutcome::Failed => RunOutcome::Failed,
                     CommandOutcome::Cancelled => RunOutcome::Cancelled,
-                    // No matching interruption step exists until the orchestration task.
+                    CommandOutcome::Interrupted if self.verified_interruption() => {
+                        RunOutcome::Passed
+                    }
                     CommandOutcome::Interrupted
                     | CommandOutcome::TimedOut
                     | CommandOutcome::Error => RunOutcome::Incomplete,
@@ -292,6 +346,26 @@ impl ScenarioReport {
             .iter()
             .map(StageReport::aggregate_outcome)
             .collect::<Vec<_>>();
+        for (index, stage) in self.stages.iter().enumerate() {
+            let interrupt_step = match self.scenario {
+                ScenarioKind::InterruptedInstall => Some(StepName::InterruptInstall),
+                ScenarioKind::InterruptedUpgrade => Some(StepName::InterruptUpgrade),
+                _ => None,
+            };
+            if stage.restart.as_ref().is_some_and(|proof| {
+                Some(&proof.container_id) != self.container_id.as_ref()
+                    || !self.stages[..index].last().is_some_and(|previous| {
+                        previous.step == interrupt_step && previous.verified_interruption()
+                    })
+            }) || (stage
+                .commands
+                .iter()
+                .any(|command| command.outcome == CommandOutcome::Interrupted)
+                && stage.step != interrupt_step)
+            {
+                outcomes.push(RunOutcome::Incomplete);
+            }
+        }
         if self.stages.is_empty()
             || !matches!(self.teardown, TeardownStatus::Complete)
             || !self.errors.is_empty()

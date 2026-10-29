@@ -387,3 +387,140 @@ fn version_one_independently_rejects_each_reinstall_only_feature() {
         );
     }
 }
+
+const INTERRUPTION: &str = include_str!("fixtures/recipes/v3_interruption.toml");
+#[test]
+fn v3_interruption_declares_order_and_scoped_minimum_contracts() {
+    let recipe = load_text(INTERRUPTION).expect("schema3 interruption recipe loads");
+    assert_eq!(
+        recipe
+            .declared_scenarios()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["interrupted_install", "interrupted_upgrade"]
+    );
+    recipe
+        .validate_selection(&[ProfileName::User], &recipe.declared_scenarios())
+        .unwrap();
+    for (from, to, expected) in [
+        (
+            "kind = \"present\"\npath = \"/home/theseus/partial\"",
+            "kind = \"command\"\nscript='true'\nexpected_exit=0",
+            "filesystem",
+        ),
+        (
+            "stdout_contains = \"2.0\"",
+            "stdout_contains = \"\"",
+            "Executable",
+        ),
+        (
+            "kind = \"unchanged\"",
+            "kind = \"present\"",
+            "data contract",
+        ),
+        ("base = \"base\"\n", "", "artifacts.base"),
+        (
+            "[profiles.user.steps.recover_install]\nscript = \"recover-install\"\n",
+            "",
+            "recover_install",
+        ),
+    ] {
+        let recipe = load_text(&INTERRUPTION.replace(from, to)).unwrap();
+        let error = recipe
+            .validate_selection(&[ProfileName::User], &recipe.declared_scenarios())
+            .unwrap_err();
+        assert!(error.to_string().contains(expected), "{error:#}");
+    }
+}
+#[test]
+fn interruption_requires_v3_and_valid_reference_selection_and_private_env() {
+    for version in [1, 2] {
+        assert!(
+            load_text(
+                &INTERRUPTION.replace("schema_version = 3", &format!("schema_version = {version}"))
+            )
+            .is_err()
+        );
+    }
+    for addition in [
+        "env = { THESEUS_INTERRUPT_BARRIER = 'bad' }",
+        "pass_env = ['THESEUS_INTERRUPT_BARRIER']",
+    ] {
+        assert!(
+            load_text(&INTERRUPTION.replace(
+                "script = \"recover-install\"",
+                &format!("script = \"recover-install\"\n{addition}")
+            ))
+            .is_ok()
+        );
+        assert!(
+            load_text(&INTERRUPTION.replace(
+                "timeout_seconds = 9",
+                &format!("timeout_seconds = 9\n{addition}")
+            ))
+            .is_err()
+        );
+    }
+    let preserved = INTERRUPTION.replace("kind = \"unchanged\"", "kind = \"preserved\"");
+    let recipe = load_text(&preserved).unwrap();
+    assert!(
+        recipe
+            .validate_selection(&[ProfileName::User], &recipe.declared_scenarios())
+            .is_err()
+    );
+    let selected = vec![recipe.declared_scenarios()[1]];
+    recipe
+        .validate_selection(&[ProfileName::User], &selected)
+        .unwrap();
+    assert!(
+        load_text(&INTERRUPTION.replace(
+            "scenarios = [\"interrupted_install\", \"interrupted_upgrade\"]",
+            "scenarios = ['clean']"
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn recovered_unchanged_cannot_satisfy_reinstall_minimum_and_new_features_are_independently_gated() {
+    let text = INTERRUPTION.replace(
+        "\"interrupted_upgrade\"]",
+        "\"interrupted_upgrade\", \"reinstall\"]",
+    );
+    let recipe = load_text(&text).unwrap();
+    let error = recipe
+        .validate_selection(&[ProfileName::User], &[ScenarioKind::Reinstall])
+        .unwrap_err();
+    assert!(error.to_string().contains("unchanged"));
+    let clean = include_str!("fixtures/recipes/v2_clean.toml");
+    for addition in [
+        "[profiles.user.steps.interrupt_install]\nscript='true'\n",
+        "[profiles.user.steps.recover_upgrade]\nscript='true'\n",
+        "[[profiles.user.checks]]\nid='partial'\ncheckpoint='interrupted'\nkind='present'\npath='/home/theseus/partial'\n",
+        "[[profiles.user.checks]]\nid='target'\ncheckpoint='recovered'\nkind='present'\npath='/home/theseus/bin'\n",
+    ] {
+        for version in [1, 2] {
+            let original = if version == 1 {
+                clean.replace(
+                    "schema_version = 2\nscenarios = [\"clean\"]",
+                    "schema_version = 1",
+                )
+            } else {
+                clean.into()
+            };
+            let error = load_text(&format!("{original}\n{addition}")).unwrap_err();
+            assert!(format!("{error:#}").contains("schema version 3"));
+        }
+    }
+}
+#[test]
+fn interruption_selection_ignores_contracts_at_unvisited_legacy_checkpoints() {
+    let text = format!(
+        "{INTERRUPTION}\n[[profiles.user.checks]]\nid='legacy-config'\ncheckpoint='target_installed'\nkind='preserved'\npath='/home/theseus/data'\n"
+    );
+    let recipe = load_text(&text).unwrap();
+    recipe
+        .validate_selection(&[ProfileName::User], &recipe.declared_scenarios())
+        .unwrap();
+}

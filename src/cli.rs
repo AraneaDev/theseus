@@ -53,6 +53,8 @@ pub enum ScenarioSelection {
     Clean,
     Upgrade,
     Reinstall,
+    InterruptedInstall,
+    InterruptedUpgrade,
     All,
 }
 /// Dispatch interactive and headless interfaces through the shared engine.
@@ -118,6 +120,8 @@ pub fn execute(cli: Cli) -> Result<i32> {
                 ScenarioSelection::Clean => vec![ScenarioKind::Clean],
                 ScenarioSelection::Upgrade => vec![ScenarioKind::Upgrade],
                 ScenarioSelection::Reinstall => vec![ScenarioKind::Reinstall],
+                ScenarioSelection::InterruptedInstall => vec![ScenarioKind::InterruptedInstall],
+                ScenarioSelection::InterruptedUpgrade => vec![ScenarioKind::InterruptedUpgrade],
                 ScenarioSelection::All => options.scenarios,
             };
             if !headless {

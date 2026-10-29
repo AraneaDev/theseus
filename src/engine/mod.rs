@@ -1,4 +1,5 @@
 //! Blocking scenario engine. Call on a worker thread; event callbacks must not block.
+mod interruption;
 mod stages;
 use crate::{
     model::*,
@@ -305,11 +306,7 @@ fn mark_remaining_checks(recipe: &ValidatedRecipe, scenario: &mut ScenarioReport
     };
     stage.skip_reason = Some("scenario interrupted before these checks could run".into());
     for check in &recipe.recipe.profiles[&scenario.profile].checks {
-        if (scenario.scenario != ScenarioKind::Upgrade
-            && check.checkpoint == Checkpoint::BaseInstalled)
-            || (scenario.scenario != ScenarioKind::Reinstall
-                && check.checkpoint == Checkpoint::Reinstalled)
-        {
+        if !checkpoint_applies(scenario.scenario, check.checkpoint) {
             continue;
         }
         if scenario
@@ -328,7 +325,8 @@ fn mark_remaining_checks(recipe: &ValidatedRecipe, scenario: &mut ScenarioReport
             path: check.expectation.path().map(str::to_owned),
             command_ids: vec![],
             comparison: matches!(check.expectation, Expectation::Unchanged { .. })
-                .then(ComparisonReference::reinstall),
+                .then(|| ComparisonReference::for_checkpoint(check.checkpoint))
+                .flatten(),
         });
     }
     if !stage.checks.is_empty() {

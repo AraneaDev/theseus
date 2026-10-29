@@ -302,3 +302,70 @@ fn reinstall_cli_selects_declared_repeat_without_upgrade_inputs() {
     assert!(report.scenarios.is_empty());
     assert!(!report.errors.is_empty());
 }
+
+#[test]
+fn interrupted_cli_selections_fail_unavailable_before_docker_and_preserve_declarations() {
+    for scenario in ["interrupted-install", "interrupted-upgrade"] {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("target")).unwrap();
+        std::fs::write(
+            temp.path().join("theseus.toml"),
+            include_str!("fixtures/recipes/v2_clean.toml"),
+        )
+        .unwrap();
+        let out = cli()
+            .current_dir(temp.path())
+            .env("PATH", "/no-docker")
+            .args(["run", "--headless", "--scenario", scenario])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("not declared"));
+        assert!(!temp.path().join(".theseus-runs").exists());
+    }
+}
+#[test]
+fn interrupted_cli_selects_single_or_declared_matrix_without_docker() {
+    for selection in ["all", "interrupted-install", "interrupted-upgrade"] {
+        let temp = tempfile::tempdir().unwrap();
+        for d in ["base", "target"] {
+            std::fs::create_dir(temp.path().join(d)).unwrap();
+        }
+        let user = include_str!("fixtures/recipes/v3_interruption.toml");
+        let system = user[user.find("[profiles.user.steps").unwrap()..]
+            .replace("profiles.user", "profiles.system");
+        std::fs::write(
+            temp.path().join("theseus.toml"),
+            format!("{user}\n{system}"),
+        )
+        .unwrap();
+        let out = cli()
+            .current_dir(temp.path())
+            .env("PATH", "/no-docker")
+            .args(["run", "--headless", "--scenario", selection])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        let root = std::fs::read_dir(temp.path().join(".theseus-runs"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let report = theseus::report::load(&root.path()).unwrap();
+        assert_eq!(report.selected_profiles.len(), 2);
+        let names: Vec<_> = report
+            .selected_scenarios
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            names,
+            match selection {
+                "all" => vec!["interrupted_install", "interrupted_upgrade"],
+                "interrupted-install" => vec!["interrupted_install"],
+                _ => vec!["interrupted_upgrade"],
+            }
+        );
+        assert!(!report.errors.is_empty());
+    }
+}

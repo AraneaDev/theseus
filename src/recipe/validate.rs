@@ -59,10 +59,11 @@ impl ValidatedRecipe {
                     ][..],
                     ScenarioKind::Reinstall => {
                         ensure!(
-                            profile.checks.iter().any(|check| matches!(
-                                check.expectation,
-                                Expectation::Unchanged { .. }
-                            )),
+                            profile
+                                .checks
+                                .iter()
+                                .any(|check| check.checkpoint == Checkpoint::Reinstalled
+                                    && matches!(check.expectation, Expectation::Unchanged { .. })),
                             "{name}/reinstall requires at least one unchanged contract"
                         );
                         &[
@@ -72,6 +73,63 @@ impl ValidatedRecipe {
                             StepName::Reinstall,
                             StepName::Uninstall,
                         ][..]
+                    }
+                    ScenarioKind::InterruptedInstall | ScenarioKind::InterruptedUpgrade => {
+                        ensure!(
+                            profile
+                                .checks
+                                .iter()
+                                .any(|check| check.checkpoint == Checkpoint::Interrupted
+                                    && check.expectation.path().is_some()),
+                            "{name}/{scenario} requires an interrupted filesystem contract"
+                        );
+                        ensure!(profile.checks.iter().any(|check| check.checkpoint == Checkpoint::Recovered && matches!(&check.expectation, Expectation::Executable { stdout_contains: Some(value), .. } if !value.trim().is_empty())), "{name}/{scenario} requires a recovered Executable contract with nonempty stdout_contains");
+                        if *scenario == ScenarioKind::InterruptedUpgrade {
+                            ensure!(
+                                self.base_artifact.is_some(),
+                                "interrupted_upgrade requires artifacts.base"
+                            );
+                            ensure!(
+                                profile.checks.iter().any(|check| check.checkpoint
+                                    == Checkpoint::Recovered
+                                    && match &check.expectation {
+                                        Expectation::Unchanged { .. }
+                                        | Expectation::Preserved { .. } => true,
+                                        Expectation::Command {
+                                            stdout_contains: Some(value),
+                                            ..
+                                        } => !value.trim().is_empty(),
+                                        _ => false,
+                                    }),
+                                "{name}/{scenario} requires a recovered data contract"
+                            );
+                            &[
+                                StepName::InstallBase,
+                                StepName::InterruptUpgrade,
+                                StepName::RecoverUpgrade,
+                                StepName::Configure,
+                                StepName::Exercise,
+                                StepName::Uninstall,
+                            ][..]
+                        } else {
+                            ensure!(
+                                !profile.checks.iter().any(|check| matches!(
+                                    check.checkpoint,
+                                    Checkpoint::Interrupted | Checkpoint::Recovered
+                                ) && matches!(
+                                    check.expectation,
+                                    Expectation::Preserved { .. }
+                                )),
+                                "preserved at interrupted/recovered requires interrupted_upgrade configuration"
+                            );
+                            &[
+                                StepName::InterruptInstall,
+                                StepName::RecoverInstall,
+                                StepName::Configure,
+                                StepName::Exercise,
+                                StepName::Uninstall,
+                            ][..]
+                        }
                     }
                     ScenarioKind::Upgrade => {
                         ensure!(
@@ -93,7 +151,9 @@ impl ValidatedRecipe {
                         "{name}/{scenario} requires step {step}"
                     );
                 }
-                if *scenario != ScenarioKind::Upgrade {
+                if crate::model::checkpoint_applies(*scenario, Checkpoint::TargetInstalled)
+                    && *scenario != ScenarioKind::Upgrade
+                {
                     ensure!(
                         !profile
                             .checks
@@ -122,11 +182,11 @@ pub fn load(path: &Path) -> Result<ValidatedRecipe> {
             recipe.scenarios.is_none(),
             "scenarios requires recipe schema version 2"
         ),
-        2 => {
+        2 | 3 => {
             let scenarios = recipe
                 .scenarios
                 .as_ref()
-                .context("recipe schema version 2 requires an explicit scenarios list")?;
+                .context("recipe schema version 2/3 requires an explicit scenarios list")?;
             ensure!(!scenarios.is_empty(), "declare at least one scenario");
             let mut seen = BTreeSet::new();
             for scenario in scenarios {
@@ -134,6 +194,18 @@ pub fn load(path: &Path) -> Result<ValidatedRecipe> {
             }
         }
         version => bail!("unsupported recipe schema version {version}"),
+    }
+    if recipe.schema_version < 3 {
+        ensure!(
+            !recipe
+                .scenarios
+                .as_ref()
+                .is_some_and(|scenarios| scenarios.iter().any(|kind| matches!(
+                    kind,
+                    ScenarioKind::InterruptedInstall | ScenarioKind::InterruptedUpgrade
+                ))),
+            "interruption requires recipe schema version 3"
+        );
     }
     ensure!(
         !recipe.name.trim().is_empty() && !recipe.image.trim().is_empty(),
@@ -174,6 +246,33 @@ pub fn load(path: &Path) -> Result<ValidatedRecipe> {
                 "reinstall requires recipe schema version 2"
             );
         }
+        for (step, command) in &profile.steps {
+            if matches!(
+                step,
+                StepName::InterruptInstall
+                    | StepName::RecoverInstall
+                    | StepName::InterruptUpgrade
+                    | StepName::RecoverUpgrade
+            ) {
+                ensure!(
+                    recipe.schema_version >= 3,
+                    "interruption steps require recipe schema version 3"
+                );
+            }
+            if matches!(
+                step,
+                StepName::InterruptInstall | StepName::InterruptUpgrade
+            ) {
+                ensure!(
+                    !command.env.contains_key("THESEUS_INTERRUPT_BARRIER")
+                        && !command
+                            .pass_env
+                            .iter()
+                            .any(|name| name == "THESEUS_INTERRUPT_BARRIER"),
+                    "THESEUS_INTERRUPT_BARRIER is reserved for interruption"
+                );
+            }
+        }
         let mut ids = BTreeSet::new();
         for command in profile.steps.values() {
             validate_command(
@@ -196,21 +295,40 @@ pub fn load(path: &Path) -> Result<ValidatedRecipe> {
                     "reinstalled/unchanged requires recipe schema version 2"
                 );
             }
-            if check.checkpoint == Checkpoint::Reinstalled
-                || matches!(check.expectation, Expectation::Unchanged { .. })
-            {
+            if matches!(
+                check.checkpoint,
+                Checkpoint::Interrupted | Checkpoint::Recovered
+            ) {
+                ensure!(
+                    recipe.schema_version >= 3,
+                    "interruption checkpoints require recipe schema version 3"
+                );
+                ensure!(
+                    recipe
+                        .scenarios
+                        .as_ref()
+                        .is_some_and(|scenarios| scenarios.iter().any(|scenario| {
+                            crate::model::checkpoint_applies(*scenario, check.checkpoint)
+                        })),
+                    "interruption checkpoint requires a declared interrupted scenario"
+                );
+            }
+            if check.checkpoint == Checkpoint::Reinstalled {
                 ensure!(
                     recipe
                         .scenarios
                         .as_ref()
                         .is_some_and(|scenarios| scenarios.contains(&ScenarioKind::Reinstall)),
-                    "reinstalled/unchanged requires a recipe that must declare reinstall"
+                    "reinstalled requires a recipe that must declare reinstall"
                 );
             }
             if matches!(check.expectation, Expectation::Unchanged { .. }) {
                 ensure!(
-                    check.checkpoint == Checkpoint::Reinstalled,
-                    "unchanged requires checkpoint reinstalled"
+                    matches!(
+                        check.checkpoint,
+                        Checkpoint::Reinstalled | Checkpoint::Interrupted | Checkpoint::Recovered
+                    ),
+                    "unchanged requires checkpoint reinstalled, interrupted or recovered"
                 );
             }
             match &mut check.expectation {
@@ -269,6 +387,8 @@ pub fn load(path: &Path) -> Result<ValidatedRecipe> {
                         Checkpoint::TargetInstalled
                             | Checkpoint::Uninstalled
                             | Checkpoint::Reinstalled
+                            | Checkpoint::Interrupted
+                            | Checkpoint::Recovered
                     ),
                     "preserved requires a checkpoint after configuration"
                 );
