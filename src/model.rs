@@ -52,7 +52,7 @@ pub struct Finding {
     pub message: String,
 }
 
-pub const REPORT_SCHEMA_VERSION: u32 = 2;
+pub const REPORT_SCHEMA_VERSION: u32 = 3;
 pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
 named_enum!(RunOutcome { Passed => "passed", Failed => "failed", Incomplete => "incomplete", Cancelled => "cancelled" });
 impl RunOutcome {
@@ -77,7 +77,19 @@ impl RunOutcome {
     }
 }
 named_enum!(StageOutcome { Pending => "pending", Running => "running", Passed => "passed", Failed => "failed", Incomplete => "incomplete", Cancelled => "cancelled", Skipped => "skipped" });
-named_enum!(CommandOutcome { Succeeded => "succeeded", Failed => "failed", TimedOut => "timed_out", Cancelled => "cancelled", Error => "error", Skipped => "skipped" });
+named_enum!(CommandOutcome { Interrupted => "interrupted", Succeeded => "succeeded", Failed => "failed", TimedOut => "timed_out", Cancelled => "cancelled", Error => "error", Skipped => "skipped" });
+named_enum!(InterruptionMechanism { ContainerSigkill => "container_sigkill" });
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterruptionEvidence {
+    pub mechanism: InterruptionMechanism,
+    pub readiness_verified: bool,
+    pub stopped_verified: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestartEvidence {
+    pub container_id: String,
+    pub running_verified: bool,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum TeardownStatus {
@@ -139,6 +151,8 @@ pub struct CommandRecord {
     pub stderr: Option<LogReference>,
     pub error: Option<String>,
     pub skip_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interruption: Option<InterruptionEvidence>,
 }
 impl CommandRecord {
     pub fn new(id: impl Into<String>, phase: impl Into<String>) -> Self {
@@ -160,6 +174,7 @@ impl CommandRecord {
             stderr: None,
             error: None,
             skip_reason: None,
+            interruption: None,
         }
     }
 }
@@ -176,6 +191,8 @@ pub struct StageReport {
     pub stage_diff: Vec<crate::snapshot::FileChange>,
     pub errors: Vec<String>,
     pub skip_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<RestartEvidence>,
 }
 impl StageReport {
     pub fn new(name: impl Into<String>) -> Self {
@@ -191,6 +208,7 @@ impl StageReport {
             stage_diff: Vec::new(),
             errors: Vec::new(),
             skip_reason: None,
+            restart: None,
         }
     }
     pub fn aggregate_outcome(&self) -> RunOutcome {
@@ -201,7 +219,11 @@ impl StageReport {
             _ => RunOutcome::Incomplete,
         };
         let mut outcomes = vec![initial];
-        if !self.errors.is_empty()
+        if self
+            .restart
+            .as_ref()
+            .is_some_and(|proof| !proof.running_verified)
+            || !self.errors.is_empty()
             || self.snapshots.iter().any(|s| {
                 matches!(
                     s.completeness,
@@ -228,7 +250,10 @@ impl StageReport {
                     CommandOutcome::Succeeded | CommandOutcome::Skipped => RunOutcome::Passed,
                     CommandOutcome::Failed => RunOutcome::Failed,
                     CommandOutcome::Cancelled => RunOutcome::Cancelled,
-                    CommandOutcome::TimedOut | CommandOutcome::Error => RunOutcome::Incomplete,
+                    // No matching interruption step exists until the orchestration task.
+                    CommandOutcome::Interrupted
+                    | CommandOutcome::TimedOut
+                    | CommandOutcome::Error => RunOutcome::Incomplete,
                 }
             });
         }

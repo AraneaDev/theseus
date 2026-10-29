@@ -28,13 +28,6 @@ pub(super) enum SupervisionEvent {
 }
 pub(super) enum SupervisionDecision {
     Continue,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "The planned interruption consumer is introduced in Task 2"
-        )
-    )]
     Stop,
 }
 

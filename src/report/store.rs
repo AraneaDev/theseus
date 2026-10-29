@@ -242,7 +242,7 @@ fn log_components(relative: &str) -> Result<Vec<&str>> {
 }
 fn validate_report(report: &RunReport) -> Result<()> {
     ensure!(
-        matches!(report.schema_version, 1 | REPORT_SCHEMA_VERSION),
+        matches!(report.schema_version, 1 | 2 | REPORT_SCHEMA_VERSION),
         "unsupported report schema version {}",
         report.schema_version
     );
@@ -261,6 +261,21 @@ fn validate_report(report: &RunReport) -> Result<()> {
                         })
                 }),
             "reinstall evidence and comparison references require report schema version 2"
+        );
+    }
+    if report.schema_version < 3 {
+        ensure!(
+            report
+                .scenarios
+                .iter()
+                .all(|scenario| scenario.stages.iter().all(|stage| {
+                    stage.restart.is_none()
+                        && stage.commands.iter().all(|command| {
+                            command.interruption.is_none()
+                                && command.outcome != crate::model::CommandOutcome::Interrupted
+                        })
+                })),
+            "interruption and restart evidence require report schema version 3"
         );
     }
     for scenario in &report.scenarios {

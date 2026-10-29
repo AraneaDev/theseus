@@ -63,6 +63,23 @@ pub trait Environment {
         store: &ReportStore,
         cancel: &CancellationToken,
     ) -> Result<ExecutedCommand>;
+    /// Deliberate interruption is opt-in; unsupported environments fail closed.
+    fn execute_interrupted(
+        &mut self,
+        _resource: &OwnedResource,
+        _request: CommandRequest,
+        _store: &ReportStore,
+        _cancel: &CancellationToken,
+    ) -> Result<ExecutedCommand> {
+        anyhow::bail!("environment does not support verified interruption")
+    }
+    fn restart(
+        &mut self,
+        _resource: &OwnedResource,
+        _cancel: &CancellationToken,
+    ) -> Result<RestartEvidence> {
+        anyhow::bail!("environment does not support verified restart")
+    }
     fn observe(
         &mut self,
         resource: &OwnedResource,

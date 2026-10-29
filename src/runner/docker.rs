@@ -1,4 +1,6 @@
 mod execution;
+mod interruption;
+mod ownership;
 
 use super::{
     artifacts::{self, Inputs},
@@ -129,52 +131,6 @@ impl Docker {
             "journal resource lacks ownership labels"
         );
         Ok(())
-    }
-    fn verified_exists(&self, resource: &OwnedResource) -> Result<bool> {
-        Self::validate_resource(resource)?;
-        let output = process::run(
-            self.command().args([
-                "container",
-                "inspect",
-                "--format",
-                "{{json .}}",
-                &resource.container_id,
-            ]),
-            Duration::from_secs(30),
-            &CancellationToken::default(),
-            None,
-            1_048_576,
-            || Ok(()),
-        )?;
-        ensure!(
-            !output.timed_out && !output.cancelled,
-            "ownership inspection timed out"
-        );
-        ensure!(
-            output.error.is_none(),
-            "ownership inspection failed: {:?}",
-            output.error
-        );
-        if output.status != Some(0) {
-            let error = String::from_utf8_lossy(&output.stderr.bytes);
-            if error.contains("No such container:") || error.contains("No such object:") {
-                return Ok(false);
-            }
-            bail!("ownership inspection failed: {error}");
-        }
-        ensure!(!output.stdout.truncated, "ownership metadata exceeds limit");
-        let value: serde_json::Value = serde_json::from_slice(&output.stdout.bytes)?;
-        ensure!(
-            value["Id"].as_str() == Some(&resource.container_id),
-            "container ID mismatch"
-        );
-        for (key, expected) in &resource.labels {
-            ensure!(
-                value["Config"]["Labels"][key].as_str() == Some(expected),
-                "container ownership label mismatch: {key}"
-            );
-        }
-        Ok(true)
     }
     pub fn cleanup(&mut self, run: &Path) -> Result<()> {
         let mut journal = crate::report::load_journal(run)?;
@@ -409,6 +365,22 @@ chmod 755 /home/theseus /workspace /inputs
         cancel: &CancellationToken,
     ) -> Result<ExecutedCommand> {
         self.execute_ordinary(resource, request, store, cancel)
+    }
+    fn execute_interrupted(
+        &mut self,
+        resource: &OwnedResource,
+        request: CommandRequest,
+        store: &ReportStore,
+        cancel: &CancellationToken,
+    ) -> Result<ExecutedCommand> {
+        self.interrupt(resource, request, store, cancel)
+    }
+    fn restart(
+        &mut self,
+        resource: &OwnedResource,
+        cancel: &CancellationToken,
+    ) -> Result<RestartEvidence> {
+        self.restart_owned(resource, cancel)
     }
     fn observe(
         &mut self,

@@ -16,7 +16,7 @@ pub(super) struct Launch {
 
 impl Launch {
     pub(super) fn receipt(&self) -> String {
-        format!("{}/completion", self.directory)
+        format!("{}/command/completion", self.directory)
     }
 }
 
@@ -27,6 +27,27 @@ impl Docker {
         request: &CommandRequest,
         store: &ReportStore,
         cancel: &CancellationToken,
+    ) -> Result<(CommandRecord, Launch)> {
+        self.prepare_execution_inner(resource, request, store, cancel, false)
+    }
+
+    pub(super) fn prepare_interrupted_execution(
+        &mut self,
+        resource: &OwnedResource,
+        request: &CommandRequest,
+        store: &ReportStore,
+        cancel: &CancellationToken,
+    ) -> Result<(CommandRecord, Launch)> {
+        self.prepare_execution_inner(resource, request, store, cancel, true)
+    }
+
+    fn prepare_execution_inner(
+        &mut self,
+        resource: &OwnedResource,
+        request: &CommandRequest,
+        store: &ReportStore,
+        cancel: &CancellationToken,
+        interrupted: bool,
     ) -> Result<(CommandRecord, Launch)> {
         let mut public = BTreeMap::from([
             ("HOME".into(), request.identity.home.clone()),
@@ -101,16 +122,26 @@ impl Docker {
                     && !crate::recipe::validate::contained(root, &directory)),
             "control directory overlaps observed roots"
         );
-        let prepared = self.control(
-            resource,
-            "umask 077; mkdir \"$1\" && chown \"$2\" \"$1\"",
-            &[
-                &directory,
-                &format!("{}:{}", request.identity.uid, request.identity.gid),
-            ],
-            deadline,
-            cancel,
-        );
+        let prepared = (|| {
+            // Interruption verifies ownership before any container mutation,
+            // including creation of its private control layout.
+            if interrupted {
+                let state = self
+                    .inspect_owned(resource, deadline, cancel)?
+                    .context("owned container missing before interruption")?;
+                ensure!(state.running, "owned container is not running");
+            }
+            self.control(
+                resource,
+                r#"umask 077; mkdir "$1" && chmod 755 "$1" && mkdir "$1/command" && chown "$2" "$1/command""#,
+                &[
+                    &directory,
+                    &format!("{}:{}", request.identity.uid, request.identity.gid),
+                ],
+                if interrupted { deadline.min(Instant::now() + Duration::from_secs(1)) } else { deadline },
+                cancel,
+            )
+        })();
         Ok((
             record,
             Launch {
@@ -170,6 +201,17 @@ impl Docker {
         status: Option<i32>,
         cancel: &CancellationToken,
     ) -> Result<i32> {
+        self.verify_completion_until(resource, launch, status, launch.deadline, cancel)
+    }
+
+    pub(super) fn verify_completion_until(
+        &mut self,
+        resource: &OwnedResource,
+        launch: &Launch,
+        status: Option<i32>,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<i32> {
         ensure!(
             status == Some(0),
             "Docker command control failed (status {:?}); application completion unknown",
@@ -179,7 +221,7 @@ impl Docker {
             resource,
             "test -f \"$1\" && test ! -L \"$1\" && cat \"$1\" && rm -f \"$1\"",
             &[&launch.receipt()],
-            launch.deadline,
+            deadline,
             cancel,
         )?;
         let status = text

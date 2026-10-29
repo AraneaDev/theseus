@@ -348,14 +348,14 @@ fn frozen_schema_one_report_and_journal_remain_readable_and_writable() {
 }
 
 #[test]
-fn new_reports_write_schema_two_while_journals_stay_schema_one() {
+fn new_reports_write_schema_three_while_journals_stay_schema_one() {
     let temp = tempfile::tempdir().unwrap();
     let store = report::create(&temp.path().join("run")).unwrap();
     store.save(&RunReport::new("new-run")).unwrap();
     let serialized: serde_json::Value =
         serde_json::from_slice(&fs::read(store.report_path()).unwrap()).unwrap();
-    assert_eq!(serialized["schema_version"], 2);
-    assert_eq!(report::load(store.root()).unwrap().schema_version, 2);
+    assert_eq!(serialized["schema_version"], 3);
+    assert_eq!(report::load(store.root()).unwrap().schema_version, 3);
     let journal = RunJournal {
         schema_version: 1,
         run_id: "new-run".into(),
@@ -376,7 +376,7 @@ fn new_reports_write_schema_two_while_journals_stay_schema_one() {
 fn report_versions_and_journal_versions_are_validated_independently() {
     let temp = tempfile::tempdir().unwrap();
     let store = report::create(&temp.path().join("run")).unwrap();
-    for version in [1, 2] {
+    for version in [1, 2, 3] {
         let mut run = RunReport::new("run");
         run.schema_version = version;
         store.save(&run).unwrap();
@@ -474,5 +474,120 @@ fn schema_two_reinstall_comparisons_round_trip_and_old_checks_omit_reference() {
             before_stage: "before_reinstall".into(),
             after_stage: "reinstalled".into()
         })
+    );
+}
+
+#[test]
+fn report_three_retains_interruption_proofs_but_cannot_pass_an_unmatched_stage() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = report::create(&temp.path().join("run")).unwrap();
+    let mut json: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/reports/schema1-report.json")).unwrap();
+    json["schema_version"] = 3.into();
+    json["scenarios"][0]["stages"][0]["restart"] =
+        serde_json::json!({"container_id": "owned-id", "running_verified": true});
+    let command = &mut json["scenarios"][0]["stages"][0]["commands"][0];
+    command["outcome"] = "interrupted".into();
+    command["exit_status"] = serde_json::Value::Null;
+    command["interruption"] = serde_json::json!({
+        "mechanism": "container_sigkill", "readiness_verified": true, "stopped_verified": true
+    });
+    let run: RunReport =
+        serde_json::from_value(json.clone()).expect("report3 interruption decodes");
+    store.save(&run).unwrap();
+    let loaded = report::load(store.root()).unwrap();
+    assert_eq!(serde_json::to_value(&loaded).unwrap(), json);
+    assert_eq!(
+        loaded.scenarios[0].stages[0].aggregate_outcome(),
+        RunOutcome::Incomplete
+    );
+}
+
+#[test]
+fn lower_report_versions_reject_each_interruption_feature() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = report::create(&temp.path().join("run")).unwrap();
+    for version in [1, 2] {
+        for feature in ["outcome", "interruption", "restart"] {
+            let mut json: serde_json::Value =
+                serde_json::from_str(include_str!("fixtures/reports/schema1-report.json")).unwrap();
+            json["schema_version"] = version.into();
+            let stage = &mut json["scenarios"][0]["stages"][0];
+            match feature {
+                "outcome" => stage["commands"][0]["outcome"] = "interrupted".into(),
+                "interruption" => {
+                    stage["commands"][0]["interruption"] = serde_json::json!({
+                        "mechanism":"container_sigkill", "readiness_verified":false, "stopped_verified":false
+                    })
+                }
+                _ => {
+                    stage["restart"] =
+                        serde_json::json!({"container_id":"id", "running_verified":false})
+                }
+            }
+            fs::write(store.report_path(), serde_json::to_vec(&json).unwrap()).unwrap();
+            assert!(
+                report::load(store.root()).is_err(),
+                "schema{version} accepted {feature}"
+            );
+            if let Ok(run) = serde_json::from_value::<RunReport>(json) {
+                assert!(store.save(&run).is_err(), "writer accepted {feature}");
+            }
+        }
+    }
+}
+
+#[test]
+fn old_reports_omit_new_optional_proofs() {
+    let run: RunReport =
+        serde_json::from_str(include_str!("fixtures/reports/schema1-report.json")).unwrap();
+    let json = serde_json::to_value(run).unwrap();
+    assert!(json["scenarios"][0]["stages"][0].get("restart").is_none());
+    assert!(
+        json["scenarios"][0]["stages"][0]["commands"][0]
+            .get("interruption")
+            .is_none()
+    );
+}
+
+#[test]
+fn unverified_restart_evidence_prevents_a_passing_stage() {
+    let mut stage = StageReport::new("restart_after_interrupt");
+    stage.outcome = StageOutcome::Passed;
+    stage.restart = Some(RestartEvidence {
+        container_id: "owned".into(),
+        running_verified: false,
+    });
+    assert_eq!(stage.aggregate_outcome(), RunOutcome::Incomplete);
+}
+
+#[test]
+fn frozen_schema_two_report_retains_reinstall_evidence_without_interruption_fields() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = report::create(&temporary.path().join("run")).unwrap();
+    fs::write(
+        store.report_path(),
+        include_bytes!("fixtures/reports/schema2-report.json"),
+    )
+    .unwrap();
+    let report = report::load(store.root()).unwrap();
+    assert_eq!(report.schema_version, 2);
+    assert_eq!(report.scenarios[0].scenario, ScenarioKind::Reinstall);
+    let stage = &report.scenarios[0].stages[0];
+    assert_eq!(stage.checkpoint, Some(Checkpoint::Reinstalled));
+    assert_eq!(
+        stage.checks[0].comparison,
+        Some(ComparisonReference::reinstall())
+    );
+    assert!(stage.restart.is_none());
+    assert!(stage.commands[0].interruption.is_none());
+    store.save(&report).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(store.report_path()).unwrap())
+            .unwrap(),
+        serde_json::from_str::<serde_json::Value>(include_str!(
+            "fixtures/reports/schema2-report.json"
+        ))
+        .unwrap()
     );
 }

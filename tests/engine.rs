@@ -928,3 +928,37 @@ fn reinstall_failed_prerequisites_skip_repeat_contracts_without_losing_known_fai
         }
     }
 }
+
+#[test]
+fn environment_default_interruption_and_restart_fail_closed() {
+    let mut environment = Fake { fault: "" };
+    let temporary = tempfile::tempdir().unwrap();
+    let store = theseus::report::create(&temporary.path().join("run")).unwrap();
+    let resource = OwnedResource {
+        container_id: "owned".into(),
+        labels: BTreeMap::new(),
+        removed: false,
+    };
+    let cancel = CancellationToken::default();
+    assert!(
+        environment
+            .execute_interrupted(
+                &resource,
+                CommandRequest {
+                    id: "unsupported".into(),
+                    phase: "boundary".into(),
+                    identity: ExecutionIdentity::runtime(),
+                    argv: vec!["/bin/true".into()],
+                    env: BTreeMap::new(),
+                    pass_env: vec![],
+                    timeout_seconds: 10,
+                    expected_exit: 0,
+                    log_limit: 1024,
+                },
+                &store,
+                &cancel
+            )
+            .is_err()
+    );
+    assert!(environment.restart(&resource, &cancel).is_err());
+}

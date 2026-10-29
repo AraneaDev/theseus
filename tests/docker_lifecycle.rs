@@ -922,3 +922,591 @@ fn real_pty_reinstall_selection_and_new_report_comparison_visibility() {
     );
     println!("{}", String::from_utf8_lossy(&output.stdout));
 }
+
+struct InterruptionBoundary {
+    docker: theseus::runner::Docker,
+    resource: OwnedResource,
+    store: theseus::report::ReportStore,
+    _temporary: tempfile::TempDir,
+}
+impl InterruptionBoundary {
+    fn new() -> Self {
+        use theseus::runner::Environment;
+        let recipe =
+            recipe::load(std::path::Path::new("tests/fixtures/lifecycle/recipe.toml")).unwrap();
+        let cancel = CancellationToken::default();
+        let mut docker = theseus::runner::Docker::default();
+        docker.prepare(&recipe, false, &cancel).unwrap();
+        let resource = docker
+            .create("interruption-boundary", "boundary", &recipe)
+            .unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let boundary = Self {
+            docker,
+            resource,
+            store: theseus::report::create(&temporary.path().join("run")).unwrap(),
+            _temporary: temporary,
+        };
+        let mut boundary = boundary;
+        boundary
+            .docker
+            .setup(&boundary.resource, &recipe, &cancel)
+            .unwrap();
+        boundary
+    }
+    fn request(
+        id: &str,
+        script: &str,
+        identity: ExecutionIdentity,
+    ) -> theseus::runner::CommandRequest {
+        theseus::runner::CommandRequest {
+            id: id.into(),
+            phase: "boundary".into(),
+            identity,
+            argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
+            env: Default::default(),
+            pass_env: vec![],
+            timeout_seconds: 10,
+            expected_exit: 0,
+            log_limit: 2048,
+        }
+    }
+    fn ordinary(&mut self, id: &str, script: &str, identity: ExecutionIdentity) -> String {
+        use theseus::runner::Environment;
+        let result = self
+            .docker
+            .execute(
+                &self.resource,
+                Self::request(id, script, identity),
+                &self.store,
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            result.record.outcome,
+            CommandOutcome::Succeeded,
+            "{:?}",
+            result.record
+        );
+        result.stdout
+    }
+    fn assert_absent(&self) {
+        let output = std::process::Command::new("docker")
+            .args(["inspect", &self.resource.container_id])
+            .output()
+            .unwrap();
+        assert!(
+            container_is_absent(&self.resource.container_id, &output),
+            "{output:?}"
+        );
+    }
+}
+impl Drop for InterruptionBoundary {
+    fn drop(&mut self) {
+        use theseus::runner::Environment;
+        let result = theseus::runner::Docker::default().remove(&self.resource);
+        if !std::thread::panicking() {
+            result.unwrap();
+            self.assert_absent();
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires Docker"]
+fn real_interruption_retains_partial_state_and_restarts_without_setup_or_copy() {
+    use theseus::runner::Environment;
+    for identity in [ExecutionIdentity::runtime(), ExecutionIdentity::root()] {
+        let mut boundary = InterruptionBoundary::new();
+        // Mutations that setup/chown/input-recopy would undo are independent
+        // evidence that restart only starts the original idle entrypoint.
+        boundary.ordinary(
+            "mutate-inputs",
+            "printf retained > /inputs/target/retained; chmod 711 /workspace; chown 0:0 /workspace",
+            ExecutionIdentity::root(),
+        );
+        let request = InterruptionBoundary::request(
+            "interrupt",
+            r#"set -eu
+helper=$THESEUS_INTERRUPT_BARRIER
+parent=${helper%/*}
+test "$(stat -c '%u:%g:%a' "$helper")" = '0:0:644'
+test "$(stat -c '%u:%g:%a' "$parent")" = '0:0:755'
+test ! -L "$helper"
+test "$(stat -c '%u:%g:%a' "$parent/ready")" = "$(id -u):$(id -g):700"
+if test "$(id -u)" != 0; then
+    if (printf corrupt >> "$helper") 2>/dev/null; then exit 41; fi
+    if (mv "$parent/ready" "$parent/other") 2>/dev/null; then exit 42; fi
+fi
+printf partial > "$HOME/partial"
+chmod 640 "$HOME/partial"
+(while :; do printf x >> "$HOME/writer"; sleep 0.02; done) &
+/bin/sh "$helper"
+printf forbidden > "$HOME/continued"
+"#,
+            identity.clone(),
+        );
+        let executed = boundary
+            .docker
+            .execute_interrupted(
+                &boundary.resource,
+                request,
+                &boundary.store,
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            executed.record.outcome,
+            CommandOutcome::Interrupted,
+            "{:?}",
+            executed.record
+        );
+        assert_eq!(executed.record.exit_status, None);
+        assert!(!executed.record.timed_out && !executed.record.cancelled);
+        assert!(executed.record.error.is_none());
+        let proof = executed.record.interruption.as_ref().unwrap();
+        assert_eq!(proof.mechanism, InterruptionMechanism::ContainerSigkill);
+        assert!(proof.readiness_verified && proof.stopped_verified);
+        assert!(
+            !executed
+                .record
+                .environment
+                .contains_key("THESEUS_INTERRUPT_BARRIER")
+        );
+        assert!(executed.record.forwarded_environment.is_empty());
+        let serialized = serde_json::to_string(&executed.record).unwrap();
+        assert!(!serialized.contains("/.theseus-"));
+        let stopped = std::process::Command::new("docker")
+            .args([
+                "inspect",
+                "--format",
+                "{{.State.Running}}",
+                &boundary.resource.container_id,
+            ])
+            .output()
+            .unwrap();
+        assert!(stopped.status.success());
+        assert_eq!(stopped.stdout, b"false\n");
+        let restart = boundary
+            .docker
+            .restart(&boundary.resource, &CancellationToken::default())
+            .unwrap();
+        assert_eq!(restart.container_id, boundary.resource.container_id);
+        assert!(restart.running_verified);
+        let evidence = boundary.ordinary(
+            "partial-after-restart",
+            r#"set -eu
+cat "$HOME/partial"
+printf '\n'
+stat -c '%u:%g:%a' "$HOME/partial"
+test ! -e "$HOME/continued"
+a=$(wc -c < "$HOME/writer"); sleep 0.15; b=$(wc -c < "$HOME/writer"); test "$a" = "$b"
+cat /inputs/target/retained
+printf '\n'
+stat -c '%u:%g:%a' /workspace
+"#,
+            identity.clone(),
+        );
+        assert_eq!(
+            evidence,
+            format!(
+                "partial\n{}:{}:640\nretained\n0:0:711\n",
+                identity.uid, identity.gid
+            )
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires Docker"]
+fn real_interruption_early_exit_is_failed_contract_with_real_status() {
+    use theseus::runner::Environment;
+    let mut boundary = InterruptionBoundary::new();
+    for status in [0, 7, 137] {
+        let mut request = InterruptionBoundary::request(
+            &format!("early-{status}"),
+            &format!("exit {status}"),
+            ExecutionIdentity::runtime(),
+        );
+        request.expected_exit = status;
+        let result = boundary
+            .docker
+            .execute_interrupted(
+                &boundary.resource,
+                request,
+                &boundary.store,
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            result.record.outcome,
+            CommandOutcome::Failed,
+            "{:?}",
+            result.record
+        );
+        assert_eq!(result.record.exit_status, Some(status));
+        assert!(result.record.error.is_none());
+        assert!(!result.record.timed_out && !result.record.cancelled);
+        let proof = result.record.interruption.unwrap();
+        assert!(!proof.readiness_verified && !proof.stopped_verified);
+    }
+    assert_eq!(
+        boundary.ordinary(
+            "still-running",
+            "printf alive",
+            ExecutionIdentity::runtime()
+        ),
+        "alive"
+    );
+}
+
+#[test]
+#[ignore = "requires Docker"]
+fn real_interruption_never_ready_or_invalid_receipt_removes_owned_container() {
+    use theseus::runner::Environment;
+    for mode in ["never", "stale", "symlink", "oversized", "control-word"] {
+        let mut boundary = InterruptionBoundary::new();
+        let script = match mode {
+            "never" => "sleep 600",
+            "stale" => {
+                "printf 'stale-nonce\\n' > \"${THESEUS_INTERRUPT_BARRIER%/*}/ready/receipt\"; sleep 600"
+            }
+            "control-word" => {
+                "printf waiting > \"${THESEUS_INTERRUPT_BARRIER%/*}/ready/receipt\"; sleep 600"
+            }
+            "symlink" => {
+                "ln -s /etc/passwd \"${THESEUS_INTERRUPT_BARRIER%/*}/ready/receipt\"; sleep 600"
+            }
+            _ => {
+                "dd if=/dev/zero of=\"${THESEUS_INTERRUPT_BARRIER%/*}/ready/receipt\" bs=1024 count=1 2>/dev/null; sleep 600"
+            }
+        };
+        let mut request = InterruptionBoundary::request(mode, script, ExecutionIdentity::runtime());
+        request.timeout_seconds = 2;
+        let result = boundary
+            .docker
+            .execute_interrupted(
+                &boundary.resource,
+                request,
+                &boundary.store,
+                &CancellationToken::default(),
+            )
+            .unwrap();
+        assert_ne!(result.record.outcome, CommandOutcome::Interrupted, "{mode}");
+        assert!(
+            result.record.timed_out || result.record.error.is_some(),
+            "{mode}: {:?}",
+            result.record
+        );
+        if mode != "never" {
+            assert_eq!(result.record.outcome, CommandOutcome::Error, "{mode}");
+            assert!(
+                !result.record.timed_out,
+                "malformed readiness must fail immediately: {mode}"
+            );
+        }
+        assert!(!result.record.interruption.unwrap().stopped_verified);
+        boundary.assert_absent();
+    }
+}
+
+#[test]
+#[ignore = "requires Docker"]
+fn real_interruption_ownership_mismatch_cannot_stop_or_restart_container() {
+    use theseus::runner::Environment;
+    let mut boundary = InterruptionBoundary::new();
+    let mut impostor = boundary.resource.clone();
+    impostor
+        .labels
+        .insert("io.theseus.run".into(), "someone-else".into());
+    let result = boundary
+        .docker
+        .execute_interrupted(
+            &impostor,
+            InterruptionBoundary::request(
+                "mismatch",
+                "/bin/sh \"$THESEUS_INTERRUPT_BARRIER\"",
+                ExecutionIdentity::runtime(),
+            ),
+            &boundary.store,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+    assert_eq!(result.record.outcome, CommandOutcome::Error);
+    assert!(!result.record.interruption.unwrap().stopped_verified);
+    let untouched = std::process::Command::new("docker")
+        .args([
+            "exec",
+            &boundary.resource.container_id,
+            "/bin/sh",
+            "-c",
+            "for p in /.theseus-*; do test ! -e \"$p\" || exit 1; done",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        untouched.status.success(),
+        "ownership mismatch mutated container control state"
+    );
+    assert!(
+        boundary
+            .docker
+            .restart(&impostor, &CancellationToken::default())
+            .is_err()
+    );
+    assert_eq!(
+        boundary.ordinary("owner-alive", "printf alive", ExecutionIdentity::runtime()),
+        "alive"
+    );
+}
+
+impl InterruptionBoundary {
+    /// Fault injection sits at the Docker transport boundary. Every mutation and
+    /// successful inspect still goes through the real daemon and owned resource.
+    fn proxy(&mut self, mode: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        use theseus::runner::Environment;
+        let executable = self._temporary.path().join("docker-proxy");
+        let marker = self._temporary.path().join("transition");
+        let script = r#"#!/usr/bin/python3
+import json,pathlib,subprocess,sys,time
+args=sys.argv[1:]
+mode=MODE
+marker=pathlib.Path(MARKER)
+is_inspect=args[:2]==['container','inspect']
+is_kill=args[:2]==['container','kill']
+is_start=args[:2]==['container','start']
+is_poll='-c' in args and 'iflag=nofollow,nonblock' in args[args.index('-c')+1]
+if mode=='kill-failed' and is_kill: sys.exit(1)
+if mode=='restart-failed' and is_start: sys.exit(1)
+if mode=='restart-error-cleanup' and is_start:
+    marker.touch()
+    sys.exit(1)
+if mode=='restart-error-cleanup' and args[0]=='rm' and marker.exists(): sys.exit(1)
+result=subprocess.run(['docker',*args],capture_output=True)
+if is_kill and result.returncode==0: marker.with_suffix('.killed').touch()
+ready=is_poll and result.returncode==0 and result.stdout not in [b'waiting',b'completed']
+if ready and mode=='transport': sys.exit(1)
+if ready and mode=='invalid-control': result.stdout=b'not-a-ready-receipt\n'
+if ready and mode=='blocked-control': time.sleep(5)
+if mode=='blocked-completion' and '-c' in args and args[args.index('-c')+1].startswith('test -f'): time.sleep(5)
+if mode=='stop-proof' and is_inspect and marker.with_suffix('.killed').exists() and not marker.exists():
+    marker.touch()
+    sys.exit(1)
+if mode=='restart-proof' and is_inspect and marker.with_suffix('.started').exists() and not marker.exists():
+    marker.touch()
+    sys.exit(1)
+if mode=='cancel-ready' and ready or mode=='cancel-stop' and is_kill or mode=='cancel-restart' and is_start:
+    marker.touch()
+    time.sleep(5)
+if mode=='cancel-stopped' and is_inspect and marker.with_suffix('.killed').exists() and not marker.exists():
+    marker.touch()
+    time.sleep(5)
+if mode=='restart-proof' and is_start: marker.with_suffix('.started').touch()
+sys.stdout.buffer.write(result.stdout)
+sys.stderr.buffer.write(result.stderr)
+sys.exit(result.returncode)
+"#.replace("MODE", &serde_json::to_string(mode).unwrap()).replace("MARKER", &serde_json::to_string(&marker).unwrap());
+        std::fs::write(&executable, script).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        self.docker = theseus::runner::Docker::new(executable);
+        let recipe =
+            recipe::load(std::path::Path::new("tests/fixtures/lifecycle/recipe.toml")).unwrap();
+        self.docker
+            .prepare(&recipe, false, &CancellationToken::default())
+            .unwrap();
+        marker
+    }
+    fn interrupt(&mut self, cancel: &CancellationToken) -> theseus::runner::ExecutedCommand {
+        use theseus::runner::Environment;
+        self.docker
+            .execute_interrupted(
+                &self.resource,
+                Self::request(
+                    "interrupt",
+                    "/bin/sh \"$THESEUS_INTERRUPT_BARRIER\"",
+                    ExecutionIdentity::runtime(),
+                ),
+                &self.store,
+                cancel,
+            )
+            .unwrap()
+    }
+}
+
+#[test]
+#[ignore = "requires Docker"]
+fn real_interruption_unverified_transport_and_stop_never_mint_planned_success() {
+    for mode in [
+        "transport",
+        "invalid-control",
+        "blocked-control",
+        "kill-failed",
+        "stop-proof",
+    ] {
+        let mut boundary = InterruptionBoundary::new();
+        boundary.proxy(mode);
+        let started = std::time::Instant::now();
+        let result = boundary.interrupt(&CancellationToken::default());
+        assert_eq!(
+            result.record.outcome,
+            CommandOutcome::Error,
+            "{mode}: {:?}",
+            result.record
+        );
+        assert!(result.record.error.is_some());
+        assert_eq!(result.record.exit_status, None);
+        assert!(
+            !result.record.timed_out && !result.record.cancelled,
+            "{mode}"
+        );
+        assert!(
+            !result.record.interruption.unwrap().stopped_verified,
+            "{mode}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "{mode}"
+        );
+        boundary.assert_absent();
+    }
+}
+
+fn cancel_on_marker(
+    marker: std::path::PathBuf,
+    cancel: CancellationToken,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(marker.exists(), "transition marker was not reached");
+        cancel.cancel();
+    })
+}
+
+#[test]
+#[ignore = "requires Docker"]
+fn real_interruption_cancellation_at_ready_kill_and_stopped_removes_container() {
+    for mode in [
+        "cancel-ready",
+        "cancel-stop",
+        "cancel-stopped",
+        "cancel-before",
+    ] {
+        let mut boundary = InterruptionBoundary::new();
+        let marker = boundary.proxy(mode);
+        let cancel = CancellationToken::default();
+        let signal = if mode == "cancel-before" {
+            cancel.cancel();
+            None
+        } else {
+            Some(cancel_on_marker(marker, cancel.clone()))
+        };
+        let result = boundary.interrupt(&cancel);
+        if let Some(signal) = signal {
+            signal.join().unwrap();
+        }
+        assert_eq!(
+            result.record.outcome,
+            CommandOutcome::Cancelled,
+            "{mode}: {:?}",
+            result.record
+        );
+        assert!(result.record.cancelled);
+        assert_eq!(result.record.exit_status, None);
+        boundary.assert_absent();
+    }
+}
+
+#[test]
+#[ignore = "requires Docker"]
+fn real_interruption_restart_errors_or_cancellation_remove_without_forward_mutation() {
+    use theseus::runner::Environment;
+    for mode in [
+        "restart-failed",
+        "restart-proof",
+        "cancel-restart",
+        "cancel-before-restart",
+    ] {
+        let mut boundary = InterruptionBoundary::new();
+        let marker = boundary.proxy(mode);
+        let stopped = boundary.interrupt(&CancellationToken::default());
+        assert_eq!(stopped.record.outcome, CommandOutcome::Interrupted);
+        let cancel = CancellationToken::default();
+        let signal = if mode == "cancel-before-restart" {
+            cancel.cancel();
+            None
+        } else if mode == "cancel-restart" {
+            Some(cancel_on_marker(marker, cancel.clone()))
+        } else {
+            None
+        };
+        assert!(
+            boundary
+                .docker
+                .restart(&boundary.resource, &cancel)
+                .is_err(),
+            "{mode}"
+        );
+        if let Some(signal) = signal {
+            signal.join().unwrap();
+        }
+        boundary.assert_absent();
+    }
+}
+
+#[test]
+#[ignore = "requires Docker"]
+fn real_interruption_early_completion_control_is_bounded_independently_of_command() {
+    use theseus::runner::Environment;
+    let mut boundary = InterruptionBoundary::new();
+    boundary.proxy("blocked-completion");
+    let started = std::time::Instant::now();
+    let result = boundary
+        .docker
+        .execute_interrupted(
+            &boundary.resource,
+            InterruptionBoundary::request("early", "exit 0", ExecutionIdentity::runtime()),
+            &boundary.store,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+    assert_eq!(result.record.outcome, CommandOutcome::Error);
+    assert!(!result.record.timed_out);
+    // Includes preparation, ownership inspections, and owned removal under
+    // concurrent daemon load. The injected receipt read alone stalls for 5s.
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    boundary.assert_absent();
+}
+
+#[test]
+#[ignore = "requires Docker"]
+fn real_interruption_restart_retains_primary_and_cleanup_errors() {
+    use theseus::runner::Environment;
+    let mut boundary = InterruptionBoundary::new();
+    boundary.proxy("restart-error-cleanup");
+    assert_eq!(
+        boundary
+            .interrupt(&CancellationToken::default())
+            .record
+            .outcome,
+        CommandOutcome::Interrupted
+    );
+    let error = boundary
+        .docker
+        .restart(&boundary.resource, &CancellationToken::default())
+        .unwrap_err();
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("container transition failed"),
+        "lost primary restart failure: {text}"
+    );
+    assert!(
+        text.contains("owned restart cleanup failed"),
+        "lost cleanup failure: {text}"
+    );
+    // Drop uses the real Docker adapter, so the injected removal error cannot
+    // leak the stopped resource after this boundary test.
+}
