@@ -21,6 +21,10 @@ from docker_absence import require_container_absent
 binary = str(pathlib.Path(sys.argv[1]).resolve())
 repo = pathlib.Path(__file__).resolve().parents[2]
 docker_environment = dict(os.environ)
+# Optional public recipe directory lets release acceptance reuse this exact
+# live/offline PTY workflow instead of maintaining a second terminal harness.
+recipe_source = pathlib.Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else repo / 'tests/fixtures/downgrade'
+
 
 
 class Screen:
@@ -212,7 +216,20 @@ def session(root, policy=None, saved=None, legacy=False):
             assert scenario['downgrade']['data_checks'] == (['older-data'] if policy == 'compatible' else ['data-stable'])
             data.clear()
             resize(32, 50)
-            until(lambda: b'Theseus' in rendered())
+            # Filter and navigate at the actual 50-column size. A header alone
+            # cannot prove the selected stage or its scoped comparison is usable.
+            os.write(master, b'/data-stable\r')
+            narrow_tokens = [
+                ('> ' + checkpoint).encode(), b'data-stable passed',
+                b'Scope: /home/theseus/.local/share/sample-cli',
+                b'before_downgrade', checkpoint.encode(),
+            ]
+            until(lambda: all(token in rendered() for token in narrow_tokens))
+            os.write(master, b'k')
+            until(lambda: b'> downgrade passed' in rendered()
+                  and b'No evidence for this stage/filter.' in rendered())
+            os.write(master, b'j')
+            until(lambda: all(token in rendered() for token in narrow_tokens))
         os.write(master, b'q')
         # Process exit can precede draining the last terminal-restoration bytes.
         until(lambda: proc.poll() is not None and b'\x1b[?1049l' in transcript)
@@ -238,11 +255,11 @@ with tempfile.TemporaryDirectory(prefix='theseus-downgrade-pty-') as tmp:
     parent = pathlib.Path(tmp)
     for policy in ['compatible', 'rejection']:
         root = parent / policy
-        shutil.copytree(repo / 'tests/fixtures/downgrade', root)
+        shutil.copytree(recipe_source, root, ignore=shutil.ignore_patterns('.theseus-runs'))
         shutil.copyfile(root / (policy + '.toml'), root / 'theseus.toml')
         saved = session(root, policy)
         session(root, policy, saved=saved)
-    for schema in [1, 2]:
+    for schema in ([] if len(sys.argv) > 2 else [1, 2]):
         root = parent / f'schema{schema}'
         root.mkdir()
         saved = root / 'report.json'

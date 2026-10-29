@@ -1,0 +1,185 @@
+schema_version = 4
+scenarios = ["downgrade"]
+name = "Standalone newer-data downgrade compatible"
+image = "ubuntu:24.04"
+network = "none"
+observe = ["/home/theseus", "/usr/local/bin", "/workspace"]
+[artifacts]
+base = "base"
+target = "target"
+
+[profiles.user.downgrade]
+expect = "compatible"
+data_checks = ["older-data"]
+
+[profiles.user.steps.install_target]
+script = "sh /inputs/target/install.sh user"
+timeout_seconds = 15
+
+[profiles.user.steps.configure]
+script = "sample-cli configure"
+timeout_seconds = 15
+
+[profiles.user.steps.exercise]
+script = "sample-cli smoke"
+timeout_seconds = 15
+
+[profiles.user.steps.downgrade]
+script = "sh /inputs/base/install.sh user compatible"
+timeout_seconds = 15
+
+[profiles.user.steps.exercise_downgraded]
+script = "sample-cli read-data"
+timeout_seconds = 15
+
+[profiles.user.steps.uninstall]
+script = "sh /inputs/target/uninstall.sh user"
+timeout_seconds = 15
+
+[[profiles.user.checks]]
+id = "newer-version"
+checkpoint = "target_installed"
+kind = "executable"
+name = "sample-cli"
+resolved_path = "/home/theseus/.local/bin/sample-cli"
+args = ["--version"]
+expected_exit = 0
+stdout_contains = "sample-cli 2.0.0"
+
+[[profiles.user.checks]]
+id = "retained-version"
+checkpoint = "downgraded"
+kind = "executable"
+name = "sample-cli"
+resolved_path = "/home/theseus/.local/bin/sample-cli"
+args = ["--version"]
+expected_exit = 0
+stdout_contains = "sample-cli 1.0.0"
+
+[[profiles.user.checks]]
+id = "older-data"
+checkpoint = "downgraded"
+kind = "command"
+script = "sample-cli read-data"
+expected_exit = 0
+stdout_contains = "old-reader records=2 sum=40"
+
+[[profiles.user.checks]]
+id = "data-stable"
+checkpoint = "downgraded"
+kind = "unchanged"
+path = "/home/theseus/.local/share/sample-cli"
+
+[[profiles.user.checks]]
+id = "settings-stable"
+checkpoint = "downgraded"
+kind = "unchanged"
+path = "/home/theseus/.config/sample-cli/settings"
+
+[[profiles.user.checks]]
+id = "binary-removed"
+checkpoint = "uninstalled"
+kind = "absent"
+path = "/home/theseus/.local/bin/sample-cli"
+
+[[profiles.user.checks]]
+id = "settings-retained"
+checkpoint = "uninstalled"
+kind = "preserved"
+path = "/home/theseus/.config/sample-cli/settings"
+
+[[profiles.user.checks]]
+id = "records-retained"
+checkpoint = "uninstalled"
+kind = "command"
+script = "sh /inputs/target/sample-cli read-data"
+expected_exit = 0
+stdout_contains = "new-reader records=2 sum=40"
+
+[profiles.system.downgrade]
+expect = "compatible"
+data_checks = ["older-data"]
+
+[profiles.system.steps.install_target]
+script = "sh /inputs/target/install.sh system"
+timeout_seconds = 15
+
+[profiles.system.steps.configure]
+script = "sample-cli configure"
+timeout_seconds = 15
+
+[profiles.system.steps.exercise]
+script = "sample-cli smoke"
+timeout_seconds = 15
+
+[profiles.system.steps.downgrade]
+script = "sh /inputs/base/install.sh system compatible"
+timeout_seconds = 15
+
+[profiles.system.steps.exercise_downgraded]
+script = "sample-cli read-data"
+timeout_seconds = 15
+
+[profiles.system.steps.uninstall]
+script = "sh /inputs/target/uninstall.sh system"
+timeout_seconds = 15
+
+[[profiles.system.checks]]
+id = "newer-version"
+checkpoint = "target_installed"
+kind = "executable"
+name = "sample-cli"
+resolved_path = "/usr/local/bin/sample-cli"
+args = ["--version"]
+expected_exit = 0
+stdout_contains = "sample-cli 2.0.0"
+
+[[profiles.system.checks]]
+id = "retained-version"
+checkpoint = "downgraded"
+kind = "executable"
+name = "sample-cli"
+resolved_path = "/usr/local/bin/sample-cli"
+args = ["--version"]
+expected_exit = 0
+stdout_contains = "sample-cli 1.0.0"
+
+[[profiles.system.checks]]
+id = "older-data"
+checkpoint = "downgraded"
+kind = "command"
+script = "sample-cli read-data"
+expected_exit = 0
+stdout_contains = "old-reader records=2 sum=40"
+
+[[profiles.system.checks]]
+id = "data-stable"
+checkpoint = "downgraded"
+kind = "unchanged"
+path = "/home/theseus/.local/share/sample-cli"
+
+[[profiles.system.checks]]
+id = "settings-stable"
+checkpoint = "downgraded"
+kind = "unchanged"
+path = "/home/theseus/.config/sample-cli/settings"
+
+[[profiles.system.checks]]
+id = "binary-removed"
+checkpoint = "uninstalled"
+kind = "absent"
+path = "/usr/local/bin/sample-cli"
+
+[[profiles.system.checks]]
+id = "settings-retained"
+checkpoint = "uninstalled"
+kind = "preserved"
+path = "/home/theseus/.config/sample-cli/settings"
+
+[[profiles.system.checks]]
+id = "records-retained"
+checkpoint = "uninstalled"
+kind = "command"
+script = "sh /inputs/target/sample-cli read-data"
+expected_exit = 0
+stdout_contains = "new-reader records=2 sum=40"

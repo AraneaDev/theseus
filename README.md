@@ -3,8 +3,9 @@
 Know what your tool leaves behind.
 
 Theseus rehearses CLI installation, configuration, upgrade, reinstall,
-interrupted installation/upgrade, forward recovery, runtime checks, and uninstall in disposable Linux containers. A Ratatui workbench and
-headless CLI use one scenario engine. Evidence includes commands, private logs, file fingerprints,
+interrupted installation/upgrade, forward recovery, declared downgrade compatibility
+or rejection, runtime checks, and uninstall in disposable Linux containers.
+A Ratatui workbench and headless CLI use one scenario engine. Evidence includes commands, private logs, file fingerprints,
 declared check outcomes, and remaining files that need review.
 
 Build on Linux with a current stable Rust toolchain:
@@ -69,6 +70,30 @@ input copying or chown, observes partial state, then runs explicit recovery. The
 example verifies the writer stopped, promotes the partial executable, checks the
 target version and retained data, and uninstalls.
 
+Schema 4 provides two self-contained downgrade policies, each for both profiles:
+
+```sh
+theseus validate --recipe examples/downgrade/compatible.toml
+theseus validate --recipe examples/downgrade/rejection.toml
+theseus run --headless --recipe examples/downgrade/compatible.toml
+theseus run --headless --recipe examples/downgrade/rejection.toml
+theseus run --recipe examples/downgrade/compatible.toml  # preview, then r
+theseus run --recipe examples/downgrade/rejection.toml   # preview, then r
+```
+
+Both start with `artifacts.target` (the newer 2.0.0 tool), configure a real format-2
+database, then append a second record during the newer runtime exercise.
+`artifacts.base` is the older requested 1.0.0 tool; these are declared roles,
+not inferred version ordering. The compatible recipe installs that older tool
+and requires its real reader to validate both records and calculate count 2 / sum
+40. The rejection recipe explicitly asks its installer to refuse the newer data
+before writing anything: actual exit 9 and the exact public marker must match,
+then binary, recursive data, configuration and retained newer runtime checks must
+pass. Both recipes uninstall the executable and verify retained settings/data.
+They use only shell tools in the declared Ubuntu image, without credentials or
+external application binaries. A passing recipe establishes its selected contracts
+and observed scopes, not compatibility with arbitrary data or versions.
+
 Create your own starter with `theseus init`. It refuses to overwrite an existing
 recipe. Replace the failing placeholder commands **and** the `.` artifact paths
 before running it. `theseus validate --recipe PATH` validates without Docker.
@@ -103,9 +128,11 @@ without them, use headless or JSON output.
 
 ## Recipe contract
 
-See [the working recipe](examples/standalone/theseus.toml) and its `base/` and
-`target/` installers, or the [reinstall recipe](examples/reinstall/theseus.toml) and
-[interruption recipe](examples/interruption/theseus.toml).
+See the [standalone](examples/standalone/theseus.toml),
+[reinstall](examples/reinstall/theseus.toml),
+[interruption](examples/interruption/theseus.toml),
+[compatible downgrade](examples/downgrade/compatible.toml) and
+[rejection](examples/downgrade/rejection.toml) recipes and their installers.
 Recipes reject unknown fields and define a name, image, network (`none` by default
 or explicit `bridge`), artifacts, profiles, and nonoverlapping absolute observation
 roots. Inputs resolve inside the recipe project, are materialized and hashed, then copied into
@@ -140,8 +167,21 @@ version/behavior expectation. Interrupted upgrade additionally requires an
 explicit recovered data contract; use scoped unchanged/preserved assertions or a
 command that reads real data and expects nonempty output.
 
+Schema 4 adds `downgrade`, explicit `downgrade`/`exercise_downgraded` steps and
+`downgraded`/`downgrade_rejected` checkpoints. Schemas 1/2/3 reject those features.
+Each selected profile must declare `[profiles.NAME.downgrade]` with exactly one
+policy. `expect = "compatible"` requires `data_checks` referencing real successful
+`command` readers with nonempty expected output at `downgraded`, plus an old-version
+`executable` check. `expect = "safe_rejection"` requires a literal `expected_exit`
+from 1 through 125, nonempty `stdout_contains`, and separate `binary_checks` and
+`data_checks` referencing `unchanged` assertions at `downgrade_rejected`. Binary
+scopes must be actual files or symlinks; data scopes must exist and recursive
+directory checks include added/removed children. Overlapping binary/data scopes
+are rejected. A newer-version executable check is required before either attempt
+and after rejection. All checkpoint checks must pass, including additional ones.
+
 Both `user` and `system` profiles run configure/exercise/checks as UID/GID
-10001:10001. User installation/upgrade/reinstall/interruption/recovery/uninstall
+10001:10001. User installation/upgrade/reinstall/interruption/recovery/downgrade/uninstall
 uses that same identity; system installer commands use 0:0 **inside the disposable
 container**.
 Steps are `/bin/sh -c` scripts with `/workspace` as working directory. Each step
@@ -158,8 +198,9 @@ The image must supply `/bin/sh`, `/usr/bin/env`, `sleep`, `mkdir`, `chown`, `chm
 `tar`, `cp`, `rm`, `cat`, `id`, and `awk`, with compatible UID/GID 10001
 assignments. Interruption additionally requires GNU-compatible `mv -T` and
 `dd iflag=nofollow,nonblock` for atomic readiness and bounded no-follow reads;
-the example also uses `cmp`, `wc`, and `stat`. Unsupported tools fail closed as
-failed/incomplete interruption evidence; Theseus installs no packages.
+the example also uses `cmp`, `wc`, and `stat`. The downgrade examples also use
+`head` and `wc`. Unsupported tools fail closed as
+failed/incomplete evidence; Theseus installs no packages.
 Image-declared volumes are rejected. Ubuntu 24.04 is exercised by acceptance; other images must satisfy
 preflight and supported tar observations. Tests do not prove systemd, GUI, kernel,
 macOS, or Windows behavior.
@@ -199,6 +240,19 @@ upgrade at these checkpoints. An ordinary interrupted install has not configured
 anything yet. Recovery can intentionally migrate data using behavioral readers
 rather than claiming byte equality.
 
+Downgrade executes install_target → target_installed checks → configure →
+configured checks → exercise_before_downgrade → before_downgrade reference →
+explicit downgrade attempt → the declared policy checkpoint and checks →
+exercise_downgraded (compatible) or exercise_after_rejection (the original newer
+exercise command) → uninstall → uninstalled checks. The before_downgrade snapshot
+includes earlier checks and newer exercise effects; `unchanged` compares it with
+the first post-attempt checkpoint snapshot, before checkpoint commands can mutate
+state. After-check snapshots keep those later effects visible. `preserved` still
+compares the exact configured reference. No second configure, automatic fallback,
+installer retry, restart, backup or restore occurs. A failed attempt or checkpoint
+skips dependent runtime exercise; a running container still gets the ordinary
+uninstall/final/owned cleanup tail.
+
 Checks have unique IDs and named checkpoints. `command` expects a shell exit and
 optional literal stdout substring. An application exit is evaluated only after a
 fresh in-container completion receipt is verified through a separate bounded
@@ -208,12 +262,13 @@ path, version argv, exit status, and optional literal output. `present` and
 `absent` inspect paths (including dangling links); `preserved` compares an exact
 path's content hash, kind, link, ownership and mode with configured evidence.
 Preservation is valid at upgrade target_installed, reinstalled, uninstalled,
-or interrupted/recovered in interrupted upgrade;
+downgraded/downgrade_rejected, or interrupted/recovered in interrupted upgrade;
 use an explicit command check for intentional migrations. File checks must fall
 within observed roots. Hashes establish observed bytes, not arbitrary semantic correctness.
 
 `unchanged` is valid at `reinstalled` in schema 2 declaring reinstall, and at
-`interrupted`/`recovered` in schema 3 declaring interruption scenarios. A file
+`interrupted`/`recovered` in schema 3 declaring interruption scenarios, or at the
+selected `downgraded`/`downgrade_rejected` checkpoint in schema 4 declaring downgrade. A file
 compares its hash, size, kind, UID/GID, and mode; a directory compares its own
 metadata and all observed descendants, including added/removed children. A
 symlink compares its observed link target and metadata without following it.
@@ -222,7 +277,7 @@ entries fail; incomplete, ambiguous, overflowing, or unsafe observations remain
 incomplete. Mtime, inode identity, ACLs, extended attributes, hidden remote effects,
 and state outside the declared observed scopes are outside this contract.
 Reports identify both comparison stages and retain changed-child evidence on the
-reinstall stage. Use exact-path `preserved` for retention against configured state;
+comparison checkpoint. Use exact-path `preserved` for retention against configured state;
 it does not recursively assert a directory’s children.
 
 ## Outcomes, limits, and recovery
@@ -256,9 +311,23 @@ permit declared uninstall; unavailable containers cannot provide uninstall evide
 
 This models an abrupt whole-container stop at one cooperative pause point. It
 does not establish host power-loss durability/fsync behavior, arbitrary installer
-interleavings, service-manager behavior, downgrade or rollback. Recovery is an
+interleavings or service-manager behavior. Recovery is an
 explicit forward application command; ordinary timeout/cancellation never retries
-or recovers automatically.
+or recovers automatically. Rollback remains required future work.
+
+Downgrade chooses its branch from the declared policy. A compatible attempt
+must return zero; a rejection policy must return its exact declared status with
+verified bounded stdout. Unexpected success, wrong status or marker fails. A
+missing completion receipt, Docker transport/control failure, truncated output,
+timeout or cancellation cannot establish refusal, even if text contains the
+marker. An `expected_rejection` command outcome records the real status and marker
+proof, but the scenario passes only with all required binary/data/runtime checks.
+Live and offline UI distinguishes “Compatible downgrade passed” from “Declared
+rejection checks passed” and shows actual status, marker verification, scopes and
+comparison stages. Safe rejection only establishes these observed scopes; it does
+not prove arbitrary installer safety. Downgrade does not implement rollback:
+restoring known-good runtime and data requires an explicit restoration contract
+and scoped backup/restore evidence in a future milestone.
 
 Timeout/cancellation removes the owned scenario container, including descendants;
 it cannot promise application uninstall observations after that removal. If the
@@ -273,11 +342,12 @@ Acquisition errors, unsupported archives, symlinked observed-root ancestors and
 observation overflow remain incomplete rather than silently passing.
 
 Runs are saved under the recipe project's `.theseus-runs/<id>/`, using private
-0700 directories and 0600 files: atomic `report.json` (schema 3), `journal.json`
-(schema 1), and separate bounded logs. Readers accept report schemas 1, 2 and 3; schema 1
+0700 directories and 0600 files: atomic `report.json` (schema 4), `journal.json`
+(schema 1), and separate bounded logs. Readers accept report schemas 1, 2, 3 and 4; schema 1
 continues to represent clean/upgrade evidence, while reinstall/comparison evidence
 requires schema 2 or later. Interruption/proof/restart evidence requires schema 3.
-Recovery journals remain version 1. No observed file contents are retained except explicit command output; metadata/hashes and diffs are stored.
+Downgrade policy, checkpoints and rejection proof require schema 4. Recovery
+journals and ownership labels remain version 1. No observed file contents are retained except explicit command output; metadata/hashes and diffs are stored.
 Reports can be large (load limit 64 MiB), and UI reloads parse saved metadata on progress notifications.
 
 ```sh
@@ -301,6 +371,7 @@ cargo test --locked
 cargo build --locked --release
 cargo test --locked --test docker_lifecycle -- --ignored --test-threads=1
 cargo test --locked --test interruption_lifecycle -- --ignored --test-threads=1
+cargo test --locked --test downgrade_lifecycle -- --ignored --test-threads=1
 ```
 
 Regular tests include wide/narrow TestBackend behavior and actual Unix PTY
@@ -314,7 +385,11 @@ and cancellation during the second invocation. Interruption acceptance covers th
 four profile/scenario combinations, actual partial bytes and retained data, descendant stop, same-ID restart without setup or
 input recopy, invalid readiness, early completion, recovery failures, transport
 errors, timeout and cancellation before readiness, while stopped and during restart.
-Both ignored Docker test binaries are explicitly required in CI. Actual PTYs exercise narrow live
+Downgrade acceptance covers both profiles and policies, real old-data readers,
+silent reader omissions, lost records, changed binary/mode/link/configuration,
+added/removed data children, wrong status/marker, unexpected success, missing
+receipt/reference, transport failure, truncated output and timeout/cancellation.
+All three ignored Docker test binaries are explicitly required in CI. Actual PTYs exercise narrow live
 selection, new-report comparison visibility, offline viewing, and terminal recovery.
 
 A separate real Phrourion 0.8.1 → 0.8.2 rehearsal passed all four matrix entries
