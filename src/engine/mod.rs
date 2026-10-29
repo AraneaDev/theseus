@@ -1,5 +1,6 @@
 //! Blocking scenario engine. Call on a worker thread; event callbacks must not block.
 mod downgrade;
+mod interrupted_rollback;
 mod interruption;
 mod rollback;
 mod rollback_checks;
@@ -161,6 +162,10 @@ pub fn run_with(
                     if *scenario == ScenarioKind::Downgrade {
                         report.scenarios[index].downgrade =
                             recipe.recipe.profiles[profile].downgrade.clone();
+                    }
+                    if *scenario == ScenarioKind::InterruptedRollback {
+                        report.scenarios[index].interrupted_rollback =
+                            recipe.recipe.profiles[profile].interrupted_rollback.clone();
                     }
                     if *scenario == ScenarioKind::Rollback {
                         report.scenarios[index].rollback =
@@ -324,6 +329,21 @@ fn mark_remaining_checks(recipe: &ValidatedRecipe, scenario: &mut ScenarioReport
         ) {
             continue;
         }
+        if !checkpoint_applies_with_recovery(
+            scenario.scenario,
+            check.checkpoint,
+            scenario.rollback_recovery(),
+        ) {
+            continue;
+        }
+        if matches!(check.expectation, Expectation::Changed { .. })
+            && check.checkpoint == Checkpoint::Interrupted
+            && !scenario
+                .rollback_recovery()
+                .is_some_and(|p| p.change_checks.contains(&check.id))
+        {
+            continue;
+        }
         if scenario
             .stages
             .iter()
@@ -333,6 +353,7 @@ fn mark_remaining_checks(recipe: &ValidatedRecipe, scenario: &mut ScenarioReport
             continue;
         }
         stage.checks.push(CheckResult {
+            command_expectation: None,
             id: check.id.clone(),
             checkpoint: check.checkpoint,
             outcome: CheckOutcome::Incomplete,
@@ -340,9 +361,12 @@ fn mark_remaining_checks(recipe: &ValidatedRecipe, scenario: &mut ScenarioReport
             path: check.expectation.path().map(str::to_owned),
             command_ids: vec![],
             backup: None,
-            comparison: matches!(check.expectation, Expectation::Unchanged { .. })
-                .then(|| ComparisonReference::for_checkpoint(check.checkpoint))
-                .flatten(),
+            comparison: matches!(
+                check.expectation,
+                Expectation::Unchanged { .. } | Expectation::Changed { .. }
+            )
+            .then(|| ComparisonReference::for_checkpoint(check.checkpoint))
+            .flatten(),
         });
     }
     if !stage.checks.is_empty() {

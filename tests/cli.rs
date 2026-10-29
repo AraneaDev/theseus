@@ -425,3 +425,46 @@ fn rollback_cli_selects_schema_five_and_rejects_missing_steps_before_docker() {
     assert!(error.contains("requires step rollback"), "{error}");
     assert!(!temp.path().join(".theseus-runs").exists());
 }
+
+#[test]
+fn interrupted_rollback_cli_selection_validates_offline_and_rejects_recovery_substitution() {
+    let temp = tempfile::tempdir().unwrap();
+    for name in ["base", "target"] {
+        std::fs::create_dir(temp.path().join(name)).unwrap();
+    }
+    let text = include_str!("fixtures/recipes/interrupted_rollback.toml");
+    let path = temp.path().join("theseus.toml");
+    std::fs::write(&path, text).unwrap();
+    let output = cli()
+        .current_dir(temp.path())
+        .env("PATH", "/no-docker")
+        .args(["validate"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::write(
+        &path,
+        text.replace("steps.rollback]", "steps.recover_upgrade]"),
+    )
+    .unwrap();
+    let output = cli()
+        .current_dir(temp.path())
+        .env("PATH", "/no-docker")
+        .args([
+            "run",
+            "--headless",
+            "--scenario",
+            "interrupted-rollback",
+            "--profile",
+            "user",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires step rollback"));
+}

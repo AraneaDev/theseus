@@ -22,3 +22,36 @@ pub fn validate_interrupted_rollback_contract(
 ) -> Result<()> {
     validate_rollback_recovery(&contract.recovery)
 }
+
+pub(super) fn validate_profile(
+    profile: &super::Profile,
+    observe: &[String],
+    scenarios: &[crate::model::ScenarioKind],
+) -> Result<()> {
+    let policy = profile
+        .interrupted_rollback
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("interrupted_rollback requires explicit policy"))?;
+    validate_interrupted_rollback_contract(policy)?;
+    for check in &profile.checks {
+        anyhow::ensure!(
+            !(check.checkpoint == crate::model::Checkpoint::Interrupted
+                && matches!(check.expectation, super::Expectation::Changed { .. }))
+                || policy.recovery.change_checks.contains(&check.id),
+            "Changed at Interrupted must be declared in interrupted_rollback change_checks"
+        );
+    }
+    super::rollback::validate_recovery_profile(
+        profile,
+        observe,
+        &policy.recovery,
+        crate::model::Checkpoint::Interrupted,
+        scenarios.contains(&crate::model::ScenarioKind::Rollback)
+            && profile.rollback.as_ref().is_some_and(|p| {
+                matches!(
+                    p.recovery.restoration,
+                    super::RestorationPolicy::RestoreData { .. }
+                )
+            }),
+    )
+}

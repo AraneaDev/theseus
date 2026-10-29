@@ -84,6 +84,7 @@ pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
     match kind {
         ScenarioKind::Downgrade => super::downgrade::run(c, &mut state)?,
         ScenarioKind::Rollback => super::rollback::run(c, &mut state)?,
+        ScenarioKind::InterruptedRollback => super::interrupted_rollback::run(c, &mut state)?,
         ScenarioKind::InterruptedInstall | ScenarioKind::InterruptedUpgrade => {
             super::interruption::run(c, &mut state, kind)?
         }
@@ -96,7 +97,8 @@ pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
                 ScenarioKind::InterruptedInstall
                 | ScenarioKind::InterruptedUpgrade
                 | ScenarioKind::Downgrade
-                | ScenarioKind::Rollback => {
+                | ScenarioKind::Rollback
+                | ScenarioKind::InterruptedRollback => {
                     unreachable!("handled explicitly above")
                 }
             };
@@ -114,7 +116,8 @@ pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
                 ScenarioKind::InterruptedInstall
                 | ScenarioKind::InterruptedUpgrade
                 | ScenarioKind::Downgrade
-                | ScenarioKind::Rollback => {
+                | ScenarioKind::Rollback
+                | ScenarioKind::InterruptedRollback => {
                     unreachable!("handled explicitly above")
                 }
                 ScenarioKind::Reinstall => {
@@ -410,11 +413,16 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
         {
             state.configured = Some(stage.snapshots.clone());
         }
-        if self.report.scenarios[self.index].scenario == ScenarioKind::Rollback {
-            let policy = self.report.scenarios[self.index].rollback.as_ref().unwrap();
+        if matches!(
+            self.report.scenarios[self.index].scenario,
+            ScenarioKind::Rollback | ScenarioKind::InterruptedRollback
+        ) {
+            let policy = self.report.scenarios[self.index]
+                .rollback_recovery()
+                .unwrap();
             {
                 let derived = super::rollback_checks::derived(
-                    &policy.recovery,
+                    policy,
                     checkpoint,
                     state.before_upgrade.as_deref().unwrap_or_default(),
                     &stage.snapshots,
@@ -439,7 +447,16 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
         let checks = self.recipe.recipe.profiles[&self.report.scenarios[self.index].profile]
             .checks
             .clone();
-        for check in checks.iter().filter(|c| c.checkpoint == checkpoint) {
+        let change_ids = self.report.scenarios[self.index]
+            .rollback_recovery()
+            .map(|p| p.change_checks.clone())
+            .unwrap_or_default();
+        for check in checks.iter().filter(|c| {
+            c.checkpoint == checkpoint
+                && (checkpoint != Checkpoint::Interrupted
+                    || !matches!(c.expectation, Expectation::Changed { .. })
+                    || change_ids.contains(&c.id))
+        }) {
             let prerequisite_skipped = self.report.scenarios[self.index]
                 .stages
                 .iter()
@@ -456,6 +473,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                 && (blocked || prerequisite_skipped || retention_without_configuration)
             {
                 CheckResult {
+                    command_expectation: None,
                     id: check.id.clone(),
                     checkpoint,
                     outcome: CheckOutcome::Skipped,
@@ -467,6 +485,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                 }
             } else if state.availability != Availability::Running {
                 CheckResult {
+                    command_expectation: None,
                     id: check.id.clone(),
                     checkpoint,
                     outcome: CheckOutcome::Incomplete,
@@ -495,8 +514,82 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
         self.capture(state, &mut after);
         self.finish(after)
     }
+    fn command_expectation(
+        &self,
+        check: &Check,
+        executed: &ExecutedCommand,
+    ) -> Option<CommandExpectationEvidence> {
+        if self.report.scenarios[self.index].scenario != ScenarioKind::InterruptedRollback {
+            return None;
+        }
+        let required = matches!(
+            (&check.checkpoint, &check.expectation),
+            (
+                Checkpoint::BaseInstalled,
+                Expectation::Executable {
+                    expected_exit: 0,
+                    ..
+                }
+            ) | (
+                Checkpoint::KnownGood,
+                Expectation::Command {
+                    expected_exit: 0,
+                    ..
+                }
+            )
+        ) || self.report.scenarios[self.index]
+            .rollback_recovery()
+            .is_some_and(|p| {
+                p.runtime_checks.contains(&check.id) || p.data_checks.contains(&check.id)
+            });
+        if !required {
+            return None;
+        }
+        let (expected_exit, marker, executable) = match &check.expectation {
+            Expectation::Command {
+                expected_exit,
+                stdout_contains: Some(marker),
+                ..
+            } => (*expected_exit, marker, None),
+            Expectation::Executable {
+                name,
+                resolved_path,
+                args,
+                expected_exit,
+                stdout_contains: Some(marker),
+                ..
+            } => (
+                *expected_exit,
+                marker,
+                Some(ExecutableExpectationEvidence {
+                    name: name.clone(),
+                    resolved_path: resolved_path.clone(),
+                    args: args.clone(),
+                }),
+            ),
+            _ => return None,
+        };
+        let matched = observed(executed).complete
+            && marker.len() as u64 <= self.options.log_limit
+            && executed.stdout.contains(marker);
+        Some(CommandExpectationEvidence {
+            expected_exit,
+            stdout_contains: marker.clone(),
+            stdout_matched: matched,
+            stdout_match: if matched {
+                executed
+                    .stdout
+                    .find(marker)
+                    .map(|offset| executed.stdout[offset..offset + marker.len()].to_string())
+            } else {
+                None
+            },
+            executable,
+        })
+    }
     fn check(&mut self, state: &mut State, check: &Check, stage: &mut StageReport) -> CheckResult {
         let command_start = stage.commands.len();
+        let mut command_expectation = None;
         let mut result = match &check.expectation {
             Expectation::Command {
                 script,
@@ -521,6 +614,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                     *expected_exit,
                 );
                 let executed = self.execute(state, request, stage);
+                command_expectation = self.command_expectation(check, &executed);
                 checks::evaluate_command(check, &observed(&executed))
             }
             Expectation::Executable {
@@ -574,6 +668,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                         *expected_exit,
                     );
                     let executed = self.execute(state, request, stage);
+                    command_expectation = self.command_expectation(check, &executed);
                     checks::evaluate_executable(check, Some(&resolved), &observed(&executed))
                 }
             }
@@ -613,9 +708,8 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                 }
                 if check.checkpoint == Checkpoint::RolledBack
                     && self.report.scenarios[self.index]
-                        .rollback
-                        .as_ref()
-                        .is_some_and(|p| p.recovery.binary_checks.contains(&check.id))
+                        .rollback_recovery()
+                        .is_some_and(|p| p.binary_checks.contains(&check.id))
                     && state.before_upgrade.as_ref().is_some_and(|snapshots| {
                         snapshots.iter().any(|s| {
                             s.entries.get(path).is_some_and(|e| {
@@ -629,6 +723,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                         "binary scope must be a file or symlink before upgrade".into();
                 }
                 CheckResult {
+                    command_expectation: None,
                     id: check.id.clone(),
                     checkpoint: check.checkpoint,
                     outcome: stability.outcome,
@@ -642,10 +737,16 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
             Expectation::Changed { path } => {
                 let r = checks::compare_changed(
                     path,
-                    state.before_attempt.as_deref().unwrap_or_default(),
+                    if check.checkpoint == Checkpoint::Interrupted {
+                        state.before_interrupt.as_deref()
+                    } else {
+                        state.before_attempt.as_deref()
+                    }
+                    .unwrap_or_default(),
                     &stage.snapshots,
                 );
                 CheckResult {
+                    command_expectation: None,
                     id: check.id.clone(),
                     checkpoint: check.checkpoint,
                     outcome: r.outcome,
@@ -658,6 +759,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
             }
             _ => checks::evaluate_filesystem(check, &stage.snapshots, state.configured.as_deref()),
         };
+        result.command_expectation = command_expectation;
         result.command_ids = stage.commands[command_start..]
             .iter()
             .map(|c| c.id.clone())

@@ -26,46 +26,7 @@ pub(super) fn run<E: Environment, F: FnMut(EngineEvent)>(
         .rollback
         .clone()
         .expect("validated rollback policy");
-    c.step(state, StepName::InstallBase)?;
-    c.checkpoint(state, Checkpoint::BaseInstalled, false)?;
-    c.step(state, StepName::Configure)?;
-    c.checkpoint(state, Checkpoint::Configured, true)?;
-    c.step_named(state, StepName::Exercise, "exercise_before_upgrade")?;
-    c.checkpoint(state, Checkpoint::KnownGood, false)?;
-    state.before_upgrade = Some(reference(c, state, "before_upgrade")?);
-    if let RestorationPolicy::RestoreData { backup_root, .. } = &policy.recovery.restoration {
-        let mut stage = StageReport::new("backup");
-        stage.step = Some(StepName::Backup);
-        if state.forward && state.availability == Availability::Running && !c.cancel.is_cancelled()
-        {
-            let check = super::rollback_checks::root_absent(
-                backup_root,
-                state.before_upgrade.as_deref().unwrap_or_default(),
-                Checkpoint::BackupCreated,
-                "before_upgrade",
-            );
-            state.forward &= check.outcome == CheckOutcome::Passed;
-            stage.checks.push(check);
-            if !state.forward {
-                c.finish(stage)?;
-            } else {
-                // Publish the pre-command result before executing trusted backup.
-                c.start(&stage)?;
-                if !c.cancel.is_cancelled() {
-                    state.rollback_backup_authorized = true;
-                    c.execute_step(state, StepName::Backup, "backup", &mut stage);
-                } else {
-                    stage.outcome = StageOutcome::Cancelled;
-                }
-                c.capture(state, &mut stage);
-                ScenarioContext::<E, F>::outcome(&mut stage);
-                c.update(&stage)?;
-            }
-        } else {
-            c.step(state, StepName::Backup)?;
-        }
-        c.checkpoint(state, Checkpoint::BackupCreated, false)?;
-    }
+    prepare(c, state, &policy.recovery)?;
     state.before_attempt = Some(reference(c, state, "before_attempt")?);
     if state.forward && state.availability == Availability::Running && !c.cancel.is_cancelled() {
         let mut stage = StageReport::new("attempt_upgrade");
@@ -111,12 +72,67 @@ pub(super) fn run<E: Environment, F: FnMut(EngineEvent)>(
         c.step(state, StepName::AttemptUpgrade)?;
     }
     c.checkpoint(state, Checkpoint::UpgradeFailed, false)?;
+    restore(c, state, &policy.recovery, Checkpoint::UpgradeFailed)
+}
+pub(super) fn prepare<E: Environment, F: FnMut(EngineEvent)>(
+    c: &mut ScenarioContext<'_, E, F>,
+    state: &mut State,
+    policy: &crate::recipe::RollbackRecoveryContract,
+) -> Result<()> {
+    c.step(state, StepName::InstallBase)?;
+    c.checkpoint(state, Checkpoint::BaseInstalled, false)?;
+    c.step(state, StepName::Configure)?;
+    c.checkpoint(state, Checkpoint::Configured, true)?;
+    c.step_named(state, StepName::Exercise, "exercise_before_upgrade")?;
+    c.checkpoint(state, Checkpoint::KnownGood, false)?;
+    state.before_upgrade = Some(reference(c, state, "before_upgrade")?);
+    if let RestorationPolicy::RestoreData { backup_root, .. } = &policy.restoration {
+        let mut stage = StageReport::new("backup");
+        stage.step = Some(StepName::Backup);
+        if state.forward && state.availability == Availability::Running && !c.cancel.is_cancelled()
+        {
+            let check = super::rollback_checks::root_absent(
+                backup_root,
+                state.before_upgrade.as_deref().unwrap_or_default(),
+                Checkpoint::BackupCreated,
+                "before_upgrade",
+            );
+            state.forward &= check.outcome == CheckOutcome::Passed;
+            stage.checks.push(check);
+            if !state.forward {
+                c.finish(stage)?;
+            } else {
+                // Publish the pre-command result before executing trusted backup.
+                c.start(&stage)?;
+                if !c.cancel.is_cancelled() {
+                    state.rollback_backup_authorized = true;
+                    c.execute_step(state, StepName::Backup, "backup", &mut stage);
+                } else {
+                    stage.outcome = StageOutcome::Cancelled;
+                }
+                c.capture(state, &mut stage);
+                ScenarioContext::<E, F>::outcome(&mut stage);
+                c.update(&stage)?;
+            }
+        } else {
+            c.step(state, StepName::Backup)?;
+        }
+        c.checkpoint(state, Checkpoint::BackupCreated, false)?;
+    }
+    Ok(())
+}
+pub(super) fn restore<E: Environment, F: FnMut(EngineEvent)>(
+    c: &mut ScenarioContext<'_, E, F>,
+    state: &mut State,
+    policy: &crate::recipe::RollbackRecoveryContract,
+    change_checkpoint: Checkpoint,
+) -> Result<()> {
     let mut ready = StageReport::new("before_rollback");
     c.capture(state, &mut ready);
     {
         ready.checks = super::rollback_checks::derived(
-            &policy.recovery,
-            Checkpoint::UpgradeFailed,
+            policy,
+            change_checkpoint,
             state.before_upgrade.as_deref().unwrap_or_default(),
             &ready.snapshots,
             "before_rollback",
@@ -138,10 +154,7 @@ pub(super) fn run<E: Environment, F: FnMut(EngineEvent)>(
     c.step(state, StepName::Rollback)?;
     c.checkpoint(state, Checkpoint::RolledBack, false)?;
     c.step(state, StepName::ExerciseRolledBack)?;
-    if matches!(
-        policy.recovery.restoration,
-        RestorationPolicy::RestoreData { .. }
-    ) {
+    if matches!(policy.restoration, RestorationPolicy::RestoreData { .. }) {
         c.step(state, StepName::CleanupBackup)?;
         c.checkpoint(state, Checkpoint::BackupRemoved, false)?;
     }

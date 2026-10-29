@@ -651,7 +651,7 @@ const ROLLBACK: &str = include_str!("fixtures/recipes/rollback.toml");
 
 #[test]
 fn ordinary_recipes_accept_rollback_prefixed_check_ids() {
-    for version in 1..=5 {
+    for version in 1..=6 {
         let text = VALID
             .replace(
                 "schema_version = 1",
@@ -744,4 +744,83 @@ fn rollback_rejects_missing_unbound_or_mismatched_runtime_and_other_roles() {
     assert!(
         load_text(&ROLLBACK.replace("scenarios = ['rollback']", "scenarios = ['clean']")).is_err()
     );
+}
+
+const INTERRUPTED_ROLLBACK: &str = include_str!("fixtures/recipes/interrupted_rollback.toml");
+#[test]
+fn interrupted_rollback_requires_schema_six_and_independent_known_good_restoration_roles() {
+    let recipe = load_text(INTERRUPTED_ROLLBACK).unwrap();
+    recipe
+        .validate_selection(&[ProfileName::User], &[ScenarioKind::InterruptedRollback])
+        .unwrap();
+    for version in 1..=5 {
+        assert!(
+            load_text(
+                &INTERRUPTED_ROLLBACK
+                    .replace("schema_version = 6", &format!("schema_version = {version}"))
+            )
+            .is_err()
+        );
+    }
+    for (from, to) in [
+        ("base = 'base'\n", ""),
+        ("steps.install_base", "steps.install_target"),
+        ("steps.configure", "steps.upgrade"),
+        ("steps.exercise]", "steps.reinstall]"),
+        ("steps.interrupt_upgrade", "steps.recover_upgrade"),
+        ("steps.rollback]", "steps.downgrade]"),
+        ("steps.exercise_rolled_back", "steps.exercise_downgraded"),
+        ("steps.uninstall", "steps.recover_install"),
+        ("steps.backup]", "steps.install_target]"),
+        ("steps.cleanup_backup", "steps.upgrade"),
+        ("checkpoint = 'base_installed'", "checkpoint = 'configured'"),
+        ("checkpoint = 'known_good'", "checkpoint = 'configured'"),
+        (
+            "checkpoint = 'interrupted'",
+            "checkpoint = 'upgrade_failed'",
+        ),
+        ("binary_checks = ['binary']", "binary_checks = ['reader']"),
+        (
+            "runtime_checks = ['runtime']",
+            "runtime_checks = ['reader']",
+        ),
+        ("data_checks = ['reader']", "data_checks = ['binary']"),
+        ("change_checks = ['changed']", "change_checks = ['unknown']"),
+        ("stdout_contains = 'known good'", "stdout_contains = ''"),
+    ] {
+        let changed = INTERRUPTED_ROLLBACK.replace(from, to);
+        let accepted = load_text(&changed).and_then(|r| {
+            r.validate_selection(&[ProfileName::User], &[ScenarioKind::InterruptedRollback])
+        });
+        assert!(accepted.is_err(), "{from} -> {to}");
+    }
+    let forbidden_failure = INTERRUPTED_ROLLBACK.replace("[profiles.user.interrupted_rollback.restoration]", "[profiles.user.interrupted_rollback.failure]\nexpected_exit=9\nstdout_contains='failure'\n[profiles.user.interrupted_rollback.restoration]");
+    assert!(load_text(&forbidden_failure).is_err());
+}
+
+#[test]
+fn interrupted_changed_checks_must_be_declared_policy_roles() {
+    let extra = format!(
+        "{INTERRUPTED_ROLLBACK}\n[[profiles.user.checks]]\nid='undeclared-change'\ncheckpoint='interrupted'\nkind='changed'\npath='/workspace/tool'\n"
+    );
+    assert!(load_text(&extra).is_err());
+}
+
+#[test]
+fn binary_only_still_rejects_backup_steps_without_another_declared_restore_data_policy() {
+    for (fixture, policy) in [
+        (ROLLBACK, "rollback"),
+        (INTERRUPTED_ROLLBACK, "interrupted_rollback"),
+    ] {
+        let mut value: toml::Value = toml::from_str(fixture).unwrap();
+        value["profiles"]["user"][policy]["restoration"] =
+            toml::from_str("mode='binary_only'").unwrap();
+        let text = toml::to_string(&value).unwrap();
+        assert!(toml::from_str::<theseus::recipe::Recipe>(&text).is_ok());
+        let error = load_text(&text).unwrap_err().to_string();
+        assert!(
+            error.contains("binary_only has no backup steps"),
+            "{policy}: {error}"
+        );
+    }
 }

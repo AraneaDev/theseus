@@ -19,6 +19,7 @@ pub use rejection::{RejectionAssessment, assess_rejection};
 pub use stability::{StabilityResult, compare_unchanged};
 fn result(check: &Check, outcome: CheckOutcome, message: impl Into<String>) -> CheckResult {
     CheckResult {
+        command_expectation: None,
         id: check.id.clone(),
         checkpoint: check.checkpoint,
         outcome,

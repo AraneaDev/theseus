@@ -181,6 +181,62 @@ impl App {
                         }
                     }
                 }
+                if options
+                    .scenarios
+                    .contains(&ScenarioKind::InterruptedRollback)
+                {
+                    text += "Interrupted rollback artifact roles: base = known-good; target = interrupted candidate.\nInterruption: ContainerSigkill at synchronous THESEUS_INTERRUPT_BARRIER; abrupt whole-container stop, same-ID restart without setup or input copying.\nOriginal reference: before_upgrade after KnownGood checks; Changed: before_interrupt -> interrupted before checks; restoration: before_upgrade -> rolled_back.\nFresh before_rollback revalidates backup after Interrupted check effects.\n";
+                    if let Some(command) = profile.steps.get(&StepName::InterruptUpgrade) {
+                        text += &format!(
+                            "Candidate barrier/stop budget: {}s\n",
+                            command.timeout_seconds
+                        );
+                    }
+                    if let Some(command) = profile.steps.get(&StepName::Rollback) {
+                        text += &format!("Explicit rollback command: {}\n", command.script);
+                    }
+                    if let Some(policy) = &profile.interrupted_rollback {
+                        text += &format!(
+                            "Changed checks: {:?}; binary checks: {:?}; runtime checks: {:?}; data readers: {:?}\n",
+                            policy.recovery.change_checks,
+                            policy.recovery.binary_checks,
+                            policy.recovery.runtime_checks,
+                            policy.recovery.data_checks
+                        );
+                        match &policy.recovery.restoration {
+                            crate::recipe::RestorationPolicy::BinaryOnly => {
+                                text += "Policy: binary_only; known-good runtime must read retained partially changed data.\n"
+                            }
+                            crate::recipe::RestorationPolicy::RestoreData {
+                                backup_root,
+                                scopes,
+                            } => {
+                                text += &format!(
+                                    "Policy: restore_data; backup root {backup_root}\nDerived checks: __theseus_rollback_root_absent (Backup before command); __theseus_rollback_backup_removed (BackupRemoved)\n"
+                                );
+                                for scope in scopes {
+                                    text += &format!(
+                                        "Scope {}: {} -> {backup_root}/{}\n",
+                                        scope.id, scope.source, scope.stored
+                                    );
+                                    for (phase, label) in [
+                                        ("BackupCreated", "source_stable"),
+                                        ("BackupCreated", "backup_matches"),
+                                        ("Interrupted", "backup_intact"),
+                                        ("before_rollback", "backup_ready"),
+                                        ("RolledBack", "restored"),
+                                        ("RolledBack", "backup_retained"),
+                                    ] {
+                                        text += &format!(
+                                            "Derived {phase}: __theseus_rollback_{label}_{}\n",
+                                            scope.id
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if options.scenarios.contains(&ScenarioKind::Rollback) {
                     text += "Rollback artifact roles: base = known-good; target = failed candidate.\nKnown-good reference: before_upgrade after KnownGood checks; Changed: before_attempt -> upgrade_failed; restore: before_upgrade -> rolled_back.\n";
                     if let Some(policy) = &profile.rollback {
@@ -369,6 +425,14 @@ impl App {
                         _ => "Rollback verified: known-good binary and retained-data readers passed",
                     }.into());
                 }
+                if let Some(scenario) = self.scenario()
+                    && scenario.verified_interrupted_rollback()
+                {
+                    items.push(match scenario.interrupted_rollback.as_ref().map(|p| &p.recovery.restoration) {
+                        Some(crate::recipe::RestorationPolicy::RestoreData { .. }) => "Interrupted rollback verified: same-ID restart, known-good binary, restored scopes and data readers passed",
+                        _ => "Interrupted rollback verified: same-ID restart, known-good binary and retained-data readers passed",
+                    }.into());
+                }
                 items.push(format!("{}: {}", stage.name, stage.outcome));
                 items.extend(stage.checks.iter().map(check_text));
                 items.extend(stage.errors.iter().cloned());
@@ -514,6 +578,18 @@ pub fn safe_text(text: &str) -> String {
 
 fn check_text(check: &CheckResult) -> String {
     let mut text = format!("{} {}: {}", check.id, check.outcome, check.message);
+    if let Some(proof) = &check.command_expectation {
+        text += &format!(
+            "\nReader/runtime expectation: exit={} matched={} marker={:?}",
+            proof.expected_exit, proof.stdout_matched, proof.stdout_contains
+        );
+        if let Some(executable) = &proof.executable {
+            text += &format!(
+                "; {} -> {} {:?}",
+                executable.name, executable.resolved_path, executable.args
+            );
+        }
+    }
     if let Some(path) = &check.path {
         text += &format!("\nScope: {path}");
     }

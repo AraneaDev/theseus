@@ -17,6 +17,7 @@ fn failed_contract_evidence_survives_cleanup_error_and_cancellation_wins() {
     let mut scenario = ScenarioReport::new("user-clean", ProfileName::User, ScenarioKind::Clean);
     let mut stage = StageReport::new("uninstalled");
     stage.checks.push(CheckResult {
+        command_expectation: None,
         id: "binary-removed".into(),
         checkpoint: Checkpoint::Uninstalled,
         outcome: CheckOutcome::Failed,
@@ -349,14 +350,14 @@ fn frozen_schema_one_report_and_journal_remain_readable_and_writable() {
 }
 
 #[test]
-fn new_reports_write_schema_five_while_journals_stay_schema_one() {
+fn new_reports_write_schema_six_while_journals_stay_schema_one() {
     let temp = tempfile::tempdir().unwrap();
     let store = report::create(&temp.path().join("run")).unwrap();
     store.save(&RunReport::new("new-run")).unwrap();
     let serialized: serde_json::Value =
         serde_json::from_slice(&fs::read(store.report_path()).unwrap()).unwrap();
-    assert_eq!(serialized["schema_version"], 5);
-    assert_eq!(report::load(store.root()).unwrap().schema_version, 5);
+    assert_eq!(serialized["schema_version"], 6);
+    assert_eq!(report::load(store.root()).unwrap().schema_version, 6);
     let journal = RunJournal {
         schema_version: 1,
         run_id: "new-run".into(),
@@ -377,13 +378,13 @@ fn new_reports_write_schema_five_while_journals_stay_schema_one() {
 fn report_versions_and_journal_versions_are_validated_independently() {
     let temp = tempfile::tempdir().unwrap();
     let store = report::create(&temp.path().join("run")).unwrap();
-    for version in [1, 2, 3, 4, 5] {
+    for version in [1, 2, 3, 4, 5, 6] {
         let mut run = RunReport::new("run");
         run.schema_version = version;
         store.save(&run).unwrap();
         assert_eq!(report::load(store.root()).unwrap().schema_version, version);
     }
-    for version in [0, 6, 999] {
+    for version in [0, 7, 999] {
         let mut run = RunReport::new("run");
         run.schema_version = version;
         assert!(store.save(&run).is_err());
@@ -697,6 +698,7 @@ fn rejected_downgrade_report() -> RunReport {
     checkpoint.outcome = StageOutcome::Passed;
     for id in ["binary", "data"] {
         checkpoint.checks.push(CheckResult {
+            command_expectation: None,
             id: id.into(),
             checkpoint: Checkpoint::DowngradeRejected,
             outcome: CheckOutcome::Passed,
@@ -872,6 +874,7 @@ fn downgrade_each_feature_has_schema_four_floor_and_optional_fields_omit_none() 
                 "exercise" => stage.step = Some(StepName::ExerciseDowngraded),
                 "checkpoint" => stage.checkpoint = Some(Checkpoint::Downgraded),
                 "check" | "comparison" => stage.checks.push(CheckResult {
+                    command_expectation: None,
                     id: "x".into(),
                     checkpoint: if feature == "check" {
                         Checkpoint::DowngradeRejected
@@ -1024,7 +1027,7 @@ fn report_five_roundtrips_rollback_metadata_without_authorizing_unmatched_flow()
 fn legacy_report_reader_accepts_ordinary_rollback_prefixed_check_ids() {
     let temp = tempfile::tempdir().unwrap();
     let store = report::create(&temp.path().join("run")).unwrap();
-    for version in 1..=4 {
+    for version in 1..=6 {
         let mut value: serde_json::Value =
             serde_json::from_str(include_str!("fixtures/reports/schema1-report.json")).unwrap();
         value["schema_version"] = version.into();
@@ -1050,7 +1053,7 @@ fn legacy_report_writer_accepts_ordinary_rollback_prefixed_check_ids() {
     let mut run: RunReport =
         serde_json::from_str(include_str!("fixtures/reports/schema1-report.json")).unwrap();
     run.scenarios[0].stages[0].checks[0].id = "__theseus_rollback_user-retention".into();
-    for version in 1..=4 {
+    for version in 1..=6 {
         run.schema_version = version;
         store
             .save(&run)
@@ -1261,4 +1264,44 @@ fn old_reports_omit_rollback_fields_and_schema_four_still_normalizes() {
         report::load(store.root()).unwrap().outcome,
         RunOutcome::Incomplete
     );
+}
+
+#[test]
+fn report_six_floor_is_typed_scenario_policy_and_command_evidence_only() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = report::create(&temp.path().join("run")).unwrap();
+    let original: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/reports/schema1-report.json")).unwrap();
+    for feature in ["scenario", "selection", "policy", "command_expectation"] {
+        let mut value = original.clone();
+        match feature {
+            "scenario" => value["scenarios"][0]["scenario"] = "interrupted_rollback".into(),
+            "selection" => {
+                value["selected_scenarios"] = serde_json::json!(["interrupted_rollback"])
+            }
+            "policy" => {
+                let mut policy = rollback_policy_json();
+                policy.as_object_mut().unwrap().remove("failure");
+                value["scenarios"][0]["interrupted_rollback"] = policy;
+            }
+            _ => {
+                value["scenarios"][0]["stages"][0]["checks"][0]["command_expectation"] = serde_json::json!({"expected_exit":0,"stdout_contains":"old","stdout_matched":true,"stdout_match":"old","executable":null})
+            }
+        }
+        for version in 1..=6 {
+            value["schema_version"] = version.into();
+            let decoded: RunReport = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(
+                store.save(&decoded).is_ok(),
+                version == 6,
+                "{feature} writer {version}"
+            );
+            fs::write(store.report_path(), serde_json::to_vec(&value).unwrap()).unwrap();
+            assert_eq!(
+                report::load(store.root()).is_ok(),
+                version == 6,
+                "{feature} reader {version}"
+            );
+        }
+    }
 }

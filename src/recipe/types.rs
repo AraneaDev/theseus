@@ -65,6 +65,8 @@ pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback: Option<super::RollbackContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupted_rollback: Option<super::InterruptedRollbackContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub downgrade: Option<super::DowngradeContract>,
     pub steps: BTreeMap<StepName, CommandSpec>,
     #[serde(default)]

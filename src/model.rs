@@ -1,5 +1,8 @@
 //! Stable, serializable identifiers and evidence shared by every interface.
+mod interrupted_rollback;
 mod rollback;
+mod rollback_validation;
+pub use interrupted_rollback::{CommandExpectationEvidence, ExecutableExpectationEvidence};
 pub(crate) use rollback::rollback_reference;
 pub use rollback::{BackupReference, ExpectedFailureEvidence};
 use serde::{Deserialize, Serialize};
@@ -18,7 +21,7 @@ macro_rules! named_enum {
     };
 }
 named_enum!(ProfileName { User => "user", System => "system" });
-named_enum!(ScenarioKind { Clean => "clean", Upgrade => "upgrade", Reinstall => "reinstall", InterruptedInstall => "interrupted_install", InterruptedUpgrade => "interrupted_upgrade", Downgrade => "downgrade", Rollback => "rollback" });
+named_enum!(ScenarioKind { Clean => "clean", Upgrade => "upgrade", Reinstall => "reinstall", InterruptedInstall => "interrupted_install", InterruptedUpgrade => "interrupted_upgrade", Downgrade => "downgrade", Rollback => "rollback", InterruptedRollback => "interrupted_rollback" });
 named_enum!(StepName { InstallBase => "install_base", InstallTarget => "install_target", Configure => "configure", Upgrade => "upgrade", Exercise => "exercise", Reinstall => "reinstall", Uninstall => "uninstall", InterruptInstall => "interrupt_install", RecoverInstall => "recover_install", InterruptUpgrade => "interrupt_upgrade", RecoverUpgrade => "recover_upgrade", Downgrade => "downgrade", ExerciseDowngraded => "exercise_downgraded", Backup => "backup", AttemptUpgrade => "attempt_upgrade", Rollback => "rollback", ExerciseRolledBack => "exercise_rolled_back", CleanupBackup => "cleanup_backup" });
 named_enum!(Checkpoint { BaseInstalled => "base_installed", Configured => "configured", TargetInstalled => "target_installed", Uninstalled => "uninstalled", Reinstalled => "reinstalled", Interrupted => "interrupted", Recovered => "recovered", Downgraded => "downgraded", DowngradeRejected => "downgrade_rejected", KnownGood => "known_good", BackupCreated => "backup_created", UpgradeFailed => "upgrade_failed", RolledBack => "rolled_back", BackupRemoved => "backup_removed" });
 /// One applicability map for selection, orchestration and unperformed evidence.
@@ -26,7 +29,10 @@ pub fn checkpoint_applies(scenario: ScenarioKind, checkpoint: Checkpoint) -> boo
     match checkpoint {
         Checkpoint::BaseInstalled => matches!(
             scenario,
-            ScenarioKind::Upgrade | ScenarioKind::InterruptedUpgrade | ScenarioKind::Rollback
+            ScenarioKind::Upgrade
+                | ScenarioKind::InterruptedUpgrade
+                | ScenarioKind::Rollback
+                | ScenarioKind::InterruptedRollback
         ),
         Checkpoint::TargetInstalled => matches!(
             scenario,
@@ -38,18 +44,36 @@ pub fn checkpoint_applies(scenario: ScenarioKind, checkpoint: Checkpoint) -> boo
         Checkpoint::Reinstalled => scenario == ScenarioKind::Reinstall,
         Checkpoint::KnownGood
         | Checkpoint::BackupCreated
-        | Checkpoint::UpgradeFailed
         | Checkpoint::RolledBack
-        | Checkpoint::BackupRemoved => scenario == ScenarioKind::Rollback,
+        | Checkpoint::BackupRemoved => matches!(
+            scenario,
+            ScenarioKind::Rollback | ScenarioKind::InterruptedRollback
+        ),
+        Checkpoint::UpgradeFailed => scenario == ScenarioKind::Rollback,
         Checkpoint::Downgraded | Checkpoint::DowngradeRejected => {
             scenario == ScenarioKind::Downgrade
         }
+        Checkpoint::Interrupted if scenario == ScenarioKind::InterruptedRollback => true,
         Checkpoint::Interrupted | Checkpoint::Recovered => matches!(
             scenario,
             ScenarioKind::InterruptedInstall | ScenarioKind::InterruptedUpgrade
         ),
         Checkpoint::Configured | Checkpoint::Uninstalled => true,
     }
+}
+/// Backup checkpoints belong only to the active restoration policy.
+/// A profile may share backup commands with a different declared matrix entry.
+pub fn checkpoint_applies_with_recovery(
+    scenario: ScenarioKind,
+    checkpoint: Checkpoint,
+    recovery: Option<&crate::recipe::RollbackRecoveryContract>,
+) -> bool {
+    checkpoint_applies(scenario, checkpoint)
+        && (!matches!(
+            checkpoint,
+            Checkpoint::BackupCreated | Checkpoint::BackupRemoved
+        ) || !recovery
+            .is_some_and(|p| matches!(p.restoration, crate::recipe::RestorationPolicy::BinaryOnly)))
 }
 /// Policy-aware applicability; old scenarios retain the two-argument semantics.
 pub fn checkpoint_applies_with_policy(
@@ -85,6 +109,8 @@ pub struct CheckResult {
     pub comparison: Option<ComparisonReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup: Option<BackupReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_expectation: Option<CommandExpectationEvidence>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComparisonReference {
@@ -128,7 +154,7 @@ pub struct Finding {
     pub message: String,
 }
 
-pub const REPORT_SCHEMA_VERSION: u32 = 5;
+pub const REPORT_SCHEMA_VERSION: u32 = 6;
 pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
 named_enum!(RunOutcome { Passed => "passed", Failed => "failed", Incomplete => "incomplete", Cancelled => "cancelled" });
 impl RunOutcome {
@@ -308,6 +334,8 @@ impl StageReport {
             && self.errors.is_empty()
             && self.commands.iter().all(|command| {
                 command.phase == self.name
+                    && command.expected_failure.is_none()
+                    && command.rejection.is_none()
                     && command.outcome == CommandOutcome::Interrupted
                     && command.exit_status.is_none()
                     && command.error.is_none()
@@ -421,6 +449,8 @@ pub struct ScenarioReport {
     pub downgrade: Option<crate::recipe::DowngradeContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback: Option<crate::recipe::RollbackContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupted_rollback: Option<crate::recipe::InterruptedRollbackContract>,
     pub outcome: RunOutcome,
     pub container_id: Option<String>,
     pub stages: Vec<StageReport>,
@@ -429,6 +459,12 @@ pub struct ScenarioReport {
     pub errors: Vec<String>,
 }
 impl ScenarioReport {
+    pub(crate) fn rollback_recovery(&self) -> Option<&crate::recipe::RollbackRecoveryContract> {
+        self.rollback
+            .as_ref()
+            .map(|p| &p.recovery)
+            .or_else(|| self.interrupted_rollback.as_ref().map(|p| &p.recovery))
+    }
     pub fn new(id: impl Into<String>, profile: ProfileName, scenario: ScenarioKind) -> Self {
         Self {
             id: id.into(),
@@ -436,6 +472,7 @@ impl ScenarioReport {
             scenario,
             downgrade: None,
             rollback: None,
+            interrupted_rollback: None,
             outcome: RunOutcome::Incomplete,
             container_id: None,
             stages: Vec::new(),
@@ -450,13 +487,15 @@ impl ScenarioReport {
             .iter()
             .map(StageReport::aggregate_outcome)
             .collect::<Vec<_>>();
-        if self.unmatched_rollback_policy() {
+        if self.unmatched_rollback_policy() || self.unmatched_interrupted_rollback_policy() {
             outcomes.push(RunOutcome::Incomplete);
         }
         for (index, stage) in self.stages.iter().enumerate() {
             let interrupt_step = match self.scenario {
                 ScenarioKind::InterruptedInstall => Some(StepName::InterruptInstall),
-                ScenarioKind::InterruptedUpgrade => Some(StepName::InterruptUpgrade),
+                ScenarioKind::InterruptedUpgrade | ScenarioKind::InterruptedRollback => {
+                    Some(StepName::InterruptUpgrade)
+                }
                 _ => None,
             };
             if stage.restart.as_ref().is_some_and(|proof| {

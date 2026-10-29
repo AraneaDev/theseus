@@ -15,6 +15,7 @@ fn result(
     after: &str,
 ) -> CheckResult {
     CheckResult {
+        command_expectation: None,
         id,
         checkpoint,
         outcome: evidence.outcome,
@@ -76,8 +77,10 @@ pub(super) fn derived(
         let stored = format!("{backup_root}/{}", scope.stored);
         let prefix = match (checkpoint, phase) {
             (Checkpoint::BackupCreated, _) => "backup_matches",
-            (Checkpoint::UpgradeFailed, "before_rollback") => "backup_ready",
-            (Checkpoint::UpgradeFailed, _) => "backup_intact",
+            (Checkpoint::UpgradeFailed | Checkpoint::Interrupted, "before_rollback") => {
+                "backup_ready"
+            }
+            (Checkpoint::UpgradeFailed | Checkpoint::Interrupted, _) => "backup_intact",
             (Checkpoint::RolledBack, _) => "backup_retained",
             _ => continue,
         };

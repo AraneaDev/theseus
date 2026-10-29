@@ -18,6 +18,7 @@ fn fixture(root: &Path) -> App {
     let mut second = StageReport::new("target_installed");
     second.outcome = StageOutcome::Incomplete;
     second.checks.push(CheckResult {
+        command_expectation: None,
         id: "target-path".into(),
         checkpoint: Checkpoint::TargetInstalled,
         outcome: CheckOutcome::Failed,
@@ -438,6 +439,7 @@ fn reinstall_failed_directory_scope_and_comparison_references_are_browsable() {
     let mut stage = StageReport::new("reinstalled");
     stage.outcome = StageOutcome::Failed;
     stage.checks.push(CheckResult {
+        command_expectation: None,
         id: "stable-config".into(),
         checkpoint: Checkpoint::Reinstalled,
         outcome: CheckOutcome::Failed,
@@ -722,6 +724,7 @@ fn rollback_offline_narrow_evidence_shows_failed_mutation_and_mapped_restore() {
     let mut stage = StageReport::new("rolled_back");
     stage.outcome = StageOutcome::Failed;
     stage.checks.push(CheckResult {
+        command_expectation: None,
         id: "restored-data".into(),
         checkpoint: Checkpoint::RolledBack,
         outcome: CheckOutcome::Failed,
@@ -762,4 +765,34 @@ fn rollback_offline_narrow_evidence_shows_failed_mutation_and_mapped_restore() {
     assert!(narrow.contains("Expected failure"));
     assert!(narrow.contains("restore scope differs"));
     assert!(!narrow.contains("Rollback verified"));
+}
+
+#[test]
+fn interrupted_rollback_preview_describes_real_barrier_and_original_restoration_reference() {
+    let temp = tempfile::tempdir().unwrap();
+    for name in ["base", "target"] {
+        std::fs::create_dir(temp.path().join(name)).unwrap();
+    }
+    let path = temp.path().join("theseus.toml");
+    std::fs::write(
+        &path,
+        include_str!("fixtures/recipes/interrupted_rollback.toml"),
+    )
+    .unwrap();
+    let recipe = theseus::recipe::load(&path).unwrap();
+    let app = App::preview(recipe.clone(), theseus::engine::RunOptions::all(&recipe));
+    let text = app.preview_text();
+    for expected in [
+        "THESEUS_INTERRUPT_BARRIER",
+        "ContainerSigkill",
+        "same-ID restart",
+        "before_interrupt -> interrupted",
+        "before_upgrade -> rolled_back",
+        "restore_data",
+        "/workspace/data -> /workspace/backup/data",
+        "Explicit rollback command: rollback",
+    ] {
+        assert!(text.contains(expected), "{expected}: {text}");
+    }
+    assert!(!text.contains("Expected failure:"));
 }

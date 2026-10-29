@@ -248,7 +248,7 @@ fn log_components(relative: &str) -> Result<Vec<&str>> {
 }
 fn validate_report(report: &RunReport) -> Result<()> {
     ensure!(
-        matches!(report.schema_version, 1..=5),
+        matches!(report.schema_version, 1..=6),
         "unsupported report schema version {}",
         report.schema_version
     );
@@ -337,6 +337,23 @@ fn validate_report(report: &RunReport) -> Result<()> {
                         })
                     })),
             "downgrade evidence requires report schema version 4"
+        );
+    }
+    if report.schema_version < 6 {
+        ensure!(
+            !report
+                .selected_scenarios
+                .contains(&ScenarioKind::InterruptedRollback)
+                && report
+                    .scenarios
+                    .iter()
+                    .all(|s| s.scenario != ScenarioKind::InterruptedRollback
+                        && s.interrupted_rollback.is_none()
+                        && s.stages.iter().all(|stage| stage
+                            .checks
+                            .iter()
+                            .all(|c| c.command_expectation.is_none()))),
+            "interrupted rollback requires report schema version 6"
         );
     }
     if report.schema_version < 5 {

@@ -36,7 +36,7 @@ pub(super) fn run<E: Environment, F: FnMut(EngineEvent)>(
     }
     c.step_named(state, StepName::Exercise, "exercise_after_recovery")
 }
-fn stop<E: Environment, F: FnMut(EngineEvent)>(
+pub(super) fn stop<E: Environment, F: FnMut(EngineEvent)>(
     c: &mut ScenarioContext<'_, E, F>,
     state: &mut State,
     step: StepName,
@@ -92,7 +92,10 @@ fn stop<E: Environment, F: FnMut(EngineEvent)>(
         stage.outcome = StageOutcome::Cancelled;
         state.availability = Availability::Unavailable;
         state.forward = false;
-    } else if stage.verified_interruption() {
+    } else if stage.verified_interruption()
+        && (c.report.scenarios[c.index].scenario != ScenarioKind::InterruptedRollback
+            || stage.verified_rollback_interruption())
+    {
         state.availability = Availability::Stopped;
     } else {
         state.forward = false;
@@ -117,7 +120,7 @@ fn stop<E: Environment, F: FnMut(EngineEvent)>(
     }
     c.update(&stage)
 }
-fn restart<E: Environment, F: FnMut(EngineEvent)>(
+pub(super) fn restart<E: Environment, F: FnMut(EngineEvent)>(
     c: &mut ScenarioContext<'_, E, F>,
     state: &mut State,
 ) -> Result<()> {
