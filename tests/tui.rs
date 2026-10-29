@@ -523,3 +523,72 @@ fn interruption_preview_and_offline_proof_remain_explicit_and_narrow() {
     app.tab = Tab::Commands;
     assert!(app.items().join("\n").contains("ContainerSigkill"));
 }
+
+#[test]
+fn mixed_schema_three_preview_keeps_stability_scopes_with_their_checkpoint_references() {
+    let temp = tempfile::tempdir().unwrap();
+    for artifact in ["base", "target"] {
+        std::fs::create_dir(temp.path().join(artifact)).unwrap();
+    }
+    let path = temp.path().join("theseus.toml");
+    let interruption = include_str!("fixtures/recipes/v3_interruption.toml").replace(
+        "scenarios = [\"interrupted_install\", \"interrupted_upgrade\"]",
+        "scenarios = [\"reinstall\", \"interrupted_install\", \"interrupted_upgrade\"]",
+    );
+    std::fs::write(
+        &path,
+        format!(
+            "{interruption}\n\
+             [profiles.user.steps.install_target]\nscript='install-target'\n\
+             [profiles.user.steps.reinstall]\nscript='reinstall-target'\n\
+             [[profiles.user.checks]]\nid='stable-config'\ncheckpoint='reinstalled'\nkind='unchanged'\npath='/home/theseus/config'\n\
+             [[profiles.user.checks]]\nid='stable-partial'\ncheckpoint='interrupted'\nkind='unchanged'\npath='/home/theseus/partial-data'\n"
+        ),
+    )
+    .unwrap();
+    let recipe = theseus::recipe::load(&path).unwrap();
+    recipe
+        .validate_selection(&[ProfileName::User], &recipe.declared_scenarios())
+        .unwrap();
+    for scenarios in [vec![ScenarioKind::Reinstall], recipe.declared_scenarios()] {
+        let includes_interruption = scenarios.len() > 1;
+        let options = theseus::engine::RunOptions {
+            scenarios,
+            ..theseus::engine::RunOptions::all(&recipe)
+        };
+        let app = App::preview(recipe.clone(), options);
+        let preview = app.preview_text();
+        let reinstall_scopes = preview
+            .lines()
+            .find(|line| line.starts_with("Declared stable scopes"))
+            .expect("selected reinstall has a stability summary");
+        assert_eq!(
+            reinstall_scopes,
+            "Declared stable scopes (path and descendants): [\"/home/theseus/config\"]",
+            "reinstall summary must exclude interrupted/recovered scopes: {preview}"
+        );
+        assert!(preview.contains("Compare before_reinstall (after first exercise) to reinstalled (before checks and second exercise)."));
+        assert_eq!(
+            preview.contains(
+                "Unchanged compares before_interrupt -> interrupted/recovered (before checks)."
+            ),
+            includes_interruption
+        );
+        for (id, checkpoint, scope) in [
+            ("stable-config", "reinstalled", "/home/theseus/config"),
+            (
+                "stable-partial",
+                "interrupted",
+                "/home/theseus/partial-data",
+            ),
+            ("data", "recovered", "/home/theseus/data"),
+        ] {
+            assert!(
+                preview.contains(&format!(
+                    "check {id} @ {checkpoint}: Unchanged {{ path: \"{scope}\" }}"
+                )),
+                "declared contract must retain its checkpoint and scope: {preview}"
+            );
+        }
+    }
+}

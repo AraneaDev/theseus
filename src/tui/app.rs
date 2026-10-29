@@ -190,6 +190,7 @@ impl App {
                     let stable: Vec<_> = profile
                         .checks
                         .iter()
+                        .filter(|check| check.checkpoint == Checkpoint::Reinstalled)
                         .filter_map(|check| match &check.expectation {
                             Expectation::Unchanged { path } => Some(path.as_str()),
                             _ => None,
