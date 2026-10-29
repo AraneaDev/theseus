@@ -73,6 +73,25 @@ fn run(
                 spec.timeout_seconds = 2;
             }
         }
+        if fault == "directory-binary-promise" {
+            p.steps
+                .get_mut(&StepName::Configure)
+                .unwrap()
+                .script
+                .push_str(" && mkdir -p /workspace/binary-promise");
+            p.rollback
+                .as_mut()
+                .unwrap()
+                .binary_checks
+                .push("directory-binary".into());
+            p.checks.push(recipe::Check {
+                id: "directory-binary".into(),
+                checkpoint: Checkpoint::RolledBack,
+                expectation: recipe::Expectation::Unchanged {
+                    path: "/workspace/binary-promise".into(),
+                },
+            });
+        }
         if fault == "preexisting-root" {
             p.steps.get_mut(&StepName::Configure).unwrap().script.push_str(" && mkdir -p /workspace/rollback-backup && printf baseline > /workspace/rollback-backup/owned-before");
         }
@@ -757,7 +776,7 @@ fn real_rollback_live_offline_narrow_pty_both_policies() {
     println!("{}", String::from_utf8_lossy(&output.stdout));
 }
 #[test]
-fn rollback_invalid_paths_and_binary_promises_reject_offline_before_resources() {
+fn rollback_invalid_paths_and_scope_overlap_reject_offline_before_resources() {
     let temp = tempfile::tempdir().unwrap();
     let source = std::fs::read_to_string("tests/fixtures/rollback/restore-data.toml").unwrap();
     for role in ["base", "target"] {
@@ -803,6 +822,13 @@ fn rollback_invalid_paths_and_binary_promises_reject_offline_before_resources() 
             .output()
             .unwrap();
         assert!(!out.status.success(), "accepted {to}");
+        if to == "path = \"/home/theseus/.local/share/sample-cli\"" {
+            assert_eq!(out.status.code(), Some(2));
+            assert_eq!(
+                String::from_utf8_lossy(&out.stderr),
+                "theseus: binary and data scopes overlap\n"
+            );
+        }
         assert!(!temp.path().join(".theseus-runs").exists());
     }
     // Host artifact symlink escapes are rejected while loading, before Docker.
@@ -879,4 +905,64 @@ fn real_reference_boundaries_capture_check_effects_before_forward_mutation() {
             .as_deref(),
         Some(hash(b"known-effect").as_str())
     );
+}
+
+#[test]
+#[ignore = "requires Docker"]
+fn real_directory_binary_reference_fails_its_kind_check_without_scope_overlap() {
+    let (_temp, result) = run(
+        "restore-data",
+        "directory-binary-promise",
+        vec![ProfileName::User],
+    );
+    assert_eq!(
+        result.report.outcome,
+        RunOutcome::Failed,
+        "{:#?}",
+        result.report
+    );
+    let scenario = &result.report.scenarios[0];
+    prerequisites(scenario);
+    assert!(stage(scenario, "attempt_upgrade").verified_failure());
+    assert_eq!(stage(scenario, "rollback").outcome, StageOutcome::Passed);
+    let before = stage(scenario, "before_upgrade");
+    let after = stage(scenario, "rolled_back");
+    let path = "/workspace/binary-promise";
+    let directory = entry(before, path).unwrap();
+    assert_eq!(directory.kind, FileKind::Directory);
+    assert_eq!(entry(after, path), Some(directory));
+    // A generic directory Unchanged check would pass: only the binary-role kind
+    // restriction can reject this otherwise stable, disjoint reference object.
+    assert_eq!(
+        theseus::checks::compare_unchanged(path, &before.snapshots, &after.snapshots).outcome,
+        CheckOutcome::Passed
+    );
+    let rejected = check(scenario, "rolled_back", "directory-binary");
+    assert_eq!(rejected.path.as_deref(), Some(path));
+    assert_eq!(rejected.outcome, CheckOutcome::Failed);
+    assert_eq!(
+        rejected.message,
+        "binary scope must be a file or symlink before upgrade"
+    );
+    assert!(
+        after
+            .checks
+            .iter()
+            .filter(|check| check.id != "directory-binary")
+            .all(|check| check.outcome == CheckOutcome::Passed)
+    );
+    assert!(
+        scenario
+            .stages
+            .iter()
+            .flat_map(|stage| &stage.checks)
+            .filter(|check| check.outcome == CheckOutcome::Failed)
+            .all(|check| check.id == "directory-binary")
+    );
+    assert!(stage(scenario, "exercise_rolled_back").commands.is_empty());
+    assert_eq!(
+        stage(scenario, "cleanup_backup").outcome,
+        StageOutcome::Passed
+    );
+    assert_eq!(stage(scenario, "uninstall").outcome, StageOutcome::Passed);
 }
