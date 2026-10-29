@@ -53,7 +53,7 @@ def session(root, args, live, saved=None):
             until(lambda: (value := report()) and value['finished_at'], 45)
             saved = next(root.glob('.theseus-runs/*/report.json'))
         value = json.loads(saved.read_text())
-        assert value['schema_version'] == 5 and value['outcome'] == 'passed', value
+        assert value['schema_version'] == 6 and value['outcome'] == 'passed', value
         assert value['selected_profiles'] == ['user'], value['selected_profiles']
         assert value['selected_scenarios'] == ['reinstall']
         assert len(value['scenarios']) == 1

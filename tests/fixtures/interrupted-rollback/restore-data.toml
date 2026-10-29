@@ -1,0 +1,243 @@
+schema_version = 6
+scenarios = ["interrupted_rollback"]
+name = "Real interrupted rollback restore-data"
+image = "ubuntu:24.04"
+network = "none"
+observe = ["/home/theseus", "/usr/local/bin", "/workspace"]
+[artifacts]
+base = "base"
+target = "target"
+
+[profiles.user.interrupted_rollback]
+change_checks = ["candidate-changed-state"]
+binary_checks = ["known-good-binary"]
+runtime_checks = ["known-good-version-restored"]
+data_checks = ["known-good-reader"]
+[profiles.user.interrupted_rollback.restoration]
+mode = "restore_data"
+backup_root = "/workspace/rollback-backup"
+[[profiles.user.interrupted_rollback.restoration.scopes]]
+id = "data"
+source = "/home/theseus/.local/share/sample-cli"
+stored = "saved"
+
+[profiles.user.steps.install_base]
+script = "sh /inputs/base/install.sh user"
+timeout_seconds = 15
+
+[profiles.user.steps.configure]
+script = "sample-cli configure"
+timeout_seconds = 15
+
+[profiles.user.steps.exercise]
+script = "sample-cli read-data"
+timeout_seconds = 15
+
+[profiles.user.steps.interrupt_upgrade]
+script = "sh /inputs/target/interrupt.sh user"
+timeout_seconds = 15
+
+[profiles.user.steps.rollback]
+script = "sh /inputs/target/rollback.sh user restore-data"
+timeout_seconds = 15
+
+[profiles.user.steps.exercise_rolled_back]
+script = "sample-cli read-data"
+timeout_seconds = 15
+
+[profiles.user.steps.uninstall]
+script = "sh /inputs/target/uninstall.sh user"
+timeout_seconds = 15
+
+[profiles.user.steps.backup]
+script = "sh /inputs/target/backup.sh"
+timeout_seconds = 15
+
+[profiles.user.steps.cleanup_backup]
+script = "sh /inputs/target/cleanup.sh"
+timeout_seconds = 15
+
+[[profiles.user.checks]]
+id = "base-version"
+checkpoint = "base_installed"
+kind = "executable"
+name = "sample-cli"
+resolved_path = "/home/theseus/.local/bin/sample-cli"
+args = ["--version"]
+expected_exit = 0
+stdout_contains = "sample-cli 1.0.0"
+
+[[profiles.user.checks]]
+id = "known-reader"
+checkpoint = "known_good"
+kind = "command"
+script = "sample-cli read-data"
+expected_exit = 0
+stdout_contains = "reader records=2 sum=40"
+
+[[profiles.user.checks]]
+id = "candidate-changed-state"
+checkpoint = "interrupted"
+kind = "changed"
+path = "/home/theseus/.local/share/sample-cli"
+
+[[profiles.user.checks]]
+id = "known-good-binary"
+checkpoint = "rolled_back"
+kind = "unchanged"
+path = "/home/theseus/.local/bin/sample-cli"
+
+[[profiles.user.checks]]
+id = "known-good-version-restored"
+checkpoint = "rolled_back"
+kind = "executable"
+name = "sample-cli"
+resolved_path = "/home/theseus/.local/bin/sample-cli"
+args = ["--version"]
+expected_exit = 0
+stdout_contains = "sample-cli 1.0.0"
+
+[[profiles.user.checks]]
+id = "known-good-reader"
+checkpoint = "rolled_back"
+kind = "command"
+script = "sample-cli read-data"
+expected_exit = 0
+stdout_contains = "reader records=2 sum=40"
+
+[[profiles.user.checks]]
+id = "binary-removed"
+checkpoint = "uninstalled"
+kind = "absent"
+path = "/home/theseus/.local/bin/sample-cli"
+
+[profiles.system.interrupted_rollback]
+change_checks = ["candidate-changed-state"]
+binary_checks = ["known-good-binary"]
+runtime_checks = ["known-good-version-restored"]
+data_checks = ["known-good-reader"]
+[profiles.system.interrupted_rollback.restoration]
+mode = "restore_data"
+backup_root = "/workspace/rollback-backup"
+[[profiles.system.interrupted_rollback.restoration.scopes]]
+id = "data"
+source = "/home/theseus/.local/share/sample-cli"
+stored = "saved"
+
+[profiles.system.steps.install_base]
+script = "sh /inputs/base/install.sh system"
+timeout_seconds = 15
+
+[profiles.system.steps.configure]
+script = "sample-cli configure"
+timeout_seconds = 15
+
+[profiles.system.steps.exercise]
+script = "sample-cli read-data"
+timeout_seconds = 15
+
+[profiles.system.steps.interrupt_upgrade]
+script = "sh /inputs/target/interrupt.sh system"
+timeout_seconds = 15
+
+[profiles.system.steps.rollback]
+script = "sh /inputs/target/rollback.sh system restore-data"
+timeout_seconds = 15
+
+[profiles.system.steps.exercise_rolled_back]
+script = "sample-cli read-data"
+timeout_seconds = 15
+
+[profiles.system.steps.uninstall]
+script = "sh /inputs/target/uninstall.sh system"
+timeout_seconds = 15
+
+[profiles.system.steps.backup]
+script = "sh /inputs/target/backup.sh"
+timeout_seconds = 15
+
+[profiles.system.steps.cleanup_backup]
+script = "sh /inputs/target/cleanup.sh"
+timeout_seconds = 15
+
+[[profiles.system.checks]]
+id = "base-version"
+checkpoint = "base_installed"
+kind = "executable"
+name = "sample-cli"
+resolved_path = "/usr/local/bin/sample-cli"
+args = ["--version"]
+expected_exit = 0
+stdout_contains = "sample-cli 1.0.0"
+
+[[profiles.system.checks]]
+id = "known-reader"
+checkpoint = "known_good"
+kind = "command"
+script = "sample-cli read-data"
+expected_exit = 0
+stdout_contains = "reader records=2 sum=40"
+
+[[profiles.system.checks]]
+id = "candidate-changed-state"
+checkpoint = "interrupted"
+kind = "changed"
+path = "/home/theseus/.local/share/sample-cli"
+
+[[profiles.system.checks]]
+id = "known-good-binary"
+checkpoint = "rolled_back"
+kind = "unchanged"
+path = "/usr/local/bin/sample-cli"
+
+[[profiles.system.checks]]
+id = "known-good-version-restored"
+checkpoint = "rolled_back"
+kind = "executable"
+name = "sample-cli"
+resolved_path = "/usr/local/bin/sample-cli"
+args = ["--version"]
+expected_exit = 0
+stdout_contains = "sample-cli 1.0.0"
+
+[[profiles.system.checks]]
+id = "known-good-reader"
+checkpoint = "rolled_back"
+kind = "command"
+script = "sample-cli read-data"
+expected_exit = 0
+stdout_contains = "reader records=2 sum=40"
+
+[[profiles.system.checks]]
+id = "binary-removed"
+checkpoint = "uninstalled"
+kind = "absent"
+path = "/usr/local/bin/sample-cli"
+
+[[profiles.user.checks]]
+id = "writer-stopped"
+checkpoint = "interrupted"
+kind = "command"
+expected_exit = 0
+script = 'set -eu; a=$(wc -c < /workspace/writer); sleep 0.2; b=$(wc -c < /workspace/writer); test "$a" = "$b"; echo stopped'
+stdout_contains = "stopped"
+
+[[profiles.user.checks]]
+id = "no-continuation"
+checkpoint = "interrupted"
+kind = "absent"
+path = "/workspace/continued"
+
+[[profiles.system.checks]]
+id = "writer-stopped"
+checkpoint = "interrupted"
+kind = "command"
+expected_exit = 0
+script = 'set -eu; a=$(wc -c < /workspace/writer); sleep 0.2; b=$(wc -c < /workspace/writer); test "$a" = "$b"; echo stopped'
+stdout_contains = "stopped"
+
+[[profiles.system.checks]]
+id = "no-continuation"
+checkpoint = "interrupted"
+kind = "absent"
+path = "/workspace/continued"

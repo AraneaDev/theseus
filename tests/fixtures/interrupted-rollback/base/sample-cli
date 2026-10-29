@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+data=/home/theseus/.local/share/sample-cli
+case "${1:---version}" in
+--version)
+    test ! -e /workspace/wrong-runtime || { echo 'sample-cli broken'; exit 0; }
+    echo 'sample-cli 1.0.0' ;;
+configure)
+    mkdir -p "$data/nested"
+    chmod 750 "$data" "$data/nested"
+    printf 'format=1\nalpha=11\nbeta=29\n' > "$data/records"
+    printf 'known child\n' > "$data/nested/child"
+    chmod 640 "$data/records" "$data/nested/child"
+    ln -s records "$data/current" ;;
+read-data)
+    test ! -e /workspace/wrong-reader || { echo 'reader records=1 sum=11'; exit 0; }
+    case "$(head -n 1 "$data/records")" in
+        format=1) test ! -e "$data/added" ;;
+        format=2) test "$(cat "$data/added")" = 'candidate child' ;;
+        *) exit 3 ;;
+    esac
+    test "$(id -u)" = 10001
+    test "$(readlink "$data/current")" = records
+    test "$(cat "$data/nested/child")" = 'known child'
+    test "$(sed -n '2,3p' "$data/records")" = "$(printf 'alpha=11\nbeta=29')"
+    test "$(wc -l < "$data/records")" -eq 3
+    cat "$data/records"
+    awk -F= 'NR>1 {n++; sum+=$2} END {printf "reader records=%d sum=%d\n",n,sum}' "$data/records"
+    printf 'runtime uid=%s gid=%s\n' "$(id -u)" "$(id -g)" ;;
+*) exit 2 ;;
+esac

@@ -27,3 +27,6 @@ jobs:
 
       - name: Real Docker rollback acceptance (required)
         run: cargo test --locked --test rollback_lifecycle -- --ignored --test-threads=1
+
+      - name: Real Docker interrupted rollback acceptance (required)
+        run: cargo test --locked --test interrupted_rollback_lifecycle -- --ignored --test-threads=1

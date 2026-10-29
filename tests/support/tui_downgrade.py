@@ -103,7 +103,7 @@ def session(root, policy=None, saved=None, legacy=False):
             until(lambda: b'clean' in data or b'reinstall' in data)
         else:
             value = json.loads(saved.read_text())
-            assert value['schema_version'] == 5 and value['outcome'] == 'passed', value
+            assert value['schema_version'] == 6 and value['outcome'] == 'passed', value
             assert value['selected_profiles'] == ['user']
             assert value['selected_scenarios'] == ['downgrade']
             scenario = value['scenarios'][0]
