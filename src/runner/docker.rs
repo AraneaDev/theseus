@@ -5,18 +5,9 @@ use super::{
 use crate::{
     engine::{CancellationToken, now},
     recipe::Network,
-    snapshot,
 };
-use anyhow::{Context, Result, anyhow, bail, ensure};
-use std::{
-    collections::BTreeMap,
-    io::Read,
-    path::Path,
-    process::{Command, Stdio},
-    sync::mpsc,
-    thread,
-    time::{Duration, Instant},
-};
+use anyhow::{Context, Result, bail, ensure};
+use std::{collections::BTreeMap, path::Path, process::Command, time::Duration};
 
 pub const OWNER_LABEL: &str = "io.theseus.owner";
 pub const RUN_LABEL: &str = "io.theseus.run";
@@ -106,6 +97,11 @@ impl Docker {
             !output.timed_out && !output.cancelled,
             "ownership inspection timed out"
         );
+        ensure!(
+            output.error.is_none(),
+            "ownership inspection failed: {:?}",
+            output.error
+        );
         if output.status != Some(0) {
             let error = String::from_utf8_lossy(&output.stderr.bytes);
             if error.contains("No such container:") || error.contains("No such object:") {
@@ -171,86 +167,22 @@ impl Docker {
             return Ok(Snapshot::missing(root));
         }
         ensure!(present == "present", "unexpected root probe output");
-        let mut child = self
-            .command()
-            .args(["cp", &format!("{}:{root}", resource.container_id), "-"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("spawn Docker archive stream")?;
-        let mut stdout = child.stdout.take().unwrap();
-        let mut stderr = child.stderr.take().unwrap();
-        let err = thread::spawn(move || {
-            let mut bytes = vec![];
-            let result = Read::by_ref(&mut stderr)
-                .take(65536)
-                .read_to_end(&mut bytes);
-            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
-            result.map(|_| bytes)
-        });
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let root_owned = root.to_string();
-        let parser = thread::spawn(move || {
-            let result = snapshot::read_archive(&mut stdout, &root_owned, limits);
-            if result.is_ok() {
-                let _ = std::io::copy(&mut stdout, &mut std::io::sink());
-            }
-            let _ = sender.send(result);
-        });
-        let started = Instant::now();
-        let mut parsed = None;
-        let mut failure = None;
-        let status = loop {
-            if parsed.is_none() {
-                match receiver.try_recv() {
-                    Ok(result) => {
-                        if result.is_err() {
-                            let _ = child.kill();
-                        }
-                        parsed = Some(result);
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        failure = Some(anyhow!("archive parser disconnected"));
-                        let _ = child.kill();
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {}
-                }
-            }
-            if let Some(status) = child.try_wait()? {
-                break status;
-            }
-            if cancel.is_cancelled() || started.elapsed() >= Duration::from_secs(120) {
+        let mut command = self.command();
+        command.args(["cp", &format!("{}:{root}", resource.container_id), "-"]);
+        process::archive(
+            &mut command,
+            root,
+            limits,
+            Duration::from_secs(120),
+            cancel,
+            || {
                 if cancel.is_cancelled() {
-                    let _ = self.stop(resource);
+                    self.stop(resource)
+                } else {
+                    Ok(())
                 }
-                failure = Some(anyhow!("archive operation timed out or cancelled"));
-                let _ = child.kill();
-                break child.wait()?;
-            }
-            thread::sleep(Duration::from_millis(10));
-        };
-        parser
-            .join()
-            .map_err(|_| anyhow!("archive parser panicked"))?;
-        let stderr = err
-            .join()
-            .map_err(|_| anyhow!("archive stderr drain panicked"))??;
-        if let Some(error) = failure {
-            return Err(error);
-        }
-        let parsed = parsed.unwrap_or_else(|| {
-            receiver
-                .recv()
-                .unwrap_or_else(|_| Err(anyhow!("archive parser disconnected")))
-        });
-        let snapshot = parsed?;
-        ensure!(
-            status.success(),
-            "Docker archive failed: {}",
-            String::from_utf8_lossy(&stderr)
-        );
-        Ok(snapshot)
+            },
+        )
     }
 }
 impl Environment for Docker {
@@ -500,6 +432,7 @@ chmod 755 /home/theseus /workspace /inputs
             request.log_limit.min(crate::recipe::DEFAULT_LOG_LIMIT) as usize,
             || self.stop(resource),
         )?;
+        record.error = output.error;
         record.duration_ms = output.duration_ms;
         record.exit_status = output.status;
         record.timed_out = output.timed_out;
@@ -562,7 +495,41 @@ chmod 755 /home/theseus /workspace /inputs
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::{os::unix::fs::PermissionsExt, thread, time::Instant};
+    #[test]
+    fn archive_cancellation_still_applies_after_cli_exit_with_open_descriptors() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("bin")).unwrap();
+        std::fs::write(temp.path().join("bin/sample"), b"sample").unwrap();
+        let executable = temp.path().join("docker-wrapper");
+        std::fs::write(&executable, format!("#!/bin/sh\ncase \"$1\" in\nexec) printf present ;;\ncp) tar -C '{}' -cf - bin; sleep 2 & exit 0 ;;\n*) exit 99 ;;\nesac\n", temp.path().display())).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cancel = CancellationToken::default();
+        let trigger = cancel.clone();
+        let signal = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            trigger.cancel();
+        });
+        let began = Instant::now();
+        let result = Docker::new(executable.as_os_str()).snapshot(
+            &OwnedResource {
+                container_id: "a".repeat(64),
+                labels: BTreeMap::new(),
+                removed: false,
+            },
+            "/usr/local/bin",
+            Limits::default(),
+            &cancel,
+        );
+        signal.join().unwrap();
+        assert!(
+            result.is_err(),
+            "archive incorrectly completed after {}ms",
+            began.elapsed().as_millis()
+        );
+        assert!(format!("{:#}", result.unwrap_err()).contains("cancelled"));
+        assert!(began.elapsed() < Duration::from_secs(1));
+    }
     #[test]
     fn rejects_image_declared_volumes_before_creating_resources() {
         let temp = tempfile::tempdir().unwrap();
