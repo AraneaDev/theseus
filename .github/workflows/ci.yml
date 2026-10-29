@@ -21,3 +21,6 @@ jobs:
 
       - name: Real Docker interruption acceptance (required)
         run: cargo test --locked --test interruption_lifecycle -- --ignored --test-threads=1
+
+      - name: Real Docker downgrade acceptance (required)
+        run: cargo test --locked --test downgrade_lifecycle -- --ignored --test-threads=1

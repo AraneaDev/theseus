@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+case "${1:---version}" in
+--version) echo 'sample-cli 1.0.0' ;;
+read-data)
+    test ! -e /workspace/broken-reader || exit 8
+    data=$XDG_DATA_HOME/sample-cli/records
+    test "$(cat "$XDG_CONFIG_HOME/sample-cli/settings")" = colour=blue
+    test "$(cat "$data")" = "$(printf 'format=2\nalpha=11\nbeta=29')"
+    cat "$data"
+    limit=0
+    test ! -e /workspace/silent-reader-drop || limit=2
+    awk -F= -v limit="$limit" 'NR>1 && (limit==0 || NR<=limit) {n++; sum+=$2} END {printf "old-reader records=%d sum=%d\n",n,sum}' "$data"
+    printf 'runtime uid=%s gid=%s\n' "$(id -u)" "$(id -g)"
+    ;;
+*) exit 2 ;;
+esac
