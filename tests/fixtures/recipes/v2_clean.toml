@@ -1,0 +1,17 @@
+schema_version = 2
+scenarios = ["clean"]
+name = "clean-only"
+image = "debian:bookworm-slim"
+observe = ["/home/theseus"]
+
+[artifacts]
+target = "target"
+
+[profiles.user.steps.install_target]
+script = "true"
+[profiles.user.steps.configure]
+script = "true"
+[profiles.user.steps.exercise]
+script = "true"
+[profiles.user.steps.uninstall]
+script = "true"

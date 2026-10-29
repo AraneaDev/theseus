@@ -1,4 +1,4 @@
-use crate::model::{Checkpoint, FileKind, ProfileName, StepName};
+use crate::model::{Checkpoint, FileKind, ProfileName, ScenarioKind, StepName};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -41,6 +41,8 @@ impl Default for Limits {
 #[serde(deny_unknown_fields)]
 pub struct Recipe {
     pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scenarios: Option<Vec<ScenarioKind>>,
     pub name: String,
     pub image: String,
     #[serde(default)]

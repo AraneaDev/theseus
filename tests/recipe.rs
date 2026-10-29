@@ -53,7 +53,7 @@ fn rejects_unknown_fields_at_every_level() {
 #[test]
 fn rejects_invalid_schema_steps_timeouts_and_duplicate_ids() {
     for text in [
-        VALID.replace("schema_version = 1", "schema_version = 2"),
+        VALID.replace("schema_version = 1", "schema_version = 999"),
         VALID.replace("install_base]", "nonsense]"),
         VALID.replace(
             "sample-cli configure\"",
@@ -165,4 +165,97 @@ fn artifacts_resolve_in_project_and_cannot_escape_through_symlinks_or_special_fi
     fs::remove_file(dir.path().join("target/leak")).unwrap();
     let _socket = UnixListener::bind(dir.path().join("target/socket")).unwrap();
     assert!(theseus::recipe::load(&dir.path().join("theseus.toml")).is_err());
+}
+
+#[test]
+fn existing_recipe_defaults_remain_clean_and_upgrade() {
+    let recipe =
+        theseus::recipe::load(std::path::Path::new("tests/fixtures/recipes/valid.toml")).unwrap();
+    assert_eq!(
+        theseus::engine::RunOptions::all(&recipe).scenarios,
+        vec![ScenarioKind::Clean, ScenarioKind::Upgrade]
+    );
+    assert!(
+        !toml::to_string(&recipe.recipe)
+            .unwrap()
+            .contains("scenarios")
+    );
+}
+
+#[test]
+fn version_two_clean_only_requires_only_target_artifacts_and_clean_steps() {
+    let recipe =
+        theseus::recipe::load(std::path::Path::new("tests/fixtures/recipes/v2_clean.toml"))
+            .unwrap();
+    assert!(recipe.base_artifact.is_none());
+    assert!(
+        !recipe.recipe.profiles[&ProfileName::User]
+            .steps
+            .contains_key(&StepName::Upgrade)
+    );
+    assert_eq!(
+        theseus::engine::RunOptions::all(&recipe).scenarios,
+        vec![ScenarioKind::Clean]
+    );
+    recipe
+        .validate_selection(&[ProfileName::User], &[ScenarioKind::Clean])
+        .unwrap();
+}
+
+#[test]
+fn scenario_declarations_follow_recipe_version_and_are_nonempty_and_unique() {
+    for (text, expected) in [
+        (
+            format!("scenarios = [\"clean\"]\n{VALID}"),
+            "schema version 2",
+        ),
+        (
+            VALID.replace("schema_version = 1", "schema_version = 2"),
+            "scenarios",
+        ),
+        (
+            VALID.replace("schema_version = 1", "schema_version = 2\nscenarios = []"),
+            "at least one scenario",
+        ),
+        (
+            VALID.replace(
+                "schema_version = 1",
+                "schema_version = 2\nscenarios = [\"clean\", \"clean\"]",
+            ),
+            "duplicate scenario",
+        ),
+    ] {
+        let error = load_text(&text).unwrap_err();
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+    }
+    assert!(
+        load_text(&VALID.replace(
+            "schema_version = 1",
+            "schema_version = 2\nscenarios = [\"unknown\"]"
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn version_two_declaration_order_controls_defaults_and_selection_rejects_undeclared_scenarios() {
+    let recipe = load_text(&VALID.replace(
+        "schema_version = 1",
+        "schema_version = 2\nscenarios = [\"upgrade\", \"clean\"]",
+    ))
+    .unwrap();
+    assert_eq!(
+        theseus::engine::RunOptions::all(&recipe).scenarios,
+        vec![ScenarioKind::Upgrade, ScenarioKind::Clean]
+    );
+    // Keep every upgrade prerequisite present so rejection proves the declaration is enforced.
+    let clean_only = load_text(&VALID.replace(
+        "schema_version = 1",
+        "schema_version = 2\nscenarios = [\"clean\"]",
+    ))
+    .unwrap();
+    let error = clean_only
+        .validate_selection(&[ProfileName::User], &[ScenarioKind::Upgrade])
+        .unwrap_err();
+    assert!(error.to_string().contains("not declared"), "{error:#}");
 }

@@ -42,7 +42,7 @@ impl RunOptions {
     pub fn all(recipe: &ValidatedRecipe) -> Self {
         Self {
             profiles: recipe.recipe.profiles.keys().copied().collect(),
-            scenarios: vec![ScenarioKind::Clean, ScenarioKind::Upgrade],
+            scenarios: recipe.declared_scenarios(),
             output_root: recipe.project_root.join(".theseus-runs"),
             pull: false,
             log_limit: crate::recipe::DEFAULT_LOG_LIMIT,
@@ -122,7 +122,7 @@ pub fn run_with(
     report.selected_scenarios = options.scenarios.clone();
     report.started_at = now();
     let mut journal = RunJournal {
-        schema_version: 1,
+        schema_version: JOURNAL_SCHEMA_VERSION,
         run_id: id.clone(),
         resources: vec![],
         cleanup_errors: vec![],

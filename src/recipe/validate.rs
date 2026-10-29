@@ -19,6 +19,14 @@ pub struct ValidatedRecipe {
     pub digest: String,
 }
 impl ValidatedRecipe {
+    /// Declared scenario order, with the unchanged v1 clean/upgrade defaults.
+    pub fn declared_scenarios(&self) -> Vec<ScenarioKind> {
+        self.recipe
+            .scenarios
+            .clone()
+            .unwrap_or_else(|| vec![ScenarioKind::Clean, ScenarioKind::Upgrade])
+    }
+
     pub fn validate_selection(
         &self,
         profiles: &[ProfileName],
@@ -28,6 +36,13 @@ impl ValidatedRecipe {
             !profiles.is_empty() && !scenarios.is_empty(),
             "select at least one profile and scenario"
         );
+        let declared = self.declared_scenarios();
+        for scenario in scenarios {
+            ensure!(
+                declared.contains(scenario),
+                "scenario {scenario} is not declared by this recipe"
+            );
+        }
         for name in profiles {
             let profile = self
                 .recipe
@@ -86,11 +101,24 @@ pub fn load(path: &Path) -> Result<ValidatedRecipe> {
     let bytes = fs::read(&path).context("read recipe")?;
     let mut recipe: Recipe =
         toml::from_str(std::str::from_utf8(&bytes)?).context("parse theseus.toml")?;
-    ensure!(
-        recipe.schema_version == 1,
-        "unsupported recipe schema version {}",
-        recipe.schema_version
-    );
+    match recipe.schema_version {
+        1 => ensure!(
+            recipe.scenarios.is_none(),
+            "scenarios requires recipe schema version 2"
+        ),
+        2 => {
+            let scenarios = recipe
+                .scenarios
+                .as_ref()
+                .context("recipe schema version 2 requires an explicit scenarios list")?;
+            ensure!(!scenarios.is_empty(), "declare at least one scenario");
+            let mut seen = BTreeSet::new();
+            for scenario in scenarios {
+                ensure!(seen.insert(scenario), "duplicate scenario {scenario}");
+            }
+        }
+        version => bail!("unsupported recipe schema version {version}"),
+    }
     ensure!(
         !recipe.name.trim().is_empty() && !recipe.image.trim().is_empty(),
         "name and image cannot be empty"

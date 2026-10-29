@@ -329,3 +329,49 @@ fn actual_pty_idle_preview_and_offline_signals_restore_terminal() {
     );
     println!("{}", String::from_utf8_lossy(&output.stdout));
 }
+
+#[test]
+fn clean_only_preview_s_key_never_offers_undeclared_upgrade() {
+    let recipe = theseus::recipe::load(Path::new("tests/fixtures/recipes/v2_clean.toml")).unwrap();
+    let options = theseus::engine::RunOptions::all(&recipe);
+    let mut app = App::preview(recipe, options);
+    for _ in 0..4 {
+        key(&mut app, KeyCode::Char('s'));
+        assert_eq!(
+            app.options.as_ref().unwrap().scenarios,
+            vec![ScenarioKind::Clean]
+        );
+        assert!(!screen(&app, 120, 40).contains("upgrade"));
+    }
+}
+
+#[test]
+fn version_two_preview_cycles_in_declaration_order() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("base")).unwrap();
+    std::fs::create_dir(temp.path().join("target")).unwrap();
+    let path = temp.path().join("theseus.toml");
+    std::fs::write(
+        &path,
+        include_str!("fixtures/recipes/valid.toml").replace(
+            "schema_version = 1",
+            "schema_version = 2\nscenarios = [\"upgrade\", \"clean\"]",
+        ),
+    )
+    .unwrap();
+    let recipe = theseus::recipe::load(&path).unwrap();
+    let options = theseus::engine::RunOptions::all(&recipe);
+    let mut app = App::preview(recipe, options);
+    assert_eq!(
+        app.options.as_ref().unwrap().scenarios,
+        vec![ScenarioKind::Upgrade, ScenarioKind::Clean]
+    );
+    for expected in [
+        vec![ScenarioKind::Upgrade],
+        vec![ScenarioKind::Clean],
+        vec![ScenarioKind::Upgrade, ScenarioKind::Clean],
+    ] {
+        key(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.options.as_ref().unwrap().scenarios, expected);
+    }
+}

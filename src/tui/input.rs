@@ -1,5 +1,5 @@
 use super::{App, Focus, Tab};
-use crate::model::{ProfileName, ScenarioKind};
+use crate::model::ProfileName;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 pub fn input(app: &mut App, key: KeyEvent) {
     if key.kind == KeyEventKind::Release {
@@ -45,12 +45,20 @@ pub fn input(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char('s') if app.report.is_none() && !app.active => {
-            if let Some(options) = &mut app.options {
-                options.scenarios = match options.scenarios.as_slice() {
-                    [ScenarioKind::Clean] => vec![ScenarioKind::Upgrade],
-                    [ScenarioKind::Upgrade] => vec![ScenarioKind::Clean, ScenarioKind::Upgrade],
-                    _ => vec![ScenarioKind::Clean],
-                };
+            if let (Some(options), Some(recipe)) = (&mut app.options, &app.recipe) {
+                let all = recipe.declared_scenarios();
+                let mut choices = vec![all.clone()];
+                for scenario in all {
+                    let individual = vec![scenario];
+                    if !choices.contains(&individual) {
+                        choices.push(individual);
+                    }
+                }
+                let i = choices
+                    .iter()
+                    .position(|s| *s == options.scenarios)
+                    .unwrap_or(0);
+                options.scenarios = choices[(i + 1) % choices.len()].clone();
             }
         }
         KeyCode::Tab | KeyCode::Enter => {

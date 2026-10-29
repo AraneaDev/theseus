@@ -129,7 +129,7 @@ fn rejects_report_schema_and_unsafe_log_references() {
     let root = dir.path().join("run");
     let store = report::create(&root).unwrap();
     let mut run = RunReport::new("run");
-    run.schema_version = 2;
+    run.schema_version = 999;
     assert!(store.save(&run).is_err());
     fs::write(store.report_path(), serde_json::to_vec(&run).unwrap()).unwrap();
     assert!(report::load(&root).is_err());
@@ -310,4 +310,97 @@ fn reopening_a_store_for_cleanup_preserves_existing_evidence() {
     let alias = temp.path().join("alias");
     std::os::unix::fs::symlink(original.root(), &alias).unwrap();
     assert!(theseus::report::open_existing(&alias).is_err());
+}
+
+#[test]
+fn frozen_schema_one_report_and_journal_remain_readable_and_writable() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = report::create(&temp.path().join("run")).unwrap();
+    fs::write(
+        store.report_path(),
+        include_bytes!("fixtures/reports/schema1-report.json"),
+    )
+    .unwrap();
+    fs::write(
+        store.root().join("journal.json"),
+        include_bytes!("fixtures/reports/schema1-journal.json"),
+    )
+    .unwrap();
+    let run = report::load(store.root()).unwrap();
+    assert_eq!(run.schema_version, 1);
+    assert_eq!(run.outcome, RunOutcome::Passed);
+    assert_eq!(run.scenarios[0].stages[0].checks[0].id, "binary-removed");
+    assert!(
+        run.scenarios[0].stages[0].commands[0]
+            .forwarded_environment
+            .is_empty()
+    );
+    store.save(&run).unwrap();
+    let journal = report::load_journal(store.root()).unwrap();
+    assert_eq!(journal.schema_version, 1);
+    assert_eq!(journal.resources[0].labels["io.theseus.owner"], "v1");
+    store.save_journal(&journal).unwrap();
+    assert_eq!(
+        report::load_journal(store.root()).unwrap().run_id,
+        "schema1-fixture"
+    );
+}
+
+#[test]
+fn new_reports_write_schema_two_while_journals_stay_schema_one() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = report::create(&temp.path().join("run")).unwrap();
+    store.save(&RunReport::new("new-run")).unwrap();
+    let serialized: serde_json::Value =
+        serde_json::from_slice(&fs::read(store.report_path()).unwrap()).unwrap();
+    assert_eq!(serialized["schema_version"], 2);
+    assert_eq!(report::load(store.root()).unwrap().schema_version, 2);
+    let journal = RunJournal {
+        schema_version: 1,
+        run_id: "new-run".into(),
+        resources: vec![],
+        cleanup_errors: vec![],
+    };
+    store.save_journal(&journal).unwrap();
+    let serialized: serde_json::Value =
+        serde_json::from_slice(&fs::read(store.root().join("journal.json")).unwrap()).unwrap();
+    assert_eq!(serialized["schema_version"], 1);
+    assert_eq!(
+        report::load_journal(store.root()).unwrap().schema_version,
+        1
+    );
+}
+
+#[test]
+fn report_versions_and_journal_versions_are_validated_independently() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = report::create(&temp.path().join("run")).unwrap();
+    for version in [1, 2] {
+        let mut run = RunReport::new("run");
+        run.schema_version = version;
+        store.save(&run).unwrap();
+        assert_eq!(report::load(store.root()).unwrap().schema_version, version);
+    }
+    for version in [0, 999] {
+        let mut run = RunReport::new("run");
+        run.schema_version = version;
+        assert!(store.save(&run).is_err());
+        fs::write(store.report_path(), serde_json::to_vec(&run).unwrap()).unwrap();
+        assert!(report::load(store.root()).is_err());
+    }
+    for version in [0, 2, 999] {
+        let journal = RunJournal {
+            schema_version: version,
+            run_id: "run".into(),
+            resources: vec![],
+            cleanup_errors: vec![],
+        };
+        assert!(store.save_journal(&journal).is_err());
+        fs::write(
+            store.root().join("journal.json"),
+            serde_json::to_vec(&journal).unwrap(),
+        )
+        .unwrap();
+        assert!(report::load_journal(store.root()).is_err());
+    }
 }

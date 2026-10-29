@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "run_id": "schema1-fixture",
+  "resources": [{
+    "container_id": "legacy-container",
+    "labels": {
+      "io.theseus.owner": "v1",
+      "io.theseus.run": "schema1-fixture",
+      "io.theseus.scenario": "user-clean"
+    },
+    "removed": true
+  }],
+  "cleanup_errors": []
+}

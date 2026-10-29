@@ -1,5 +1,5 @@
 use crate::{
-    model::{LogReference, REPORT_SCHEMA_VERSION, RunJournal, RunReport},
+    model::{JOURNAL_SCHEMA_VERSION, LogReference, REPORT_SCHEMA_VERSION, RunJournal, RunReport},
     recipe::DEFAULT_LOG_LIMIT,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -72,10 +72,7 @@ impl ReportStore {
         self.atomic_json("report.json", report)
     }
     pub fn save_journal(&self, journal: &RunJournal) -> Result<()> {
-        ensure!(
-            journal.schema_version == REPORT_SCHEMA_VERSION,
-            "unsupported journal schema version"
-        );
+        validate_journal(journal)?;
         self.atomic_json("journal.json", journal)
     }
     fn atomic_json(&self, name: &str, value: &impl Serialize) -> Result<()> {
@@ -242,7 +239,7 @@ fn log_components(relative: &str) -> Result<Vec<&str>> {
 }
 fn validate_report(report: &RunReport) -> Result<()> {
     ensure!(
-        report.schema_version == REPORT_SCHEMA_VERSION,
+        matches!(report.schema_version, 1 | REPORT_SCHEMA_VERSION),
         "unsupported report schema version {}",
         report.schema_version
     );
@@ -266,11 +263,16 @@ pub fn load(path: &Path) -> Result<RunReport> {
 pub fn load_journal(path: &Path) -> Result<RunJournal> {
     let root = report_root(path, "journal.json")?;
     let journal: RunJournal = open_store(&root)?.read_json("journal.json")?;
-    ensure!(
-        journal.schema_version == REPORT_SCHEMA_VERSION,
-        "unsupported journal schema version"
-    );
+    validate_journal(&journal)?;
     Ok(journal)
+}
+fn validate_journal(journal: &RunJournal) -> Result<()> {
+    ensure!(
+        journal.schema_version == JOURNAL_SCHEMA_VERSION,
+        "unsupported journal schema version {}",
+        journal.schema_version
+    );
+    Ok(())
 }
 pub fn read_log(root: &Path, relative: &str, limit: usize) -> Result<LogRead> {
     open_store(root)?.read_log(relative, limit)

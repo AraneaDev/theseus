@@ -37,7 +37,8 @@ pub struct Finding {
     pub message: String,
 }
 
-pub const REPORT_SCHEMA_VERSION: u32 = 1;
+pub const REPORT_SCHEMA_VERSION: u32 = 2;
+pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
 named_enum!(RunOutcome { Passed => "passed", Failed => "failed", Incomplete => "incomplete", Cancelled => "cancelled" });
 impl RunOutcome {
     pub const fn exit_code(self) -> i32 {

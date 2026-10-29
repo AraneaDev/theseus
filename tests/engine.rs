@@ -421,3 +421,28 @@ fn missing_pass_env_is_preflight_incomplete_without_script_or_container() {
             .is_empty()
     );
 }
+
+#[test]
+fn version_two_clean_defaults_run_without_upgrade_inputs() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("target")).unwrap();
+    let path = temp.path().join("theseus.toml");
+    std::fs::write(&path, include_str!("fixtures/recipes/v2_clean.toml")).unwrap();
+    let recipe = load(&path).unwrap();
+    let options = RunOptions {
+        output_root: temp.path().join("runs"),
+        ..RunOptions::all(&recipe)
+    };
+    let result = engine::run_with(
+        &recipe,
+        options,
+        CancellationToken::default(),
+        &mut Fake { fault: "" },
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(result.report.outcome, RunOutcome::Passed);
+    assert_eq!(result.report.selected_scenarios, vec![ScenarioKind::Clean]);
+    assert_eq!(result.report.scenarios.len(), 1);
+    assert_eq!(result.report.scenarios[0].scenario, ScenarioKind::Clean);
+}
