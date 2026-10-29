@@ -402,6 +402,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                     message: "dependent prerequisite/configuration was deliberately skipped".into(),
                     path: check.expectation.path().map(str::to_owned),
                     command_ids: vec![],
+                    backup: None,
                     comparison: None,
                 }
             } else if state.availability != Availability::Running {
@@ -412,6 +413,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                     message: "container stopped after timeout/cancellation".into(),
                     path: check.expectation.path().map(str::to_owned),
                     command_ids: vec![],
+                    backup: None,
                     comparison: None,
                 }
             } else {
@@ -552,6 +554,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                     message: stability.message,
                     path: Some(path.clone()),
                     command_ids: vec![],
+                    backup: None,
                     comparison: None,
                 }
             }

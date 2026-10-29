@@ -24,6 +24,7 @@ fn fixture(root: &Path) -> App {
         message: "old executable wins on PATH".into(),
         path: None,
         command_ids: vec![],
+        backup: None,
         comparison: None,
     });
     second.errors.push("observation could not finish".into());
@@ -443,6 +444,7 @@ fn reinstall_failed_directory_scope_and_comparison_references_are_browsable() {
         message: "declared directory changed".into(),
         path: Some("/home/theseus/config".into()),
         command_ids: vec![],
+        backup: None,
         comparison: Some(ComparisonReference::reinstall()),
     });
     scenario.stages.push(stage);

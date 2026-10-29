@@ -23,6 +23,7 @@ fn failed_contract_evidence_survives_cleanup_error_and_cancellation_wins() {
         message: "binary remains".into(),
         path: Some("/usr/local/bin/tool".into()),
         command_ids: vec![],
+        backup: None,
         comparison: None,
     });
     stage.outcome = StageOutcome::Failed;
@@ -348,14 +349,14 @@ fn frozen_schema_one_report_and_journal_remain_readable_and_writable() {
 }
 
 #[test]
-fn new_reports_write_schema_four_while_journals_stay_schema_one() {
+fn new_reports_write_schema_five_while_journals_stay_schema_one() {
     let temp = tempfile::tempdir().unwrap();
     let store = report::create(&temp.path().join("run")).unwrap();
     store.save(&RunReport::new("new-run")).unwrap();
     let serialized: serde_json::Value =
         serde_json::from_slice(&fs::read(store.report_path()).unwrap()).unwrap();
-    assert_eq!(serialized["schema_version"], 4);
-    assert_eq!(report::load(store.root()).unwrap().schema_version, 4);
+    assert_eq!(serialized["schema_version"], 5);
+    assert_eq!(report::load(store.root()).unwrap().schema_version, 5);
     let journal = RunJournal {
         schema_version: 1,
         run_id: "new-run".into(),
@@ -376,13 +377,13 @@ fn new_reports_write_schema_four_while_journals_stay_schema_one() {
 fn report_versions_and_journal_versions_are_validated_independently() {
     let temp = tempfile::tempdir().unwrap();
     let store = report::create(&temp.path().join("run")).unwrap();
-    for version in [1, 2, 3] {
+    for version in [1, 2, 3, 4, 5] {
         let mut run = RunReport::new("run");
         run.schema_version = version;
         store.save(&run).unwrap();
         assert_eq!(report::load(store.root()).unwrap().schema_version, version);
     }
-    for version in [0, 999] {
+    for version in [0, 6, 999] {
         let mut run = RunReport::new("run");
         run.schema_version = version;
         assert!(store.save(&run).is_err());
@@ -702,6 +703,7 @@ fn rejected_downgrade_report() -> RunReport {
             message: "stable".into(),
             path: Some(format!("/home/theseus/{id}")),
             command_ids: vec![],
+            backup: None,
             comparison: ComparisonReference::for_checkpoint(Checkpoint::DowngradeRejected),
         });
     }
@@ -812,6 +814,7 @@ fn downgrade_schema_four_reader_recomputes_forged_pass_and_preserves_older_reade
     let temp = tempfile::tempdir().unwrap();
     let store = report::create(&temp.path().join("run")).unwrap();
     let mut run = rejected_downgrade_report();
+    run.schema_version = 4;
     run.scenarios[0].stages[1].checks.clear();
     // Simulate hand-edited persisted metadata that falsely claims Passed.
     fs::write(store.report_path(), serde_json::to_vec(&run).unwrap()).unwrap();
@@ -879,6 +882,7 @@ fn downgrade_each_feature_has_schema_four_floor_and_optional_fields_omit_none() 
                     message: "x".into(),
                     path: None,
                     command_ids: vec![],
+                    backup: None,
                     comparison: if feature == "comparison" {
                         ComparisonReference::for_checkpoint(Checkpoint::Downgraded)
                     } else {
@@ -960,4 +964,215 @@ fn downgrade_incomplete_proof_cannot_pass_a_stage_and_cancellation_wins() {
             "{mutation}"
         );
     }
+}
+
+#[test]
+fn stray_expected_failure_proof_prevents_passing_even_on_successful_commands() {
+    let mut stage = StageReport::new("install_target");
+    stage.outcome = StageOutcome::Passed;
+    let mut command = CommandRecord::new("cmd", "install_target");
+    command.outcome = CommandOutcome::Succeeded;
+    command.exit_status = Some(0);
+    let mut json = serde_json::to_value(command).unwrap();
+    json["expected_failure"] =
+        serde_json::json!({"expected_exit":9,"stdout_contains":"failed","stdout_matched":true});
+    stage.commands.push(serde_json::from_value(json).unwrap());
+    assert_eq!(stage.aggregate_outcome(), RunOutcome::Incomplete);
+}
+
+fn rollback_policy_json() -> serde_json::Value {
+    serde_json::json!({
+        "failure":{"expected_exit":9,"stdout_contains":"upgrade failed"},
+        "change_checks":["changed"],"binary_checks":["binary"],"data_checks":["reader"],
+        "restoration":{"mode":"restore_data","backup_root":"/workspace/backup","scopes":[{"id":"data","source":"/home/theseus/data","stored":"data"}]}
+    })
+}
+
+#[test]
+fn report_five_roundtrips_rollback_metadata_without_authorizing_unmatched_flow() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = report::create(&temp.path().join("run")).unwrap();
+    let mut value: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/reports/schema2-report.json")).unwrap();
+    value["schema_version"] = 5.into();
+    value["scenarios"][0]["rollback"] = rollback_policy_json();
+    let stage = &mut value["scenarios"][0]["stages"][0];
+    stage["checks"][0]["backup"] = serde_json::json!({"source_path":"/home/theseus/data","stored_path":"/workspace/backup/data"});
+    stage["commands"][0]["expected_failure"] = serde_json::json!({"expected_exit":9,"stdout_contains":"upgrade failed","stdout_matched":true});
+    stage["commands"][0]["outcome"] = "expected_failure".into();
+    stage["commands"][0]["exit_status"] = 9.into();
+    let run: RunReport = serde_json::from_value(value.clone()).unwrap();
+    store.save(&run).unwrap();
+    let loaded = report::load(store.root()).unwrap();
+    assert_eq!(loaded.outcome, RunOutcome::Incomplete);
+    let saved = serde_json::to_value(loaded).unwrap();
+    assert_eq!(
+        saved["scenarios"][0]["rollback"],
+        value["scenarios"][0]["rollback"]
+    );
+    assert_eq!(
+        saved["scenarios"][0]["stages"][0]["commands"][0]["expected_failure"],
+        value["scenarios"][0]["stages"][0]["commands"][0]["expected_failure"]
+    );
+    assert_eq!(
+        saved["scenarios"][0]["stages"][0]["checks"][0]["backup"],
+        value["scenarios"][0]["stages"][0]["checks"][0]["backup"]
+    );
+}
+
+#[test]
+fn rollback_metadata_and_every_reference_have_report_five_floor() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = report::create(&temp.path().join("run")).unwrap();
+    for version in 1..=4 {
+        for feature in [
+            "policy",
+            "proof",
+            "backup",
+            "outcome",
+            "before_upgrade",
+            "before_attempt",
+            "before_rollback",
+            "known_good",
+            "backup_created",
+            "upgrade_failed",
+            "rolled_back",
+            "backup_removed",
+        ] {
+            for side in ["before_stage", "after_stage"] {
+                let mut value: serde_json::Value =
+                    serde_json::from_str(include_str!("fixtures/reports/schema2-report.json"))
+                        .unwrap();
+                value["schema_version"] = version.into();
+                // Remove preexisting newer evidence so the targeted feature is the only reason for rejection.
+                value["selected_scenarios"] = serde_json::json!(["clean"]);
+                let scenario = &mut value["scenarios"][0];
+                scenario["scenario"] = "clean".into();
+                let stage = &mut scenario["stages"][0];
+                stage["step"] = "install_target".into();
+                stage["checkpoint"] = "target_installed".into();
+                stage["checks"][0]["checkpoint"] = "target_installed".into();
+                stage["checks"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("comparison");
+                match feature {
+                    "policy" => scenario["rollback"] = rollback_policy_json(),
+                    "proof" => {
+                        stage["commands"][0]["expected_failure"] = serde_json::json!({"expected_exit":9,"stdout_contains":"failed","stdout_matched":true})
+                    }
+                    "backup" => {
+                        stage["checks"][0]["backup"] =
+                            serde_json::json!({"source_path":"/data","stored_path":"/backup/data"})
+                    }
+                    "outcome" => stage["commands"][0]["outcome"] = "expected_failure".into(),
+                    _ => {
+                        stage["checks"][0]["comparison"] = serde_json::json!({"before_stage":"configured","after_stage":"target_installed"});
+                        stage["checks"][0]["comparison"][side] = feature.into();
+                    }
+                }
+                fs::write(store.report_path(), serde_json::to_vec(&value).unwrap()).unwrap();
+                assert!(
+                    report::load(store.root()).is_err(),
+                    "schema{version}/{feature}/{side}"
+                );
+                if let Ok(run) = serde_json::from_value::<RunReport>(value) {
+                    assert!(
+                        store.save(&run).is_err(),
+                        "writer schema{version}/{feature}/{side}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn failure_proof_is_strict_and_never_passes_without_rollback_context() {
+    let mut stage = StageReport::new("attempt_upgrade");
+    stage.outcome = StageOutcome::Passed;
+    let mut command =
+        serde_json::to_value(CommandRecord::new("attempt", "attempt_upgrade")).unwrap();
+    command["outcome"] = "expected_failure".into();
+    command["exit_status"] = 9.into();
+    command["expected_failure"] =
+        serde_json::json!({"expected_exit":9,"stdout_contains":"failed","stdout_matched":true});
+    for mutation in [
+        "valid",
+        "missing-proof",
+        "invalid-status",
+        "empty-marker",
+        "unmatched",
+        "missing-receipt",
+        "truncated",
+        "timeout",
+        "error",
+        "stray-proof",
+        "cancel",
+    ] {
+        let mut value = command.clone();
+        match mutation {
+            "missing-proof" => {
+                value.as_object_mut().unwrap().remove("expected_failure");
+            }
+            "invalid-status" => value["expected_failure"]["expected_exit"] = 126.into(),
+            "empty-marker" => value["expected_failure"]["stdout_contains"] = "".into(),
+            "unmatched" => value["expected_failure"]["stdout_matched"] = false.into(),
+            "missing-receipt" => value["exit_status"] = serde_json::Value::Null,
+            "truncated" => {
+                value["stdout"] = serde_json::json!({"path":"logs/out","bytes":20,"truncated":true})
+            }
+            "timeout" => value["timed_out"] = true.into(),
+            "error" => value["error"] = "transport".into(),
+            "stray-proof" => value["outcome"] = "succeeded".into(),
+            "cancel" => value["cancelled"] = true.into(),
+            _ => {}
+        }
+        stage.commands = vec![serde_json::from_value(value).unwrap()];
+        assert_eq!(
+            stage.aggregate_outcome(),
+            if mutation == "cancel" {
+                RunOutcome::Cancelled
+            } else {
+                RunOutcome::Incomplete
+            },
+            "{mutation}"
+        );
+    }
+    for malformed in [
+        serde_json::json!({"expected_exit":9,"stdout_contains":"failed"}),
+        serde_json::json!({"expected_exit":"9","stdout_contains":"failed","stdout_matched":true}),
+        serde_json::json!({"expected_exit":9,"stdout_contains":"failed","stdout_matched":true,"extra":true}),
+    ] {
+        let mut value = command.clone();
+        value["expected_failure"] = malformed;
+        assert!(serde_json::from_value::<CommandRecord>(value).is_err());
+    }
+}
+
+#[test]
+fn old_reports_omit_rollback_fields_and_schema_four_still_normalizes() {
+    let mut run: RunReport =
+        serde_json::from_str(include_str!("fixtures/reports/schema2-report.json")).unwrap();
+    let value = serde_json::to_value(&run).unwrap();
+    assert!(value["scenarios"][0].get("rollback").is_none());
+    assert!(
+        value["scenarios"][0]["stages"][0]["commands"][0]
+            .get("expected_failure")
+            .is_none()
+    );
+    assert!(
+        value["scenarios"][0]["stages"][0]["checks"][0]
+            .get("backup")
+            .is_none()
+    );
+    run.schema_version = 4;
+    run.scenarios[0].stages[0].commands[0].error = Some("incomplete".into());
+    let temp = tempfile::tempdir().unwrap();
+    let store = report::create(&temp.path().join("run")).unwrap();
+    store.save(&run).unwrap();
+    assert_eq!(
+        report::load(store.root()).unwrap().outcome,
+        RunOutcome::Incomplete
+    );
 }

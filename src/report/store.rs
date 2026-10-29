@@ -1,7 +1,7 @@
 use crate::{
     model::{
-        Checkpoint, JOURNAL_SCHEMA_VERSION, LogReference, REPORT_SCHEMA_VERSION, RunJournal,
-        RunReport, ScenarioKind, StepName,
+        Checkpoint, JOURNAL_SCHEMA_VERSION, LogReference, RunJournal, RunReport, ScenarioKind,
+        StepName,
     },
     recipe::DEFAULT_LOG_LIMIT,
 };
@@ -248,7 +248,7 @@ fn log_components(relative: &str) -> Result<Vec<&str>> {
 }
 fn validate_report(report: &RunReport) -> Result<()> {
     ensure!(
-        matches!(report.schema_version, 1 | 2 | 3 | REPORT_SCHEMA_VERSION),
+        matches!(report.schema_version, 1..=5),
         "unsupported report schema version {}",
         report.schema_version
     );
@@ -337,6 +337,26 @@ fn validate_report(report: &RunReport) -> Result<()> {
                         })
                     })),
             "downgrade evidence requires report schema version 4"
+        );
+    }
+    if report.schema_version < 5 {
+        ensure!(
+            report.scenarios.iter().all(|scenario| {
+                scenario.rollback.is_none()
+                    && scenario.stages.iter().all(|stage| {
+                        stage.commands.iter().all(|command| {
+                            command.expected_failure.is_none()
+                                && command.outcome != crate::model::CommandOutcome::ExpectedFailure
+                        }) && stage.checks.iter().all(|check| {
+                            check.backup.is_none()
+                                && check.comparison.as_ref().is_none_or(|reference| {
+                                    !crate::model::rollback_reference(&reference.before_stage)
+                                        && !crate::model::rollback_reference(&reference.after_stage)
+                                })
+                        })
+                    })
+            }),
+            "rollback evidence requires report schema version 5"
         );
     }
     for scenario in &report.scenarios {

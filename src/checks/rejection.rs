@@ -16,34 +16,17 @@ pub fn assess_rejection(
     stdout_contains: &str,
     observed: &CommandObservation,
 ) -> RejectionAssessment {
-    let (outcome, message) =
-        if !(1..=125).contains(&expected_exit) || stdout_contains.trim().is_empty() {
-            (
-                CheckOutcome::Incomplete,
-                "invalid declared refusal status or stdout marker",
-            )
-        } else if !observed.complete || observed.error.is_some() || observed.exit_status.is_none() {
-            (CheckOutcome::Incomplete, "refusal evidence incomplete")
-        } else if observed.exit_status != Some(expected_exit) {
-            (
-                CheckOutcome::Failed,
-                "exit status differs from declared refusal",
-            )
-        } else if !observed.stdout.contains(stdout_contains) {
-            (
-                CheckOutcome::Failed,
-                "literal stdout marker for declared refusal is absent",
-            )
-        } else {
-            (
-                CheckOutcome::Passed,
-                "declared refusal status and literal stdout marker matched",
-            )
-        };
-    // Static summaries are valid UTF-8, below 1024 bytes, and never copy output,
-    // adapter errors or potentially forwarded values into report summaries.
-    RejectionAssessment {
-        outcome,
-        message: message.into(),
-    }
+    let (outcome, message) = super::completion::assess(
+        expected_exit,
+        stdout_contains,
+        observed,
+        [
+            "invalid declared refusal status or stdout marker",
+            "refusal evidence incomplete",
+            "exit status differs from declared refusal",
+            "literal stdout marker for declared refusal is absent",
+            "declared refusal status and literal stdout marker matched",
+        ],
+    );
+    RejectionAssessment { outcome, message }
 }

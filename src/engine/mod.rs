@@ -333,6 +333,7 @@ fn mark_remaining_checks(recipe: &ValidatedRecipe, scenario: &mut ScenarioReport
             message: "scenario interrupted; check not performed".into(),
             path: check.expectation.path().map(str::to_owned),
             command_ids: vec![],
+            backup: None,
             comparison: matches!(check.expectation, Expectation::Unchanged { .. })
                 .then(|| ComparisonReference::for_checkpoint(check.checkpoint))
                 .flatten(),

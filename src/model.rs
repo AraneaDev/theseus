@@ -1,4 +1,7 @@
 //! Stable, serializable identifiers and evidence shared by every interface.
+mod rollback;
+pub(crate) use rollback::rollback_reference;
+pub use rollback::{BackupReference, ExpectedFailureEvidence};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -75,6 +78,8 @@ pub struct CheckResult {
     pub command_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comparison: Option<ComparisonReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup: Option<BackupReference>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComparisonReference {
@@ -110,7 +115,7 @@ pub struct Finding {
     pub message: String,
 }
 
-pub const REPORT_SCHEMA_VERSION: u32 = 4;
+pub const REPORT_SCHEMA_VERSION: u32 = 5;
 pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
 named_enum!(RunOutcome { Passed => "passed", Failed => "failed", Incomplete => "incomplete", Cancelled => "cancelled" });
 impl RunOutcome {
@@ -135,7 +140,7 @@ impl RunOutcome {
     }
 }
 named_enum!(StageOutcome { Pending => "pending", Running => "running", Passed => "passed", Failed => "failed", Incomplete => "incomplete", Cancelled => "cancelled", Skipped => "skipped" });
-named_enum!(CommandOutcome { ExpectedRejection => "expected_rejection", Interrupted => "interrupted", Succeeded => "succeeded", Failed => "failed", TimedOut => "timed_out", Cancelled => "cancelled", Error => "error", Skipped => "skipped" });
+named_enum!(CommandOutcome { ExpectedFailure => "expected_failure", ExpectedRejection => "expected_rejection", Interrupted => "interrupted", Succeeded => "succeeded", Failed => "failed", TimedOut => "timed_out", Cancelled => "cancelled", Error => "error", Skipped => "skipped" });
 named_enum!(InterruptionMechanism { ContainerSigkill => "container_sigkill" });
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterruptionEvidence {
@@ -219,6 +224,8 @@ pub struct CommandRecord {
     pub interruption: Option<InterruptionEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rejection: Option<RejectionEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_failure: Option<ExpectedFailureEvidence>,
 }
 impl CommandRecord {
     pub fn new(id: impl Into<String>, phase: impl Into<String>) -> Self {
@@ -242,6 +249,7 @@ impl CommandRecord {
             skip_reason: None,
             interruption: None,
             rejection: None,
+            expected_failure: None,
         }
     }
 }
@@ -327,6 +335,9 @@ impl StageReport {
             _ => RunOutcome::Incomplete,
         };
         let mut outcomes = vec![initial];
+        if self.unmatched_rollback_evidence() {
+            outcomes.push(RunOutcome::Incomplete);
+        }
         if self.restart.as_ref().is_some_and(|proof| {
             !proof.running_verified
                 || self.name != "restart_after_interrupt"
@@ -370,7 +381,9 @@ impl StageReport {
                     CommandOutcome::ExpectedRejection if self.verified_rejection() => {
                         RunOutcome::Passed
                     }
-                    CommandOutcome::ExpectedRejection => RunOutcome::Incomplete,
+                    CommandOutcome::ExpectedRejection | CommandOutcome::ExpectedFailure => {
+                        RunOutcome::Incomplete
+                    }
                     CommandOutcome::Interrupted if self.verified_interruption() => {
                         RunOutcome::Passed
                     }
@@ -390,6 +403,8 @@ pub struct ScenarioReport {
     pub scenario: ScenarioKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub downgrade: Option<crate::recipe::DowngradeContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback: Option<crate::recipe::RollbackContract>,
     pub outcome: RunOutcome,
     pub container_id: Option<String>,
     pub stages: Vec<StageReport>,
@@ -404,6 +419,7 @@ impl ScenarioReport {
             profile,
             scenario,
             downgrade: None,
+            rollback: None,
             outcome: RunOutcome::Incomplete,
             container_id: None,
             stages: Vec::new(),
@@ -418,6 +434,9 @@ impl ScenarioReport {
             .iter()
             .map(StageReport::aggregate_outcome)
             .collect::<Vec<_>>();
+        if self.unmatched_rollback_policy() {
+            outcomes.push(RunOutcome::Incomplete);
+        }
         for (index, stage) in self.stages.iter().enumerate() {
             let interrupt_step = match self.scenario {
                 ScenarioKind::InterruptedInstall => Some(StepName::InterruptInstall),
