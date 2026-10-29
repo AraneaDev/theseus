@@ -4,8 +4,8 @@ Know what your tool leaves behind.
 
 Theseus rehearses CLI installation, configuration, upgrade, reinstall,
 interrupted installation/upgrade, forward recovery, declared downgrade compatibility
-or rejection, rollback after a declared failed upgrade, runtime checks, and uninstall
-in disposable Linux containers.
+or rejection, rollback after a declared failed or deliberately interrupted upgrade,
+runtime checks and uninstall in disposable Linux containers.
 A Ratatui workbench and headless CLI use one scenario engine. Evidence includes commands, private logs, file fingerprints,
 declared check outcomes, and remaining files that need review.
 
@@ -111,8 +111,26 @@ declared failure marker, and exits 9. Explicit rollback restores the known-good
 binary. `binary_only` retains migrated data and proves the old tool can read it;
 `restore_data` additionally verifies a mapped in-container backup and restoration
 of the entire declared data subtree. See the [rollback walkthrough](examples/rollback/README.md)
-for timing, generated checks, failure evidence and limits. Rollback after an
-interrupted upgrade remains the required next milestone.
+for timing, generated checks, failure evidence and limits.
+
+Schema 6 adds rollback after a deliberately interrupted upgrade, again with both
+policies and user/system profiles:
+
+```sh
+theseus validate --recipe examples/interrupted-rollback/binary-only.toml
+theseus validate --recipe examples/interrupted-rollback/restore-data.toml
+theseus run --headless --recipe examples/interrupted-rollback/binary-only.toml
+theseus run --headless --recipe examples/interrupted-rollback/restore-data.toml
+theseus run --recipe examples/interrupted-rollback/restore-data.toml  # preview, then r
+```
+
+The candidate changes the binary and data, starts a background writer and reaches
+a cooperative barrier. Theseus verifies whole-container SIGKILL and same-ID
+restart, observes actual Changed evidence, then authorizes explicit rollback.
+`binary_only` proves the old tool can read retained partial data; `restore_data`
+also proves mapped backup/restoration and cleanup. The [interrupted rollback
+walkthrough](examples/interrupted-rollback/README.md) explains original versus
+immediate references, typed runtime/reader evidence, authorization and limits.
 
 Create your own starter with `theseus init`. It refuses to overwrite an existing
 recipe. Replace the failing placeholder commands **and** the `.` artifact paths
@@ -125,6 +143,17 @@ environment before execution. In preview, `p` cycles available profiles and `s`
 cycles the recipe’s declared scenarios and all; `r` starts the displayed selection.
 Arrows or `j/k` and Page Up/Down scroll the preview. Preview never executes
 automatically.
+
+Interactive startup and ordinary idle exit show Theseus entering and retracing a
+labyrinth with Ariadne's thread: six 900ms frames per scene (5.4 seconds each).
+These scenes are decorative, with no observed lifecycle progress or success claim.
+Space skips startup; `q` quits startup without starting a run. Space or `q` skips
+exit. Run/selection input during startup is discarded. Global `--no-animation`
+skips both scenes, for example `theseus --no-animation run --recipe PATH`.
+TERM=dumb, terminals below 40 columns or 18 rows, and a resize below that size skip
+without dwell. Headless, JSON, validate, init, help and version never animate.
+Active quit starts cancellation immediately; signals, errors and cleanup deadlines
+bypass the exit scene and preserve the actual outcome and terminal restoration.
 
 During live or saved report viewing:
 
@@ -152,8 +181,9 @@ See the [standalone](examples/standalone/theseus.toml),
 [reinstall](examples/reinstall/theseus.toml),
 [interruption](examples/interruption/theseus.toml),
 [compatible downgrade](examples/downgrade/compatible.toml),
-[rejection](examples/downgrade/rejection.toml), and
-[rollback policies](examples/rollback/README.md) and their installers.
+[rejection](examples/downgrade/rejection.toml),
+[rollback policies](examples/rollback/README.md), and
+[interrupted rollback policies](examples/interrupted-rollback/README.md) and their installers.
 Recipes reject unknown fields and define a name, image, network (`none` by default
 or explicit `bridge`), artifacts, profiles, and nonoverlapping absolute observation
 roots. Inputs resolve inside the recipe project, are materialized and hashed, then copied into
@@ -215,7 +245,21 @@ also be a selected binary check. `binary_only` declares no backup. `restore_data
 requires explicit `backup`/`cleanup_backup` commands, a previously absent
 `backup_root`, and 1..64 nonoverlapping source-to-relative-storage mappings.
 Sources and storage must lie within observations and be separate from binaries.
-The `__theseus_rollback_` check ID prefix is reserved for generated checks.
+The `__theseus_rollback_` check ID prefix is reserved for generated checks in
+rollback-enabled recipes.
+
+Schema 6 adds `interrupted_rollback`, selected with CLI
+`--scenario interrupted-rollback`, and `[profiles.NAME.interrupted_rollback]`.
+It declares the same `change_checks`, `binary_checks`, `runtime_checks`,
+`data_checks` and `restoration` keys as rollback, with no `failure` field.
+It reuses `interrupt_upgrade`, `rollback`, `exercise_rolled_back` and optional
+`backup`/`cleanup_backup`. Changed checks belong to `interrupted`; no forward
+`recover_upgrade` runs. A known-good actual reader is required before the attempt,
+and required runtime/readers retain typed expected-exit, literal-match and
+command/log evidence. Restored executable name/path/args/marker bind to the original;
+known-good and restored reader scripts may differ. Ordinary and interrupted
+rollback can coexist with different modes/check IDs; each entry gets its own owned
+container and independent authorization.
 
 Both `user` and `system` profiles run configure/exercise/checks as UID/GID
 10001:10001. User installation/upgrade/reinstall/interruption/recovery/downgrade,
@@ -312,17 +356,18 @@ path, version argv, exit status, and optional literal output. `present` and
 `absent` inspect paths (including dangling links); `preserved` compares an exact
 path's content hash, kind, link, ownership and mode with configured evidence.
 Preservation is valid at upgrade target_installed, reinstalled, uninstalled,
-downgraded/downgrade_rejected, or interrupted/recovered in interrupted upgrade;
-use an explicit command check for intentional migrations. File checks must fall
-within observed roots. Hashes establish observed bytes, not arbitrary semantic correctness.
+downgraded/downgrade_rejected, interrupted/recovered in interrupted upgrade, or
+interrupted in interrupted rollback; use an explicit command check for intentional
+migrations. File checks must fall within observed roots. Hashes establish observed bytes, not arbitrary semantic correctness.
 
 `unchanged` is valid at `reinstalled` in schema 2 declaring reinstall, and at
 `interrupted`/`recovered` in schema 3 declaring interruption scenarios, or at the
 selected `downgraded`/`downgrade_rejected` checkpoint in schema 4 declaring downgrade,
-or `rolled_back` in schema 5 declaring rollback. `changed` is valid only at
-rollback's `upgrade_failed`: observed additions, removals and content/type/metadata
-changes pass; equality or absence at both ends fails. Uncertain coverage or an
-unsafe ancestor remains incomplete. Unchanged compares a file’s hash, size, kind,
+or `rolled_back` in schema 5 declaring rollback or schema 6 declaring interrupted
+rollback. `changed` is valid at ordinary rollback's `upgrade_failed` and
+interrupted rollback's `interrupted`: observed additions, removals and
+content/type/metadata changes pass; equality or absence at both ends fails.
+Uncertain coverage or an unsafe ancestor remains incomplete. Unchanged compares a file’s hash, size, kind,
 UID/GID, and mode; a directory compares its own
 metadata and all observed descendants, including added/removed children. A
 symlink compares its observed link target and metadata without following it.
@@ -367,8 +412,8 @@ This models an abrupt whole-container stop at one cooperative pause point. It
 does not establish host power-loss durability/fsync behavior, arbitrary installer
 interleavings or service-manager behavior. Recovery is an
 explicit forward application command; ordinary timeout/cancellation never retries
-or recovers automatically. Rollback after an interrupted upgrade remains required
-future work.
+or recovers automatically. Rollback after an interrupted upgrade uses
+a separate schema-6 scenario with explicit rollback and known-good proof.
 
 Downgrade chooses its branch from the declared policy. A compatible attempt
 must return zero; a rejection policy must return its exact declared status with
@@ -396,6 +441,22 @@ bytes/metadata; application authors own quiescence and application-specific back
 and restoration, including database consistency. No host backup/export, atomic
 snapshot or power-loss durability is claimed.
 
+Interrupted rollback follows the same known-good/backup prefix, captures
+`before_interrupt` immediately before `interrupt_upgrade`, verifies stop and
+same-ID restart, captures Interrupted and its checks, then captures fresh
+`before_rollback` before the shared rollback/cleanup tail. Actual Changed compares
+`before_interrupt` to `interrupted`; restoration and fresh mapped backup readiness
+compare original `before_upgrade`. No observation is claimed while stopped.
+Verified stop/restart, complete observations, actual mutation, every prerequisite
+and fresh backup readiness are all required. Missing proof is Incomplete; known
+predicate mismatch is Failed; cancellation retains precedence. A prior successful
+backup check cannot authorize restoration after later check-induced corruption.
+The backup root is never deleted if it predated the run; cleanup is authorized only
+when absent-root verification passed and backup actually started. See the
+[walkthrough](examples/interrupted-rollback/README.md) for the mapped check list.
+This declared cooperative barrier does not establish arbitrary fault timing or
+host/database durability; authors own quiescence and database consistency.
+
 Timeout/cancellation removes the owned scenario container, including descendants;
 it cannot promise application uninstall observations after that removal. If the
 daemon is unavailable, separately bounded cleanup may fail and leave journaled
@@ -409,12 +470,13 @@ Acquisition errors, unsupported archives, symlinked observed-root ancestors and
 observation overflow remain incomplete rather than silently passing.
 
 Runs are saved under the recipe project's `.theseus-runs/<id>/`, using private
-0700 directories and 0600 files: atomic `report.json` (schema 5), `journal.json`
-(schema 1), and separate bounded logs. Readers accept report schemas 1, 2, 3, 4 and 5; schema 1
+0700 directories and 0600 files: atomic `report.json` (schema 6), `journal.json`
+(schema 1), and separate bounded logs. Readers accept report schemas 1 through 6; schema 1
 continues to represent clean/upgrade evidence, while reinstall/comparison evidence
 requires schema 2 or later. Interruption/proof/restart evidence requires schema 3.
 Downgrade policy, checkpoints and rejection proof require schema 4. Rollback
-policy, failure proof, Changed checks and backup metadata require schema 5. Recovery
+policy, failure proof, Changed checks and backup metadata require schema 5.
+Interrupted rollback and its typed command expectations require schema 6. Recovery
 journals and ownership labels remain version 1. No observed file contents are retained except explicit command output; metadata/hashes and diffs are stored.
 Reports can be large (load limit 64 MiB), and UI reloads parse saved metadata on progress notifications.
 
@@ -434,13 +496,10 @@ Inspect Docker separately in that exceptional window.
 
 ```sh
 cargo fmt --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
-cargo build --locked --release
-cargo test --locked --test docker_lifecycle -- --ignored --test-threads=1
-cargo test --locked --test interruption_lifecycle -- --ignored --test-threads=1
-cargo test --locked --test downgrade_lifecycle -- --ignored --test-threads=1
-cargo test --locked --test rollback_lifecycle -- --ignored --test-threads=1
+cargo clippy --offline --locked --all-targets -- -D warnings
+cargo test --offline --locked
+cargo build --offline --locked --release
+cargo test --offline --locked --test docker_lifecycle --test interruption_lifecycle --test downgrade_lifecycle --test rollback_lifecycle --test interrupted_rollback_lifecycle -- --ignored --test-threads=1
 ```
 
 Regular tests include wide/narrow TestBackend behavior and actual Unix PTY
@@ -462,8 +521,13 @@ Rollback acceptance covers both profiles and restoration policies, exact failure
 and Changed evidence, complete mapped backup/restoration checks, runtime/readers,
 source/backup corruption, baseline-root protection, no-op/partial restoration,
 metadata/link/child changes, reference timing and timeout/cancellation.
-All four ignored Docker test binaries are explicitly required in CI. Actual PTYs exercise narrow live
-selection, new-report comparison visibility, offline viewing, and terminal recovery.
+Interrupted-rollback acceptance adds both profiles/policies with same-ID stop and
+restart, original/immediate/fresh reference boundaries, typed runtime/reader proof,
+faults that block restoration and exact owned teardown. Default animation PTYs
+exercise frames, skips, discarded input, opt-outs, active cancellation, signals,
+errors and terminal restoration. All five ignored Docker test binaries are
+explicitly required in CI. Actual PTYs exercise narrow live selection, new-report
+comparison visibility, offline viewing, and terminal recovery.
 
 A separate real Phrourion 0.8.1 → 0.8.2 rehearsal passed all four matrix entries
 and 32 declared checks, using actual binaries, controlled configuration and a

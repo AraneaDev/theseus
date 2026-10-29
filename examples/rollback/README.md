@@ -110,12 +110,13 @@ fallback, retry or container restart in this scenario.
 
 Recipe/report schema 5 supplies rollback, Changed, failure proof and backup
 metadata. Earlier recipes retain their semantics, and readers accept reports
-1/2/3/4/5; journals and ownership remain version 1. Headless/TUI outcomes use exit
+1/2/3/4/5/6; journals and ownership remain version 1. Headless/TUI outcomes use exit
 0 for all declared expectations passed (including cleanup), 1 for failed
 expectations, 2 for invalid input/incomplete evidence, and 130 for cancellation.
 `report --json` returns 0 when it successfully reads a report, irrespective of the
 saved run outcome. Inspect the saved outcome and review findings as well.
 
-This milestone handles an ordinary declared failed upgrade. Rollback after an
-interrupted upgrade remains required next; the interruption examples currently
-perform explicit forward recovery.
+These recipes handle an ordinary declared failed upgrade. The separate
+[interrupted rollback recipes](../interrupted-rollback/README.md) use verified
+whole-container stop and same-ID restart before explicit known-good rollback.
+The interruption examples continue to perform explicit forward recovery.

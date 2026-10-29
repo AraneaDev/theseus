@@ -1,9 +1,10 @@
 # Theseus roadmap
 
-Theseus 0.5 ships a shared Docker lifecycle engine, Ratatui workbench, headless
+Theseus 0.6 ships a shared Docker lifecycle engine, Ratatui workbench, headless
 CLI, versioned recipes/reports, private bounded logs, user/system profiles,
 clean/upgrade/reinstall, interrupted-install/upgrade, downgrade and failed-upgrade
-rollback scenarios, explicit assertions, cancellation and verified recovery.
+rollback scenarios, interrupted-upgrade rollback, decorative startup/exit animations,
+explicit assertions, cancellation and verified recovery.
 Self-contained fixtures establish these declared container contracts. A separate
 real Phrourion binary-copy rehearsal covers clean/upgrade and reinstall.
 Reinstall uses explicit schema-2 declarations and stable path/subtree
@@ -37,18 +38,36 @@ returns an exact declared failure. Explicit rollback restores the binary and
 proves the bound old runtime and actual data reader. `binary_only` retains data;
 `restore_data` adds complete source-to-stored backup comparisons, fresh backup
 validation before restoration, restored scopes and backup cleanup. Both profiles
-pass real Docker and live/offline narrow PTY acceptance. Reports write schema 5
-and read schemas 1/2/3/4/5. These are observed scoped contracts, not generic host
+pass real Docker and live/offline narrow PTY acceptance. Schema-5 evidence remains
+readable. These are observed scoped contracts, not generic host
 backup/restore, atomic snapshots or database-consistency guarantees.
+
+Schema 6 adds explicit rollback after a deliberately interrupted upgrade, with
+both `binary_only` and `restore_data` policies for both profiles. A cooperative
+nonce-bound barrier precedes verified whole-container SIGKILL and same-ID restart
+without setup/input recopy. Changed evidence uses the immediate `before_interrupt`
+reference; original `before_upgrade` remains immutable for binary/restoration and
+fresh mapped-backup readiness checks. Bound original runtime and actual old-tool
+readers retain typed expected-exit/literal-match and command/log evidence. Ordinary
+failed-upgrade rollback keeps its separate normal-failure contract. Both policies
+pass real Docker and live/offline narrow PTYs, including missing-proof, corrupt
+backup, no-op/partial restore, metadata/reader/runtime faults and cancellation.
+Reports write schema 6 and read schemas 1 through 6; journals and ownership stay
+version 1. These are scoped cooperative observations with author-managed
+quiescence, not arbitrary fault timing, database consistency or host durability.
+
+Interactive startup and ordinary idle exit animate Theseus entering and retracing
+the labyrinth along Ariadne's thread. Each default scene has six 900ms frames
+(5.4 seconds); Space skips startup and Space/q skips exit. Global `--no-animation`,
+TERM=dumb and small terminals skip scenes; headless/JSON/validation never animate.
+Scenes are decorative and make no lifecycle-progress or success claim. Active
+quit cancels immediately, and signals/errors/cleanup deadlines bypass exit scenes.
+Actual normal and active Docker PTYs verify controls and terminal restoration.
 
 The following capabilities are planned, not available features.
 
-## Additional lifecycle scenarios
+## Next: comparisons and scalable browsing
 
-- **Required next: rollback after an interrupted upgrade.** Combine verified
-  interruption and same-ID restart with the known-good backup/rollback contract.
-  The current interruption scenarios run explicit forward recovery; schema-5
-  rollback handles an ordinary declared failure. Interrupted rollback is not shipped.
 - Comparisons between installation methods and image versions.
 - More scalable metadata/log paging for large reports and preview editing.
 
