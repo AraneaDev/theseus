@@ -52,6 +52,7 @@ pub enum ProfileSelection {
 pub enum ScenarioSelection {
     Clean,
     Upgrade,
+    Reinstall,
     All,
 }
 /// Dispatch interactive and headless interfaces through the shared engine.
@@ -116,6 +117,7 @@ pub fn execute(cli: Cli) -> Result<i32> {
             options.scenarios = match scenario {
                 ScenarioSelection::Clean => vec![ScenarioKind::Clean],
                 ScenarioSelection::Upgrade => vec![ScenarioKind::Upgrade],
+                ScenarioSelection::Reinstall => vec![ScenarioKind::Reinstall],
                 ScenarioSelection::All => options.scenarios,
             };
             if !headless {

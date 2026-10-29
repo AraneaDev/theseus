@@ -1,5 +1,8 @@
 use crate::{
-    model::{JOURNAL_SCHEMA_VERSION, LogReference, REPORT_SCHEMA_VERSION, RunJournal, RunReport},
+    model::{
+        Checkpoint, JOURNAL_SCHEMA_VERSION, LogReference, REPORT_SCHEMA_VERSION, RunJournal,
+        RunReport, ScenarioKind, StepName,
+    },
     recipe::DEFAULT_LOG_LIMIT,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -243,6 +246,23 @@ fn validate_report(report: &RunReport) -> Result<()> {
         "unsupported report schema version {}",
         report.schema_version
     );
+    if report.schema_version == 1 {
+        ensure!(
+            !report.selected_scenarios.contains(&ScenarioKind::Reinstall)
+                && report.scenarios.iter().all(|scenario| {
+                    scenario.scenario != ScenarioKind::Reinstall
+                        && scenario.stages.iter().all(|stage| {
+                            stage.step != Some(StepName::Reinstall)
+                                && stage.checkpoint != Some(Checkpoint::Reinstalled)
+                                && stage.checks.iter().all(|check| {
+                                    check.checkpoint != Checkpoint::Reinstalled
+                                        && check.comparison.is_none()
+                                })
+                        })
+                }),
+            "reinstall evidence and comparison references require report schema version 2"
+        );
+    }
     for scenario in &report.scenarios {
         for stage in &scenario.stages {
             for command in &stage.commands {

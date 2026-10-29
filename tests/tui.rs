@@ -24,6 +24,7 @@ fn fixture(root: &Path) -> App {
         message: "old executable wins on PATH".into(),
         path: None,
         command_ids: vec![],
+        comparison: None,
     });
     second.errors.push("observation could not finish".into());
     let mut command = CommandRecord::new("cmd1", "version");
@@ -374,4 +375,89 @@ fn version_two_preview_cycles_in_declaration_order() {
         key(&mut app, KeyCode::Char('s'));
         assert_eq!(app.options.as_ref().unwrap().scenarios, expected);
     }
+}
+
+#[test]
+fn reinstall_preview_explains_repeat_exercise_and_stable_scopes_and_cycles_declarations() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("target")).unwrap();
+    let path = temp.path().join("theseus.toml");
+    let text = include_str!("fixtures/recipes/v2_reinstall.toml");
+    for (declaration, choices) in [
+        ("[\"reinstall\"]", vec![vec![ScenarioKind::Reinstall]]),
+        (
+            "[\"reinstall\", \"clean\", \"upgrade\"]",
+            vec![
+                vec![
+                    ScenarioKind::Reinstall,
+                    ScenarioKind::Clean,
+                    ScenarioKind::Upgrade,
+                ],
+                vec![ScenarioKind::Reinstall],
+                vec![ScenarioKind::Clean],
+                vec![ScenarioKind::Upgrade],
+            ],
+        ),
+    ] {
+        std::fs::write(&path, text.replace("[\"reinstall\"]", declaration)).unwrap();
+        let recipe = theseus::recipe::load(&path).unwrap();
+        let mut app = App::preview(recipe.clone(), theseus::engine::RunOptions::all(&recipe));
+        let preview = app.preview_text();
+        for expected in [
+            "exercise_before_reinstall",
+            "exercise_after_reinstall",
+            "before_reinstall",
+            "Declared stable scopes",
+            "/home/theseus/config",
+            "sh /inputs/target/install.sh user",
+        ] {
+            assert!(
+                preview.contains(expected),
+                "preview missing {expected}: {preview}"
+            );
+        }
+        assert!(!app.start_requested);
+        for choice in choices.iter().cycle().take(9) {
+            assert_eq!(&app.options.as_ref().unwrap().scenarios, choice);
+            key(&mut app, KeyCode::Char('s'));
+        }
+        key(&mut app, KeyCode::Char('r'));
+        // An all-three selection may require missing upgrade inputs, but preview
+        // selection itself never starts an execution implicitly.
+        if declaration == "[\"reinstall\"]" {
+            assert!(app.start_requested);
+        }
+    }
+}
+#[test]
+fn reinstall_failed_directory_scope_and_comparison_references_are_browsable() {
+    let mut report = RunReport::new("reinstall-failed");
+    let mut scenario =
+        ScenarioReport::new("user-reinstall", ProfileName::User, ScenarioKind::Reinstall);
+    let mut stage = StageReport::new("reinstalled");
+    stage.outcome = StageOutcome::Failed;
+    stage.checks.push(CheckResult {
+        id: "stable-config".into(),
+        checkpoint: Checkpoint::Reinstalled,
+        outcome: CheckOutcome::Failed,
+        message: "declared directory changed".into(),
+        path: Some("/home/theseus/config".into()),
+        command_ids: vec![],
+        comparison: Some(ComparisonReference::reinstall()),
+    });
+    scenario.stages.push(stage);
+    report.scenarios.push(scenario);
+    let mut app = App::offline(report, std::path::PathBuf::new());
+    for tab in [Tab::Stages, Tab::Findings, Tab::Files] {
+        app.tab = tab;
+        let items = app.items().join("\n");
+        for expected in ["before_reinstall", "reinstalled", "/home/theseus/config"] {
+            assert!(
+                items.contains(expected),
+                "missing {expected} in {tab:?}: {items}"
+            );
+        }
+    }
+    app.tab = Tab::Stages;
+    assert!(screen(&app, 52, 24).contains("declared directory changed"));
 }

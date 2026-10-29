@@ -23,6 +23,7 @@ fn failed_contract_evidence_survives_cleanup_error_and_cancellation_wins() {
         message: "binary remains".into(),
         path: Some("/usr/local/bin/tool".into()),
         command_ids: vec![],
+        comparison: None,
     });
     stage.outcome = StageOutcome::Failed;
     scenario.stages.push(stage);
@@ -403,4 +404,75 @@ fn report_versions_and_journal_versions_are_validated_independently() {
         .unwrap();
         assert!(report::load_journal(store.root()).is_err());
     }
+}
+
+#[test]
+fn schema_one_cannot_claim_new_reinstall_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = report::create(&temp.path().join("run")).unwrap();
+    let old: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/reports/schema1-report.json")).unwrap();
+    for (pointer, value) in [
+        ("/selected_scenarios/0", serde_json::json!("reinstall")),
+        ("/scenarios/0/scenario", serde_json::json!("reinstall")),
+        ("/scenarios/0/stages/0/step", serde_json::json!("reinstall")),
+        (
+            "/scenarios/0/stages/0/checkpoint",
+            serde_json::json!("reinstalled"),
+        ),
+        (
+            "/scenarios/0/stages/0/checks/0/checkpoint",
+            serde_json::json!("reinstalled"),
+        ),
+    ] {
+        let mut json = old.clone();
+        *json.pointer_mut(pointer).unwrap() = value;
+        fs::write(store.report_path(), serde_json::to_vec(&json).unwrap()).unwrap();
+        let error = report::load(store.root()).expect_err(pointer);
+        assert!(error.to_string().contains("schema version 2"), "{error:#}");
+        // The writer enforces the same rule as the reader.
+        assert!(store.save(&serde_json::from_value(json).unwrap()).is_err());
+    }
+    let mut json = old;
+    json["scenarios"][0]["stages"][0]["checks"][0]["comparison"] =
+        serde_json::json!({"before_stage":"before_reinstall", "after_stage":"reinstalled"});
+    fs::write(store.report_path(), serde_json::to_vec(&json).unwrap()).unwrap();
+    assert!(
+        report::load(store.root())
+            .unwrap_err()
+            .to_string()
+            .contains("schema version 2")
+    );
+}
+#[test]
+fn schema_two_reinstall_comparisons_round_trip_and_old_checks_omit_reference() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = report::create(&temp.path().join("run")).unwrap();
+    let mut json: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/reports/schema1-report.json")).unwrap();
+    let old: RunReport = serde_json::from_value(json.clone()).unwrap();
+    assert!(old.scenarios[0].stages[0].checks[0].comparison.is_none());
+    assert!(
+        serde_json::to_value(old).unwrap()["scenarios"][0]["stages"][0]["checks"][0]
+            .get("comparison")
+            .is_none()
+    );
+    json["schema_version"] = 2.into();
+    json["selected_scenarios"] = serde_json::json!(["reinstall"]);
+    json["scenarios"][0]["scenario"] = "reinstall".into();
+    json["scenarios"][0]["stages"][0]["step"] = "reinstall".into();
+    json["scenarios"][0]["stages"][0]["checkpoint"] = "reinstalled".into();
+    json["scenarios"][0]["stages"][0]["checks"][0]["checkpoint"] = "reinstalled".into();
+    json["scenarios"][0]["stages"][0]["checks"][0]["comparison"] =
+        serde_json::json!({"before_stage":"before_reinstall", "after_stage":"reinstalled"});
+    store.save(&serde_json::from_value(json).unwrap()).unwrap();
+    let loaded = report::load(store.root()).unwrap();
+    assert_eq!(loaded.scenarios[0].scenario, ScenarioKind::Reinstall);
+    assert_eq!(
+        loaded.scenarios[0].stages[0].checks[0].comparison,
+        Some(ComparisonReference {
+            before_stage: "before_reinstall".into(),
+            after_stage: "reinstalled".into()
+        })
+    );
 }

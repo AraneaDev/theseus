@@ -259,3 +259,131 @@ fn version_two_declaration_order_controls_defaults_and_selection_rejects_undecla
         .unwrap_err();
     assert!(error.to_string().contains("not declared"), "{error:#}");
 }
+
+const REINSTALL: &str = include_str!("fixtures/recipes/v2_reinstall.toml");
+#[test]
+fn reinstall_only_requires_repeat_and_stable_contract_for_each_selected_profile() {
+    let valid = load_text(REINSTALL).expect("v2 reinstall-only is valid without base inputs");
+    let selection = valid.declared_scenarios();
+    valid
+        .validate_selection(&[ProfileName::User], &selection)
+        .unwrap();
+    assert!(valid.base_artifact.is_none());
+    for (text, expected) in [
+        (
+            REINSTALL.replace(
+                "[profiles.user.steps.reinstall]\nscript = \"sh /inputs/target/install.sh user\"\n",
+                "",
+            ),
+            "requires step reinstall",
+        ),
+        (
+            REINSTALL.replace("kind = \"unchanged\"", "kind = \"present\""),
+            "unchanged",
+        ),
+    ] {
+        let recipe = load_text(&text).unwrap();
+        let error = recipe
+            .validate_selection(&[ProfileName::User], &recipe.declared_scenarios())
+            .unwrap_err();
+        assert!(error.to_string().contains(expected), "{error:#}");
+    }
+    let text = format!(
+        "{REINSTALL}\n[profiles.system.steps.install_target]\nscript='true'\n[profiles.system.steps.reinstall]\nscript='true'\n[profiles.system.steps.configure]\nscript='true'\n[profiles.system.steps.exercise]\nscript='true'\n[profiles.system.steps.uninstall]\nscript='true'\n"
+    );
+    let recipe = load_text(&text).unwrap();
+    recipe
+        .validate_selection(&[ProfileName::User], &recipe.declared_scenarios())
+        .unwrap();
+    assert!(
+        recipe
+            .validate_selection(&[ProfileName::System], &recipe.declared_scenarios())
+            .unwrap_err()
+            .to_string()
+            .contains("unchanged")
+    );
+}
+#[test]
+fn reinstall_contracts_require_version_declaration_observation_and_checkpoint() {
+    for (text, expected) in [
+        (
+            REINSTALL.replace("/home/theseus/config", "/etc/config"),
+            "outside observed roots",
+        ),
+        (
+            REINSTALL.replace(
+                "checkpoint = \"reinstalled\"",
+                "checkpoint = \"configured\"",
+            ),
+            "reinstalled",
+        ),
+        (
+            REINSTALL.replace("scenarios = [\"reinstall\"]", "scenarios = [\"clean\"]"),
+            "declare reinstall",
+        ),
+        (
+            REINSTALL.replace(
+                "schema_version = 2\nscenarios = [\"reinstall\"]",
+                "schema_version = 1",
+            ),
+            "schema version 2",
+        ),
+        (
+            REINSTALL
+                .replace("kind = \"unchanged\"", "kind = \"present\"")
+                .replace(
+                    "checkpoint = \"reinstalled\"",
+                    "checkpoint = \"configured\"",
+                )
+                .replace(
+                    "schema_version = 2\nscenarios = [\"reinstall\"]",
+                    "schema_version = 1",
+                ),
+            "schema version 2",
+        ),
+    ] {
+        let error = load_text(&text).unwrap_err();
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+    }
+}
+#[test]
+fn reinstalled_preservation_uses_configured_reference_but_target_requires_upgrade() {
+    let text = format!(
+        "{REINSTALL}\n[[profiles.user.checks]]\nid='retained'\ncheckpoint='reinstalled'\nkind='preserved'\npath='/home/theseus/config'\n"
+    );
+    let recipe = load_text(&text).unwrap();
+    recipe
+        .validate_selection(&[ProfileName::User], &recipe.declared_scenarios())
+        .unwrap();
+    let recipe = load_text(&text.replace(
+        "id='retained'\ncheckpoint='reinstalled'",
+        "id='retained'\ncheckpoint='target_installed'",
+    ))
+    .unwrap();
+    assert!(
+        recipe
+            .validate_selection(&[ProfileName::User], &recipe.declared_scenarios())
+            .unwrap_err()
+            .to_string()
+            .contains("requires the upgrade scenario")
+    );
+}
+
+#[test]
+fn version_one_independently_rejects_each_reinstall_only_feature() {
+    let ordinary = include_str!("fixtures/recipes/v2_clean.toml").replace(
+        "schema_version = 2\nscenarios = [\"clean\"]",
+        "schema_version = 1",
+    );
+    for addition in [
+        "[profiles.user.steps.reinstall]\nscript='true'\n",
+        "[[profiles.user.checks]]\nid='stable'\ncheckpoint='configured'\nkind='unchanged'\npath='/home/theseus/config'\n",
+        "[[profiles.user.checks]]\nid='present'\ncheckpoint='reinstalled'\nkind='present'\npath='/home/theseus/config'\n",
+    ] {
+        let error = load_text(&format!("{ordinary}\n{addition}")).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("schema version 2"),
+            "{error:#}"
+        );
+    }
+}

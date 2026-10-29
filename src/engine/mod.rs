@@ -305,7 +305,10 @@ fn mark_remaining_checks(recipe: &ValidatedRecipe, scenario: &mut ScenarioReport
     };
     stage.skip_reason = Some("scenario interrupted before these checks could run".into());
     for check in &recipe.recipe.profiles[&scenario.profile].checks {
-        if scenario.scenario == ScenarioKind::Clean && check.checkpoint == Checkpoint::BaseInstalled
+        if (scenario.scenario != ScenarioKind::Upgrade
+            && check.checkpoint == Checkpoint::BaseInstalled)
+            || (scenario.scenario != ScenarioKind::Reinstall
+                && check.checkpoint == Checkpoint::Reinstalled)
         {
             continue;
         }
@@ -324,6 +327,8 @@ fn mark_remaining_checks(recipe: &ValidatedRecipe, scenario: &mut ScenarioReport
             message: "scenario interrupted; check not performed".into(),
             path: check.expectation.path().map(str::to_owned),
             command_ids: vec![],
+            comparison: matches!(check.expectation, Expectation::Unchanged { .. })
+                .then(ComparisonReference::reinstall),
         });
     }
     if !stage.checks.is_empty() {

@@ -1,0 +1,22 @@
+schema_version = 2
+scenarios = ["reinstall"]
+name = "reinstall-only"
+image = "debian:bookworm-slim"
+observe = ["/home/theseus"]
+[artifacts]
+target = "target"
+[profiles.user.steps.install_target]
+script = "sh /inputs/target/install.sh user"
+[profiles.user.steps.reinstall]
+script = "sh /inputs/target/install.sh user"
+[profiles.user.steps.configure]
+script = "configure"
+[profiles.user.steps.exercise]
+script = "exercise"
+[profiles.user.steps.uninstall]
+script = "uninstall"
+[[profiles.user.checks]]
+id = "stable"
+checkpoint = "reinstalled"
+kind = "unchanged"
+path = "/home/theseus/config"

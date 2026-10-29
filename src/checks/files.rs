@@ -18,6 +18,13 @@ pub fn evaluate_filesystem(
             "runtime command evidence is required",
         );
     };
+    if matches!(check.expectation, Expectation::Unchanged { .. }) {
+        return result(
+            check,
+            CheckOutcome::Incomplete,
+            "before_reinstall reference is required for unchanged",
+        );
+    }
     let entry = match observed(path, current) {
         Ok(entry) => entry,
         Err(reason) => return result(check, CheckOutcome::Incomplete, reason),
@@ -41,7 +48,13 @@ pub fn evaluate_filesystem(
                 Err(reason) => return result(check, CheckOutcome::Incomplete, reason),
             }
         }
-        _ => unreachable!("path expectations handled above"),
+        _ => {
+            return result(
+                check,
+                CheckOutcome::Incomplete,
+                "runtime evidence is required",
+            );
+        }
     };
     result(
         check,

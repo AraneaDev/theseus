@@ -18,5 +18,6 @@ fn result(check: &Check, outcome: CheckOutcome, message: impl Into<String>) -> C
         message: message.into(),
         path: check.expectation.path().map(str::to_owned),
         command_ids: Vec::new(),
+        comparison: None,
     }
 }

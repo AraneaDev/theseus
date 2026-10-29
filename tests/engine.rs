@@ -446,3 +446,485 @@ fn version_two_clean_defaults_run_without_upgrade_inputs() {
     assert_eq!(result.report.scenarios.len(), 1);
     assert_eq!(result.report.scenarios[0].scenario, ScenarioKind::Clean);
 }
+
+/// Only the container boundary is simulated; lifecycle, assertions, persistence,
+/// observations, diffs, outcome aggregation and cleanup journals are real.
+#[derive(Default)]
+struct ReinstallEnvironment {
+    fault: &'static str,
+    files: BTreeMap<String, BTreeMap<String, theseus::snapshot::FileEntry>>,
+    phase: String,
+}
+fn entry(kind: FileKind, content: &str) -> theseus::snapshot::FileEntry {
+    theseus::snapshot::FileEntry {
+        kind,
+        mode: if kind == FileKind::Directory {
+            0o755
+        } else {
+            0o644
+        },
+        uid: 10001,
+        gid: 10001,
+        size: content.len() as u64,
+        sha256: (kind == FileKind::File).then(|| content.to_owned()),
+        link_target: None,
+    }
+}
+impl Environment for ReinstallEnvironment {
+    fn prepare(
+        &mut self,
+        _: &ValidatedRecipe,
+        _: bool,
+        _: &CancellationToken,
+    ) -> Result<PreparedEnvironment> {
+        Ok(PreparedEnvironment {
+            image_id: "sha256:reinstall".into(),
+            artifacts: vec![],
+        })
+    }
+    fn create(&mut self, run: &str, scenario: &str, _: &ValidatedRecipe) -> Result<OwnedResource> {
+        let id = format!("{run}-{scenario}");
+        self.files.insert(
+            id.clone(),
+            BTreeMap::from([("/home/theseus".into(), entry(FileKind::Directory, ""))]),
+        );
+        Ok(OwnedResource {
+            container_id: id,
+            labels: BTreeMap::new(),
+            removed: false,
+        })
+    }
+    fn setup(
+        &mut self,
+        _: &OwnedResource,
+        _: &ValidatedRecipe,
+        _: &CancellationToken,
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn execute(
+        &mut self,
+        resource: &OwnedResource,
+        request: CommandRequest,
+        _: &ReportStore,
+        _: &CancellationToken,
+    ) -> Result<ExecutedCommand> {
+        self.phase = request.phase.clone();
+        let files = self
+            .files
+            .get_mut(&resource.container_id)
+            .expect("same owned scenario container");
+        let mut record = CommandRecord::new(request.id, &request.phase);
+        record.argv = request.argv;
+        record.identity = request.identity;
+        record.exit_status = Some(0);
+        record.outcome = CommandOutcome::Succeeded;
+        match request.phase.as_str() {
+            "install_target" => {
+                files.insert("/home/theseus/bin".into(), entry(FileKind::File, "target"));
+            }
+            "configure" => {
+                files.insert(
+                    "/home/theseus/config".into(),
+                    entry(FileKind::Directory, ""),
+                );
+                files.insert(
+                    "/home/theseus/config/settings".into(),
+                    entry(FileKind::File, "configured"),
+                );
+                files.insert(
+                    "/home/theseus/log".into(),
+                    entry(FileKind::File, "configured"),
+                );
+            }
+            "exercise_before_reinstall" => {
+                files.insert(
+                    "/home/theseus/log".into(),
+                    entry(FileKind::File, "first exercise"),
+                );
+            }
+            "reinstall" => match self.fault {
+                "reset" => {
+                    files.insert(
+                        "/home/theseus/config/settings".into(),
+                        entry(FileKind::File, "reset"),
+                    );
+                }
+                "duplicate" => {
+                    files.insert(
+                        "/home/theseus/config/settings".into(),
+                        entry(FileKind::File, "configured\nconfigured"),
+                    );
+                }
+                "mode" => {
+                    files.get_mut("/home/theseus/config/settings").unwrap().mode = 0o600;
+                }
+                "add" => {
+                    files.insert(
+                        "/home/theseus/config/extra".into(),
+                        entry(FileKind::File, "new"),
+                    );
+                }
+                "remove" => {
+                    files.remove("/home/theseus/config/settings");
+                }
+                "reject" => {
+                    record.outcome = CommandOutcome::Failed;
+                    record.exit_status = Some(1);
+                }
+                "timeout" | "cancel" => {
+                    record.exit_status = None;
+                    record.timed_out = self.fault == "timeout";
+                    record.cancelled = self.fault == "cancel";
+                    record.outcome = if record.cancelled {
+                        CommandOutcome::Cancelled
+                    } else {
+                        CommandOutcome::TimedOut
+                    };
+                }
+                _ => {}
+            },
+            "check:runtime" => {
+                files.insert(
+                    "/home/theseus/log".into(),
+                    entry(FileKind::File, "check side effect"),
+                );
+            }
+            "exercise_after_reinstall" => {
+                files.insert(
+                    "/home/theseus/log".into(),
+                    entry(FileKind::File, "second exercise"),
+                );
+            }
+            "uninstall" => {
+                files.remove("/home/theseus/bin");
+            }
+            _ => {}
+        }
+        if (self.fault == "first_install" && request.phase == "install_target")
+            || (self.fault == "first_exercise" && request.phase == "exercise_before_reinstall")
+        {
+            record.exit_status = Some(1);
+            record.outcome = CommandOutcome::Failed;
+        }
+        Ok(ExecutedCommand {
+            record,
+            stdout: String::new(),
+            stdout_complete: true,
+        })
+    }
+    fn observe(
+        &mut self,
+        resource: &OwnedResource,
+        _: &[String],
+        _: Limits,
+        _: &CancellationToken,
+    ) -> Result<Vec<Snapshot>> {
+        Ok(vec![
+            if self.fault == "incomplete" && self.phase == "exercise_before_reinstall" {
+                Snapshot::incomplete("/home/theseus", "reference truncated")
+            } else {
+                Snapshot {
+                    root: "/home/theseus".into(),
+                    completeness: theseus::snapshot::ObservationStatus::Complete,
+                    entries: self.files[&resource.container_id].clone(),
+                }
+            },
+        ])
+    }
+    fn stop(&mut self, _: &OwnedResource) -> Result<()> {
+        Ok(())
+    }
+    fn remove(&mut self, _: &OwnedResource) -> Result<()> {
+        Ok(())
+    }
+}
+fn reinstall_recipe() -> (tempfile::TempDir, ValidatedRecipe) {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("target")).unwrap();
+    let user = include_str!("fixtures/recipes/v2_reinstall.toml");
+    let system = user[user.find("[profiles.user.steps").unwrap()..]
+        .replace("profiles.user", "profiles.system")
+        .replace("install.sh user", "install.sh system");
+    let path = temp.path().join("theseus.toml");
+    std::fs::write(&path, format!("{user}\n{system}")).unwrap();
+    (temp, load(&path).expect("reinstall fixture must load"))
+}
+fn run_reinstall(
+    fault: &'static str,
+    extra_checks: &str,
+) -> (tempfile::TempDir, engine::RunResult) {
+    let (temp, mut recipe) = reinstall_recipe();
+    if !extra_checks.is_empty() {
+        let text = std::fs::read_to_string(&recipe.path).unwrap();
+        std::fs::write(&recipe.path, format!("{text}\n{extra_checks}")).unwrap();
+        recipe = load(&recipe.path).unwrap();
+    }
+    let options = RunOptions {
+        output_root: temp.path().join("runs"),
+        ..RunOptions::all(&recipe)
+    };
+    let result = engine::run_with(
+        &recipe,
+        options,
+        CancellationToken::default(),
+        &mut ReinstallEnvironment {
+            fault,
+            ..Default::default()
+        },
+        |_| {},
+    )
+    .unwrap();
+    (temp, result)
+}
+fn stage<'a>(scenario: &'a ScenarioReport, name: &str) -> &'a StageReport {
+    scenario.stages.iter().find(|s| s.name == name).unwrap()
+}
+#[test]
+fn reinstall_exact_order_identities_target_and_distinct_profile_containers() {
+    let (_temp, result) = run_reinstall("", "");
+    assert_eq!(result.report.outcome, RunOutcome::Passed);
+    assert_eq!(result.report.scenarios.len(), 2);
+    assert_ne!(
+        result.report.scenarios[0].container_id,
+        result.report.scenarios[1].container_id
+    );
+    for scenario in &result.report.scenarios {
+        assert_eq!(
+            scenario
+                .stages
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "baseline",
+                "install_target",
+                "target_installed",
+                "target_installed:after_checks",
+                "configure",
+                "configured",
+                "configured:after_checks",
+                "exercise_before_reinstall",
+                "before_reinstall",
+                "reinstall",
+                "reinstalled",
+                "reinstalled:after_checks",
+                "exercise_after_reinstall",
+                "uninstall",
+                "uninstalled",
+                "uninstalled:after_checks",
+                "final",
+            ]
+        );
+        assert_eq!(
+            stage(scenario, "install_target").commands[0].argv,
+            stage(scenario, "reinstall").commands[0].argv
+        );
+        assert_eq!(
+            stage(scenario, "exercise_before_reinstall").commands[0].argv,
+            stage(scenario, "exercise_after_reinstall").commands[0].argv
+        );
+        for s in &scenario.stages {
+            for c in &s.commands {
+                let installer =
+                    ["install_target", "reinstall", "uninstall"].contains(&c.phase.as_str());
+                assert_eq!(
+                    c.identity.uid,
+                    if installer && scenario.profile == ProfileName::System {
+                        0
+                    } else {
+                        10001
+                    }
+                );
+                assert_eq!(c.identity.gid, c.identity.uid);
+            }
+        }
+        let check = &stage(scenario, "reinstalled").checks[0];
+        assert_eq!(check.outcome, CheckOutcome::Passed);
+        let json = serde_json::to_value(check).unwrap();
+        assert_eq!(json["comparison"]["before_stage"], "before_reinstall");
+        assert_eq!(json["comparison"]["after_stage"], "reinstalled");
+        assert!(matches!(scenario.teardown, TeardownStatus::Complete));
+        assert!(
+            scenario
+                .findings
+                .iter()
+                .any(|f| f.path.as_deref() == Some("/home/theseus/config/settings"))
+        );
+    }
+    let journal = theseus::report::load_journal(result.report_path.parent().unwrap()).unwrap();
+    assert_eq!(journal.resources.len(), 2);
+    assert!(journal.resources.iter().all(|r| r.removed));
+    let loaded = theseus::report::load(&result.report_path).unwrap();
+    assert_eq!(
+        loaded.scenarios[0]
+            .stages
+            .iter()
+            .flat_map(|s| &s.checks)
+            .find(|c| c.id == "stable")
+            .unwrap()
+            .comparison
+            .as_ref()
+            .unwrap()
+            .before_stage,
+        "before_reinstall"
+    );
+}
+#[test]
+fn reinstall_reference_follows_first_exercise_and_precedes_check_and_second_exercise() {
+    let (_temp, result) = run_reinstall(
+        "",
+        "[[profiles.user.checks]]\nid='runtime'\ncheckpoint='reinstalled'\nkind='command'\nscript='touch log'\nexpected_exit=0\n[[profiles.user.checks]]\nid='stable-log'\ncheckpoint='reinstalled'\nkind='unchanged'\npath='/home/theseus/log'\n",
+    );
+    assert_eq!(result.report.outcome, RunOutcome::Passed);
+    let scenario = &result.report.scenarios[0];
+    for name in ["before_reinstall", "reinstalled"] {
+        assert_eq!(
+            stage(scenario, name).snapshots[0].entries["/home/theseus/log"]
+                .sha256
+                .as_deref(),
+            Some("first exercise")
+        );
+    }
+    assert_eq!(
+        stage(scenario, "reinstalled:after_checks").snapshots[0].entries["/home/theseus/log"]
+            .sha256
+            .as_deref(),
+        Some("check side effect")
+    );
+    assert_eq!(
+        stage(scenario, "exercise_after_reinstall").snapshots[0].entries["/home/theseus/log"]
+            .sha256
+            .as_deref(),
+        Some("second exercise")
+    );
+    assert!(
+        stage(scenario, "reinstalled")
+            .checks
+            .iter()
+            .all(|c| c.outcome == CheckOutcome::Passed)
+    );
+}
+#[test]
+fn preservation_keeps_configured_reference_separate_from_before_reinstall() {
+    let (_temp, result) = run_reinstall(
+        "",
+        "[[profiles.user.checks]]\nid='retained-log'\ncheckpoint='reinstalled'\nkind='preserved'\npath='/home/theseus/log'\n[[profiles.user.checks]]\nid='uninstalled-log'\ncheckpoint='uninstalled'\nkind='preserved'\npath='/home/theseus/log'\n",
+    );
+    assert_eq!(result.report.outcome, RunOutcome::Failed);
+    let scenario = &result.report.scenarios[0];
+    assert_eq!(
+        stage(scenario, "reinstalled")
+            .checks
+            .iter()
+            .find(|c| c.id == "retained-log")
+            .unwrap()
+            .outcome,
+        CheckOutcome::Failed
+    );
+    assert_eq!(
+        stage(scenario, "uninstalled").checks[0].outcome,
+        CheckOutcome::Failed
+    );
+}
+#[test]
+fn repeat_detects_reset_duplicates_permissions_and_directory_additions_removals() {
+    for fault in ["reset", "duplicate", "mode", "add", "remove"] {
+        let (_temp, result) = run_reinstall(fault, "");
+        assert_eq!(result.report.outcome, RunOutcome::Failed, "{fault}");
+        for scenario in &result.report.scenarios {
+            assert_eq!(
+                stage(scenario, "reinstalled").checks[0].outcome,
+                CheckOutcome::Failed,
+                "{fault}"
+            );
+            assert!(!stage(scenario, "reinstall").stage_diff.is_empty());
+            assert_eq!(
+                stage(scenario, "exercise_after_reinstall").outcome,
+                StageOutcome::Skipped
+            );
+            assert_eq!(stage(scenario, "uninstall").commands.len(), 1);
+        }
+    }
+}
+#[test]
+fn rejected_repeat_skips_second_exercise_but_uninstalls_and_keeps_failure() {
+    let (_temp, result) = run_reinstall("reject", "");
+    assert_eq!(result.report.outcome, RunOutcome::Failed);
+    for scenario in &result.report.scenarios {
+        assert_eq!(
+            stage(scenario, "reinstalled").checks[0].outcome,
+            CheckOutcome::Passed
+        );
+        assert_eq!(
+            stage(scenario, "exercise_after_reinstall").outcome,
+            StageOutcome::Skipped
+        );
+        assert_eq!(stage(scenario, "uninstall").commands.len(), 1);
+        assert!(matches!(scenario.teardown, TeardownStatus::Complete));
+    }
+}
+#[test]
+fn incomplete_repeat_reference_cannot_pass() {
+    let (_temp, result) = run_reinstall("incomplete", "");
+    assert_eq!(result.report.outcome, RunOutcome::Incomplete);
+    for scenario in &result.report.scenarios {
+        assert_eq!(
+            stage(scenario, "reinstalled").checks[0].outcome,
+            CheckOutcome::Incomplete
+        );
+    }
+}
+#[test]
+fn repeat_timeout_and_cancel_keep_incomplete_evidence_and_owned_cleanup() {
+    for (fault, expected) in [
+        ("timeout", RunOutcome::Incomplete),
+        ("cancel", RunOutcome::Cancelled),
+    ] {
+        let (_temp, result) = run_reinstall(fault, "");
+        assert_eq!(result.report.outcome, expected);
+        let scenario = &result.report.scenarios[0];
+        assert_eq!(
+            stage(scenario, "reinstalled").checks[0].outcome,
+            CheckOutcome::Incomplete
+        );
+        assert_eq!(stage(scenario, "uninstall").outcome, StageOutcome::Skipped);
+        assert!(stage(scenario, "final").snapshots.iter().all(|s| matches!(
+            s.completeness,
+            theseus::snapshot::ObservationStatus::Incomplete { .. }
+        )));
+        assert!(matches!(scenario.teardown, TeardownStatus::Complete));
+        assert!(
+            theseus::report::load_journal(result.report_path.parent().unwrap())
+                .unwrap()
+                .resources
+                .iter()
+                .all(|r| r.removed)
+        );
+    }
+}
+
+#[test]
+fn reinstall_failed_prerequisites_skip_repeat_contracts_without_losing_known_failure() {
+    for fault in ["first_install", "first_exercise"] {
+        let (_temp, result) = run_reinstall(fault, "");
+        assert_eq!(result.report.outcome, RunOutcome::Failed, "{fault}");
+        for scenario in &result.report.scenarios {
+            assert_eq!(stage(scenario, "reinstall").outcome, StageOutcome::Skipped);
+            assert_eq!(
+                stage(scenario, "reinstalled").checks[0].outcome,
+                CheckOutcome::Skipped
+            );
+            assert_eq!(
+                stage(scenario, "exercise_after_reinstall").outcome,
+                StageOutcome::Skipped
+            );
+            assert_eq!(stage(scenario, "uninstall").commands.len(), 1);
+            assert!(matches!(scenario.teardown, TeardownStatus::Complete));
+            assert_eq!(
+                stage(scenario, "final").snapshots[0].completeness,
+                theseus::snapshot::ObservationStatus::Complete
+            );
+        }
+    }
+}

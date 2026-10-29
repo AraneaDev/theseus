@@ -234,3 +234,71 @@ fn version_two_cli_all_uses_declarations_and_rejects_undeclared_upgrade_before_d
         1
     );
 }
+
+#[test]
+fn reinstall_cli_rejects_undeclared_or_unavailable_before_creating_run() {
+    for (text, expected) in [
+        (
+            include_str!("fixtures/recipes/v2_clean.toml").to_owned(),
+            "not declared",
+        ),
+        (
+            include_str!("fixtures/recipes/v2_reinstall.toml").replace(
+                "[profiles.user.steps.reinstall]\nscript = \"sh /inputs/target/install.sh user\"\n",
+                "",
+            ),
+            "requires step reinstall",
+        ),
+        (
+            include_str!("fixtures/recipes/v2_reinstall.toml")
+                .replace("kind = \"unchanged\"", "kind = \"present\""),
+            "unchanged",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("target")).unwrap();
+        std::fs::write(temp.path().join("theseus.toml"), text).unwrap();
+        let output = cli()
+            .current_dir(temp.path())
+            .env("PATH", "/no-docker")
+            .args(["run", "--headless", "--scenario", "reinstall"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!temp.path().join(".theseus-runs").exists());
+    }
+}
+#[test]
+fn reinstall_cli_selects_declared_repeat_without_upgrade_inputs() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("target")).unwrap();
+    std::fs::write(
+        temp.path().join("theseus.toml"),
+        include_str!("fixtures/recipes/v2_reinstall.toml"),
+    )
+    .unwrap();
+    let output = cli()
+        .current_dir(temp.path())
+        .env("PATH", "/no-docker")
+        .args(["run", "--headless", "--scenario", "reinstall"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let run = std::fs::read_dir(temp.path().join(".theseus-runs"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    let report = theseus::report::load(&run.path()).unwrap();
+    assert_eq!(
+        report.selected_scenarios,
+        [theseus::model::ScenarioKind::Reinstall]
+    );
+    assert!(report.scenarios.is_empty());
+    assert!(!report.errors.is_empty());
+}

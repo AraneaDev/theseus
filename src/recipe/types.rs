@@ -126,13 +126,17 @@ pub enum Expectation {
     Preserved {
         path: String,
     },
+    Unchanged {
+        path: String,
+    },
 }
 impl Expectation {
     pub fn path(&self) -> Option<&str> {
         match self {
-            Self::Absent { path } | Self::Present { path, .. } | Self::Preserved { path } => {
-                Some(path)
-            }
+            Self::Absent { path }
+            | Self::Present { path, .. }
+            | Self::Preserved { path }
+            | Self::Unchanged { path } => Some(path),
             _ => None,
         }
     }

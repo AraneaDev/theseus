@@ -57,6 +57,22 @@ impl ValidatedRecipe {
                         StepName::Exercise,
                         StepName::Uninstall,
                     ][..],
+                    ScenarioKind::Reinstall => {
+                        ensure!(
+                            profile.checks.iter().any(|check| matches!(
+                                check.expectation,
+                                Expectation::Unchanged { .. }
+                            )),
+                            "{name}/reinstall requires at least one unchanged contract"
+                        );
+                        &[
+                            StepName::InstallTarget,
+                            StepName::Configure,
+                            StepName::Exercise,
+                            StepName::Reinstall,
+                            StepName::Uninstall,
+                        ][..]
+                    }
                     ScenarioKind::Upgrade => {
                         ensure!(
                             self.base_artifact.is_some(),
@@ -77,7 +93,7 @@ impl ValidatedRecipe {
                         "{name}/{scenario} requires step {step}"
                     );
                 }
-                if *scenario == ScenarioKind::Clean {
+                if *scenario != ScenarioKind::Upgrade {
                     ensure!(
                         !profile
                             .checks
@@ -152,6 +168,12 @@ pub fn load(path: &Path) -> Result<ValidatedRecipe> {
         }
     }
     for (name, profile) in &mut recipe.profiles {
+        if recipe.schema_version == 1 {
+            ensure!(
+                !profile.steps.contains_key(&StepName::Reinstall),
+                "reinstall requires recipe schema version 2"
+            );
+        }
         let mut ids = BTreeSet::new();
         for command in profile.steps.values() {
             validate_command(
@@ -167,6 +189,30 @@ pub fn load(path: &Path) -> Result<ValidatedRecipe> {
                 "duplicate/empty check ID in {name}: {}",
                 check.id
             );
+            if recipe.schema_version == 1 {
+                ensure!(
+                    check.checkpoint != Checkpoint::Reinstalled
+                        && !matches!(check.expectation, Expectation::Unchanged { .. }),
+                    "reinstalled/unchanged requires recipe schema version 2"
+                );
+            }
+            if check.checkpoint == Checkpoint::Reinstalled
+                || matches!(check.expectation, Expectation::Unchanged { .. })
+            {
+                ensure!(
+                    recipe
+                        .scenarios
+                        .as_ref()
+                        .is_some_and(|scenarios| scenarios.contains(&ScenarioKind::Reinstall)),
+                    "reinstalled/unchanged requires a recipe that must declare reinstall"
+                );
+            }
+            if matches!(check.expectation, Expectation::Unchanged { .. }) {
+                ensure!(
+                    check.checkpoint == Checkpoint::Reinstalled,
+                    "unchanged requires checkpoint reinstalled"
+                );
+            }
             match &mut check.expectation {
                 Expectation::Command {
                     script,
@@ -206,7 +252,8 @@ pub fn load(path: &Path) -> Result<ValidatedRecipe> {
                 }
                 Expectation::Absent { path }
                 | Expectation::Present { path, .. }
-                | Expectation::Preserved { path } => {
+                | Expectation::Preserved { path }
+                | Expectation::Unchanged { path } => {
                     *path = normalize_container_path(path)?;
                     ensure!(
                         recipe.observe.iter().any(|root| contained(path, root)),
@@ -219,7 +266,9 @@ pub fn load(path: &Path) -> Result<ValidatedRecipe> {
                 ensure!(
                     matches!(
                         check.checkpoint,
-                        Checkpoint::TargetInstalled | Checkpoint::Uninstalled
+                        Checkpoint::TargetInstalled
+                            | Checkpoint::Uninstalled
+                            | Checkpoint::Reinstalled
                     ),
                     "preserved requires a checkpoint after configuration"
                 );

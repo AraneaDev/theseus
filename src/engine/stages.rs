@@ -25,6 +25,7 @@ struct State {
     baseline: Vec<Snapshot>,
     previous: Vec<Snapshot>,
     configured: Option<Vec<Snapshot>>,
+    before_reinstall: Option<Vec<Snapshot>>,
     sequence: usize,
 }
 pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
@@ -54,6 +55,7 @@ pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
         baseline: vec![],
         previous: vec![],
         configured: None,
+        before_reinstall: None,
         sequence: 0,
     };
     let baseline = c.observation(&state);
@@ -63,25 +65,34 @@ pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
     stage.snapshots = baseline;
     c.finish(stage)?;
     let kind = c.report.scenarios[c.index].scenario;
-    let first = if kind == ScenarioKind::Clean {
-        StepName::InstallTarget
-    } else {
-        StepName::InstallBase
-    };
-    let first_cp = if kind == ScenarioKind::Clean {
-        Checkpoint::TargetInstalled
-    } else {
-        Checkpoint::BaseInstalled
+    let (first, first_cp) = match kind {
+        ScenarioKind::Clean | ScenarioKind::Reinstall => {
+            (StepName::InstallTarget, Checkpoint::TargetInstalled)
+        }
+        ScenarioKind::Upgrade => (StepName::InstallBase, Checkpoint::BaseInstalled),
     };
     c.step(&mut state, first)?;
     c.checkpoint(&mut state, first_cp, false)?;
     c.step(&mut state, StepName::Configure)?;
     c.checkpoint(&mut state, Checkpoint::Configured, true)?;
-    if kind == ScenarioKind::Upgrade {
-        c.step(&mut state, StepName::Upgrade)?;
-        c.checkpoint(&mut state, Checkpoint::TargetInstalled, false)?;
+    match kind {
+        ScenarioKind::Upgrade => {
+            c.step(&mut state, StepName::Upgrade)?;
+            c.checkpoint(&mut state, Checkpoint::TargetInstalled, false)?;
+            c.step(&mut state, StepName::Exercise)?;
+        }
+        ScenarioKind::Clean => c.step(&mut state, StepName::Exercise)?,
+        ScenarioKind::Reinstall => {
+            c.step_named(&mut state, StepName::Exercise, "exercise_before_reinstall")?;
+            let mut reference = StageReport::new("before_reinstall");
+            c.capture(&mut state, &mut reference);
+            state.before_reinstall = Some(reference.snapshots.clone());
+            c.finish(reference)?;
+            c.step(&mut state, StepName::Reinstall)?;
+            c.checkpoint(&mut state, Checkpoint::Reinstalled, false)?;
+            c.step_named(&mut state, StepName::Exercise, "exercise_after_reinstall")?;
+        }
     }
-    c.step(&mut state, StepName::Exercise)?;
     c.step(&mut state, StepName::Uninstall)?;
     c.checkpoint(&mut state, Checkpoint::Uninstalled, false)?;
     let mut final_stage = StageReport::new("final");
@@ -235,7 +246,10 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
         executed
     }
     fn step(&mut self, state: &mut State, step: StepName) -> Result<()> {
-        let mut stage = StageReport::new(step.to_string());
+        self.step_named(state, step, &step.to_string())
+    }
+    fn step_named(&mut self, state: &mut State, step: StepName, name: &str) -> Result<()> {
+        let mut stage = StageReport::new(name);
         stage.step = Some(step);
         if state.dead || (!state.forward && step != StepName::Uninstall) {
             stage.outcome = StageOutcome::Skipped;
@@ -257,6 +271,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
             StepName::InstallBase
                 | StepName::InstallTarget
                 | StepName::Upgrade
+                | StepName::Reinstall
                 | StepName::Uninstall
         );
         let identity = if installer && profile_name == ProfileName::System {
@@ -266,7 +281,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
         };
         let request = self.request(
             state,
-            step.to_string(),
+            name.to_owned(),
             &spec,
             identity,
             vec!["/bin/sh".into(), "-c".into(), spec.script.clone()],
@@ -313,7 +328,8 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                     && self.report.scenarios[self.index].stages.iter().any(|s| {
                         s.step == Some(StepName::Configure) && s.outcome == StageOutcome::Skipped
                     });
-            let result = if !state.dead && (prerequisite_skipped || retention_without_configuration)
+            let mut result = if !state.dead
+                && (prerequisite_skipped || retention_without_configuration)
             {
                 CheckResult {
                     id: check.id.clone(),
@@ -322,6 +338,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                     message: "dependent prerequisite/configuration was deliberately skipped".into(),
                     path: check.expectation.path().map(str::to_owned),
                     command_ids: vec![],
+                    comparison: None,
                 }
             } else if state.dead {
                 CheckResult {
@@ -331,10 +348,14 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                     message: "container stopped after timeout/cancellation".into(),
                     path: check.expectation.path().map(str::to_owned),
                     command_ids: vec![],
+                    comparison: None,
                 }
             } else {
                 self.check(state, check, &mut stage)
             };
+            if matches!(check.expectation, Expectation::Unchanged { .. }) {
+                result.comparison = Some(ComparisonReference::reinstall());
+            }
             state.forward &= result.outcome == CheckOutcome::Passed;
             stage.checks.push(result);
             self.update(&stage)?;
@@ -425,6 +446,22 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                     );
                     let executed = self.execute(state, request, stage);
                     checks::evaluate_executable(check, Some(&resolved), &observed(&executed))
+                }
+            }
+            Expectation::Unchanged { path } => {
+                let stability = checks::compare_unchanged(
+                    path,
+                    state.before_reinstall.as_deref().unwrap_or_default(),
+                    &stage.snapshots,
+                );
+                CheckResult {
+                    id: check.id.clone(),
+                    checkpoint: check.checkpoint,
+                    outcome: stability.outcome,
+                    message: stability.message,
+                    path: Some(path.clone()),
+                    command_ids: vec![],
+                    comparison: None,
                 }
             }
             _ => checks::evaluate_filesystem(check, &stage.snapshots, state.configured.as_deref()),

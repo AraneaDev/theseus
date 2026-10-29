@@ -15,9 +15,9 @@ macro_rules! named_enum {
     };
 }
 named_enum!(ProfileName { User => "user", System => "system" });
-named_enum!(ScenarioKind { Clean => "clean", Upgrade => "upgrade" });
-named_enum!(StepName { InstallBase => "install_base", InstallTarget => "install_target", Configure => "configure", Upgrade => "upgrade", Exercise => "exercise", Uninstall => "uninstall" });
-named_enum!(Checkpoint { BaseInstalled => "base_installed", Configured => "configured", TargetInstalled => "target_installed", Uninstalled => "uninstalled" });
+named_enum!(ScenarioKind { Clean => "clean", Upgrade => "upgrade", Reinstall => "reinstall" });
+named_enum!(StepName { InstallBase => "install_base", InstallTarget => "install_target", Configure => "configure", Upgrade => "upgrade", Exercise => "exercise", Reinstall => "reinstall", Uninstall => "uninstall" });
+named_enum!(Checkpoint { BaseInstalled => "base_installed", Configured => "configured", TargetInstalled => "target_installed", Uninstalled => "uninstalled", Reinstalled => "reinstalled" });
 named_enum!(FileKind { File => "file", Directory => "directory", Symlink => "symlink" });
 named_enum!(CheckOutcome { Passed => "passed", Failed => "failed", Incomplete => "incomplete", Skipped => "skipped" });
 named_enum!(FindingKind { Leftover => "leftover", BaselineDeletion => "baseline_deletion", ChangedBaseline => "changed_baseline", ObservationIncomplete => "observation_incomplete" });
@@ -29,6 +29,21 @@ pub struct CheckResult {
     pub message: String,
     pub path: Option<String>,
     pub command_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<ComparisonReference>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComparisonReference {
+    pub before_stage: String,
+    pub after_stage: String,
+}
+impl ComparisonReference {
+    pub fn reinstall() -> Self {
+        Self {
+            before_stage: "before_reinstall".into(),
+            after_stage: "reinstalled".into(),
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Finding {

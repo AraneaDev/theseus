@@ -610,3 +610,18 @@ fn stability_summary_bounds_large_observation_errors() {
         result.message.len()
     );
 }
+
+#[test]
+fn generic_filesystem_dispatch_cannot_use_configured_as_an_unchanged_reference() {
+    let snapshots = [snapshot(Tar::new().root().file("bin/tool", b"target"))];
+    let check = Check {
+        id: "stable".into(),
+        checkpoint: Checkpoint::Reinstalled,
+        expectation: Expectation::Unchanged {
+            path: "/usr/local/bin/tool".into(),
+        },
+    };
+    let result = evaluate_filesystem(&check, &snapshots, Some(&snapshots));
+    assert_eq!(result.outcome, CheckOutcome::Incomplete);
+    assert!(result.message.contains("before_reinstall"));
+}

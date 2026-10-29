@@ -1,4 +1,9 @@
-use crate::{engine::RunOptions, model::*, recipe::ValidatedRecipe, report};
+use crate::{
+    engine::RunOptions,
+    model::*,
+    recipe::{Expectation, ValidatedRecipe},
+    report,
+};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +140,24 @@ impl App {
         for name in &options.profiles {
             if let Some(profile) = recipe.recipe.profiles.get(name) {
                 text += &format!("\n[{name}]\n");
+                if options.scenarios.contains(&ScenarioKind::Reinstall) {
+                    text += "Reinstall rehearsal: install_target, configure, exercise_before_reinstall, before_reinstall, reinstall, reinstalled, exercise_after_reinstall, uninstall.\nBoth exercise stages run the same exercise command as UID/GID 10001:10001.\n";
+                    if let Some(command) = profile.steps.get(&StepName::Reinstall) {
+                        text +=
+                            &format!("Repeated target installation command: {}\n", command.script);
+                    }
+                    let stable: Vec<_> = profile
+                        .checks
+                        .iter()
+                        .filter_map(|check| match &check.expectation {
+                            Expectation::Unchanged { path } => Some(path.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    text += &format!(
+                        "Declared stable scopes (path and descendants): {stable:?}\nCompare before_reinstall (after first exercise) to reinstalled (before checks and second exercise).\n"
+                    );
+                }
                 for (step, command) in &profile.steps {
                     text += &format!(
                         "{step} ({}s) env={:?} pass_env names={:?}\n{}\n",
@@ -169,12 +192,7 @@ impl App {
         match self.tab {
             Tab::Stages => {
                 items.push(format!("{}: {}", stage.name, stage.outcome));
-                items.extend(
-                    stage
-                        .checks
-                        .iter()
-                        .map(|c| format!("{} {}: {}", c.id, c.outcome, c.message)),
-                );
+                items.extend(stage.checks.iter().map(check_text));
                 items.extend(stage.errors.iter().cloned());
                 if let Some(reason) = &stage.skip_reason {
                     items.push(format!("Skipped: {reason}"));
@@ -189,12 +207,7 @@ impl App {
                 }
             }
             Tab::Findings => {
-                items.extend(
-                    stage
-                        .checks
-                        .iter()
-                        .map(|c| format!("{} {}: {} {:?}", c.outcome, c.id, c.message, c.path)),
-                );
+                items.extend(stage.checks.iter().map(check_text));
                 items.extend(stage.errors.iter().cloned());
                 if let Some(scenario) = self.scenario() {
                     items.extend(
@@ -219,6 +232,13 @@ impl App {
                 }
             }
             Tab::Files => {
+                items.extend(
+                    stage
+                        .checks
+                        .iter()
+                        .filter(|check| check.comparison.is_some())
+                        .map(check_text),
+                );
                 for (label, changes) in [
                     ("Stage", &stage.stage_diff),
                     ("Baseline", &stage.baseline_diff),
@@ -312,4 +332,18 @@ pub fn safe_text(text: &str) -> String {
             }
         })
         .collect()
+}
+
+fn check_text(check: &CheckResult) -> String {
+    let mut text = format!("{} {}: {}", check.id, check.outcome, check.message);
+    if let Some(path) = &check.path {
+        text += &format!("\nScope: {path}");
+    }
+    if let Some(comparison) = &check.comparison {
+        text += &format!(
+            "\nComparison: {} -> {}",
+            comparison.before_stage, comparison.after_stage
+        );
+    }
+    text
 }
