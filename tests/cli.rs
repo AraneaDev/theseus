@@ -369,3 +369,37 @@ fn interrupted_cli_selects_single_or_declared_matrix_without_docker() {
         assert!(!report.errors.is_empty());
     }
 }
+
+#[test]
+fn downgrade_cli_selection_is_explicit_and_validated_before_docker() {
+    use clap::Parser;
+    let parsed = theseus::cli::Cli::try_parse_from([
+        "theseus",
+        "run",
+        "--headless",
+        "--scenario",
+        "downgrade",
+    ])
+    .unwrap();
+    assert!(matches!(
+        parsed.command,
+        Some(theseus::cli::Action::Run {
+            scenario: theseus::cli::ScenarioSelection::Downgrade,
+            ..
+        })
+    ));
+    let temp = tempfile::tempdir().unwrap();
+    for name in ["base", "target"] {
+        std::fs::create_dir(temp.path().join(name)).unwrap();
+    }
+    let text = include_str!("fixtures/recipes/v4_downgrade.toml").replace("base = \"base\"\n", "");
+    std::fs::write(temp.path().join("theseus.toml"), text).unwrap();
+    let out = cli()
+        .current_dir(temp.path())
+        .env("PATH", "/no-docker")
+        .args(["run", "--headless", "--scenario", "downgrade"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("downgrade requires artifacts.base"));
+}

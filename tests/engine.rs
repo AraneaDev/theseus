@@ -1478,3 +1478,566 @@ fn interruption_checks_and_exercise_do_not_rebase_comparison_or_configuration() 
         }
     }
 }
+
+#[derive(Default)]
+struct DowngradeEnvironment {
+    inner: ReinstallEnvironment,
+    rejection: bool,
+    fault: &'static str,
+    calls: Vec<(String, String, i32)>,
+    removed: usize,
+}
+impl Environment for DowngradeEnvironment {
+    fn prepare(
+        &mut self,
+        r: &ValidatedRecipe,
+        p: bool,
+        c: &CancellationToken,
+    ) -> Result<PreparedEnvironment> {
+        assert!(r.base_artifact.is_some());
+        self.inner.prepare(r, p, c)
+    }
+    fn create(&mut self, run: &str, sid: &str, r: &ValidatedRecipe) -> Result<OwnedResource> {
+        self.inner.create(run, sid, r)
+    }
+    fn setup(
+        &mut self,
+        r: &OwnedResource,
+        v: &ValidatedRecipe,
+        c: &CancellationToken,
+    ) -> Result<()> {
+        self.inner.setup(r, v, c)
+    }
+    fn execute(
+        &mut self,
+        r: &OwnedResource,
+        q: CommandRequest,
+        _: &ReportStore,
+        c: &CancellationToken,
+    ) -> Result<ExecutedCommand> {
+        assert!(!c.is_cancelled());
+        self.inner.phase = q.phase.clone();
+        self.calls
+            .push((r.container_id.clone(), q.phase.clone(), q.expected_exit));
+        let files = self.inner.files.get_mut(&r.container_id).unwrap();
+        let mut record = CommandRecord::new(q.id, &q.phase);
+        record.identity = q.identity;
+        record.argv = q.argv;
+        record.exit_status = Some(0);
+        record.outcome = CommandOutcome::Succeeded;
+        let mut stdout = "2.0".to_string();
+        if q.phase.starts_with("resolve:") {
+            stdout = "/home/theseus/bin".into();
+        }
+        match q.phase.as_str() {
+            "install_target" => {
+                files.insert(
+                    "/home/theseus/bin".into(),
+                    entry(
+                        if self.fault == "directory-binary" {
+                            FileKind::Directory
+                        } else {
+                            FileKind::File
+                        },
+                        "newer",
+                    ),
+                );
+            }
+            "configure" => {
+                files.insert("/home/theseus/data".into(), entry(FileKind::Directory, ""));
+                files.insert(
+                    "/home/theseus/data/record".into(),
+                    entry(FileKind::File, "configured"),
+                );
+            }
+            "exercise_before_downgrade" => {
+                files.insert(
+                    "/home/theseus/data/record".into(),
+                    entry(FileKind::File, "exercised"),
+                );
+            }
+            "downgrade" => {
+                if self.rejection {
+                    record.exit_status = Some(9);
+                    stdout = "newer data refusal".into();
+                    match self.fault {
+                        "binary" => {
+                            files.insert(
+                                "/home/theseus/bin".into(),
+                                entry(FileKind::File, "changed"),
+                            );
+                        }
+                        "add" => {
+                            files.insert(
+                                "/home/theseus/data/extra".into(),
+                                entry(FileKind::File, "extra"),
+                            );
+                        }
+                        "remove" => {
+                            files.remove("/home/theseus/data/record");
+                        }
+                        "wrong-status" => record.exit_status = Some(8),
+                        "success" => record.exit_status = Some(0),
+                        "marker" => stdout = "different".into(),
+                        "receipt" => record.exit_status = None,
+                        "transport" => record.error = Some("lost control".into()),
+                        "cancel" => {
+                            record.cancelled = true;
+                            record.outcome = CommandOutcome::Cancelled;
+                            c.cancel();
+                        }
+                        "timeout" => {
+                            record.timed_out = true;
+                            record.outcome = CommandOutcome::TimedOut;
+                        }
+                        _ => {}
+                    }
+                } else {
+                    files.insert("/home/theseus/bin".into(), entry(FileKind::File, "older"));
+                    if self.fault == "wrong-status" {
+                        record.exit_status = Some(9);
+                    }
+                }
+                if !record.cancelled {
+                    record.outcome = if record.exit_status == Some(q.expected_exit) {
+                        CommandOutcome::Succeeded
+                    } else {
+                        CommandOutcome::Failed
+                    };
+                }
+            }
+            "check:older" => stdout = "1.0".into(),
+            "check:older-data" => {
+                stdout = "record survives".into();
+                if self.fault == "reader" {
+                    record.exit_status = Some(1);
+                    record.outcome = CommandOutcome::Failed;
+                }
+            }
+            "check:writer" => {
+                files.insert(
+                    "/home/theseus/data/record".into(),
+                    entry(FileKind::File, "check-side-effect"),
+                );
+            }
+            "uninstall" => {
+                files.remove("/home/theseus/bin");
+            }
+            _ => {}
+        }
+        if (self.fault == "initial" && q.phase == "exercise_before_downgrade")
+            || (self.fault == "install" && q.phase == "install_target")
+            || (self.fault == "configure" && q.phase == "configure")
+            || (self.fault == "newer-check" && q.phase == "check:newer")
+        {
+            record.exit_status = Some(1);
+            record.outcome = CommandOutcome::Failed;
+        }
+        Ok(ExecutedCommand {
+            record,
+            stdout,
+            stdout_complete: self.fault != "truncated" || q.phase != "downgrade",
+        })
+    }
+    fn observe(
+        &mut self,
+        r: &OwnedResource,
+        _: &[String],
+        _: Limits,
+        _: &CancellationToken,
+    ) -> Result<Vec<Snapshot>> {
+        if self.fault == "incomplete" && self.inner.phase == "downgrade" {
+            return Ok(vec![Snapshot::incomplete(
+                "/home/theseus",
+                "post-attempt unavailable",
+            )]);
+        }
+        Ok(vec![Snapshot {
+            root: "/home/theseus".into(),
+            completeness: theseus::snapshot::ObservationStatus::Complete,
+            entries: self.inner.files[&r.container_id].clone(),
+        }])
+    }
+    fn stop(&mut self, _: &OwnedResource) -> Result<()> {
+        Ok(())
+    }
+    fn remove(&mut self, _: &OwnedResource) -> Result<()> {
+        self.removed += 1;
+        Ok(())
+    }
+}
+fn downgrade_recipe(rejection: bool) -> (tempfile::TempDir, ValidatedRecipe) {
+    let temp = tempfile::tempdir().unwrap();
+    for name in ["base", "target"] {
+        std::fs::create_dir(temp.path().join(name)).unwrap();
+    }
+    let mut text = include_str!("fixtures/recipes/v4_downgrade.toml").to_string();
+    if rejection {
+        text = text.replace("expect = \"compatible\"\ndata_checks = [\"older-data\"]", "expect = \"safe_rejection\"\nexpected_exit = 9\nstdout_contains = \"newer data refusal\"\nbinary_checks = [\"binary-stable\"]\ndata_checks = [\"data-stable\"]");
+        text.truncate(
+            text.find("[[profiles.user.checks]]\nid = \"older\"")
+                .unwrap(),
+        );
+        text.push_str("\n[[profiles.user.checks]]\nid = \"still-newer\"\ncheckpoint = \"downgrade_rejected\"\nkind = \"executable\"\nname = \"sample-cli\"\nresolved_path = \"/home/theseus/bin\"\nexpected_exit = 0\nstdout_contains = \"2.0\"\n[[profiles.user.checks]]\nid = \"binary-stable\"\ncheckpoint = \"downgrade_rejected\"\nkind = \"unchanged\"\npath = \"/home/theseus/bin\"\n[[profiles.user.checks]]\nid = \"data-stable\"\ncheckpoint = \"downgrade_rejected\"\nkind = \"unchanged\"\npath = \"/home/theseus/data\"\n");
+    }
+    let suffix = text[text.find("[profiles.user.downgrade]").unwrap()..]
+        .replace("profiles.user", "profiles.system");
+    let path = temp.path().join("theseus.toml");
+    std::fs::write(&path, format!("{text}\n{suffix}")).unwrap();
+    (temp, load(&path).expect("downgrade recipe loads"))
+}
+fn run_downgrade(
+    rejection: bool,
+    fault: &'static str,
+) -> (tempfile::TempDir, engine::RunResult, DowngradeEnvironment) {
+    let (temp, recipe) = downgrade_recipe(rejection);
+    let mut env = DowngradeEnvironment {
+        rejection,
+        fault,
+        ..Default::default()
+    };
+    let options = RunOptions {
+        output_root: temp.path().join("runs"),
+        ..RunOptions::all(&recipe)
+    };
+    let result = engine::run_with(
+        &recipe,
+        options,
+        CancellationToken::default(),
+        &mut env,
+        |_| {},
+    )
+    .unwrap();
+    (temp, result, env)
+}
+#[test]
+fn downgrade_actual_flow_uses_declared_policy_same_container_and_persists_refusal() {
+    for rejection in [false, true] {
+        let (_temp, result, env) = run_downgrade(rejection, "");
+        assert_eq!(result.report.outcome, RunOutcome::Passed);
+        assert_eq!(env.removed, 2);
+        for s in &result.report.scenarios {
+            let mut expected = vec![
+                "baseline",
+                "install_target",
+                "target_installed",
+                "target_installed:after_checks",
+                "configure",
+                "configured",
+                "configured:after_checks",
+                "exercise_before_downgrade",
+                "before_downgrade",
+                "downgrade",
+            ];
+            expected.extend(if rejection {
+                vec![
+                    "downgrade_rejected",
+                    "downgrade_rejected:after_checks",
+                    "exercise_after_rejection",
+                ]
+            } else {
+                vec![
+                    "downgraded",
+                    "downgraded:after_checks",
+                    "exercise_downgraded",
+                ]
+            });
+            expected.extend([
+                "uninstall",
+                "uninstalled",
+                "uninstalled:after_checks",
+                "final",
+            ]);
+            assert_eq!(
+                s.stages.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(
+                stage(s, "before_downgrade").snapshots[0].entries["/home/theseus/data/record"]
+                    .sha256
+                    .as_deref(),
+                Some("exercised")
+            );
+            for cmd in s.stages.iter().flat_map(|s| &s.commands) {
+                let root = s.profile == ProfileName::System
+                    && ["install_target", "downgrade", "uninstall"].contains(&cmd.phase.as_str());
+                assert_eq!(cmd.identity.uid, if root { 0 } else { 10001 });
+                assert_eq!(cmd.identity.gid, cmd.identity.uid);
+                if cmd.phase == "downgrade" {
+                    assert!(cmd.argv.last().unwrap().contains("/inputs/base/"));
+                    assert_eq!(cmd.exit_status, Some(if rejection { 9 } else { 0 }));
+                    assert_eq!(
+                        cmd.outcome.to_string(),
+                        if rejection {
+                            "expected_rejection"
+                        } else {
+                            "succeeded"
+                        }
+                    );
+                }
+            }
+            assert!(
+                env.calls
+                    .iter()
+                    .filter(|(id, _, _)| Some(id) == s.container_id.as_ref())
+                    .all(|(_, phase, expected)| *expected
+                        == if phase == "downgrade" && rejection {
+                            9
+                        } else {
+                            0
+                        })
+            );
+        }
+        let loaded = theseus::report::load(&result.report_path).unwrap();
+        assert_eq!(loaded.schema_version, 4);
+        assert_eq!(loaded.outcome, RunOutcome::Passed);
+        if rejection {
+            assert_eq!(
+                stage(&loaded.scenarios[0], "downgrade").commands[0]
+                    .outcome
+                    .to_string(),
+                "expected_rejection"
+            );
+        }
+    }
+}
+#[test]
+fn downgrade_actual_failures_preserve_selected_branch_evidence_and_cleanup() {
+    for (rejection, fault, outcome) in [
+        (true, "binary", RunOutcome::Failed),
+        (true, "add", RunOutcome::Failed),
+        (true, "remove", RunOutcome::Failed),
+        (true, "directory-binary", RunOutcome::Failed),
+        (true, "wrong-status", RunOutcome::Failed),
+        (true, "success", RunOutcome::Failed),
+        (true, "marker", RunOutcome::Failed),
+        (true, "timeout", RunOutcome::Incomplete),
+        (true, "incomplete", RunOutcome::Incomplete),
+        (true, "receipt", RunOutcome::Incomplete),
+        (true, "transport", RunOutcome::Incomplete),
+        (true, "truncated", RunOutcome::Incomplete),
+        (true, "cancel", RunOutcome::Cancelled),
+        (false, "install", RunOutcome::Failed),
+        (false, "configure", RunOutcome::Failed),
+        (false, "newer-check", RunOutcome::Failed),
+        (false, "reader", RunOutcome::Failed),
+        (false, "wrong-status", RunOutcome::Failed),
+        (false, "initial", RunOutcome::Failed),
+    ] {
+        let (_temp, result, env) = run_downgrade(rejection, fault);
+        assert_eq!(result.report.outcome, outcome, "{rejection}/{fault}");
+        assert_eq!(env.removed, if fault == "cancel" { 1 } else { 2 });
+        for s in &result.report.scenarios {
+            if s.container_id.is_none() {
+                continue;
+            }
+            let cp = if rejection {
+                "downgrade_rejected"
+            } else {
+                "downgraded"
+            };
+            assert!(s.stages.iter().any(|s| s.name == cp));
+            assert!(!s.stages.iter().any(|s| s.name
+                == if rejection {
+                    "downgraded"
+                } else {
+                    "downgrade_rejected"
+                }));
+            assert!(
+                stage(
+                    s,
+                    if rejection {
+                        "exercise_after_rejection"
+                    } else {
+                        "exercise_downgraded"
+                    }
+                )
+                .commands
+                .is_empty(),
+                "{fault}"
+            );
+            if ["initial", "install", "configure", "newer-check"].contains(&fault) {
+                assert!(stage(s, "downgrade").commands.is_empty());
+            }
+            if !["cancel", "timeout"].contains(&fault) {
+                assert_eq!(stage(s, "uninstall").commands.len(), 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn downgrade_comparison_precedes_checkpoint_side_effects_and_keeps_configured_reference() {
+    for preserved in [false, true] {
+        let (temp, mut recipe) = downgrade_recipe(true);
+        let p = recipe.recipe.profiles.get_mut(&ProfileName::User).unwrap();
+        // Put the writer before stability checks to prove comparisons use the
+        // initial checkpoint observation, not a later command-mutated snapshot.
+        p.checks.insert(
+            0,
+            Check {
+                id: "writer".into(),
+                checkpoint: Checkpoint::DowngradeRejected,
+                expectation: Expectation::Command {
+                    script: "mutate".into(),
+                    timeout_seconds: 10,
+                    env: BTreeMap::new(),
+                    pass_env: vec![],
+                    expected_exit: 0,
+                    stdout_contains: None,
+                },
+            },
+        );
+        if preserved {
+            p.checks.push(Check {
+                id: "configured-data".into(),
+                checkpoint: Checkpoint::DowngradeRejected,
+                expectation: Expectation::Preserved {
+                    path: "/home/theseus/data/record".into(),
+                },
+            });
+        }
+        let options = RunOptions {
+            profiles: vec![ProfileName::User],
+            output_root: temp.path().join("runs"),
+            ..RunOptions::all(&recipe)
+        };
+        let result = engine::run_with(
+            &recipe,
+            options,
+            CancellationToken::default(),
+            &mut DowngradeEnvironment {
+                rejection: true,
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            result.report.outcome,
+            if preserved {
+                RunOutcome::Failed
+            } else {
+                RunOutcome::Passed
+            }
+        );
+        let s = &result.report.scenarios[0];
+        let hash = |name: &str| {
+            stage(s, name).snapshots[0].entries["/home/theseus/data/record"]
+                .sha256
+                .as_deref()
+                .unwrap()
+        };
+        assert_eq!(hash("configured"), "configured");
+        assert_eq!(hash("before_downgrade"), "exercised");
+        assert_eq!(hash("downgrade_rejected"), "exercised");
+        assert_eq!(hash("downgrade_rejected:after_checks"), "check-side-effect");
+        let stable = stage(s, "downgrade_rejected")
+            .checks
+            .iter()
+            .find(|c| c.id == "data-stable")
+            .unwrap();
+        assert_eq!(stable.outcome, CheckOutcome::Passed);
+        assert_eq!(
+            stable.comparison.as_ref().unwrap().before_stage,
+            "before_downgrade"
+        );
+    }
+}
+#[test]
+fn downgrade_cancellation_at_every_event_boundary_prevents_later_mutation() {
+    for rejection in [false, true] {
+        let (_reference_temp, reference, _) = run_downgrade(rejection, "");
+        for kind in [
+            engine::EventKind::StageStarted,
+            engine::EventKind::StageFinished,
+        ] {
+            for name in reference.report.scenarios[0]
+                .stages
+                .iter()
+                .map(|s| s.name.as_str())
+            {
+                let (temp, recipe) = downgrade_recipe(rejection);
+                let token = CancellationToken::default();
+                let trigger = token.clone();
+                let mut env = DowngradeEnvironment {
+                    rejection,
+                    ..Default::default()
+                };
+                let options = RunOptions {
+                    profiles: vec![ProfileName::User],
+                    output_root: temp.path().join("runs"),
+                    ..RunOptions::all(&recipe)
+                };
+                let result = engine::run_with(&recipe, options, token, &mut env, |e| {
+                    if e.kind == kind && e.stage.as_deref() == Some(name) {
+                        trigger.cancel();
+                    }
+                })
+                .unwrap();
+                assert_eq!(
+                    result.report.outcome,
+                    RunOutcome::Cancelled,
+                    "{rejection}/{kind:?}/{name}"
+                );
+                assert_eq!(env.removed, 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn downgrade_unperformed_evidence_excludes_the_other_policy_checkpoint() {
+    for rejection in [false, true] {
+        let (temp, mut recipe) = downgrade_recipe(rejection);
+        let other = if rejection {
+            Checkpoint::Downgraded
+        } else {
+            Checkpoint::DowngradeRejected
+        };
+        recipe
+            .recipe
+            .profiles
+            .get_mut(&ProfileName::User)
+            .unwrap()
+            .checks
+            .push(Check {
+                id: "other-policy-only".into(),
+                checkpoint: other,
+                expectation: Expectation::Present {
+                    path: "/home/theseus/unused".into(),
+                    expected_kind: None,
+                },
+            });
+        let options = RunOptions {
+            profiles: vec![ProfileName::User],
+            output_root: temp.path().join("runs"),
+            ..RunOptions::all(&recipe)
+        };
+        let token = CancellationToken::default();
+        token.cancel();
+        let result = engine::run_with(
+            &recipe,
+            options,
+            token,
+            &mut DowngradeEnvironment {
+                rejection,
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+        let checks = result.report.scenarios[0]
+            .stages
+            .iter()
+            .flat_map(|s| &s.checks)
+            .collect::<Vec<_>>();
+        assert!(!checks.is_empty());
+        assert!(
+            checks
+                .iter()
+                .all(|c| c.checkpoint != other && c.id != "other-policy-only")
+        );
+        assert_eq!(result.report.outcome, RunOutcome::Cancelled);
+    }
+}

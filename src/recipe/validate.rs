@@ -51,6 +51,29 @@ impl ValidatedRecipe {
                 .with_context(|| format!("profile {name} is not defined"))?;
             for scenario in scenarios {
                 let required = match scenario {
+                    ScenarioKind::Downgrade => {
+                        ensure!(
+                            self.base_artifact.is_some(),
+                            "downgrade requires artifacts.base"
+                        );
+                        super::downgrade::validate_profile(profile)?;
+                        if matches!(
+                            profile.downgrade,
+                            Some(DowngradeContract::Compatible { .. })
+                        ) {
+                            ensure!(
+                                profile.steps.contains_key(&StepName::ExerciseDowngraded),
+                                "{name}/downgrade requires step exercise_downgraded"
+                            );
+                        }
+                        &[
+                            StepName::InstallTarget,
+                            StepName::Configure,
+                            StepName::Exercise,
+                            StepName::Downgrade,
+                            StepName::Uninstall,
+                        ][..]
+                    }
                     ScenarioKind::Clean => &[
                         StepName::InstallTarget,
                         StepName::Configure,
@@ -182,11 +205,11 @@ pub fn load(path: &Path) -> Result<ValidatedRecipe> {
             recipe.scenarios.is_none(),
             "scenarios requires recipe schema version 2"
         ),
-        2 | 3 => {
+        2..=4 => {
             let scenarios = recipe
                 .scenarios
                 .as_ref()
-                .context("recipe schema version 2/3 requires an explicit scenarios list")?;
+                .context("recipe schema version 2/3/4 requires an explicit scenarios list")?;
             ensure!(!scenarios.is_empty(), "declare at least one scenario");
             let mut seen = BTreeSet::new();
             for scenario in scenarios {
@@ -195,6 +218,14 @@ pub fn load(path: &Path) -> Result<ValidatedRecipe> {
         }
         version => bail!("unsupported recipe schema version {version}"),
     }
+    let downgrade_declared = recipe
+        .scenarios
+        .as_ref()
+        .is_some_and(|scenarios| scenarios.contains(&ScenarioKind::Downgrade));
+    ensure!(
+        !downgrade_declared || recipe.schema_version >= 4,
+        "downgrade requires recipe schema version 4"
+    );
     if recipe.schema_version < 3 {
         ensure!(
             !recipe
@@ -240,6 +271,25 @@ pub fn load(path: &Path) -> Result<ValidatedRecipe> {
         }
     }
     for (name, profile) in &mut recipe.profiles {
+        let downgrade_features = profile.downgrade.is_some()
+            || profile
+                .steps
+                .keys()
+                .any(|step| matches!(step, StepName::Downgrade | StepName::ExerciseDowngraded))
+            || profile.checks.iter().any(|check| {
+                matches!(
+                    check.checkpoint,
+                    Checkpoint::Downgraded | Checkpoint::DowngradeRejected
+                )
+            });
+        ensure!(
+            !downgrade_features || recipe.schema_version >= 4,
+            "downgrade requires recipe schema version 4"
+        );
+        ensure!(
+            !downgrade_features || downgrade_declared,
+            "downgrade features require declared downgrade scenario"
+        );
         if recipe.schema_version == 1 {
             ensure!(
                 !profile.steps.contains_key(&StepName::Reinstall),
@@ -326,9 +376,13 @@ pub fn load(path: &Path) -> Result<ValidatedRecipe> {
                 ensure!(
                     matches!(
                         check.checkpoint,
-                        Checkpoint::Reinstalled | Checkpoint::Interrupted | Checkpoint::Recovered
+                        Checkpoint::Reinstalled
+                            | Checkpoint::Interrupted
+                            | Checkpoint::Recovered
+                            | Checkpoint::Downgraded
+                            | Checkpoint::DowngradeRejected
                     ),
-                    "unchanged requires checkpoint reinstalled, interrupted or recovered"
+                    "unchanged requires checkpoint reinstalled, interrupted, recovered, downgraded or downgrade_rejected"
                 );
             }
             match &mut check.expectation {
@@ -389,10 +443,17 @@ pub fn load(path: &Path) -> Result<ValidatedRecipe> {
                             | Checkpoint::Reinstalled
                             | Checkpoint::Interrupted
                             | Checkpoint::Recovered
+                            | Checkpoint::Downgraded
+                            | Checkpoint::DowngradeRejected
                     ),
                     "preserved requires a checkpoint after configuration"
                 );
             }
+        }
+    }
+    for profile in recipe.profiles.values() {
+        if profile.downgrade.is_some() {
+            super::downgrade::validate_profile(profile)?;
         }
     }
     let target_artifact = resolve_artifact(&project_root, &recipe.artifacts.target)?;

@@ -181,6 +181,33 @@ impl App {
                         }
                     }
                 }
+                if options.scenarios.contains(&ScenarioKind::Downgrade) {
+                    text += "Downgrade artifact roles: target = newer installed; base = older requested.\nCompare before_downgrade (after newer exercise) to the declared policy checkpoint before checks. Preserved uses configured.\n";
+                    if let Some(policy) = &profile.downgrade {
+                        match policy {
+                            crate::recipe::DowngradeContract::Compatible { data_checks } => {
+                                text += &format!(
+                                    "Policy: compatible; older runtime and data reader checks: {data_checks:?}\n"
+                                );
+                            }
+                            crate::recipe::DowngradeContract::SafeRejection {
+                                expected_exit,
+                                stdout_contains,
+                                binary_checks,
+                                data_checks,
+                            } => {
+                                text += &format!(
+                                    "Policy: safe_rejection; expected refusal exit={expected_exit}, stdout marker={stdout_contains:?}\nBinary scopes: {binary_checks:?}; data scopes: {data_checks:?}\n"
+                                );
+                            }
+                        }
+                    }
+                    for step in [StepName::Exercise, StepName::ExerciseDowngraded] {
+                        if let Some(command) = profile.steps.get(&step) {
+                            text += &format!("Downgrade runtime {step}: {}\n", command.script);
+                        }
+                    }
+                }
                 if options.scenarios.contains(&ScenarioKind::Reinstall) {
                     text += "Reinstall rehearsal: install_target, configure, exercise_before_reinstall, before_reinstall, reinstall, reinstalled, exercise_after_reinstall, uninstall.\nBoth exercise stages run the same exercise command as UID/GID 10001:10001.\n";
                     if let Some(command) = profile.steps.get(&StepName::Reinstall) {
@@ -239,6 +266,15 @@ impl App {
                 ));
             }
             for command in &stage.commands {
+                if let Some(proof) = &command.rejection {
+                    items.push(format!(
+                        "Declared refusal: actual={:?} expected={} matched={} marker={:?}",
+                        command.exit_status,
+                        proof.expected_exit,
+                        proof.stdout_matched,
+                        proof.stdout_contains
+                    ));
+                }
                 if let Some(proof) = &command.interruption {
                     items.push(format!(
                         "Interruption {:?}: readiness={} stopped={}",
@@ -258,6 +294,20 @@ impl App {
         }
         match self.tab {
             Tab::Stages => {
+                if let Some(scenario) = self.scenario()
+                    && scenario.scenario == ScenarioKind::Downgrade
+                    && scenario.outcome == RunOutcome::Passed
+                {
+                    match &scenario.downgrade {
+                        Some(crate::recipe::DowngradeContract::Compatible { .. }) => {
+                            items.push("Compatible downgrade passed".into())
+                        }
+                        Some(crate::recipe::DowngradeContract::SafeRejection { .. }) => {
+                            items.push("Declared rejection checks passed".into())
+                        }
+                        None => {}
+                    }
+                }
                 items.push(format!("{}: {}", stage.name, stage.outcome));
                 items.extend(stage.checks.iter().map(check_text));
                 items.extend(stage.errors.iter().cloned());

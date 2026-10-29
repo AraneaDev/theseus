@@ -15,9 +15,9 @@ macro_rules! named_enum {
     };
 }
 named_enum!(ProfileName { User => "user", System => "system" });
-named_enum!(ScenarioKind { Clean => "clean", Upgrade => "upgrade", Reinstall => "reinstall", InterruptedInstall => "interrupted_install", InterruptedUpgrade => "interrupted_upgrade" });
-named_enum!(StepName { InstallBase => "install_base", InstallTarget => "install_target", Configure => "configure", Upgrade => "upgrade", Exercise => "exercise", Reinstall => "reinstall", Uninstall => "uninstall", InterruptInstall => "interrupt_install", RecoverInstall => "recover_install", InterruptUpgrade => "interrupt_upgrade", RecoverUpgrade => "recover_upgrade" });
-named_enum!(Checkpoint { BaseInstalled => "base_installed", Configured => "configured", TargetInstalled => "target_installed", Uninstalled => "uninstalled", Reinstalled => "reinstalled", Interrupted => "interrupted", Recovered => "recovered" });
+named_enum!(ScenarioKind { Clean => "clean", Upgrade => "upgrade", Reinstall => "reinstall", InterruptedInstall => "interrupted_install", InterruptedUpgrade => "interrupted_upgrade", Downgrade => "downgrade" });
+named_enum!(StepName { InstallBase => "install_base", InstallTarget => "install_target", Configure => "configure", Upgrade => "upgrade", Exercise => "exercise", Reinstall => "reinstall", Uninstall => "uninstall", InterruptInstall => "interrupt_install", RecoverInstall => "recover_install", InterruptUpgrade => "interrupt_upgrade", RecoverUpgrade => "recover_upgrade", Downgrade => "downgrade", ExerciseDowngraded => "exercise_downgraded" });
+named_enum!(Checkpoint { BaseInstalled => "base_installed", Configured => "configured", TargetInstalled => "target_installed", Uninstalled => "uninstalled", Reinstalled => "reinstalled", Interrupted => "interrupted", Recovered => "recovered", Downgraded => "downgraded", DowngradeRejected => "downgrade_rejected" });
 /// One applicability map for selection, orchestration and unperformed evidence.
 pub fn checkpoint_applies(scenario: ScenarioKind, checkpoint: Checkpoint) -> bool {
     match checkpoint {
@@ -27,15 +27,40 @@ pub fn checkpoint_applies(scenario: ScenarioKind, checkpoint: Checkpoint) -> boo
         ),
         Checkpoint::TargetInstalled => matches!(
             scenario,
-            ScenarioKind::Clean | ScenarioKind::Upgrade | ScenarioKind::Reinstall
+            ScenarioKind::Clean
+                | ScenarioKind::Upgrade
+                | ScenarioKind::Reinstall
+                | ScenarioKind::Downgrade
         ),
         Checkpoint::Reinstalled => scenario == ScenarioKind::Reinstall,
+        Checkpoint::Downgraded | Checkpoint::DowngradeRejected => {
+            scenario == ScenarioKind::Downgrade
+        }
         Checkpoint::Interrupted | Checkpoint::Recovered => matches!(
             scenario,
             ScenarioKind::InterruptedInstall | ScenarioKind::InterruptedUpgrade
         ),
         Checkpoint::Configured | Checkpoint::Uninstalled => true,
     }
+}
+/// Policy-aware applicability; old scenarios retain the two-argument semantics.
+pub fn checkpoint_applies_with_policy(
+    scenario: ScenarioKind,
+    checkpoint: Checkpoint,
+    policy: Option<&crate::recipe::DowngradeContract>,
+) -> bool {
+    checkpoint_applies(scenario, checkpoint)
+        && match checkpoint {
+            Checkpoint::Downgraded => matches!(
+                policy,
+                Some(crate::recipe::DowngradeContract::Compatible { .. })
+            ),
+            Checkpoint::DowngradeRejected => matches!(
+                policy,
+                Some(crate::recipe::DowngradeContract::SafeRejection { .. })
+            ),
+            _ => true,
+        }
 }
 named_enum!(FileKind { File => "file", Directory => "directory", Symlink => "symlink" });
 named_enum!(CheckOutcome { Passed => "passed", Failed => "failed", Incomplete => "incomplete", Skipped => "skipped" });
@@ -60,6 +85,10 @@ impl ComparisonReference {
     pub fn for_checkpoint(checkpoint: Checkpoint) -> Option<Self> {
         match checkpoint {
             Checkpoint::Reinstalled => Some(Self::reinstall()),
+            Checkpoint::Downgraded | Checkpoint::DowngradeRejected => Some(Self {
+                before_stage: "before_downgrade".into(),
+                after_stage: checkpoint.to_string(),
+            }),
             Checkpoint::Interrupted | Checkpoint::Recovered => Some(Self {
                 before_stage: "before_interrupt".into(),
                 after_stage: checkpoint.to_string(),
@@ -81,7 +110,7 @@ pub struct Finding {
     pub message: String,
 }
 
-pub const REPORT_SCHEMA_VERSION: u32 = 3;
+pub const REPORT_SCHEMA_VERSION: u32 = 4;
 pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
 named_enum!(RunOutcome { Passed => "passed", Failed => "failed", Incomplete => "incomplete", Cancelled => "cancelled" });
 impl RunOutcome {
@@ -106,13 +135,19 @@ impl RunOutcome {
     }
 }
 named_enum!(StageOutcome { Pending => "pending", Running => "running", Passed => "passed", Failed => "failed", Incomplete => "incomplete", Cancelled => "cancelled", Skipped => "skipped" });
-named_enum!(CommandOutcome { Interrupted => "interrupted", Succeeded => "succeeded", Failed => "failed", TimedOut => "timed_out", Cancelled => "cancelled", Error => "error", Skipped => "skipped" });
+named_enum!(CommandOutcome { ExpectedRejection => "expected_rejection", Interrupted => "interrupted", Succeeded => "succeeded", Failed => "failed", TimedOut => "timed_out", Cancelled => "cancelled", Error => "error", Skipped => "skipped" });
 named_enum!(InterruptionMechanism { ContainerSigkill => "container_sigkill" });
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterruptionEvidence {
     pub mechanism: InterruptionMechanism,
     pub readiness_verified: bool,
     pub stopped_verified: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectionEvidence {
+    pub expected_exit: i32,
+    pub stdout_contains: String,
+    pub stdout_matched: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestartEvidence {
@@ -182,6 +217,8 @@ pub struct CommandRecord {
     pub skip_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interruption: Option<InterruptionEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection: Option<RejectionEvidence>,
 }
 impl CommandRecord {
     pub fn new(id: impl Into<String>, phase: impl Into<String>) -> Self {
@@ -204,6 +241,7 @@ impl CommandRecord {
             error: None,
             skip_reason: None,
             interruption: None,
+            rejection: None,
         }
     }
 }
@@ -260,6 +298,27 @@ impl StageReport {
                         .is_some_and(|proof| proof.readiness_verified && proof.stopped_verified)
             })
     }
+    pub fn verified_rejection(&self) -> bool {
+        self.step == Some(StepName::Downgrade)
+            && self.name == "downgrade"
+            && self.commands.len() == 1
+            && self.errors.is_empty()
+            && self.commands.iter().all(|command| {
+                command.phase == "downgrade"
+                    && command.outcome == CommandOutcome::ExpectedRejection
+                    && !command.timed_out
+                    && !command.cancelled
+                    && command.error.is_none()
+                    && command.interruption.is_none()
+                    && command.stdout.as_ref().is_none_or(|log| !log.truncated)
+                    && command.rejection.as_ref().is_some_and(|proof| {
+                        (1..=125).contains(&proof.expected_exit)
+                            && command.exit_status == Some(proof.expected_exit)
+                            && !proof.stdout_contains.trim().is_empty()
+                            && proof.stdout_matched
+                    })
+            })
+    }
     pub fn aggregate_outcome(&self) -> RunOutcome {
         let initial = match self.outcome {
             StageOutcome::Passed | StageOutcome::Skipped => RunOutcome::Passed,
@@ -293,6 +352,12 @@ impl StageReport {
             });
         }
         for command in &self.commands {
+            if command.rejection.is_some()
+                && (command.outcome != CommandOutcome::ExpectedRejection
+                    || !self.verified_rejection())
+            {
+                outcomes.push(RunOutcome::Incomplete);
+            }
             outcomes.push(if command.cancelled {
                 RunOutcome::Cancelled
             } else if command.timed_out || command.error.is_some() {
@@ -302,6 +367,10 @@ impl StageReport {
                     CommandOutcome::Succeeded | CommandOutcome::Skipped => RunOutcome::Passed,
                     CommandOutcome::Failed => RunOutcome::Failed,
                     CommandOutcome::Cancelled => RunOutcome::Cancelled,
+                    CommandOutcome::ExpectedRejection if self.verified_rejection() => {
+                        RunOutcome::Passed
+                    }
+                    CommandOutcome::ExpectedRejection => RunOutcome::Incomplete,
                     CommandOutcome::Interrupted if self.verified_interruption() => {
                         RunOutcome::Passed
                     }
@@ -319,6 +388,8 @@ pub struct ScenarioReport {
     pub id: String,
     pub profile: ProfileName,
     pub scenario: ScenarioKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downgrade: Option<crate::recipe::DowngradeContract>,
     pub outcome: RunOutcome,
     pub container_id: Option<String>,
     pub stages: Vec<StageReport>,
@@ -332,6 +403,7 @@ impl ScenarioReport {
             id: id.into(),
             profile,
             scenario,
+            downgrade: None,
             outcome: RunOutcome::Incomplete,
             container_id: None,
             stages: Vec::new(),
@@ -362,6 +434,127 @@ impl ScenarioReport {
                 .iter()
                 .any(|command| command.outcome == CommandOutcome::Interrupted)
                 && stage.step != interrupt_step)
+            {
+                outcomes.push(RunOutcome::Incomplete);
+            }
+        }
+        if self.downgrade.is_some() != (self.scenario == ScenarioKind::Downgrade)
+            || self
+                .downgrade
+                .as_ref()
+                .is_some_and(|policy| crate::recipe::validate_downgrade_contract(policy).is_err())
+        {
+            outcomes.push(RunOutcome::Incomplete);
+        }
+        for stage in &self.stages {
+            if stage.checkpoint.is_some_and(|cp| {
+                (self.scenario == ScenarioKind::Downgrade
+                    || matches!(cp, Checkpoint::Downgraded | Checkpoint::DowngradeRejected))
+                    && !checkpoint_applies_with_policy(self.scenario, cp, self.downgrade.as_ref())
+            }) || stage.checks.iter().any(|check| {
+                (self.scenario == ScenarioKind::Downgrade
+                    || matches!(
+                        check.checkpoint,
+                        Checkpoint::Downgraded | Checkpoint::DowngradeRejected
+                    ))
+                    && !checkpoint_applies_with_policy(
+                        self.scenario,
+                        check.checkpoint,
+                        self.downgrade.as_ref(),
+                    )
+            }) {
+                outcomes.push(RunOutcome::Incomplete);
+            }
+            for command in &stage.commands {
+                if command.outcome == CommandOutcome::ExpectedRejection
+                    || command.rejection.is_some()
+                {
+                    let matches_policy = match (&self.downgrade, &command.rejection) {
+                        (
+                            Some(crate::recipe::DowngradeContract::SafeRejection {
+                                expected_exit,
+                                stdout_contains,
+                                ..
+                            }),
+                            Some(proof),
+                        ) => {
+                            self.scenario == ScenarioKind::Downgrade
+                                && stage.verified_rejection()
+                                && proof.expected_exit == *expected_exit
+                                && proof.stdout_contains == *stdout_contains
+                        }
+                        _ => false,
+                    };
+                    if !matches_policy {
+                        outcomes.push(RunOutcome::Incomplete);
+                    }
+                }
+            }
+        }
+        // Completed successful runs need their policy checkpoint and every named
+        // contract. Failed/cancelled runs and intermediate saves may lack them.
+        if self.scenario == ScenarioKind::Downgrade
+            && matches!(self.teardown, TeardownStatus::Complete)
+            && RunOutcome::aggregate(outcomes.iter().copied()) == RunOutcome::Passed
+            && let Some(policy) = &self.downgrade
+        {
+            let (checkpoint, ids) = match policy {
+                crate::recipe::DowngradeContract::Compatible { data_checks } => (
+                    Checkpoint::Downgraded,
+                    data_checks.iter().collect::<Vec<_>>(),
+                ),
+                crate::recipe::DowngradeContract::SafeRejection {
+                    binary_checks,
+                    data_checks,
+                    ..
+                } => (
+                    Checkpoint::DowngradeRejected,
+                    binary_checks.iter().chain(data_checks).collect(),
+                ),
+            };
+            let checkpoints = self
+                .stages
+                .iter()
+                .filter(|s| s.checkpoint == Some(checkpoint))
+                .collect::<Vec<_>>();
+            let attempts = self
+                .stages
+                .iter()
+                .filter(|s| s.step == Some(StepName::Downgrade))
+                .collect::<Vec<_>>();
+            let attempt_valid = attempts.len() == 1
+                && attempts[0].outcome == StageOutcome::Passed
+                && match policy {
+                    crate::recipe::DowngradeContract::SafeRejection { .. } => {
+                        attempts[0].verified_rejection()
+                    }
+                    crate::recipe::DowngradeContract::Compatible { .. } => {
+                        attempts[0].name == "downgrade"
+                            && attempts[0].commands.len() == 1
+                            && attempts[0].commands.iter().all(|command| {
+                                command.phase == "downgrade"
+                                    && command.outcome == CommandOutcome::Succeeded
+                                    && command.exit_status == Some(0)
+                                    && command.rejection.is_none()
+                            })
+                    }
+                };
+            if !attempt_valid
+                || checkpoints.len() != 1
+                || checkpoints.iter().any(|s| {
+                    s.outcome != StageOutcome::Passed
+                        || s.checks
+                            .iter()
+                            .any(|check| check.outcome != CheckOutcome::Passed)
+                })
+                || ids.iter().any(|id| {
+                    let checks = checkpoints
+                        .iter()
+                        .flat_map(|s| &s.checks)
+                        .filter(|c| &c.id == *id && c.checkpoint == checkpoint)
+                        .collect::<Vec<_>>();
+                    checks.len() != 1 || checks[0].outcome != CheckOutcome::Passed
+                })
             {
                 outcomes.push(RunOutcome::Incomplete);
             }

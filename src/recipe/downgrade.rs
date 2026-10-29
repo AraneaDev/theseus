@@ -64,3 +64,75 @@ fn validate_references<'a>(ids: &'a [String], role: &str) -> Result<BTreeSet<&'a
     }
     Ok(unique)
 }
+
+pub(super) fn validate_profile(profile: &super::Profile) -> Result<()> {
+    use super::Expectation;
+    use crate::model::Checkpoint;
+    let policy = profile
+        .downgrade
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("downgrade requires an explicit policy"))?;
+    validate_downgrade_contract(policy)?;
+    let runtime = |checkpoint| {
+        profile.checks.iter().any(|check| check.checkpoint == checkpoint && matches!(&check.expectation,
+        Expectation::Executable { expected_exit: 0, stdout_contains: Some(marker), .. } if !marker.trim().is_empty()))
+    };
+    ensure!(
+        runtime(Checkpoint::TargetInstalled),
+        "downgrade requires a newer Executable contract at target_installed"
+    );
+    let (checkpoint, data) = match policy {
+        DowngradeContract::Compatible { data_checks } => (Checkpoint::Downgraded, data_checks),
+        DowngradeContract::SafeRejection { data_checks, .. } => {
+            (Checkpoint::DowngradeRejected, data_checks)
+        }
+    };
+    ensure!(
+        runtime(checkpoint),
+        "downgrade requires an Executable contract at {checkpoint}"
+    );
+    let resolve = |id: &String| -> Result<&super::Check> {
+        let check = profile
+            .checks
+            .iter()
+            .find(|check| &check.id == id)
+            .ok_or_else(|| anyhow::anyhow!("unknown downgrade check {id}"))?;
+        ensure!(
+            check.checkpoint == checkpoint,
+            "downgrade check {id} requires checkpoint {checkpoint}"
+        );
+        Ok(check)
+    };
+    for id in data {
+        let check = resolve(id)?;
+        match policy {
+            DowngradeContract::Compatible { .. } => ensure!(
+                matches!(&check.expectation, Expectation::Command { expected_exit: 0, stdout_contains: Some(marker), .. } if !marker.trim().is_empty()),
+                "compatible data check {id} requires Command with expected_exit 0 and nonempty stdout_contains"
+            ),
+            DowngradeContract::SafeRejection { .. } => ensure!(
+                matches!(check.expectation, Expectation::Unchanged { .. }),
+                "safe rejection data check {id} requires Unchanged"
+            ),
+        }
+    }
+    if let DowngradeContract::SafeRejection { binary_checks, .. } = policy {
+        for id in binary_checks {
+            let check = resolve(id)?;
+            ensure!(
+                matches!(check.expectation, Expectation::Unchanged { .. }),
+                "safe rejection binary check {id} requires Unchanged"
+            );
+            let binary_path = check.expectation.path().unwrap();
+            for data_id in data {
+                let data_path = resolve(data_id)?.expectation.path().unwrap();
+                ensure!(
+                    !super::validate::contained(binary_path, data_path)
+                        && !super::validate::contained(data_path, binary_path),
+                    "binary and data scopes overlap"
+                );
+            }
+        }
+    }
+    Ok(())
+}

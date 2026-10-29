@@ -50,6 +50,7 @@ pub enum ProfileSelection {
 }
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum ScenarioSelection {
+    Downgrade,
     Clean,
     Upgrade,
     Reinstall,
@@ -117,6 +118,7 @@ pub fn execute(cli: Cli) -> Result<i32> {
                 ProfileSelection::All => options.profiles,
             };
             options.scenarios = match scenario {
+                ScenarioSelection::Downgrade => vec![ScenarioKind::Downgrade],
                 ScenarioSelection::Clean => vec![ScenarioKind::Clean],
                 ScenarioSelection::Upgrade => vec![ScenarioKind::Upgrade],
                 ScenarioSelection::Reinstall => vec![ScenarioKind::Reinstall],

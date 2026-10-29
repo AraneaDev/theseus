@@ -348,14 +348,14 @@ fn frozen_schema_one_report_and_journal_remain_readable_and_writable() {
 }
 
 #[test]
-fn new_reports_write_schema_three_while_journals_stay_schema_one() {
+fn new_reports_write_schema_four_while_journals_stay_schema_one() {
     let temp = tempfile::tempdir().unwrap();
     let store = report::create(&temp.path().join("run")).unwrap();
     store.save(&RunReport::new("new-run")).unwrap();
     let serialized: serde_json::Value =
         serde_json::from_slice(&fs::read(store.report_path()).unwrap()).unwrap();
-    assert_eq!(serialized["schema_version"], 3);
-    assert_eq!(report::load(store.root()).unwrap().schema_version, 3);
+    assert_eq!(serialized["schema_version"], 4);
+    assert_eq!(report::load(store.root()).unwrap().schema_version, 4);
     let journal = RunJournal {
         schema_version: 1,
         run_id: "new-run".into(),
@@ -665,4 +665,299 @@ fn interruption_variants_are_schema_three_only_and_proof_is_scoped() {
         RunOutcome::Incomplete,
         "restart without matching verified stop"
     );
+}
+
+fn rejected_downgrade_report() -> RunReport {
+    let mut run = RunReport::new("refusal");
+    let mut scenario =
+        ScenarioReport::new("user-downgrade", ProfileName::User, ScenarioKind::Downgrade);
+    scenario.downgrade = Some(theseus::recipe::DowngradeContract::SafeRejection {
+        expected_exit: 9,
+        stdout_contains: "newer data".into(),
+        binary_checks: vec!["binary".into()],
+        data_checks: vec!["data".into()],
+    });
+    scenario.teardown = TeardownStatus::Complete;
+    let mut stage = StageReport::new("downgrade");
+    stage.step = Some(StepName::Downgrade);
+    stage.outcome = StageOutcome::Passed;
+    let mut command = CommandRecord::new("attempt", "downgrade");
+    command.outcome = CommandOutcome::ExpectedRejection;
+    command.exit_status = Some(9);
+    command.rejection = Some(RejectionEvidence {
+        expected_exit: 9,
+        stdout_contains: "newer data".into(),
+        stdout_matched: true,
+    });
+    stage.commands.push(command);
+    scenario.stages.push(stage);
+    let mut checkpoint = StageReport::new("downgrade_rejected");
+    checkpoint.checkpoint = Some(Checkpoint::DowngradeRejected);
+    checkpoint.outcome = StageOutcome::Passed;
+    for id in ["binary", "data"] {
+        checkpoint.checks.push(CheckResult {
+            id: id.into(),
+            checkpoint: Checkpoint::DowngradeRejected,
+            outcome: CheckOutcome::Passed,
+            message: "stable".into(),
+            path: Some(format!("/home/theseus/{id}")),
+            command_ids: vec![],
+            comparison: ComparisonReference::for_checkpoint(Checkpoint::DowngradeRejected),
+        });
+    }
+    scenario.stages.push(checkpoint);
+    run.scenarios.push(scenario);
+    run.recompute_outcome();
+    assert_eq!(run.outcome, RunOutcome::Passed);
+    run
+}
+#[test]
+fn downgrade_refusal_proof_and_policy_context_are_required_for_aggregation() {
+    let valid = rejected_downgrade_report();
+    assert_eq!(
+        valid.scenarios[0].stages[0].aggregate_outcome(),
+        RunOutcome::Passed
+    );
+    for mutation in [
+        "step",
+        "phase",
+        "name",
+        "status",
+        "missing-proof",
+        "empty-marker",
+        "unmatched",
+        "policy-status",
+        "policy-marker",
+        "policy-compatible",
+        "scenario",
+        "checkpoint",
+        "missing-data",
+        "skipped-data",
+        "stray-proof",
+        "skipped-checkpoint",
+        "skipped-extra-check",
+        "missing-attempt",
+    ] {
+        let mut run = valid.clone();
+        let s = &mut run.scenarios[0];
+        match mutation {
+            "step" => s.stages[0].step = Some(StepName::InstallTarget),
+            "phase" => s.stages[0].commands[0].phase = "install_target".into(),
+            "name" => s.stages[0].name = "other".into(),
+            "status" => s.stages[0].commands[0].exit_status = Some(0),
+            "missing-proof" => s.stages[0].commands[0].rejection = None,
+            "empty-marker" => s.stages[0].commands[0]
+                .rejection
+                .as_mut()
+                .unwrap()
+                .stdout_contains
+                .clear(),
+            "unmatched" => {
+                s.stages[0].commands[0]
+                    .rejection
+                    .as_mut()
+                    .unwrap()
+                    .stdout_matched = false
+            }
+            "policy-status" => {
+                if let Some(theseus::recipe::DowngradeContract::SafeRejection {
+                    expected_exit,
+                    ..
+                }) = &mut s.downgrade
+                {
+                    *expected_exit = 8;
+                }
+            }
+            "policy-marker" => {
+                if let Some(theseus::recipe::DowngradeContract::SafeRejection {
+                    stdout_contains,
+                    ..
+                }) = &mut s.downgrade
+                {
+                    *stdout_contains = "other".into();
+                }
+            }
+            "policy-compatible" => {
+                s.downgrade = Some(theseus::recipe::DowngradeContract::Compatible {
+                    data_checks: vec!["data".into()],
+                })
+            }
+            "scenario" => s.scenario = ScenarioKind::Clean,
+            "checkpoint" => {
+                s.stages.pop();
+            }
+            "missing-data" => {
+                s.stages[1].checks.pop();
+            }
+            "skipped-data" => s.stages[1].checks[1].outcome = CheckOutcome::Skipped,
+            "stray-proof" => s.stages[0].commands[0].outcome = CommandOutcome::Succeeded,
+            "skipped-checkpoint" => s.stages[1].outcome = StageOutcome::Skipped,
+            "skipped-extra-check" => {
+                let mut extra = s.stages[1].checks[0].clone();
+                extra.id = "extra".into();
+                extra.outcome = CheckOutcome::Skipped;
+                s.stages[1].checks.push(extra);
+            }
+            "missing-attempt" => {
+                s.stages.remove(0);
+            }
+            _ => unreachable!(),
+        }
+        run.recompute_outcome();
+        assert_eq!(run.outcome, RunOutcome::Incomplete, "{mutation}");
+    }
+}
+#[test]
+fn downgrade_schema_four_reader_recomputes_forged_pass_and_preserves_older_readers() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = report::create(&temp.path().join("run")).unwrap();
+    let mut run = rejected_downgrade_report();
+    run.scenarios[0].stages[1].checks.clear();
+    // Simulate hand-edited persisted metadata that falsely claims Passed.
+    fs::write(store.report_path(), serde_json::to_vec(&run).unwrap()).unwrap();
+    assert_eq!(
+        report::load(store.root()).unwrap().outcome,
+        RunOutcome::Incomplete
+    );
+    store.save(&run).unwrap();
+    let saved: RunReport = serde_json::from_slice(&fs::read(store.report_path()).unwrap()).unwrap();
+    assert_eq!(saved.outcome, RunOutcome::Incomplete);
+    for version in [1, 2, 3] {
+        let mut old = RunReport::new("old");
+        old.schema_version = version;
+        store.save(&old).unwrap();
+        assert_eq!(report::load(store.root()).unwrap().schema_version, version);
+        old.scenarios = rejected_downgrade_report().scenarios;
+        assert!(
+            store.save(&old).is_err(),
+            "old schema {version} accepted downgrade"
+        );
+        fs::write(store.report_path(), serde_json::to_vec(&old).unwrap()).unwrap();
+        assert!(report::load(store.root()).is_err());
+    }
+}
+
+#[test]
+fn downgrade_each_feature_has_schema_four_floor_and_optional_fields_omit_none() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = report::create(&temp.path().join("run")).unwrap();
+    for version in [1, 2, 3] {
+        for feature in [
+            "selection",
+            "scenario",
+            "metadata",
+            "step",
+            "exercise",
+            "checkpoint",
+            "check",
+            "comparison",
+            "proof",
+            "outcome",
+        ] {
+            let mut run = RunReport::new("floor");
+            run.schema_version = version;
+            let mut s = ScenarioReport::new("user-clean", ProfileName::User, ScenarioKind::Clean);
+            let mut stage = StageReport::new("test");
+            let mut cmd = CommandRecord::new("test", "test");
+            match feature {
+                "selection" => run.selected_scenarios.push(ScenarioKind::Downgrade),
+                "scenario" => s.scenario = ScenarioKind::Downgrade,
+                "metadata" => {
+                    s.downgrade = rejected_downgrade_report().scenarios[0].downgrade.clone()
+                }
+                "step" => stage.step = Some(StepName::Downgrade),
+                "exercise" => stage.step = Some(StepName::ExerciseDowngraded),
+                "checkpoint" => stage.checkpoint = Some(Checkpoint::Downgraded),
+                "check" | "comparison" => stage.checks.push(CheckResult {
+                    id: "x".into(),
+                    checkpoint: if feature == "check" {
+                        Checkpoint::DowngradeRejected
+                    } else {
+                        Checkpoint::Uninstalled
+                    },
+                    outcome: CheckOutcome::Passed,
+                    message: "x".into(),
+                    path: None,
+                    command_ids: vec![],
+                    comparison: if feature == "comparison" {
+                        ComparisonReference::for_checkpoint(Checkpoint::Downgraded)
+                    } else {
+                        None
+                    },
+                }),
+                "proof" => {
+                    cmd.rejection = Some(RejectionEvidence {
+                        expected_exit: 9,
+                        stdout_contains: "refusal".into(),
+                        stdout_matched: true,
+                    })
+                }
+                "outcome" => cmd.outcome = CommandOutcome::ExpectedRejection,
+                _ => unreachable!(),
+            }
+            stage.commands.push(cmd);
+            s.stages.push(stage);
+            run.scenarios.push(s);
+            assert!(store.save(&run).is_err(), "{version}/{feature}");
+            fs::write(store.report_path(), serde_json::to_vec(&run).unwrap()).unwrap();
+            assert!(report::load(store.root()).is_err(), "{version}/{feature}");
+        }
+    }
+    let run = RunReport::new("optional");
+    let s = ScenarioReport::new("x", ProfileName::User, ScenarioKind::Clean);
+    let c = CommandRecord::new("x", "x");
+    assert!(
+        serde_json::to_value(&run)
+            .unwrap()
+            .get("downgrade")
+            .is_none()
+    );
+    assert!(serde_json::to_value(&s).unwrap().get("downgrade").is_none());
+    assert!(serde_json::to_value(&c).unwrap().get("rejection").is_none());
+}
+#[test]
+fn downgrade_incomplete_proof_cannot_pass_a_stage_and_cancellation_wins() {
+    let valid = rejected_downgrade_report().scenarios[0].stages[0].clone();
+    for mutation in [
+        "truncated",
+        "timeout",
+        "cancel",
+        "error",
+        "receipt",
+        "invalid-status",
+        "proof",
+        "extra-command",
+    ] {
+        let mut stage = valid.clone();
+        let c = &mut stage.commands[0];
+        match mutation {
+            "truncated" => {
+                c.stdout = Some(LogReference {
+                    path: "logs/out".into(),
+                    bytes: 1,
+                    truncated: true,
+                })
+            }
+            "timeout" => c.timed_out = true,
+            "cancel" => c.cancelled = true,
+            "error" => c.error = Some("control error".into()),
+            "receipt" => c.exit_status = None,
+            "invalid-status" => {
+                c.exit_status = Some(126);
+                c.rejection.as_mut().unwrap().expected_exit = 126;
+            }
+            "proof" => c.rejection = None,
+            "extra-command" => stage.commands.push(valid.commands[0].clone()),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            stage.aggregate_outcome(),
+            if mutation == "cancel" {
+                RunOutcome::Cancelled
+            } else {
+                RunOutcome::Incomplete
+            },
+            "{mutation}"
+        );
+    }
 }

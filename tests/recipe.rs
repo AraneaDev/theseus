@@ -524,3 +524,125 @@ fn interruption_selection_ignores_contracts_at_unvisited_legacy_checkpoints() {
         .validate_selection(&[ProfileName::User], &recipe.declared_scenarios())
         .unwrap();
 }
+
+#[test]
+fn downgrade_schema_four_recipe_loads_runtime_contract() {
+    let temporary = tempfile::tempdir().unwrap();
+    for name in ["base", "target"] {
+        std::fs::create_dir(temporary.path().join(name)).unwrap();
+    }
+    let path = temporary.path().join("theseus.toml");
+    std::fs::write(&path, include_str!("fixtures/recipes/v4_downgrade.toml")).unwrap();
+    let recipe = theseus::recipe::load(&path).expect("explicit downgrade schema loads");
+    recipe
+        .validate_selection(
+            &[theseus::model::ProfileName::User],
+            &recipe.declared_scenarios(),
+        )
+        .unwrap();
+    assert_eq!(recipe.declared_scenarios()[0].to_string(), "downgrade");
+}
+
+const DOWNGRADE: &str = include_str!("fixtures/recipes/v4_downgrade.toml");
+#[test]
+fn downgrade_rejects_invalid_contract_references_and_schema_features() {
+    for text in [
+        DOWNGRADE.replace("schema_version = 4", "schema_version = 3"),
+        DOWNGRADE.replace("scenarios = [\"downgrade\"]", "scenarios = [\"clean\"]"),
+        DOWNGRADE.replace(
+            "data_checks = [\"older-data\"]",
+            "data_checks = [\"unknown\"]",
+        ),
+        DOWNGRADE.replace(
+            "data_checks = [\"older-data\"]",
+            "data_checks = [\"older\"]",
+        ),
+        DOWNGRADE.replace(
+            "checkpoint = \"downgraded\"\nkind = \"command\"",
+            "checkpoint = \"configured\"\nkind = \"command\"",
+        ),
+        DOWNGRADE.replace(
+            "stdout_contains = \"record survives\"",
+            "stdout_contains = \" \"",
+        ),
+        DOWNGRADE.replace("stdout_contains = \"1.0\"", "stdout_contains = \"\""),
+        DOWNGRADE.replace("stdout_contains = \"2.0\"", "stdout_contains = \"\""),
+    ] {
+        assert!(load_text(&text).is_err(), "accepted {text}");
+    }
+    for text in [
+        DOWNGRADE.replace("base = \"base\"\n", ""),
+        DOWNGRADE.replace(
+            "[profiles.user.steps.downgrade]\nscript = \"sh /inputs/base/install.sh user\"\n",
+            "",
+        ),
+        DOWNGRADE.replace(
+            "[profiles.user.steps.exercise_downgraded]\nscript = \"exercise-older\"\n",
+            "",
+        ),
+        DOWNGRADE.replace(
+            "[profiles.user.downgrade]\nexpect = \"compatible\"\ndata_checks = [\"older-data\"]\n",
+            "",
+        ),
+    ] {
+        let recipe = load_text(&text).unwrap();
+        assert!(
+            recipe
+                .validate_selection(&[ProfileName::User], &recipe.declared_scenarios())
+                .is_err()
+        );
+    }
+}
+#[test]
+fn downgrade_rejection_requires_distinct_observed_unchanged_roles() {
+    let text = DOWNGRADE.replace("expect = \"compatible\"\ndata_checks = [\"older-data\"]", "expect = \"safe_rejection\"\nexpected_exit = 9\nstdout_contains = \"newer data\"\nbinary_checks = [\"binary\"]\ndata_checks = [\"data\"]");
+    let mut text = text[..text
+        .find("[[profiles.user.checks]]\nid = \"older\"")
+        .unwrap()]
+        .to_string();
+    text.push_str("\n[[profiles.user.checks]]\nid = \"newer-still\"\ncheckpoint = \"downgrade_rejected\"\nkind = \"executable\"\nname = \"sample-cli\"\nresolved_path = \"/home/theseus/bin\"\nexpected_exit = 0\nstdout_contains = \"2.0\"\n[[profiles.user.checks]]\nid = \"binary\"\ncheckpoint = \"downgrade_rejected\"\nkind = \"unchanged\"\npath = \"/home/theseus/bin\"\n[[profiles.user.checks]]\nid = \"data\"\ncheckpoint = \"downgrade_rejected\"\nkind = \"unchanged\"\npath = \"/home/theseus/data\"\n");
+    load_text(&text)
+        .unwrap()
+        .validate_selection(&[ProfileName::User], &[ScenarioKind::Downgrade])
+        .unwrap();
+    for broken in [
+        text.replace("expected_exit = 9", "expected_exit = 126"),
+        text.replace("stdout_contains = \"newer data\"", "stdout_contains = \"\""),
+        text.replace("binary_checks = [\"binary\"]", "binary_checks = [\"data\"]"),
+        text.replace(
+            "path = \"/home/theseus/data\"",
+            "path = \"/home/theseus/bin/data\"",
+        ),
+        text.replace("path = \"/home/theseus/data\"", "path = \"/home/theseus\""),
+        text.replace("path = \"/home/theseus/data\"", "path = \"/outside\""),
+        text.replace("kind = \"unchanged\"", "kind = \"preserved\""),
+        text.replace(
+            "checkpoint = \"downgrade_rejected\"\nkind = \"unchanged\"",
+            "checkpoint = \"downgraded\"\nkind = \"unchanged\"",
+        ),
+    ] {
+        assert!(load_text(&broken).is_err(), "accepted {broken}");
+    }
+}
+#[test]
+fn downgrade_checks_do_not_satisfy_reinstall_or_interruption_minima() {
+    let text = DOWNGRADE.replace(
+        "scenarios = [\"downgrade\"]",
+        "scenarios = [\"downgrade\", \"reinstall\", \"interrupted_upgrade\"]",
+    );
+    let recipe = load_text(&text).unwrap();
+    for kind in [ScenarioKind::Reinstall, ScenarioKind::InterruptedUpgrade] {
+        let error = recipe
+            .validate_selection(&[ProfileName::User], &[kind])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(if kind == ScenarioKind::Reinstall {
+                "unchanged"
+            } else {
+                "interrupted filesystem"
+            }),
+            "{error}"
+        );
+    }
+}

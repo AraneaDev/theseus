@@ -1,4 +1,5 @@
 //! Blocking scenario engine. Call on a worker thread; event callbacks must not block.
+mod downgrade;
 mod interruption;
 mod stages;
 use crate::{
@@ -155,6 +156,10 @@ pub fn run_with(
                     report
                         .scenarios
                         .push(ScenarioReport::new(&sid, *profile, *scenario));
+                    if *scenario == ScenarioKind::Downgrade {
+                        report.scenarios[index].downgrade =
+                            recipe.recipe.profiles[profile].downgrade.clone();
+                    }
                     let result = stages::scenario(stages::ScenarioContext {
                         recipe,
                         options: &options,
@@ -306,7 +311,11 @@ fn mark_remaining_checks(recipe: &ValidatedRecipe, scenario: &mut ScenarioReport
     };
     stage.skip_reason = Some("scenario interrupted before these checks could run".into());
     for check in &recipe.recipe.profiles[&scenario.profile].checks {
-        if !checkpoint_applies(scenario.scenario, check.checkpoint) {
+        if !checkpoint_applies_with_policy(
+            scenario.scenario,
+            check.checkpoint,
+            scenario.downgrade.as_ref(),
+        ) {
             continue;
         }
         if scenario

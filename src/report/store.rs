@@ -72,7 +72,13 @@ impl ReportStore {
     }
     pub fn save(&self, report: &RunReport) -> Result<()> {
         validate_report(report)?;
-        self.atomic_json("report.json", report)
+        if report.schema_version >= 4 {
+            let mut normalized = report.clone();
+            normalized.recompute_outcome();
+            self.atomic_json("report.json", &normalized)
+        } else {
+            self.atomic_json("report.json", report)
+        }
     }
     pub fn save_journal(&self, journal: &RunJournal) -> Result<()> {
         validate_journal(journal)?;
@@ -242,7 +248,7 @@ fn log_components(relative: &str) -> Result<Vec<&str>> {
 }
 fn validate_report(report: &RunReport) -> Result<()> {
     ensure!(
-        matches!(report.schema_version, 1 | 2 | REPORT_SCHEMA_VERSION),
+        matches!(report.schema_version, 1 | 2 | 3 | REPORT_SCHEMA_VERSION),
         "unsupported report schema version {}",
         report.schema_version
     );
@@ -302,6 +308,37 @@ fn validate_report(report: &RunReport) -> Result<()> {
             "interruption and restart evidence require report schema version 3"
         );
     }
+    if report.schema_version < 4 {
+        ensure!(
+            !report.selected_scenarios.contains(&ScenarioKind::Downgrade)
+                && report.scenarios.iter().all(|scenario| scenario.scenario
+                    != ScenarioKind::Downgrade
+                    && scenario.downgrade.is_none()
+                    && scenario.stages.iter().all(|stage| {
+                        !matches!(
+                            stage.step,
+                            Some(StepName::Downgrade | StepName::ExerciseDowngraded)
+                        ) && !matches!(
+                            stage.checkpoint,
+                            Some(Checkpoint::Downgraded | Checkpoint::DowngradeRejected)
+                        ) && stage.checks.iter().all(|check| {
+                            !matches!(
+                                check.checkpoint,
+                                Checkpoint::Downgraded | Checkpoint::DowngradeRejected
+                            ) && check.comparison.as_ref().is_none_or(|reference| {
+                                reference.before_stage != "before_downgrade"
+                                    && reference.after_stage != "downgraded"
+                                    && reference.after_stage != "downgrade_rejected"
+                            })
+                        }) && stage.commands.iter().all(|command| {
+                            command.rejection.is_none()
+                                && command.outcome
+                                    != crate::model::CommandOutcome::ExpectedRejection
+                        })
+                    })),
+            "downgrade evidence requires report schema version 4"
+        );
+    }
     for scenario in &report.scenarios {
         for stage in &scenario.stages {
             for command in &stage.commands {
@@ -315,8 +352,11 @@ fn validate_report(report: &RunReport) -> Result<()> {
 }
 pub fn load(path: &Path) -> Result<RunReport> {
     let root = report_root(path, "report.json")?;
-    let report = open_store(&root)?.read_json("report.json")?;
+    let mut report: RunReport = open_store(&root)?.read_json("report.json")?;
     validate_report(&report)?;
+    if report.schema_version >= 4 {
+        report.recompute_outcome();
+    }
     Ok(report)
 }
 pub fn load_journal(path: &Path) -> Result<RunJournal> {

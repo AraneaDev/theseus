@@ -1,0 +1,46 @@
+schema_version = 4
+scenarios = ["downgrade"]
+name = "downgrade-contract"
+image = "ubuntu:24.04"
+observe = ["/home/theseus"]
+[artifacts]
+base = "base"
+target = "target"
+[profiles.user.downgrade]
+expect = "compatible"
+data_checks = ["older-data"]
+[profiles.user.steps.install_target]
+script = "sh /inputs/target/install.sh user"
+[profiles.user.steps.configure]
+script = "configure"
+[profiles.user.steps.exercise]
+script = "exercise-newer"
+[profiles.user.steps.downgrade]
+script = "sh /inputs/base/install.sh user"
+[profiles.user.steps.exercise_downgraded]
+script = "exercise-older"
+[profiles.user.steps.uninstall]
+script = "uninstall"
+[[profiles.user.checks]]
+id = "newer"
+checkpoint = "target_installed"
+kind = "executable"
+name = "sample-cli"
+resolved_path = "/home/theseus/bin"
+expected_exit = 0
+stdout_contains = "2.0"
+[[profiles.user.checks]]
+id = "older"
+checkpoint = "downgraded"
+kind = "executable"
+name = "sample-cli"
+resolved_path = "/home/theseus/bin"
+expected_exit = 0
+stdout_contains = "1.0"
+[[profiles.user.checks]]
+id = "older-data"
+checkpoint = "downgraded"
+kind = "command"
+script = "sample-cli read-data"
+expected_exit = 0
+stdout_contains = "record survives"

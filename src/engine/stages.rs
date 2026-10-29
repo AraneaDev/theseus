@@ -33,6 +33,7 @@ pub(super) struct State {
     pub(super) configured: Option<Vec<Snapshot>>,
     pub(super) before_reinstall: Option<Vec<Snapshot>>,
     pub(super) before_interrupt: Option<Vec<Snapshot>>,
+    pub(super) before_downgrade: Option<Vec<Snapshot>>,
     pub(super) sequence: usize,
 }
 pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
@@ -64,6 +65,7 @@ pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
         configured: None,
         before_reinstall: None,
         before_interrupt: None,
+        before_downgrade: None,
         sequence: 0,
     };
     let baseline = c.observation(&state);
@@ -74,6 +76,7 @@ pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
     c.finish(stage)?;
     let kind = c.report.scenarios[c.index].scenario;
     match kind {
+        ScenarioKind::Downgrade => super::downgrade::run(c, &mut state)?,
         ScenarioKind::InterruptedInstall | ScenarioKind::InterruptedUpgrade => {
             super::interruption::run(c, &mut state, kind)?
         }
@@ -83,7 +86,9 @@ pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
                     (StepName::InstallTarget, Checkpoint::TargetInstalled)
                 }
                 ScenarioKind::Upgrade => (StepName::InstallBase, Checkpoint::BaseInstalled),
-                ScenarioKind::InterruptedInstall | ScenarioKind::InterruptedUpgrade => {
+                ScenarioKind::InterruptedInstall
+                | ScenarioKind::InterruptedUpgrade
+                | ScenarioKind::Downgrade => {
                     unreachable!("handled explicitly above")
                 }
             };
@@ -98,7 +103,9 @@ pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
                     c.step(&mut state, StepName::Exercise)?;
                 }
                 ScenarioKind::Clean => c.step(&mut state, StepName::Exercise)?,
-                ScenarioKind::InterruptedInstall | ScenarioKind::InterruptedUpgrade => {
+                ScenarioKind::InterruptedInstall
+                | ScenarioKind::InterruptedUpgrade
+                | ScenarioKind::Downgrade => {
                     unreachable!("handled explicitly above")
                 }
                 ScenarioKind::Reinstall => {
@@ -228,7 +235,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
             log_limit: self.options.log_limit,
         }
     }
-    fn execute(
+    pub(super) fn execute(
         &mut self,
         state: &mut State,
         request: CommandRequest,
@@ -320,6 +327,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                 | StepName::InstallTarget
                 | StepName::Upgrade
                 | StepName::Reinstall
+                | StepName::Downgrade
                 | StepName::Uninstall
                 | StepName::RecoverInstall
                 | StepName::RecoverUpgrade
@@ -505,18 +513,38 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                 }
             }
             Expectation::Unchanged { path } => {
-                let stability = checks::compare_unchanged(
+                let mut stability = checks::compare_unchanged(
                     path,
                     match check.checkpoint {
                         Checkpoint::Reinstalled => state.before_reinstall.as_deref(),
                         Checkpoint::Interrupted | Checkpoint::Recovered => {
                             state.before_interrupt.as_deref()
                         }
+                        Checkpoint::Downgraded | Checkpoint::DowngradeRejected => {
+                            state.before_downgrade.as_deref()
+                        }
                         _ => None,
                     }
                     .unwrap_or_default(),
                     &stage.snapshots,
                 );
+                if check.checkpoint == Checkpoint::DowngradeRejected
+                    && stability.outcome == CheckOutcome::Passed
+                    && matches!(&self.report.scenarios[self.index].downgrade,
+                        Some(crate::recipe::DowngradeContract::SafeRejection { binary_checks, .. }) if binary_checks.contains(&check.id))
+                    && state.before_downgrade.as_ref().is_some_and(|snapshots| {
+                        snapshots.iter().any(|snapshot| {
+                            snapshot
+                                .entries
+                                .get(path)
+                                .is_some_and(|entry| entry.kind == FileKind::Directory)
+                        })
+                    })
+                {
+                    stability.outcome = CheckOutcome::Failed;
+                    stability.message =
+                        "binary scope must be a file or symlink before downgrade".into();
+                }
                 CheckResult {
                     id: check.id.clone(),
                     checkpoint: check.checkpoint,
@@ -536,7 +564,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
         result
     }
 }
-fn observed(executed: &ExecutedCommand) -> CommandObservation {
+pub(super) fn observed(executed: &ExecutedCommand) -> CommandObservation {
     CommandObservation {
         exit_status: executed.record.exit_status,
         stdout: executed.stdout.clone(),

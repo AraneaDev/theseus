@@ -62,6 +62,8 @@ pub struct Artifacts {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downgrade: Option<super::DowngradeContract>,
     pub steps: BTreeMap<StepName, CommandSpec>,
     #[serde(default)]
     pub checks: Vec<Check>,

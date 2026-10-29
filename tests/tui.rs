@@ -592,3 +592,85 @@ fn mixed_schema_three_preview_keeps_stability_scopes_with_their_checkpoint_refer
         }
     }
 }
+
+#[test]
+fn downgrade_preview_explains_roles_policy_reader_and_reference() {
+    let temp = tempfile::tempdir().unwrap();
+    for name in ["base", "target"] {
+        std::fs::create_dir(temp.path().join(name)).unwrap();
+    }
+    let path = temp.path().join("theseus.toml");
+    std::fs::write(&path, include_str!("fixtures/recipes/v4_downgrade.toml")).unwrap();
+    let recipe = theseus::recipe::load(&path).unwrap();
+    let options = theseus::engine::RunOptions::all(&recipe);
+    let app = App::preview(recipe, options);
+    let text = app.preview_text();
+    for expected in [
+        "target = newer",
+        "base = older",
+        "compatible",
+        "older-data",
+        "before_downgrade",
+        "exercise-newer",
+        "exercise-older",
+    ] {
+        assert!(text.contains(expected), "missing {expected}");
+    }
+}
+#[test]
+fn downgrade_offline_evidence_shows_actual_refusal_and_declared_marker() {
+    let mut run = RunReport::new("offline-downgrade");
+    let mut s = ScenarioReport::new("user-downgrade", ProfileName::User, ScenarioKind::Downgrade);
+    let mut stage = StageReport::new("downgrade");
+    stage.step = Some(StepName::Downgrade);
+    stage.outcome = StageOutcome::Passed;
+    let mut c = CommandRecord::new("attempt", "downgrade");
+    c.outcome = CommandOutcome::ExpectedRejection;
+    c.exit_status = Some(9);
+    c.rejection = Some(RejectionEvidence {
+        expected_exit: 9,
+        stdout_contains: "newer data".into(),
+        stdout_matched: true,
+    });
+    stage.commands.push(c);
+    s.stages.push(stage);
+    run.scenarios.push(s);
+    let app = App::offline(run, std::path::PathBuf::new());
+    let text = app.items().join("\n");
+    for expected in ["actual=Some(9)", "expected=9", "matched=true", "newer data"] {
+        assert!(text.contains(expected), "missing {expected}: {text}");
+    }
+    assert!(screen(&app, 52, 24).contains("expected=9"));
+}
+
+#[test]
+fn downgrade_completed_evidence_names_the_declared_result() {
+    for rejection in [false, true] {
+        let mut run = RunReport::new("completed");
+        let mut s =
+            ScenarioReport::new("user-downgrade", ProfileName::User, ScenarioKind::Downgrade);
+        s.outcome = RunOutcome::Passed;
+        s.downgrade = Some(if rejection {
+            theseus::recipe::DowngradeContract::SafeRejection {
+                expected_exit: 9,
+                stdout_contains: "newer data".into(),
+                binary_checks: vec!["binary".into()],
+                data_checks: vec!["data".into()],
+            }
+        } else {
+            theseus::recipe::DowngradeContract::Compatible {
+                data_checks: vec!["reader".into()],
+            }
+        });
+        let mut stage = StageReport::new("final");
+        stage.outcome = StageOutcome::Passed;
+        s.stages.push(stage);
+        run.scenarios.push(s);
+        let app = App::offline(run, std::path::PathBuf::new());
+        assert!(app.items().join("\n").contains(if rejection {
+            "Declared rejection checks passed"
+        } else {
+            "Compatible downgrade passed"
+        }));
+    }
+}
