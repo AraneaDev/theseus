@@ -646,3 +646,67 @@ fn downgrade_checks_do_not_satisfy_reinstall_or_interruption_minima() {
         );
     }
 }
+
+const ROLLBACK: &str = include_str!("fixtures/recipes/rollback.toml");
+#[test]
+fn rollback_recipe_five_loads_and_selects_declared_profile() {
+    let recipe = load_text(ROLLBACK).unwrap();
+    let scenarios = recipe.declared_scenarios();
+    assert_eq!(scenarios[0].to_string(), "rollback");
+    recipe
+        .validate_selection(&[ProfileName::User], &scenarios)
+        .unwrap();
+}
+
+#[test]
+fn rollback_rejects_missing_unbound_or_mismatched_runtime_and_other_roles() {
+    for text in [
+        ROLLBACK.replace("runtime_checks = ['runtime']\n", ""),
+        ROLLBACK.replace(
+            "runtime_checks = ['runtime']",
+            "runtime_checks = ['reader']",
+        ),
+        ROLLBACK.replace("runtime_checks = ['runtime']", "runtime_checks = []"),
+        ROLLBACK.replace(
+            "\npath = '/workspace/tool'",
+            "\npath = '/workspace/unrelated'",
+        ),
+        ROLLBACK.replacen(
+            "stdout_contains = 'known good'",
+            "stdout_contains = 'candidate'",
+            1,
+        ),
+        ROLLBACK.replace("change_checks = ['changed']", "change_checks = ['binary']"),
+        ROLLBACK.replace("data_checks = ['reader']", "data_checks = ['binary']"),
+        ROLLBACK.replace("id = 'reader'", "id = '__theseus_rollback_reader'"),
+        ROLLBACK.replace("source = '/workspace/data'", "source = '/unobserved/data'"),
+        ROLLBACK.replace(
+            "\npath = '/workspace/tool'",
+            "\npath = '/workspace/data/tool'",
+        ),
+    ] {
+        assert!(load_text(&text).is_err(), "accepted {text}");
+    }
+    for version in 1..=4 {
+        assert!(
+            load_text(
+                &ROLLBACK.replace("schema_version = 5", &format!("schema_version = {version}"))
+            )
+            .is_err()
+        );
+    }
+    let recipe = load_text(
+        &ROLLBACK
+            .replace("script = 'rollback'\n", "")
+            .replace("[profiles.user.steps.rollback]\n", ""),
+    )
+    .unwrap();
+    assert!(
+        recipe
+            .validate_selection(&[ProfileName::User], &[ScenarioKind::Rollback])
+            .is_err()
+    );
+    assert!(
+        load_text(&ROLLBACK.replace("scenarios = ['rollback']", "scenarios = ['clean']")).is_err()
+    );
+}

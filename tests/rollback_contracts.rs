@@ -16,6 +16,7 @@ fn contract() -> RollbackContract {
         },
         change_checks: vec!["changed".into()],
         binary_checks: vec!["binary".into()],
+        runtime_checks: vec!["runtime".into()],
         data_checks: vec!["reader".into()],
         restoration: RestorationPolicy::RestoreData {
             backup_root: "/workspace/backup".into(),
@@ -72,7 +73,12 @@ fn policy_requires_valid_failure_and_distinct_nonempty_reference_roles() {
         c.failure.stdout_contains = marker.into();
         assert!(validate_rollback_contract(&c).is_err());
     }
-    for role in ["change_checks", "binary_checks", "data_checks"] {
+    for role in [
+        "change_checks",
+        "binary_checks",
+        "runtime_checks",
+        "data_checks",
+    ] {
         for ids in [
             json!([]),
             json!([""]),
@@ -91,6 +97,9 @@ fn policy_requires_valid_failure_and_distinct_nonempty_reference_roles() {
         ("change_checks", "binary_checks"),
         ("change_checks", "data_checks"),
         ("binary_checks", "data_checks"),
+        ("runtime_checks", "change_checks"),
+        ("runtime_checks", "binary_checks"),
+        ("runtime_checks", "data_checks"),
     ] {
         let mut value = serde_json::to_value(contract()).unwrap();
         value[roles.0] = json!(["shared"]);
@@ -381,6 +390,7 @@ fn policy_decode_rejects_missing_fields_unknown_modes_and_wrong_types() {
         "failure",
         "change_checks",
         "binary_checks",
+        "runtime_checks",
         "data_checks",
         "restoration",
     ] {

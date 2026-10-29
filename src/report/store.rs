@@ -341,21 +341,57 @@ fn validate_report(report: &RunReport) -> Result<()> {
     }
     if report.schema_version < 5 {
         ensure!(
-            report.scenarios.iter().all(|scenario| {
-                scenario.rollback.is_none()
-                    && scenario.stages.iter().all(|stage| {
-                        stage.commands.iter().all(|command| {
-                            command.expected_failure.is_none()
-                                && command.outcome != crate::model::CommandOutcome::ExpectedFailure
-                        }) && stage.checks.iter().all(|check| {
-                            check.backup.is_none()
-                                && check.comparison.as_ref().is_none_or(|reference| {
-                                    !crate::model::rollback_reference(&reference.before_stage)
-                                        && !crate::model::rollback_reference(&reference.after_stage)
+            !report.selected_scenarios.contains(&ScenarioKind::Rollback)
+                && report.scenarios.iter().all(|scenario| {
+                    scenario.scenario != ScenarioKind::Rollback
+                        && scenario.rollback.is_none()
+                        && scenario.stages.iter().all(|stage| {
+                            !crate::model::rollback_reference(&stage.name)
+                                && !matches!(
+                                    stage.step,
+                                    Some(
+                                        StepName::Backup
+                                            | StepName::AttemptUpgrade
+                                            | StepName::Rollback
+                                            | StepName::ExerciseRolledBack
+                                            | StepName::CleanupBackup
+                                    )
+                                )
+                                && !matches!(
+                                    stage.checkpoint,
+                                    Some(
+                                        Checkpoint::KnownGood
+                                            | Checkpoint::BackupCreated
+                                            | Checkpoint::UpgradeFailed
+                                            | Checkpoint::RolledBack
+                                            | Checkpoint::BackupRemoved
+                                    )
+                                )
+                                && stage.commands.iter().all(|command| {
+                                    command.expected_failure.is_none()
+                                        && command.outcome
+                                            != crate::model::CommandOutcome::ExpectedFailure
+                                })
+                                && stage.checks.iter().all(|check| {
+                                    !matches!(
+                                        check.checkpoint,
+                                        Checkpoint::KnownGood
+                                            | Checkpoint::BackupCreated
+                                            | Checkpoint::UpgradeFailed
+                                            | Checkpoint::RolledBack
+                                            | Checkpoint::BackupRemoved
+                                    ) && !check.id.starts_with("__theseus_rollback_")
+                                        && check.backup.is_none()
+                                        && check.comparison.as_ref().is_none_or(|reference| {
+                                            !crate::model::rollback_reference(
+                                                &reference.before_stage,
+                                            ) && !crate::model::rollback_reference(
+                                                &reference.after_stage,
+                                            )
+                                        })
                                 })
                         })
-                    })
-            }),
+                }),
             "rollback evidence requires report schema version 5"
         );
     }

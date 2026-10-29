@@ -1,6 +1,8 @@
 //! Blocking scenario engine. Call on a worker thread; event callbacks must not block.
 mod downgrade;
 mod interruption;
+mod rollback;
+mod rollback_checks;
 mod stages;
 use crate::{
     model::*,
@@ -159,6 +161,10 @@ pub fn run_with(
                     if *scenario == ScenarioKind::Downgrade {
                         report.scenarios[index].downgrade =
                             recipe.recipe.profiles[profile].downgrade.clone();
+                    }
+                    if *scenario == ScenarioKind::Rollback {
+                        report.scenarios[index].rollback =
+                            recipe.recipe.profiles[profile].rollback.clone();
                     }
                     let result = stages::scenario(stages::ScenarioContext {
                         recipe,

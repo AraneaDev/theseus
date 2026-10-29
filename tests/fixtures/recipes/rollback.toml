@@ -1,0 +1,82 @@
+schema_version = 5
+scenarios = ['rollback']
+name = 'rollback fixture'
+image = 'ubuntu:24.04'
+observe = ['/workspace']
+[artifacts]
+base = 'base'
+target = 'target'
+[profiles.user.rollback]
+change_checks = ['changed']
+binary_checks = ['binary']
+runtime_checks = ['runtime']
+data_checks = ['reader']
+[profiles.user.rollback.failure]
+expected_exit = 9
+stdout_contains = 'migration failed'
+[profiles.user.rollback.restoration]
+mode = 'restore_data'
+backup_root = '/workspace/backup'
+[[profiles.user.rollback.restoration.scopes]]
+id = 'data'
+source = '/workspace/data'
+stored = 'data'
+[profiles.user.steps.install_base]
+script = 'install base'
+[profiles.user.steps.configure]
+script = 'configure'
+[profiles.user.steps.exercise]
+script = 'exercise'
+[profiles.user.steps.backup]
+script = 'backup'
+[profiles.user.steps.attempt_upgrade]
+script = 'attempt upgrade'
+[profiles.user.steps.rollback]
+script = 'rollback'
+[profiles.user.steps.exercise_rolled_back]
+script = 'exercise rolled back'
+[profiles.user.steps.cleanup_backup]
+script = 'cleanup backup'
+[profiles.user.steps.uninstall]
+script = 'uninstall'
+[[profiles.user.checks]]
+id = 'base'
+checkpoint = 'base_installed'
+kind = 'executable'
+name = 'tool'
+resolved_path = '/workspace/tool'
+expected_exit = 0
+stdout_contains = 'known good'
+[[profiles.user.checks]]
+id = 'known'
+checkpoint = 'known_good'
+kind = 'command'
+script = 'tool read'
+expected_exit = 0
+stdout_contains = 'readable'
+[[profiles.user.checks]]
+id = 'changed'
+checkpoint = 'upgrade_failed'
+kind = 'changed'
+path = '/workspace/data'
+[[profiles.user.checks]]
+id = 'binary'
+checkpoint = 'rolled_back'
+kind = 'unchanged'
+path = '/workspace/tool'
+[[profiles.user.checks]]
+id = 'reader'
+checkpoint = 'rolled_back'
+kind = 'command'
+script = 'tool read'
+expected_exit = 0
+stdout_contains = 'readable'
+
+[[profiles.user.checks]]
+id = 'runtime'
+checkpoint = 'rolled_back'
+kind = 'executable'
+name = 'tool'
+resolved_path = '/workspace/tool'
+expected_exit = 0
+stdout_contains = 'known good'

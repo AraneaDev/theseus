@@ -35,6 +35,9 @@ pub(super) struct State {
     pub(super) before_interrupt: Option<Vec<Snapshot>>,
     pub(super) before_downgrade: Option<Vec<Snapshot>>,
     pub(super) sequence: usize,
+    pub(super) before_upgrade: Option<Vec<Snapshot>>,
+    pub(super) before_attempt: Option<Vec<Snapshot>>,
+    pub(super) rollback_backup_authorized: bool,
 }
 pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
     mut context: ScenarioContext<'_, E, F>,
@@ -67,6 +70,9 @@ pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
         before_interrupt: None,
         before_downgrade: None,
         sequence: 0,
+        before_upgrade: None,
+        before_attempt: None,
+        rollback_backup_authorized: false,
     };
     let baseline = c.observation(&state);
     state.baseline = baseline.clone();
@@ -77,6 +83,7 @@ pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
     let kind = c.report.scenarios[c.index].scenario;
     match kind {
         ScenarioKind::Downgrade => super::downgrade::run(c, &mut state)?,
+        ScenarioKind::Rollback => super::rollback::run(c, &mut state)?,
         ScenarioKind::InterruptedInstall | ScenarioKind::InterruptedUpgrade => {
             super::interruption::run(c, &mut state, kind)?
         }
@@ -88,7 +95,8 @@ pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
                 ScenarioKind::Upgrade => (StepName::InstallBase, Checkpoint::BaseInstalled),
                 ScenarioKind::InterruptedInstall
                 | ScenarioKind::InterruptedUpgrade
-                | ScenarioKind::Downgrade => {
+                | ScenarioKind::Downgrade
+                | ScenarioKind::Rollback => {
                     unreachable!("handled explicitly above")
                 }
             };
@@ -105,7 +113,8 @@ pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
                 ScenarioKind::Clean => c.step(&mut state, StepName::Exercise)?,
                 ScenarioKind::InterruptedInstall
                 | ScenarioKind::InterruptedUpgrade
-                | ScenarioKind::Downgrade => {
+                | ScenarioKind::Downgrade
+                | ScenarioKind::Rollback => {
                     unreachable!("handled explicitly above")
                 }
                 ScenarioKind::Reinstall => {
@@ -305,7 +314,10 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
             self.report.cancelled = true;
         }
         if state.availability != Availability::Running
-            || (!state.forward && step != StepName::Uninstall)
+            || (step == StepName::CleanupBackup && !state.rollback_backup_authorized)
+            || (!state.forward
+                && step != StepName::Uninstall
+                && !(step == StepName::CleanupBackup && state.rollback_backup_authorized))
         {
             stage.outcome = StageOutcome::Skipped;
             stage.skip_reason = Some(
@@ -319,6 +331,18 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
             return self.finish(stage);
         }
         self.start(&stage)?;
+        self.execute_step(state, step, name, &mut stage);
+        self.capture(state, &mut stage);
+        Self::outcome(&mut stage);
+        self.update(&stage)
+    }
+    pub(super) fn execute_step(
+        &mut self,
+        state: &mut State,
+        step: StepName,
+        name: &str,
+        stage: &mut StageReport,
+    ) {
         let profile_name = self.report.scenarios[self.index].profile;
         let spec = self.recipe.recipe.profiles[&profile_name].steps[&step].clone();
         let installer = matches!(
@@ -331,6 +355,10 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                 | StepName::Uninstall
                 | StepName::RecoverInstall
                 | StepName::RecoverUpgrade
+                | StepName::Backup
+                | StepName::AttemptUpgrade
+                | StepName::Rollback
+                | StepName::CleanupBackup
         );
         let identity = if installer && profile_name == ProfileName::System {
             ExecutionIdentity::root()
@@ -345,11 +373,8 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
             vec!["/bin/sh".into(), "-c".into(), spec.script.clone()],
             0,
         );
-        let executed = self.execute(state, request, &mut stage);
+        let executed = self.execute(state, request, stage);
         state.forward &= executed.record.outcome == CommandOutcome::Succeeded;
-        self.capture(state, &mut stage);
-        Self::outcome(&mut stage);
-        self.update(&stage)
     }
     pub(super) fn checkpoint(
         &mut self,
@@ -361,8 +386,17 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
             state.availability = Availability::Unavailable;
             self.report.cancelled = true;
         }
-        let blocked =
-            !state.forward && matches!(checkpoint, Checkpoint::Interrupted | Checkpoint::Recovered);
+        let blocked = !state.forward
+            && matches!(
+                checkpoint,
+                Checkpoint::Interrupted
+                    | Checkpoint::Recovered
+                    | Checkpoint::KnownGood
+                    | Checkpoint::BackupCreated
+                    | Checkpoint::UpgradeFailed
+                    | Checkpoint::RolledBack
+            )
+            || checkpoint == Checkpoint::BackupRemoved && !state.rollback_backup_authorized;
         let mut stage = StageReport::new(checkpoint.to_string());
         stage.checkpoint = Some(checkpoint);
         self.start(&stage)?;
@@ -375,6 +409,32 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                 .any(|s| s.step == Some(StepName::Configure) && s.outcome != StageOutcome::Skipped)
         {
             state.configured = Some(stage.snapshots.clone());
+        }
+        if self.report.scenarios[self.index].scenario == ScenarioKind::Rollback {
+            let policy = self.report.scenarios[self.index].rollback.as_ref().unwrap();
+            {
+                let derived = super::rollback_checks::derived(
+                    policy,
+                    checkpoint,
+                    state.before_upgrade.as_deref().unwrap_or_default(),
+                    &stage.snapshots,
+                    &stage.name,
+                );
+                for mut check in derived {
+                    if blocked {
+                        check.outcome = CheckOutcome::Skipped;
+                        check.message =
+                            "required rollback prerequisite was skipped or failed".into();
+                    } else if state.availability != Availability::Running {
+                        check.outcome = CheckOutcome::Incomplete;
+                        check.message = "container unavailable".into();
+                    }
+                    if !blocked {
+                        state.forward &= check.outcome == CheckOutcome::Passed;
+                    }
+                    stage.checks.push(check);
+                }
+            }
         }
         let checks = self.recipe.recipe.profiles[&self.report.scenarios[self.index].profile]
             .checks
@@ -419,7 +479,10 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
             } else {
                 self.check(state, check, &mut stage)
             };
-            if matches!(check.expectation, Expectation::Unchanged { .. }) {
+            if matches!(
+                check.expectation,
+                Expectation::Unchanged { .. } | Expectation::Changed { .. }
+            ) {
                 result.comparison = ComparisonReference::for_checkpoint(checkpoint);
             }
             state.forward &= result.outcome == CheckOutcome::Passed;
@@ -519,6 +582,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                     path,
                     match check.checkpoint {
                         Checkpoint::Reinstalled => state.before_reinstall.as_deref(),
+                        Checkpoint::RolledBack => state.before_upgrade.as_deref(),
                         Checkpoint::Interrupted | Checkpoint::Recovered => {
                             state.before_interrupt.as_deref()
                         }
@@ -547,11 +611,45 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                     stability.message =
                         "binary scope must be a file or symlink before downgrade".into();
                 }
+                if check.checkpoint == Checkpoint::RolledBack
+                    && self.report.scenarios[self.index]
+                        .rollback
+                        .as_ref()
+                        .is_some_and(|p| p.binary_checks.contains(&check.id))
+                    && state.before_upgrade.as_ref().is_some_and(|snapshots| {
+                        snapshots.iter().any(|s| {
+                            s.entries.get(path).is_some_and(|e| {
+                                !matches!(e.kind, FileKind::File | FileKind::Symlink)
+                            })
+                        })
+                    })
+                {
+                    stability.outcome = CheckOutcome::Failed;
+                    stability.message =
+                        "binary scope must be a file or symlink before upgrade".into();
+                }
                 CheckResult {
                     id: check.id.clone(),
                     checkpoint: check.checkpoint,
                     outcome: stability.outcome,
                     message: stability.message,
+                    path: Some(path.clone()),
+                    command_ids: vec![],
+                    backup: None,
+                    comparison: None,
+                }
+            }
+            Expectation::Changed { path } => {
+                let r = checks::compare_changed(
+                    path,
+                    state.before_attempt.as_deref().unwrap_or_default(),
+                    &stage.snapshots,
+                );
+                CheckResult {
+                    id: check.id.clone(),
+                    checkpoint: check.checkpoint,
+                    outcome: r.outcome,
+                    message: r.message,
                     path: Some(path.clone()),
                     command_ids: vec![],
                     backup: None,

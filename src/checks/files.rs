@@ -18,7 +18,10 @@ pub fn evaluate_filesystem(
             "runtime command evidence is required",
         );
     };
-    if matches!(check.expectation, Expectation::Unchanged { .. }) {
+    if matches!(
+        check.expectation,
+        Expectation::Unchanged { .. } | Expectation::Changed { .. }
+    ) {
         return result(
             check,
             CheckOutcome::Incomplete,

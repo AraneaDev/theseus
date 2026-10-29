@@ -63,6 +63,8 @@ pub struct Artifacts {
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback: Option<super::RollbackContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub downgrade: Option<super::DowngradeContract>,
     pub steps: BTreeMap<StepName, CommandSpec>,
     #[serde(default)]
@@ -131,6 +133,9 @@ pub enum Expectation {
     Unchanged {
         path: String,
     },
+    Changed {
+        path: String,
+    },
 }
 impl Expectation {
     pub fn path(&self) -> Option<&str> {
@@ -138,7 +143,8 @@ impl Expectation {
             Self::Absent { path }
             | Self::Present { path, .. }
             | Self::Preserved { path }
-            | Self::Unchanged { path } => Some(path),
+            | Self::Unchanged { path }
+            | Self::Changed { path } => Some(path),
             _ => None,
         }
     }

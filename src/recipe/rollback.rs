@@ -14,6 +14,7 @@ pub struct RollbackContract {
     pub failure: ExpectedFailureContract,
     pub change_checks: Vec<String>,
     pub binary_checks: Vec<String>,
+    pub runtime_checks: Vec<String>,
     pub data_checks: Vec<String>,
     pub restoration: RestorationPolicy,
 }
@@ -75,6 +76,7 @@ pub fn validate_rollback_contract(contract: &RollbackContract) -> Result<()> {
     for ids in [
         &contract.change_checks,
         &contract.binary_checks,
+        &contract.runtime_checks,
         &contract.data_checks,
     ] {
         ensure!(
@@ -156,4 +158,171 @@ fn validate_absolute(path: &str) -> Result<()> {
 }
 fn overlap(a: &str, b: &str) -> bool {
     super::validate::contained(a, b) || super::validate::contained(b, a)
+}
+
+pub(super) fn validate_features(
+    profile: &super::Profile,
+    version: u32,
+    declared: bool,
+) -> Result<()> {
+    use super::Expectation;
+    use crate::model::{Checkpoint, StepName};
+    let features = profile.rollback.is_some()
+        || profile.steps.keys().any(|s| {
+            matches!(
+                s,
+                StepName::Backup
+                    | StepName::AttemptUpgrade
+                    | StepName::Rollback
+                    | StepName::ExerciseRolledBack
+                    | StepName::CleanupBackup
+            )
+        })
+        || profile.checks.iter().any(|c| {
+            matches!(
+                c.checkpoint,
+                Checkpoint::KnownGood
+                    | Checkpoint::BackupCreated
+                    | Checkpoint::UpgradeFailed
+                    | Checkpoint::RolledBack
+                    | Checkpoint::BackupRemoved
+            ) || matches!(c.expectation, Expectation::Changed { .. })
+        });
+    ensure!(
+        !features || version >= 5,
+        "rollback requires recipe schema version 5"
+    );
+    ensure!(
+        !features || declared,
+        "rollback features require declared rollback scenario"
+    );
+    for check in &profile.checks {
+        ensure!(
+            !declared || !check.id.starts_with("__theseus_rollback_"),
+            "reserved rollback check ID"
+        );
+        ensure!(
+            !matches!(check.expectation, Expectation::Changed { .. })
+                || check.checkpoint == Checkpoint::UpgradeFailed,
+            "changed requires upgrade_failed checkpoint"
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn validate_profile(profile: &super::Profile, observe: &[String]) -> Result<()> {
+    use super::Expectation;
+    use crate::model::{Checkpoint, StepName};
+    let policy = profile
+        .rollback
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("rollback requires explicit policy"))?;
+    validate_rollback_contract(policy)?;
+    ensure!(profile.checks.iter().any(|c| c.checkpoint == Checkpoint::BaseInstalled && matches!(&c.expectation, Expectation::Executable { expected_exit: 0, stdout_contains: Some(s), .. } if !s.trim().is_empty())), "rollback requires BaseInstalled Executable marker");
+    ensure!(profile.checks.iter().any(|c| c.checkpoint == Checkpoint::KnownGood && matches!(&c.expectation, Expectation::Command { expected_exit: 0, stdout_contains: Some(s), .. } if !s.trim().is_empty())), "rollback requires KnownGood data reader");
+    let resolve = |id: &String| -> Result<&super::Check> {
+        profile
+            .checks
+            .iter()
+            .find(|c| &c.id == id)
+            .ok_or_else(|| anyhow::anyhow!("unknown rollback check {id}"))
+    };
+    for id in &policy.change_checks {
+        let c = resolve(id)?;
+        ensure!(
+            c.checkpoint == Checkpoint::UpgradeFailed
+                && matches!(c.expectation, Expectation::Changed { .. }),
+            "rollback change_checks require Changed at UpgradeFailed"
+        );
+    }
+    for id in &policy.binary_checks {
+        let c = resolve(id)?;
+        ensure!(
+            c.checkpoint == Checkpoint::RolledBack
+                && matches!(c.expectation, Expectation::Unchanged { .. }),
+            "rollback binary_checks require Unchanged at RolledBack"
+        );
+    }
+    for id in &policy.runtime_checks {
+        let c = resolve(id)?;
+        let Expectation::Executable {
+            name,
+            resolved_path,
+            args,
+            expected_exit: 0,
+            stdout_contains: Some(marker),
+            ..
+        } = &c.expectation
+        else {
+            anyhow::bail!(
+                "runtime_checks require Executable expected_exit0 with known-good marker"
+            );
+        };
+        ensure!(
+            c.checkpoint == Checkpoint::RolledBack && !marker.trim().is_empty(),
+            "runtime_checks require RolledBack and nonempty marker"
+        );
+        ensure!(profile.checks.iter().any(|base| base.checkpoint == Checkpoint::BaseInstalled && matches!(&base.expectation, Expectation::Executable { name: n, resolved_path: p, args: a, expected_exit: 0, stdout_contains: Some(m), .. } if n == name && p == resolved_path && a == args && m == marker)), "rollback runtime must match known-good Executable name/path/args/marker");
+        ensure!(
+            policy.binary_checks.iter().any(|id| resolve(id)
+                .is_ok_and(|b| b.expectation.path() == Some(resolved_path.as_str()))),
+            "rollback runtime path must equal a binary Unchanged path"
+        );
+    }
+    for id in &policy.data_checks {
+        let c = resolve(id)?;
+        ensure!(
+            c.checkpoint == Checkpoint::RolledBack
+                && matches!(&c.expectation, Expectation::Command { expected_exit: 0, stdout_contains: Some(s), .. } if !s.trim().is_empty()),
+            "rollback data_checks require Command reader at RolledBack"
+        );
+    }
+    match &policy.restoration {
+        RestorationPolicy::BinaryOnly => {
+            ensure!(
+                !profile.checks.iter().any(|c| matches!(
+                    c.checkpoint,
+                    Checkpoint::BackupCreated | Checkpoint::BackupRemoved
+                )),
+                "binary_only has no backup checkpoints"
+            );
+            ensure!(
+                !profile.steps.contains_key(&StepName::Backup)
+                    && !profile.steps.contains_key(&StepName::CleanupBackup),
+                "binary_only has no backup steps"
+            );
+        }
+        RestorationPolicy::RestoreData {
+            backup_root,
+            scopes,
+        } => {
+            ensure!(
+                profile.steps.contains_key(&StepName::Backup)
+                    && profile.steps.contains_key(&StepName::CleanupBackup),
+                "restore_data requires backup and cleanup_backup"
+            );
+            for path in std::iter::once(backup_root).chain(scopes.iter().map(|s| &s.source)) {
+                ensure!(
+                    observe.iter().any(|r| super::validate::contained(path, r)),
+                    "rollback scope outside observed roots"
+                );
+            }
+            for id in &policy.binary_checks {
+                let path = resolve(id)?.expectation.path().unwrap();
+                for scope in scopes {
+                    ensure!(
+                        !super::validate::contained(path, &scope.source)
+                            && !super::validate::contained(&scope.source, path),
+                        "binary and data scopes overlap"
+                    );
+                }
+                ensure!(
+                    !super::validate::contained(path, backup_root)
+                        && !super::validate::contained(backup_root, path),
+                    "binary and backup scopes overlap"
+                );
+            }
+        }
+    }
+    Ok(())
 }

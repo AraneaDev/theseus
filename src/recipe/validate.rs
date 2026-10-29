@@ -51,6 +51,22 @@ impl ValidatedRecipe {
                 .with_context(|| format!("profile {name} is not defined"))?;
             for scenario in scenarios {
                 let required = match scenario {
+                    ScenarioKind::Rollback => {
+                        ensure!(
+                            self.base_artifact.is_some(),
+                            "rollback requires artifacts.base"
+                        );
+                        super::rollback::validate_profile(profile, &self.recipe.observe)?;
+                        &[
+                            StepName::InstallBase,
+                            StepName::Configure,
+                            StepName::Exercise,
+                            StepName::AttemptUpgrade,
+                            StepName::Rollback,
+                            StepName::ExerciseRolledBack,
+                            StepName::Uninstall,
+                        ][..]
+                    }
                     ScenarioKind::Downgrade => {
                         ensure!(
                             self.base_artifact.is_some(),
@@ -205,11 +221,11 @@ pub fn load(path: &Path) -> Result<ValidatedRecipe> {
             recipe.scenarios.is_none(),
             "scenarios requires recipe schema version 2"
         ),
-        2..=4 => {
+        2..=5 => {
             let scenarios = recipe
                 .scenarios
                 .as_ref()
-                .context("recipe schema version 2/3/4 requires an explicit scenarios list")?;
+                .context("recipe schema version 2/3/4/5 requires an explicit scenarios list")?;
             ensure!(!scenarios.is_empty(), "declare at least one scenario");
             let mut seen = BTreeSet::new();
             for scenario in scenarios {
@@ -218,6 +234,14 @@ pub fn load(path: &Path) -> Result<ValidatedRecipe> {
         }
         version => bail!("unsupported recipe schema version {version}"),
     }
+    let rollback_declared = recipe
+        .scenarios
+        .as_ref()
+        .is_some_and(|s| s.contains(&ScenarioKind::Rollback));
+    ensure!(
+        !rollback_declared || recipe.schema_version >= 5,
+        "rollback requires recipe schema version 5"
+    );
     let downgrade_declared = recipe
         .scenarios
         .as_ref()
@@ -271,6 +295,7 @@ pub fn load(path: &Path) -> Result<ValidatedRecipe> {
         }
     }
     for (name, profile) in &mut recipe.profiles {
+        super::rollback::validate_features(profile, recipe.schema_version, rollback_declared)?;
         let downgrade_features = profile.downgrade.is_some()
             || profile
                 .steps
@@ -381,6 +406,7 @@ pub fn load(path: &Path) -> Result<ValidatedRecipe> {
                             | Checkpoint::Recovered
                             | Checkpoint::Downgraded
                             | Checkpoint::DowngradeRejected
+                            | Checkpoint::RolledBack
                     ),
                     "unchanged requires checkpoint reinstalled, interrupted, recovered, downgraded or downgrade_rejected"
                 );
@@ -425,7 +451,8 @@ pub fn load(path: &Path) -> Result<ValidatedRecipe> {
                 Expectation::Absent { path }
                 | Expectation::Present { path, .. }
                 | Expectation::Preserved { path }
-                | Expectation::Unchanged { path } => {
+                | Expectation::Unchanged { path }
+                | Expectation::Changed { path } => {
                     *path = normalize_container_path(path)?;
                     ensure!(
                         recipe.observe.iter().any(|root| contained(path, root)),
@@ -452,6 +479,9 @@ pub fn load(path: &Path) -> Result<ValidatedRecipe> {
         }
     }
     for profile in recipe.profiles.values() {
+        if rollback_declared {
+            super::rollback::validate_profile(profile, &recipe.observe)?;
+        }
         if profile.downgrade.is_some() {
             super::downgrade::validate_profile(profile)?;
         }

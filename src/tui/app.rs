@@ -181,6 +181,52 @@ impl App {
                         }
                     }
                 }
+                if options.scenarios.contains(&ScenarioKind::Rollback) {
+                    text += "Rollback artifact roles: base = known-good; target = failed candidate.\nKnown-good reference: before_upgrade after KnownGood checks; Changed: before_attempt -> upgrade_failed; restore: before_upgrade -> rolled_back.\n";
+                    if let Some(policy) = &profile.rollback {
+                        text += &format!(
+                            "Expected failure: attempt_upgrade exit={} marker={:?}\nChanged checks: {:?}; binary checks: {:?}; runtime checks: {:?}; data readers: {:?}\n",
+                            policy.failure.expected_exit,
+                            policy.failure.stdout_contains,
+                            policy.change_checks,
+                            policy.binary_checks,
+                            policy.runtime_checks,
+                            policy.data_checks
+                        );
+                        match &policy.restoration {
+                            crate::recipe::RestorationPolicy::BinaryOnly => {
+                                text += "Policy: binary_only; known-good runtime must read retained data.\n"
+                            }
+                            crate::recipe::RestorationPolicy::RestoreData {
+                                backup_root,
+                                scopes,
+                            } => {
+                                text += &format!(
+                                    "Policy: restore_data; backup root {backup_root}\nDerived checks: __theseus_rollback_root_absent (Backup before command, before_upgrade reference); __theseus_rollback_backup_removed (BackupRemoved)\n"
+                                );
+                                for scope in scopes {
+                                    text += &format!(
+                                        "Scope {}: {} -> {backup_root}/{}\n",
+                                        scope.id, scope.source, scope.stored
+                                    );
+                                    for (phase, label) in [
+                                        ("BackupCreated", "source_stable"),
+                                        ("BackupCreated", "backup_matches"),
+                                        ("UpgradeFailed", "backup_intact"),
+                                        ("before_rollback", "backup_ready"),
+                                        ("RolledBack", "restored"),
+                                        ("RolledBack", "backup_retained"),
+                                    ] {
+                                        text += &format!(
+                                            "Derived {phase}: __theseus_rollback_{label}_{}\n",
+                                            scope.id
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if options.scenarios.contains(&ScenarioKind::Downgrade) {
                     text += "Downgrade artifact roles: target = newer installed; base = older requested.\nCompare before_downgrade (after newer exercise) to the declared policy checkpoint before checks. Preserved uses configured.\n";
                     if let Some(policy) = &profile.downgrade {
@@ -266,6 +312,12 @@ impl App {
                 ));
             }
             for command in &stage.commands {
+                if let Some(proof) = &command.expected_failure {
+                    items.push(format!(
+                        "Expected failure: exit={} matched={} marker={:?}",
+                        proof.expected_exit, proof.stdout_matched, proof.stdout_contains
+                    ));
+                }
                 if let Some(proof) = &command.rejection {
                     items.push(format!(
                         "Declared refusal: actual={:?} expected={} matched={} marker={:?}",
@@ -307,6 +359,15 @@ impl App {
                         }
                         None => {}
                     }
+                }
+                if let Some(scenario) = self.scenario()
+                    && scenario.scenario == ScenarioKind::Rollback
+                    && scenario.outcome == RunOutcome::Passed
+                {
+                    items.push(match scenario.rollback.as_ref().map(|p| &p.restoration) {
+                        Some(crate::recipe::RestorationPolicy::RestoreData { .. }) => "Rollback verified: known-good binary, restored scopes and data readers passed",
+                        _ => "Rollback verified: known-good binary and retained-data readers passed",
+                    }.into());
                 }
                 items.push(format!("{}: {}", stage.name, stage.outcome));
                 items.extend(stage.checks.iter().map(check_text));
@@ -455,6 +516,12 @@ fn check_text(check: &CheckResult) -> String {
     let mut text = format!("{} {}: {}", check.id, check.outcome, check.message);
     if let Some(path) = &check.path {
         text += &format!("\nScope: {path}");
+    }
+    if let Some(backup) = &check.backup {
+        text += &format!(
+            " source {} stored {}",
+            backup.source_path, backup.stored_path
+        );
     }
     if let Some(comparison) = &check.comparison {
         text += &format!(

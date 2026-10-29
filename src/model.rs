@@ -18,15 +18,15 @@ macro_rules! named_enum {
     };
 }
 named_enum!(ProfileName { User => "user", System => "system" });
-named_enum!(ScenarioKind { Clean => "clean", Upgrade => "upgrade", Reinstall => "reinstall", InterruptedInstall => "interrupted_install", InterruptedUpgrade => "interrupted_upgrade", Downgrade => "downgrade" });
-named_enum!(StepName { InstallBase => "install_base", InstallTarget => "install_target", Configure => "configure", Upgrade => "upgrade", Exercise => "exercise", Reinstall => "reinstall", Uninstall => "uninstall", InterruptInstall => "interrupt_install", RecoverInstall => "recover_install", InterruptUpgrade => "interrupt_upgrade", RecoverUpgrade => "recover_upgrade", Downgrade => "downgrade", ExerciseDowngraded => "exercise_downgraded" });
-named_enum!(Checkpoint { BaseInstalled => "base_installed", Configured => "configured", TargetInstalled => "target_installed", Uninstalled => "uninstalled", Reinstalled => "reinstalled", Interrupted => "interrupted", Recovered => "recovered", Downgraded => "downgraded", DowngradeRejected => "downgrade_rejected" });
+named_enum!(ScenarioKind { Clean => "clean", Upgrade => "upgrade", Reinstall => "reinstall", InterruptedInstall => "interrupted_install", InterruptedUpgrade => "interrupted_upgrade", Downgrade => "downgrade", Rollback => "rollback" });
+named_enum!(StepName { InstallBase => "install_base", InstallTarget => "install_target", Configure => "configure", Upgrade => "upgrade", Exercise => "exercise", Reinstall => "reinstall", Uninstall => "uninstall", InterruptInstall => "interrupt_install", RecoverInstall => "recover_install", InterruptUpgrade => "interrupt_upgrade", RecoverUpgrade => "recover_upgrade", Downgrade => "downgrade", ExerciseDowngraded => "exercise_downgraded", Backup => "backup", AttemptUpgrade => "attempt_upgrade", Rollback => "rollback", ExerciseRolledBack => "exercise_rolled_back", CleanupBackup => "cleanup_backup" });
+named_enum!(Checkpoint { BaseInstalled => "base_installed", Configured => "configured", TargetInstalled => "target_installed", Uninstalled => "uninstalled", Reinstalled => "reinstalled", Interrupted => "interrupted", Recovered => "recovered", Downgraded => "downgraded", DowngradeRejected => "downgrade_rejected", KnownGood => "known_good", BackupCreated => "backup_created", UpgradeFailed => "upgrade_failed", RolledBack => "rolled_back", BackupRemoved => "backup_removed" });
 /// One applicability map for selection, orchestration and unperformed evidence.
 pub fn checkpoint_applies(scenario: ScenarioKind, checkpoint: Checkpoint) -> bool {
     match checkpoint {
         Checkpoint::BaseInstalled => matches!(
             scenario,
-            ScenarioKind::Upgrade | ScenarioKind::InterruptedUpgrade
+            ScenarioKind::Upgrade | ScenarioKind::InterruptedUpgrade | ScenarioKind::Rollback
         ),
         Checkpoint::TargetInstalled => matches!(
             scenario,
@@ -36,6 +36,11 @@ pub fn checkpoint_applies(scenario: ScenarioKind, checkpoint: Checkpoint) -> boo
                 | ScenarioKind::Downgrade
         ),
         Checkpoint::Reinstalled => scenario == ScenarioKind::Reinstall,
+        Checkpoint::KnownGood
+        | Checkpoint::BackupCreated
+        | Checkpoint::UpgradeFailed
+        | Checkpoint::RolledBack
+        | Checkpoint::BackupRemoved => scenario == ScenarioKind::Rollback,
         Checkpoint::Downgraded | Checkpoint::DowngradeRejected => {
             scenario == ScenarioKind::Downgrade
         }
@@ -90,6 +95,14 @@ impl ComparisonReference {
     pub fn for_checkpoint(checkpoint: Checkpoint) -> Option<Self> {
         match checkpoint {
             Checkpoint::Reinstalled => Some(Self::reinstall()),
+            Checkpoint::RolledBack => Some(Self {
+                before_stage: "before_upgrade".into(),
+                after_stage: "rolled_back".into(),
+            }),
+            Checkpoint::UpgradeFailed => Some(Self {
+                before_stage: "before_attempt".into(),
+                after_stage: "upgrade_failed".into(),
+            }),
             Checkpoint::Downgraded | Checkpoint::DowngradeRejected => Some(Self {
                 before_stage: "before_downgrade".into(),
                 after_stage: checkpoint.to_string(),
@@ -378,6 +391,9 @@ impl StageReport {
                     CommandOutcome::Succeeded | CommandOutcome::Skipped => RunOutcome::Passed,
                     CommandOutcome::Failed => RunOutcome::Failed,
                     CommandOutcome::Cancelled => RunOutcome::Cancelled,
+                    CommandOutcome::ExpectedFailure if self.verified_failure() => {
+                        RunOutcome::Passed
+                    }
                     CommandOutcome::ExpectedRejection if self.verified_rejection() => {
                         RunOutcome::Passed
                     }

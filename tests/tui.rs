@@ -676,3 +676,90 @@ fn downgrade_completed_evidence_names_the_declared_result() {
         }));
     }
 }
+
+#[test]
+fn rollback_preview_lists_runtime_policy_mapping_and_all_derived_proofs() {
+    let temp = tempfile::tempdir().unwrap();
+    for p in ["base", "target"] {
+        std::fs::create_dir(temp.path().join(p)).unwrap();
+    }
+    let path = temp.path().join("theseus.toml");
+    std::fs::write(&path, include_str!("fixtures/recipes/rollback.toml")).unwrap();
+    let recipe = theseus::recipe::load(&path).unwrap();
+    let mut app = App::preview(recipe.clone(), theseus::engine::RunOptions::all(&recipe));
+    let text = app.preview_text();
+    for needle in [
+        "base = known-good",
+        "target = failed candidate",
+        "attempt_upgrade exit=9",
+        "restore_data",
+        "/workspace/data -> /workspace/backup/data",
+        "__theseus_rollback_root_absent",
+        "__theseus_rollback_source_stable_data",
+        "__theseus_rollback_backup_matches_data",
+        "__theseus_rollback_backup_intact_data",
+        "__theseus_rollback_backup_ready_data",
+        "__theseus_rollback_restored_data",
+        "__theseus_rollback_backup_retained_data",
+        "__theseus_rollback_backup_removed",
+        "runtime checks",
+    ] {
+        assert!(text.contains(needle), "{needle}: {text}");
+    }
+    key(&mut app, KeyCode::Char('s'));
+    assert_eq!(
+        app.options.as_ref().unwrap().scenarios,
+        vec![ScenarioKind::Rollback]
+    );
+}
+
+#[test]
+fn rollback_offline_narrow_evidence_shows_failed_mutation_and_mapped_restore() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut report = RunReport::new("rollback-ui");
+    let mut scenario =
+        ScenarioReport::new("user-rollback", ProfileName::User, ScenarioKind::Rollback);
+    let mut stage = StageReport::new("rolled_back");
+    stage.outcome = StageOutcome::Failed;
+    stage.checks.push(CheckResult {
+        id: "restored-data".into(),
+        checkpoint: Checkpoint::RolledBack,
+        outcome: CheckOutcome::Failed,
+        message: "restore scope differs".into(),
+        path: Some("/data".into()),
+        command_ids: vec![],
+        backup: Some(BackupReference {
+            source_path: "/data".into(),
+            stored_path: "/backup/data".into(),
+        }),
+        comparison: Some(ComparisonReference {
+            before_stage: "before_upgrade".into(),
+            after_stage: "rolled_back".into(),
+        }),
+    });
+    let mut command = CommandRecord::new("attempt", "attempt_upgrade");
+    command.outcome = CommandOutcome::ExpectedFailure;
+    command.exit_status = Some(9);
+    command.expected_failure = Some(ExpectedFailureEvidence {
+        expected_exit: 9,
+        stdout_contains: "migration failed".into(),
+        stdout_matched: true,
+    });
+    stage.commands.push(command);
+    scenario.stages.push(stage);
+    report.scenarios.push(scenario);
+    let app = App::offline(report, temp.path().into());
+    let text = app.items().join("\n");
+    for needle in [
+        "Expected failure: exit=9",
+        "migration failed",
+        "source /data stored /backup/data",
+        "before_upgrade -> rolled_back",
+    ] {
+        assert!(text.contains(needle), "{needle}: {text}");
+    }
+    let narrow = screen(&app, 52, 30);
+    assert!(narrow.contains("Expected failure"));
+    assert!(narrow.contains("restore scope differs"));
+    assert!(!narrow.contains("Rollback verified"));
+}

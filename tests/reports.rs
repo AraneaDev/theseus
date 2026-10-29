@@ -983,7 +983,7 @@ fn stray_expected_failure_proof_prevents_passing_even_on_successful_commands() {
 fn rollback_policy_json() -> serde_json::Value {
     serde_json::json!({
         "failure":{"expected_exit":9,"stdout_contains":"upgrade failed"},
-        "change_checks":["changed"],"binary_checks":["binary"],"data_checks":["reader"],
+        "change_checks":["changed"],"binary_checks":["binary"],"runtime_checks":["runtime"],"data_checks":["reader"],
         "restoration":{"mode":"restore_data","backup_root":"/workspace/backup","scopes":[{"id":"data","source":"/home/theseus/data","stored":"data"}]}
     })
 }
@@ -1026,6 +1026,18 @@ fn rollback_metadata_and_every_reference_have_report_five_floor() {
     let store = report::create(&temp.path().join("run")).unwrap();
     for version in 1..=4 {
         for feature in [
+            "scenario",
+            "selected",
+            "step_backup",
+            "step_attempt_upgrade",
+            "step_rollback",
+            "step_exercise_rolled_back",
+            "step_cleanup_backup",
+            "cp_known_good",
+            "cp_backup_created",
+            "cp_upgrade_failed",
+            "cp_rolled_back",
+            "cp_backup_removed",
             "policy",
             "proof",
             "backup",
@@ -1057,6 +1069,14 @@ fn rollback_metadata_and_every_reference_have_report_five_floor() {
                     .unwrap()
                     .remove("comparison");
                 match feature {
+                    "scenario" => scenario["scenario"] = "rollback".into(),
+                    "selected" => value["selected_scenarios"] = serde_json::json!(["rollback"]),
+                    f if f.starts_with("step_") => {
+                        stage["step"] = f.strip_prefix("step_").unwrap().into()
+                    }
+                    f if f.starts_with("cp_") => {
+                        stage["checkpoint"] = f.strip_prefix("cp_").unwrap().into();
+                    }
                     "policy" => scenario["rollback"] = rollback_policy_json(),
                     "proof" => {
                         stage["commands"][0]["expected_failure"] = serde_json::json!({"expected_exit":9,"stdout_contains":"failed","stdout_matched":true})
