@@ -75,7 +75,7 @@ id = "writer-stopped"
 checkpoint = "interrupted"
 kind = "command"
 expected_exit = 0
-script = 'a=$(wc -c < /workspace/writer); sleep 0.2; b=$(wc -c < /workspace/writer); test "$a" = "$b"; echo stopped'
+script = 'set -eu; a=$(wc -c < /workspace/writer); sleep 0.2; b=$(wc -c < /workspace/writer); test "$a" = "$b"; echo stopped'
 stdout_contains = "stopped"
 
 [[profiles.user.checks]]
@@ -163,7 +163,7 @@ id = "writer-stopped"
 checkpoint = "interrupted"
 kind = "command"
 expected_exit = 0
-script = 'a=$(wc -c < /workspace/writer); sleep 0.2; b=$(wc -c < /workspace/writer); test "$a" = "$b"; echo stopped'
+script = 'set -eu; a=$(wc -c < /workspace/writer); sleep 0.2; b=$(wc -c < /workspace/writer); test "$a" = "$b"; echo stopped'
 stdout_contains = "stopped"
 
 [[profiles.system.checks]]

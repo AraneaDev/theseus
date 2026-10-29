@@ -444,3 +444,111 @@ fn real_public_example_headless_and_live_offline_pty() {
     );
     println!("{}", String::from_utf8_lossy(&output.stdout));
 }
+
+#[test]
+#[ignore = "requires Docker"]
+fn real_declared_writer_checks_reject_a_changing_writer() {
+    use theseus::runner::{CommandRequest, Docker, Environment};
+    struct Container(OwnedResource);
+    impl Drop for Container {
+        fn drop(&mut self) {
+            let removed = Docker::default().remove(&self.0);
+            if !std::thread::panicking() {
+                removed.unwrap();
+                absent(&self.0.container_id);
+            }
+        }
+    }
+    let fixture = recipe::load(Path::new("tests/fixtures/interruption/recipe.toml")).unwrap();
+    let cancel = CancellationToken::default();
+    let mut docker = Docker::default();
+    docker.prepare(&fixture, false, &cancel).unwrap();
+    let container = Container(
+        docker
+            .create("writer-negative", "writer-negative", &fixture)
+            .unwrap(),
+    );
+    docker.setup(&container.0, &fixture, &cancel).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let store = theseus::report::create(&temp.path().join("run")).unwrap();
+    for path in [
+        "tests/fixtures/interruption/recipe.toml",
+        "examples/interruption/theseus.toml",
+    ] {
+        let declared = recipe::load(Path::new(path)).unwrap();
+        for (profile, spec) in &declared.recipe.profiles {
+            let check = spec
+                .checks
+                .iter()
+                .find(|check| check.id == "writer-stopped")
+                .unwrap();
+            let recipe::Expectation::Command {
+                script,
+                expected_exit,
+                ..
+            } = &check.expectation
+            else {
+                panic!("writer check must be an executable command")
+            };
+            let result = docker
+                .execute(
+                    &container.0,
+                    CommandRequest {
+                        id: format!(
+                            "writer-{profile}-{}",
+                            if path.starts_with("tests") {
+                                "fixture"
+                            } else {
+                                "example"
+                            }
+                        ),
+                        phase: format!("check:{}", check.id),
+                        identity: ExecutionIdentity::runtime(),
+                        // The declaration itself is executed unchanged in its own /bin/sh -c,
+                        // exactly as in the engine. Only the outer test driver owns the writer.
+                        argv: vec![
+                            "/bin/sh".into(),
+                            "-c".into(),
+                            r#"
+set -u
+printf x > /workspace/writer
+(while :; do printf x >> /workspace/writer; sleep 0.005; done) &
+writer=$!
+trap 'kill "$writer"; wait "$writer" 2>/dev/null || :' EXIT
+before=$(wc -c < /workspace/writer)
+/bin/sh -c "$1"
+status=$?
+after=$(wc -c < /workspace/writer)
+test "$after" -gt "$before" || exit 92
+exit "$status"
+"#
+                            .into(),
+                            "writer-test".into(),
+                            script.clone(),
+                        ],
+                        env: Default::default(),
+                        pass_env: vec![],
+                        timeout_seconds: 10,
+                        expected_exit: *expected_exit,
+                        log_limit: 2048,
+                    },
+                    &store,
+                    &cancel,
+                )
+                .unwrap();
+            assert_eq!(
+                result.record.exit_status,
+                Some(1),
+                "{path}/{profile}: {:?}; stdout={:?}",
+                result.record,
+                result.stdout
+            );
+            assert_eq!(result.record.outcome, CommandOutcome::Failed);
+            assert!(
+                !result.stdout.contains("stopped"),
+                "false success marker: {path}/{profile}: {:?}",
+                result.stdout
+            );
+        }
+    }
+}
