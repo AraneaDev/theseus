@@ -380,8 +380,7 @@ fn validate_report(report: &RunReport) -> Result<()> {
                                             | Checkpoint::UpgradeFailed
                                             | Checkpoint::RolledBack
                                             | Checkpoint::BackupRemoved
-                                    ) && !check.id.starts_with("__theseus_rollback_")
-                                        && check.backup.is_none()
+                                    ) && check.backup.is_none()
                                         && check.comparison.as_ref().is_none_or(|reference| {
                                             !crate::model::rollback_reference(
                                                 &reference.before_stage,

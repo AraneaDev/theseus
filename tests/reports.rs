@@ -1021,6 +1021,52 @@ fn report_five_roundtrips_rollback_metadata_without_authorizing_unmatched_flow()
 }
 
 #[test]
+fn legacy_report_reader_accepts_ordinary_rollback_prefixed_check_ids() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = report::create(&temp.path().join("run")).unwrap();
+    for version in 1..=4 {
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/reports/schema1-report.json")).unwrap();
+        value["schema_version"] = version.into();
+        value["scenarios"][0]["stages"][0]["checks"][0]["id"] =
+            "__theseus_rollback_user-retention".into();
+        fs::write(store.report_path(), serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let loaded = report::load(store.root())
+            .unwrap_or_else(|error| panic!("reader schema{version}: {error:#}"));
+        assert_eq!(loaded.schema_version, version);
+        assert_eq!(loaded.outcome, RunOutcome::Passed);
+        assert_eq!(
+            loaded.scenarios[0].stages[0].checks[0].id,
+            "__theseus_rollback_user-retention"
+        );
+    }
+}
+
+#[test]
+fn legacy_report_writer_accepts_ordinary_rollback_prefixed_check_ids() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = report::create(&temp.path().join("run")).unwrap();
+    let mut run: RunReport =
+        serde_json::from_str(include_str!("fixtures/reports/schema1-report.json")).unwrap();
+    run.scenarios[0].stages[0].checks[0].id = "__theseus_rollback_user-retention".into();
+    for version in 1..=4 {
+        run.schema_version = version;
+        store
+            .save(&run)
+            .unwrap_or_else(|error| panic!("writer schema{version}: {error:#}"));
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(store.report_path()).unwrap()).unwrap();
+        assert_eq!(saved["schema_version"], version);
+        assert_eq!(saved["outcome"], "passed");
+        assert_eq!(
+            saved["scenarios"][0]["stages"][0]["checks"][0]["id"],
+            "__theseus_rollback_user-retention"
+        );
+    }
+}
+
+#[test]
 fn rollback_metadata_and_every_reference_have_report_five_floor() {
     let temp = tempfile::tempdir().unwrap();
     let store = report::create(&temp.path().join("run")).unwrap();
@@ -1038,6 +1084,19 @@ fn rollback_metadata_and_every_reference_have_report_five_floor() {
             "cp_upgrade_failed",
             "cp_rolled_back",
             "cp_backup_removed",
+            "check_known_good",
+            "check_backup_created",
+            "check_upgrade_failed",
+            "check_rolled_back",
+            "check_backup_removed",
+            "stage_before_upgrade",
+            "stage_before_attempt",
+            "stage_before_rollback",
+            "stage_known_good",
+            "stage_backup_created",
+            "stage_upgrade_failed",
+            "stage_rolled_back",
+            "stage_backup_removed",
             "policy",
             "proof",
             "backup",
@@ -1064,6 +1123,7 @@ fn rollback_metadata_and_every_reference_have_report_five_floor() {
                 stage["step"] = "install_target".into();
                 stage["checkpoint"] = "target_installed".into();
                 stage["checks"][0]["checkpoint"] = "target_installed".into();
+                stage["checks"][0]["id"] = "__theseus_rollback_user-retention".into();
                 stage["checks"][0]
                     .as_object_mut()
                     .unwrap()
@@ -1076,6 +1136,12 @@ fn rollback_metadata_and_every_reference_have_report_five_floor() {
                     }
                     f if f.starts_with("cp_") => {
                         stage["checkpoint"] = f.strip_prefix("cp_").unwrap().into();
+                    }
+                    f if f.starts_with("check_") => {
+                        stage["checks"][0]["checkpoint"] = f.strip_prefix("check_").unwrap().into();
+                    }
+                    f if f.starts_with("stage_") => {
+                        stage["name"] = f.strip_prefix("stage_").unwrap().into();
                     }
                     "policy" => scenario["rollback"] = rollback_policy_json(),
                     "proof" => {

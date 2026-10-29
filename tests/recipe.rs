@@ -648,6 +648,41 @@ fn downgrade_checks_do_not_satisfy_reinstall_or_interruption_minima() {
 }
 
 const ROLLBACK: &str = include_str!("fixtures/recipes/rollback.toml");
+
+#[test]
+fn ordinary_recipes_accept_rollback_prefixed_check_ids() {
+    for version in 1..=5 {
+        let text = VALID
+            .replace(
+                "schema_version = 1",
+                &if version == 1 {
+                    "schema_version = 1".into()
+                } else {
+                    format!("schema_version = {version}\nscenarios = ['clean']")
+                },
+            )
+            .replace("binary-removed", "__theseus_rollback_user-retention");
+        let recipe =
+            load_text(&text).unwrap_or_else(|error| panic!("recipe schema{version}: {error:#}"));
+        recipe
+            .validate_selection(
+                &[ProfileName::User, ProfileName::System],
+                &[ScenarioKind::Clean],
+            )
+            .unwrap();
+    }
+}
+
+#[test]
+fn rollback_declared_recipes_reject_reserved_check_ids() {
+    let text = ROLLBACK.replace("'reader'", "'__theseus_rollback_reader'");
+    let error = load_text(&text).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("reserved rollback check ID"),
+        "{error:#}"
+    );
+}
+
 #[test]
 fn rollback_recipe_five_loads_and_selects_declared_profile() {
     let recipe = load_text(ROLLBACK).unwrap();
