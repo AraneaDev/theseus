@@ -24,3 +24,6 @@ jobs:
 
       - name: Real Docker downgrade acceptance (required)
         run: cargo test --locked --test downgrade_lifecycle -- --ignored --test-threads=1
+
+      - name: Real Docker rollback acceptance (required)
+        run: cargo test --locked --test rollback_lifecycle -- --ignored --test-threads=1

@@ -1,0 +1,195 @@
+schema_version = 5
+scenarios = ["rollback"]
+name = "Real rollback binary-only"
+image = "ubuntu:24.04"
+network = "none"
+observe = ["/home/theseus", "/usr/local/bin", "/workspace"]
+[artifacts]
+base = "base"
+target = "target"
+
+[profiles.user.rollback]
+change_checks = ["candidate-changed-state"]
+binary_checks = ["known-good-binary"]
+runtime_checks = ["known-good-version-restored"]
+data_checks = ["known-good-reader"]
+[profiles.user.rollback.failure]
+expected_exit = 9
+stdout_contains = "upgrade failed after migration"
+[profiles.user.rollback.restoration]
+mode = "binary_only"
+
+[profiles.user.steps.install_base]
+script = "sh /inputs/base/install.sh user"
+timeout_seconds = 15
+
+[profiles.user.steps.configure]
+script = "sample-cli configure"
+timeout_seconds = 15
+
+[profiles.user.steps.exercise]
+script = "sample-cli read-data"
+timeout_seconds = 15
+
+[profiles.user.steps.attempt_upgrade]
+script = "sh /inputs/target/attempt.sh user"
+timeout_seconds = 15
+
+[profiles.user.steps.rollback]
+script = "sh /inputs/target/rollback.sh user binary-only"
+timeout_seconds = 15
+
+[profiles.user.steps.exercise_rolled_back]
+script = "sample-cli read-data"
+timeout_seconds = 15
+
+[profiles.user.steps.uninstall]
+script = "sh /inputs/target/uninstall.sh user"
+timeout_seconds = 15
+
+[[profiles.user.checks]]
+id = "base-version"
+checkpoint = "base_installed"
+kind = "executable"
+name = "sample-cli"
+resolved_path = "/home/theseus/.local/bin/sample-cli"
+args = ["--version"]
+expected_exit = 0
+stdout_contains = "sample-cli 1.0.0"
+
+[[profiles.user.checks]]
+id = "known-reader"
+checkpoint = "known_good"
+kind = "command"
+script = "sample-cli read-data"
+expected_exit = 0
+stdout_contains = "reader records=2 sum=40"
+
+[[profiles.user.checks]]
+id = "candidate-changed-state"
+checkpoint = "upgrade_failed"
+kind = "changed"
+path = "/home/theseus/.local/share/sample-cli"
+
+[[profiles.user.checks]]
+id = "known-good-binary"
+checkpoint = "rolled_back"
+kind = "unchanged"
+path = "/home/theseus/.local/bin/sample-cli"
+
+[[profiles.user.checks]]
+id = "known-good-version-restored"
+checkpoint = "rolled_back"
+kind = "executable"
+name = "sample-cli"
+resolved_path = "/home/theseus/.local/bin/sample-cli"
+args = ["--version"]
+expected_exit = 0
+stdout_contains = "sample-cli 1.0.0"
+
+[[profiles.user.checks]]
+id = "known-good-reader"
+checkpoint = "rolled_back"
+kind = "command"
+script = "sample-cli read-data"
+expected_exit = 0
+stdout_contains = "reader records=2 sum=40"
+
+[[profiles.user.checks]]
+id = "binary-removed"
+checkpoint = "uninstalled"
+kind = "absent"
+path = "/home/theseus/.local/bin/sample-cli"
+
+[profiles.system.rollback]
+change_checks = ["candidate-changed-state"]
+binary_checks = ["known-good-binary"]
+runtime_checks = ["known-good-version-restored"]
+data_checks = ["known-good-reader"]
+[profiles.system.rollback.failure]
+expected_exit = 9
+stdout_contains = "upgrade failed after migration"
+[profiles.system.rollback.restoration]
+mode = "binary_only"
+
+[profiles.system.steps.install_base]
+script = "sh /inputs/base/install.sh system"
+timeout_seconds = 15
+
+[profiles.system.steps.configure]
+script = "sample-cli configure"
+timeout_seconds = 15
+
+[profiles.system.steps.exercise]
+script = "sample-cli read-data"
+timeout_seconds = 15
+
+[profiles.system.steps.attempt_upgrade]
+script = "sh /inputs/target/attempt.sh system"
+timeout_seconds = 15
+
+[profiles.system.steps.rollback]
+script = "sh /inputs/target/rollback.sh system binary-only"
+timeout_seconds = 15
+
+[profiles.system.steps.exercise_rolled_back]
+script = "sample-cli read-data"
+timeout_seconds = 15
+
+[profiles.system.steps.uninstall]
+script = "sh /inputs/target/uninstall.sh system"
+timeout_seconds = 15
+
+[[profiles.system.checks]]
+id = "base-version"
+checkpoint = "base_installed"
+kind = "executable"
+name = "sample-cli"
+resolved_path = "/usr/local/bin/sample-cli"
+args = ["--version"]
+expected_exit = 0
+stdout_contains = "sample-cli 1.0.0"
+
+[[profiles.system.checks]]
+id = "known-reader"
+checkpoint = "known_good"
+kind = "command"
+script = "sample-cli read-data"
+expected_exit = 0
+stdout_contains = "reader records=2 sum=40"
+
+[[profiles.system.checks]]
+id = "candidate-changed-state"
+checkpoint = "upgrade_failed"
+kind = "changed"
+path = "/home/theseus/.local/share/sample-cli"
+
+[[profiles.system.checks]]
+id = "known-good-binary"
+checkpoint = "rolled_back"
+kind = "unchanged"
+path = "/usr/local/bin/sample-cli"
+
+[[profiles.system.checks]]
+id = "known-good-version-restored"
+checkpoint = "rolled_back"
+kind = "executable"
+name = "sample-cli"
+resolved_path = "/usr/local/bin/sample-cli"
+args = ["--version"]
+expected_exit = 0
+stdout_contains = "sample-cli 1.0.0"
+
+[[profiles.system.checks]]
+id = "known-good-reader"
+checkpoint = "rolled_back"
+kind = "command"
+script = "sample-cli read-data"
+expected_exit = 0
+stdout_contains = "reader records=2 sum=40"
+
+[[profiles.system.checks]]
+id = "binary-removed"
+checkpoint = "uninstalled"
+kind = "absent"
+path = "/usr/local/bin/sample-cli"
