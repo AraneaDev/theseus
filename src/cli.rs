@@ -11,6 +11,9 @@ use std::{fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt, path::PathBu
 #[derive(Debug, Parser)]
 #[command(name = "theseus", version, about = "Installation lifecycle workbench")]
 pub struct Cli {
+    /// Skip decorative startup and exit scenes.
+    #[arg(long, global = true)]
+    pub no_animation: bool,
     #[command(subcommand)]
     pub command: Option<Action>,
 }
@@ -62,12 +65,15 @@ pub enum ScenarioSelection {
 }
 /// Dispatch interactive and headless interfaces through the shared engine.
 pub fn execute(cli: Cli) -> Result<i32> {
+    let animation = crate::tui::AnimationOptions {
+        enabled: !cli.no_animation,
+    };
     match cli.command {
         None => {
             crate::tui::terminal::require_tty()?;
             let recipe = recipe::load(std::path::Path::new("theseus.toml"))?;
             let options = RunOptions::all(&recipe);
-            crate::tui::run(crate::tui::App::preview(recipe, options))
+            crate::tui::run_with_options(crate::tui::App::preview(recipe, options), animation)
         }
         Some(Action::Init) => {
             init()?;
@@ -91,7 +97,10 @@ pub fn execute(cli: Cli) -> Result<i32> {
         }) => {
             let report = report::load(&run_directory)?;
             if !json {
-                return crate::tui::run(crate::tui::App::offline(report, run_directory));
+                return crate::tui::run_with_options(
+                    crate::tui::App::offline(report, run_directory),
+                    animation,
+                );
             }
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(0)
@@ -131,7 +140,10 @@ pub fn execute(cli: Cli) -> Result<i32> {
                 ScenarioSelection::All => options.scenarios,
             };
             if !headless {
-                return crate::tui::run(crate::tui::App::preview(recipe, options));
+                return crate::tui::run_with_options(
+                    crate::tui::App::preview(recipe, options),
+                    animation,
+                );
             }
             let cancel = CancellationToken::default();
             let sigint = signal_hook::flag::register(signal_hook::consts::SIGINT, cancel.flag())?;

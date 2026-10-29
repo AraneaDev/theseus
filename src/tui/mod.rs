@@ -1,4 +1,5 @@
 //! Responsive live and offline evidence UI; one blocking engine runs on a worker.
+mod animation;
 mod app;
 mod input;
 mod render;
@@ -7,9 +8,10 @@ use crate::{
     engine::{self, CancellationToken, RunResult},
     report,
 };
+use animation::{KeyAction, Presentation};
 use anyhow::{Result, anyhow};
 pub use app::{App, Focus, Tab, safe_text};
-use crossterm::event::{self, Event};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 pub use input::input;
 pub use render::render;
 use std::{
@@ -19,7 +21,21 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 
 /// Interactive exit reports the selected run's outcome; preview exit is successful.
-pub fn run(mut app: App) -> Result<i32> {
+pub fn run(app: App) -> Result<i32> {
+    run_with_options(app, AnimationOptions::default())
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct AnimationOptions {
+    pub enabled: bool,
+}
+impl Default for AnimationOptions {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+pub fn run_with_options(mut app: App, options: AnimationOptions) -> Result<i32> {
     terminal::require_tty()?;
     let runtime = tokio::runtime::Runtime::new()?;
     let cancel = CancellationToken::default();
@@ -30,6 +46,11 @@ pub fn run(mut app: App) -> Result<i32> {
     let mut result_rx: Option<oneshot::Receiver<Result<RunResult>>> = None;
     let mut quit_deadline = None;
     let mut last_path: Option<PathBuf> = None;
+    let started = Instant::now();
+    let mut presentation = Presentation::new(
+        options.enabled && std::env::var_os("TERM").is_none_or(|term| term != "dumb"),
+        Duration::ZERO,
+    );
     let result = (|| -> Result<i32> {
         loop {
             let mut latest = None;
@@ -63,6 +84,7 @@ pub fn run(mut app: App) -> Result<i32> {
                 }
             }
             if terminate.is_cancelled() {
+                presentation.bypass();
                 app.quit_requested = true;
                 if app.active {
                     app.cancel_requested = true;
@@ -77,23 +99,28 @@ pub fn run(mut app: App) -> Result<i32> {
                     if let Some(error) = &app.terminal_error {
                         return Err(anyhow!("{error}"));
                     }
-                    return Ok(app.exit_code());
+                    if presentation.quit(started.elapsed()) {
+                        return Ok(app.exit_code());
+                    }
                 }
-                cancel.cancel();
-                let deadline =
-                    quit_deadline.get_or_insert_with(|| Instant::now() + Duration::from_secs(5));
-                if Instant::now() >= *deadline {
-                    return Err(anyhow!(
-                        "cleanup window expired; worker may still be cleaning. Inspect saved report/journal and run theseus cleanup {}. Unresolved resources: {}",
-                        last_path
-                            .as_ref()
-                            .and_then(|p| p.parent())
-                            .map_or("<pending report>".into(), |p| p.display().to_string()),
-                        unresolved(&app)
-                    ));
+                if app.active {
+                    presentation.bypass();
+                    cancel.cancel();
+                    let deadline = quit_deadline
+                        .get_or_insert_with(|| Instant::now() + Duration::from_secs(5));
+                    if Instant::now() >= *deadline {
+                        return Err(anyhow!(
+                            "cleanup window expired; worker may still be cleaning. Inspect saved report/journal and run theseus cleanup {}. Unresolved resources: {}",
+                            last_path
+                                .as_ref()
+                                .and_then(|p| p.parent())
+                                .map_or("<pending report>".into(), |p| p.display().to_string()),
+                            unresolved(&app)
+                        ));
+                    }
                 }
             }
-            if app.start_requested {
+            if app.start_requested && !app.quit_requested {
                 app.start_requested = false;
                 let recipe = app.recipe.as_ref().unwrap().clone();
                 let options = app.options.as_ref().unwrap().clone();
@@ -120,12 +147,64 @@ pub fn run(mut app: App) -> Result<i32> {
                     });
                 }
             }
-            terminal.draw(|f| render(f, &app))?;
-            if event::poll(Duration::from_millis(50))?
-                && let Event::Key(key) = event::read()?
-            {
-                input(&mut app, key);
+            if event::poll(Duration::from_millis(50))? {
+                for _ in 0..64 {
+                    match event::read()? {
+                        Event::Key(key) if key.kind != KeyEventKind::Release => {
+                            if key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                terminate.cancel();
+                                presentation.bypass();
+                            } else {
+                                match presentation.key(key.code) {
+                                    KeyAction::Browse => input(&mut app, key),
+                                    KeyAction::Quit => app.quit_requested = true,
+                                    KeyAction::Ignore => {}
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    // Drain keys already received during the scene before advancing it.
+                    // Bound each batch so a pasted input stream cannot starve cancellation.
+                    if app.quit_requested
+                        || terminate.is_cancelled()
+                        || !event::poll(Duration::ZERO)?
+                    {
+                        break;
+                    }
+                }
             }
+            // Keep the scene's input policy until all its queued keys have been
+            // consumed. Returning to the loop between batches still services
+            // signals, worker results and the cleanup deadline under input load.
+            if event::poll(Duration::ZERO)? && !app.quit_requested && !terminate.is_cancelled() {
+                continue;
+            }
+            if terminate.is_cancelled() {
+                presentation.bypass();
+                if !app.quit_requested {
+                    continue;
+                }
+            }
+            let size = terminal.size()?;
+            let decorative_frame = presentation.frame(started.elapsed(), size.width, size.height);
+            // A completed outro exits without flashing the workbench underneath it.
+            if app.quit_requested
+                && !app.active
+                && decorative_frame.is_none()
+                && presentation.quit(started.elapsed())
+            {
+                return Ok(app.exit_code());
+            }
+            terminal.draw(|f| {
+                if let Some((direction, index)) = decorative_frame {
+                    animation::draw(f, index, direction);
+                } else {
+                    render(f, &app);
+                }
+            })?;
         }
     })();
     if app.active {

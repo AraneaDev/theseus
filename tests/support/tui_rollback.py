@@ -48,7 +48,7 @@ def session(root, policy=None, saved=None, legacy=False, unverified=False, negat
     environment = {**docker_environment, 'TERM': 'xterm-256color'}
     if not live:
         environment['DOCKER_HOST'] = 'unix:///nonexistent-theseus-rollback-offline.sock'
-    proc = subprocess.Popen([binary, *args], cwd=root, stdin=slave, stdout=slave,
+    proc = subprocess.Popen([binary, '--no-animation', *args], cwd=root, stdin=slave, stdout=slave,
                             stderr=slave, env=environment)
     data = bytearray()
     screen = Screen(32, 60)

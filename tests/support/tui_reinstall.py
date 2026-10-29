@@ -25,7 +25,7 @@ def session(root, args, live, saved=None):
     master, slave = pty.openpty()
     before = termios.tcgetattr(slave)
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 32, 60, 0, 0))
-    proc = subprocess.Popen([binary, *args], cwd=root, stdin=slave, stdout=slave,
+    proc = subprocess.Popen([binary, '--no-animation', *args], cwd=root, stdin=slave, stdout=slave,
                             stderr=slave, env={**os.environ, 'TERM': 'xterm-256color'})
     data = bytearray()
 

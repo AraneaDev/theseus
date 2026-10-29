@@ -14,12 +14,29 @@ import tempfile
 import termios
 import time
 
+sys.dont_write_bytecode = True
+from terminal_screen import Screen
+from docker_absence import require_container_absent
+
 binary = str(pathlib.Path(sys.argv[1]).resolve())
 repo = pathlib.Path(__file__).resolve().parents[2]
 docker = '--docker' in sys.argv
 
 
+selected_case = None
+if '--case' in sys.argv:
+    assert sys.argv.count('--case') == 1, 'provide --case once'
+    case_index = sys.argv.index('--case') + 1
+    assert case_index < len(sys.argv) and sys.argv[case_index], '--case requires a nonempty session name'
+    selected_case = sys.argv[case_index]
+executed_cases = []
+
+
 def session(mode, action):
+    case = f'{mode}-{action if isinstance(action, str) else signal.Signals(action).name.lower()}'
+    if selected_case is not None and case != selected_case:
+        return
+    executed_cases.append(case)
     with tempfile.TemporaryDirectory(prefix='theseus-signals-') as tmp:
         root = pathlib.Path(tmp)
         shutil.copytree(repo/'tests/fixtures/lifecycle', root, dirs_exist_ok=True)
@@ -39,13 +56,16 @@ def session(mode, action):
         master, slave = pty.openpty()
         before = termios.tcgetattr(slave)
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 36, 120, 0, 0))
-        proc = subprocess.Popen([binary, *args], cwd=root, stdin=slave, stdout=slave,
+        proc = subprocess.Popen([binary, '--no-animation', *args], cwd=root, stdin=slave, stdout=slave,
                                 stderr=slave, env={**os.environ, 'TERM': 'xterm-256color'})
         data = bytearray()
+        screen = Screen(36, 120)
         report = None
         def drain():
             if select.select([master], [], [], .03)[0]:
-                data.extend(os.read(master, 65536))
+                chunk = os.read(master, 65536)
+                data.extend(chunk)
+                screen.feed(chunk)
         def until(predicate, timeout):
             deadline = time.monotonic()+timeout
             while not predicate() and time.monotonic() < deadline:
@@ -77,15 +97,17 @@ def session(mode, action):
                 else:
                     until(lambda: (value := saved_report()) and value['finished_at'] is not None, 30)
                     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 36, 121, 0, 0))
-                    until(lambda: b'Finished' in data, 5)
+                    screen.columns = 121
+                    until(lambda: b'Finished' in screen.text(), 5)
             start = time.monotonic()
             if action == 'c':
                 os.write(master, b'c')
                 until(lambda: (value := saved_report()) and value['finished_at'] is not None, 7)
-                # Ratatui emits changed cells, so force a full repaint before
-                # matching the finished status rather than parsing diff bytes.
+                # Reconstruct the displayed cells: a status update may split
+                # Finished across separate Ratatui diff writes.
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 36, 121, 0, 0))
-                until(lambda: b'Finished' in data, 5)
+                screen.columns = 121
+                until(lambda: b'Finished' in screen.text(), 5)
                 assert proc.poll() is None, 'c quit rather than allowing report browsing'
                 assert not (termios.tcgetattr(slave)[3] & termios.ICANON)
                 os.write(master, b'\t\t\x1b[C')
@@ -97,7 +119,9 @@ def session(mode, action):
             until(lambda: proc.poll() is not None, 7)
             elapsed = time.monotonic()-start
             while select.select([master], [], [], .05)[0]:
-                data.extend(os.read(master, 65536))
+                chunk = os.read(master, 65536)
+                data.extend(chunk)
+                screen.feed(chunk)
             assert proc.returncode == (130 if mode == 'active' else 0), (mode, action, proc.returncode, data[-3000:])
             assert termios.tcgetattr(slave) == before, 'termios not restored'
             assert b'\x1b[?1049h' in data and b'\x1b[?1049l' in data, 'alternate screen not restored'
@@ -107,10 +131,12 @@ def session(mode, action):
                 journal = json.loads((report.parent/'journal.json').read_text())
                 assert all(r['removed'] for r in journal['resources']), journal
                 for resource in journal['resources']:
-                    assert subprocess.run(['docker', 'inspect', resource['container_id']], capture_output=True).returncode != 0, 'owned container survived'
+                    require_container_absent(resource['container_id'], subprocess.run(
+                        ['docker', 'inspect', resource['container_id']], capture_output=True, text=True, timeout=10))
             cleanup = ', owned cleanup verified' if mode in ('active', 'completed') else ''
             print(f'PTY {mode} {action}: exit={proc.returncode}, restored{cleanup}, {elapsed:.2f}s')
         finally:
+            pathlib.Path(f'/tmp/theseus-signals-{case}.log').write_bytes(data)
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
@@ -126,3 +152,5 @@ for sig in (signal.SIGINT, signal.SIGTERM):
         session(mode, sig)
 if docker:
     session('active', 'c')
+
+assert executed_cases, f'unknown or unavailable --case: {selected_case!r}'

@@ -11,7 +11,7 @@ def run(error):
         master, slave = pty.openpty()
         before = termios.tcgetattr(slave)
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 36, 120, 0, 0))
-        proc = subprocess.Popen([binary], cwd=root, stdin=slave, stdout=slave, stderr=slave, env={**os.environ,'TERM':'xterm-256color'})
+        proc = subprocess.Popen([binary, '--no-animation'], cwd=root, stdin=slave, stdout=slave, stderr=slave, env={**os.environ,'TERM':'xterm-256color'})
         data = bytearray()
         def drain(until):
             while time.monotonic() < until:

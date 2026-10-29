@@ -1471,3 +1471,21 @@ fn real_interruption_restart_retains_primary_and_cleanup_errors() {
     // Drop uses the real Docker adapter, so the injected removal error cannot
     // leak the stopped resource after this boundary test.
 }
+
+#[test]
+#[ignore = "requires Docker and a Unix PTY"]
+fn real_pty_default_animation_active_cancellation_precedes_outro() {
+    let output = std::process::Command::new("python3")
+        .arg("tests/support/tui_animation.py")
+        .arg(env!("CARGO_BIN_EXE_theseus"))
+        .arg("--docker")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+}

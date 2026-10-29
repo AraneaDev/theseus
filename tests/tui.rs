@@ -796,3 +796,18 @@ fn interrupted_rollback_preview_describes_real_barrier_and_original_restoration_
     }
     assert!(!text.contains("Expected failure:"));
 }
+
+#[test]
+fn actual_pty_default_animation_controls_signals_and_restoration() {
+    let output = std::process::Command::new("python3")
+        .arg("tests/support/tui_animation.py")
+        .arg(env!("CARGO_BIN_EXE_theseus"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

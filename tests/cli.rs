@@ -468,3 +468,71 @@ fn interrupted_rollback_cli_selection_validates_offline_and_rejects_recovery_sub
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("requires step rollback"));
 }
+
+#[test]
+fn no_animation_is_global_for_every_command() {
+    use clap::Parser;
+    for args in [
+        vec!["theseus", "--no-animation"],
+        vec!["theseus", "run", "--no-animation"],
+        vec!["theseus", "report", "saved", "--no-animation"],
+        vec!["theseus", "validate", "--no-animation"],
+        vec!["theseus", "init", "--no-animation"],
+    ] {
+        assert!(theseus::cli::Cli::try_parse_from(args).is_ok());
+    }
+}
+
+#[test]
+fn noninteractive_commands_do_not_draw_or_dwell_with_animation_default() {
+    let temp = tempfile::tempdir().unwrap();
+    let report = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/reports/schema1-report.json");
+    let saved = temp.path().join("saved");
+    std::fs::create_dir(&saved).unwrap();
+    std::fs::copy(report, saved.join("report.json")).unwrap();
+    let started = std::time::Instant::now();
+    for args in [
+        vec!["--help"],
+        vec!["--version"],
+        vec!["init"],
+        vec!["validate"],
+        vec!["report", saved.to_str().unwrap(), "--json"],
+        vec![
+            "run",
+            "--headless",
+            "--profile",
+            "user",
+            "--scenario",
+            "clean",
+        ],
+    ] {
+        let output = cli()
+            .current_dir(temp.path())
+            .env("PATH", "/no-docker")
+            .args(&args)
+            .output()
+            .unwrap();
+        for bytes in [&output.stdout, &output.stderr] {
+            assert!(!bytes.contains(&0x1b), "escapes for {args:?}");
+            let text = String::from_utf8_lossy(bytes);
+            assert!(
+                !text.contains("T H E S E U S") && !text.contains("Entering the labyrinth"),
+                "{text}"
+            );
+        }
+        if args.first() == Some(&"run") {
+            assert_eq!(output.status.code(), Some(2));
+        } else {
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "noninteractive path dwelled on animation"
+    );
+}
