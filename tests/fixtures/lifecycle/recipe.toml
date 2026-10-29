@@ -1,0 +1,181 @@
+# Run: theseus run --headless --recipe tests/fixtures/lifecycle/recipe.toml
+schema_version = 1
+name = "sample-cli lifecycle"
+image = "ubuntu:24.04"
+network = "none"
+observe = ["/home/theseus", "/usr/local/bin"]
+[artifacts]
+base = "base"
+target = "target"
+
+[profiles.user.steps.install_base]
+script = "sh /inputs/base/install.sh user"
+[profiles.user.steps.install_base.env]
+THESEUS_FIXTURE_FAULT = ""
+
+[profiles.user.steps.install_target]
+script = "sh /inputs/target/install.sh user"
+[profiles.user.steps.install_target.env]
+THESEUS_FIXTURE_FAULT = ""
+
+[profiles.user.steps.configure]
+script = "sample-cli configure"
+[profiles.user.steps.configure.env]
+THESEUS_FIXTURE_FAULT = ""
+
+[profiles.user.steps.upgrade]
+script = "sh /inputs/target/install.sh user"
+[profiles.user.steps.upgrade.env]
+THESEUS_FIXTURE_FAULT = ""
+
+[profiles.user.steps.exercise]
+script = "sample-cli smoke"
+[profiles.user.steps.exercise.env]
+THESEUS_FIXTURE_FAULT = ""
+
+[profiles.user.steps.uninstall]
+script = "sh /inputs/target/uninstall.sh user"
+[profiles.user.steps.uninstall.env]
+THESEUS_FIXTURE_FAULT = ""
+
+[[profiles.user.checks]]
+id = "base_installed-version"
+checkpoint = "base_installed"
+kind = "executable"
+name = "sample-cli"
+resolved_path = "/home/theseus/.local/bin/sample-cli"
+args = ["--version"]
+expected_exit = 0
+stdout_contains = "sample-cli 1.0.0"
+[profiles.user.checks.env]
+PATH = "/workspace/stale:/home/theseus/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+[[profiles.user.checks]]
+id = "target_installed-version"
+checkpoint = "target_installed"
+kind = "executable"
+name = "sample-cli"
+resolved_path = "/home/theseus/.local/bin/sample-cli"
+args = ["--version"]
+expected_exit = 0
+stdout_contains = "sample-cli 2.0.0"
+[profiles.user.checks.env]
+PATH = "/workspace/stale:/home/theseus/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+[[profiles.user.checks]]
+id = "binary-removed"
+checkpoint = "uninstalled"
+kind = "absent"
+path = "/home/theseus/.local/bin/sample-cli"
+
+[[profiles.user.checks]]
+id = "configuration-retained"
+checkpoint = "uninstalled"
+kind = "preserved"
+path = "/home/theseus/.config/sample-cli/settings"
+
+[[profiles.user.checks]]
+id = "retained-data-retained"
+checkpoint = "uninstalled"
+kind = "preserved"
+path = "/home/theseus/.local/share/sample-cli/notes"
+
+[[profiles.user.checks]]
+id = "retained-directory-0"
+checkpoint = "uninstalled"
+kind = "present"
+path = "/home/theseus/.config/sample-cli"
+expected_kind = "directory"
+
+[[profiles.user.checks]]
+id = "retained-directory-1"
+checkpoint = "uninstalled"
+kind = "present"
+path = "/home/theseus/.local/share/sample-cli"
+expected_kind = "directory"
+
+[profiles.system.steps.install_base]
+script = "sh /inputs/base/install.sh system"
+[profiles.system.steps.install_base.env]
+THESEUS_FIXTURE_FAULT = ""
+
+[profiles.system.steps.install_target]
+script = "sh /inputs/target/install.sh system"
+[profiles.system.steps.install_target.env]
+THESEUS_FIXTURE_FAULT = ""
+
+[profiles.system.steps.configure]
+script = "sample-cli configure"
+[profiles.system.steps.configure.env]
+THESEUS_FIXTURE_FAULT = ""
+
+[profiles.system.steps.upgrade]
+script = "sh /inputs/target/install.sh system"
+[profiles.system.steps.upgrade.env]
+THESEUS_FIXTURE_FAULT = ""
+
+[profiles.system.steps.exercise]
+script = "sample-cli smoke"
+[profiles.system.steps.exercise.env]
+THESEUS_FIXTURE_FAULT = ""
+
+[profiles.system.steps.uninstall]
+script = "sh /inputs/target/uninstall.sh system"
+[profiles.system.steps.uninstall.env]
+THESEUS_FIXTURE_FAULT = ""
+
+[[profiles.system.checks]]
+id = "base_installed-version"
+checkpoint = "base_installed"
+kind = "executable"
+name = "sample-cli"
+resolved_path = "/usr/local/bin/sample-cli"
+args = ["--version"]
+expected_exit = 0
+stdout_contains = "sample-cli 1.0.0"
+[profiles.system.checks.env]
+PATH = "/workspace/stale:/home/theseus/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+[[profiles.system.checks]]
+id = "target_installed-version"
+checkpoint = "target_installed"
+kind = "executable"
+name = "sample-cli"
+resolved_path = "/usr/local/bin/sample-cli"
+args = ["--version"]
+expected_exit = 0
+stdout_contains = "sample-cli 2.0.0"
+[profiles.system.checks.env]
+PATH = "/workspace/stale:/home/theseus/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+[[profiles.system.checks]]
+id = "binary-removed"
+checkpoint = "uninstalled"
+kind = "absent"
+path = "/usr/local/bin/sample-cli"
+
+[[profiles.system.checks]]
+id = "configuration-retained"
+checkpoint = "uninstalled"
+kind = "preserved"
+path = "/home/theseus/.config/sample-cli/settings"
+
+[[profiles.system.checks]]
+id = "retained-data-retained"
+checkpoint = "uninstalled"
+kind = "preserved"
+path = "/home/theseus/.local/share/sample-cli/notes"
+
+[[profiles.system.checks]]
+id = "retained-directory-0"
+checkpoint = "uninstalled"
+kind = "present"
+path = "/home/theseus/.config/sample-cli"
+expected_kind = "directory"
+
+[[profiles.system.checks]]
+id = "retained-directory-1"
+checkpoint = "uninstalled"
+kind = "present"
+path = "/home/theseus/.local/share/sample-cli"
+expected_kind = "directory"

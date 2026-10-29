@@ -286,3 +286,28 @@ fn loads_bare_relative_report_filename() {
 fn loads_bare_relative_journal_filename() {
     load_metadata_from_real_current_directory("loads_bare_relative_journal_filename", true);
 }
+
+#[test]
+fn reopening_a_store_for_cleanup_preserves_existing_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    let original = theseus::report::create(&temp.path().join("run")).unwrap();
+    original
+        .save(&theseus::model::RunReport::new("recovery"))
+        .unwrap();
+    let reopened = theseus::report::open_existing(original.root()).unwrap();
+    reopened
+        .save_journal(&theseus::model::RunJournal {
+            schema_version: 1,
+            run_id: "recovery".into(),
+            resources: vec![],
+            cleanup_errors: vec![],
+        })
+        .unwrap();
+    assert_eq!(
+        theseus::report::load(original.root()).unwrap().run_id,
+        "recovery"
+    );
+    let alias = temp.path().join("alias");
+    std::os::unix::fs::symlink(original.root(), &alias).unwrap();
+    assert!(theseus::report::open_existing(&alias).is_err());
+}

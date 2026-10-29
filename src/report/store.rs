@@ -41,6 +41,10 @@ pub fn create(root: &Path) -> Result<ReportStore> {
         .context("create fresh run directory (existing runs are never overwritten)")?;
     open_store(root)
 }
+/// Reopen a run directory for atomic recovery-journal updates; refuses symlinks.
+pub fn open_existing(root: &Path) -> Result<ReportStore> {
+    open_store(root)
+}
 fn open_store(root: &Path) -> Result<ReportStore> {
     // Reject a symlink at the user-facing directory before canonicalizing its parent.
     let directory = File::from(
