@@ -347,6 +347,7 @@ fn real_interrupted_rollback_four_way_matrix_restores_runtime_and_reads_actual_d
 #[test]
 #[ignore = "requires Docker"]
 fn real_backup_faults_block_restoration_and_preserve_preexisting_root() {
+    let mut cases = CaseFilter::from_env();
     for (fault, phase, id) in [
         (
             "preexisting-root",
@@ -374,7 +375,7 @@ fn real_backup_faults_block_restoration_and_preserve_preexisting_root() {
             "__theseus_rollback_backup_ready_data",
         ),
     ] {
-        if !enabled(fault) {
+        if !cases.enabled(fault) {
             continue;
         }
         let (_temp, result) = run("restore-data", fault, vec![ProfileName::User]);
@@ -421,7 +422,7 @@ fn real_backup_faults_block_restoration_and_preserve_preexisting_root() {
         }
     }
     for fault in ["partial-backup", "backup-predicate"] {
-        if !enabled(fault) {
+        if !cases.enabled(fault) {
             continue;
         }
         let (_temp, result) = run("restore-data", fault, vec![ProfileName::User]);
@@ -435,10 +436,12 @@ fn real_backup_faults_block_restoration_and_preserve_preexisting_root() {
         assert!(stage(s, "interrupt_upgrade").commands.is_empty());
         assert_eq!(stage(s, "cleanup_backup").outcome, StageOutcome::Passed);
     }
+    cases.finish();
 }
 #[test]
 #[ignore = "requires Docker"]
 fn real_noop_partial_and_metadata_restores_fail_independent_proofs() {
+    let mut cases = CaseFilter::from_env();
     for (fault, id, path) in [
         (
             "noop-rollback",
@@ -458,7 +461,7 @@ fn real_noop_partial_and_metadata_restores_fail_independent_proofs() {
         } else {
             vec![ProfileName::User]
         };
-        if !enabled(fault) {
+        if !cases.enabled(fault) {
             continue;
         }
         let (_temp, result) = run("restore-data", fault, profiles);
@@ -497,7 +500,7 @@ fn real_noop_partial_and_metadata_restores_fail_independent_proofs() {
         assert_eq!(stage(s, "cleanup_backup").outcome, StageOutcome::Passed);
     }
     for fault in ["restore-predicate", "cleanup-predicate"] {
-        if !enabled(fault) {
+        if !cases.enabled(fault) {
             continue;
         }
         let (_temp, result) = run("restore-data", fault, vec![ProfileName::User]);
@@ -517,22 +520,38 @@ fn real_noop_partial_and_metadata_restores_fail_independent_proofs() {
             })
         );
     }
+    cases.finish();
 }
 #[test]
 #[ignore = "requires Docker"]
 fn real_incomplete_runtime_coverage_blocks_forward_mutation() {
+    let mut cases = CaseFilter::from_env();
     for fault in [
+        "incomplete-baseline",
+        "incomplete-install",
+        "incomplete-exercise",
+        "incomplete-backup",
+        "incomplete-rollback",
         "incomplete-reference",
         "incomplete-checkpoint",
         "incomplete-after-checks",
     ] {
-        if !enabled(fault) {
+        if !cases.enabled(fault) {
             continue;
         }
         let (_temp, result) = run("restore-data", fault, vec![ProfileName::User]);
         assert_eq!(result.report.outcome, RunOutcome::Incomplete, "{fault}");
         let s = &result.report.scenarios[0];
-        assert!(stage(s, "rollback").commands.is_empty());
+        if matches!(fault, "incomplete-baseline" | "incomplete-install") {
+            assert!(
+                stage(s, "base_installed").commands.is_empty(),
+                "unverified prerequisite must block check commands: {fault}"
+            );
+        }
+        assert_eq!(
+            !stage(s, "rollback").commands.is_empty(),
+            fault == "incomplete-rollback"
+        );
         assert!(stage(s, "exercise_rolled_back").commands.is_empty());
         assert!(
             stage(s, "before_rollback")
@@ -544,7 +563,11 @@ fn real_incomplete_runtime_coverage_blocks_forward_mutation() {
                 )),
             "later complete capture cannot reauthorize {fault}"
         );
-        let had_backup = fault == "incomplete-after-checks";
+        let had_backup = matches!(
+            fault,
+            "incomplete-backup" | "incomplete-rollback" | "incomplete-after-checks"
+        );
+        let had_candidate = matches!(fault, "incomplete-rollback" | "incomplete-after-checks");
         assert_eq!(
             !stage(s, "backup").commands.is_empty(),
             had_backup,
@@ -552,7 +575,7 @@ fn real_incomplete_runtime_coverage_blocks_forward_mutation() {
         );
         assert_eq!(
             !stage(s, "interrupt_upgrade").commands.is_empty(),
-            had_backup,
+            had_candidate,
             "{fault}"
         );
         assert_eq!(
@@ -562,13 +585,15 @@ fn real_incomplete_runtime_coverage_blocks_forward_mutation() {
         );
         assert_eq!(stage(s, "uninstall").outcome, StageOutcome::Passed);
     }
+    cases.finish();
 }
 #[test]
 #[ignore = "requires Docker"]
 fn real_timeout_and_cancel_at_every_mutation_skip_forward_steps() {
+    let mut cases = CaseFilter::from_env();
     for phase in ["backup", "interrupt", "rollback", "cleanup"] {
         for fault in [format!("timeout-{phase}"), format!("cancel-{phase}")] {
-            if !enabled(&fault) {
+            if !cases.enabled(&fault) {
                 continue;
             }
             let (_temp, result) = run("restore-data", &fault, vec![ProfileName::User]);
@@ -626,6 +651,7 @@ fn real_timeout_and_cancel_at_every_mutation_skip_forward_steps() {
             }
         }
     }
+    cases.finish();
 }
 #[test]
 #[ignore = "requires Docker and Unix PTY"]
@@ -864,6 +890,7 @@ fn real_zero_return_noop_cannot_prove_original_runtime_or_restored_tree() {
 #[test]
 #[ignore = "requires Docker"]
 fn real_barrier_stop_restart_and_writer_faults_block_rollback() {
+    let mut cases = CaseFilter::from_env();
     for (fault, outcome) in [
         ("early-0", RunOutcome::Failed),
         ("early-9", RunOutcome::Failed),
@@ -877,7 +904,7 @@ fn real_barrier_stop_restart_and_writer_faults_block_rollback() {
         ("no-mutation", RunOutcome::Failed),
         ("changing-writer", RunOutcome::Failed),
     ] {
-        if !enabled(fault) {
+        if !cases.enabled(fault) {
             continue;
         }
         let (_temp, result) = run("restore-data", fault, vec![ProfileName::User]);
@@ -938,11 +965,13 @@ fn real_barrier_stop_restart_and_writer_faults_block_rollback() {
             "{fault}"
         );
     }
+    cases.finish();
 }
 
 #[test]
 #[ignore = "requires Docker"]
 fn real_control_timeouts_and_cancellation_boundaries_are_bounded_and_terminal() {
+    let mut cases = CaseFilter::from_env();
     for (fault, outcome) in [
         ("timeout-ready", RunOutcome::Incomplete),
         ("timeout-stop", RunOutcome::Incomplete),
@@ -957,7 +986,7 @@ fn real_control_timeouts_and_cancellation_boundaries_are_bounded_and_terminal() 
         ("cancel-check", RunOutcome::Cancelled),
         ("cancel-failed-cleanup", RunOutcome::Cancelled),
     ] {
-        if !enabled(fault) {
+        if !cases.enabled(fault) {
             continue;
         }
         let (_temp, result) = run("restore-data", fault, vec![ProfileName::User]);
@@ -1014,13 +1043,15 @@ fn real_control_timeouts_and_cancellation_boundaries_are_bounded_and_terminal() 
             assert!(!stdout(&result, cmd).contains("forbidden-check"));
         }
     }
+    cases.finish();
 }
 
 #[test]
 #[ignore = "requires Docker"]
 fn real_mixed_ordinary_and_interrupted_entries_keep_distinct_modes_and_owned_ids() {
+    let mut cases = CaseFilter::from_env();
     for policy in ["binary-only", "restore-data"] {
-        if !enabled(&format!("mixed-{policy}")) {
+        if !cases.enabled(&format!("mixed-{policy}")) {
             continue;
         }
         let (_temp, result) = run(policy, "mixed", vec![ProfileName::User]);
@@ -1070,4 +1101,5 @@ fn real_mixed_ordinary_and_interrupted_entries_keep_distinct_modes_and_owned_ids
             );
         }
     }
+    cases.finish();
 }

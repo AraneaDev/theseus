@@ -142,7 +142,8 @@ marker=pathlib.Path({marker:?})
 incomplete=pathlib.Path({incomplete:?})
 attempt='theseus-command' in args and any('/inputs/target/attempt.sh' in arg for arg in args)
 receipt='-c' in args and args[args.index('-c')+1].startswith('test -f')
-if mode=='incomplete-reference' and incomplete.exists() and args[0]=='cp' and args[1].endswith(':/home/theseus'):
+if mode.startswith('incomplete-') and incomplete.exists() and args[0]=='cp' and args[1].endswith(':/home/theseus'):
+    incomplete.unlink()
     sys.exit(1)
 if attempt: marker.touch()
 if mode=='transport' and receipt and marker.exists(): sys.exit(1)
@@ -154,13 +155,25 @@ sys.exit(result.returncode)
 "#,marker=marker.to_str().unwrap(),incomplete=incomplete.to_str().unwrap())).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if fault == "incomplete-baseline" {
+        std::fs::write(&incomplete, "fail exactly one cp").unwrap();
+    }
     let mut docker = theseus::runner::Docker::new(executable);
     let result = engine::run_with(&recipe, options, cancel, &mut docker, move |event| {
-        if fault == "incomplete-reference"
-            && event.kind == EventKind::StageFinished
-            && event.stage.as_deref() == Some("known_good:after_checks")
+        let incomplete_stage = match fault {
+            "incomplete-install" => Some(("install_base", EventKind::StageStarted)),
+            "incomplete-exercise" => Some(("exercise_before_upgrade", EventKind::StageStarted)),
+            "incomplete-backup" => Some(("backup", EventKind::StageStarted)),
+            "incomplete-rollback" => Some(("rollback", EventKind::StageStarted)),
+            "incomplete-reference" => Some(("known_good:after_checks", EventKind::StageFinished)),
+            "incomplete-checkpoint" => Some(("known_good", EventKind::StageStarted)),
+            "incomplete-after-checks" => Some(("upgrade_failed", EventKind::StageFinished)),
+            _ => None,
+        };
+        if incomplete_stage
+            .is_some_and(|(name, kind)| event.stage.as_deref() == Some(name) && event.kind == kind)
         {
-            std::fs::write(&incomplete, "fail cp").unwrap();
+            std::fs::write(&incomplete, "fail exactly one cp").unwrap();
         }
         if fault.starts_with("cancel-")
             && event.kind == EventKind::StageStarted
@@ -682,23 +695,57 @@ fn real_noop_partial_and_metadata_restores_fail_independent_proofs() {
 #[test]
 #[ignore = "requires Docker"]
 fn real_incomplete_runtime_coverage_blocks_forward_mutation() {
-    let (_temp, result) = run(
-        "restore-data",
-        "incomplete-reference",
-        vec![ProfileName::User],
-    );
-    assert_eq!(
-        result.report.outcome,
-        RunOutcome::Incomplete,
-        "{:#?}",
-        result.report
-    );
-    let s = &result.report.scenarios[0];
-    assert!(stage(s, "backup").commands.is_empty());
-    assert!(stage(s, "attempt_upgrade").commands.is_empty());
-    assert!(stage(s, "rollback").commands.is_empty());
-    assert!(stage(s, "cleanup_backup").commands.is_empty());
+    for (fault, backup, candidate, rollback) in [
+        ("incomplete-baseline", false, false, false),
+        ("incomplete-install", false, false, false),
+        ("incomplete-exercise", false, false, false),
+        ("incomplete-backup", true, false, false),
+        ("incomplete-rollback", true, true, true),
+        ("incomplete-reference", false, false, false),
+        ("incomplete-checkpoint", false, false, false),
+        ("incomplete-after-checks", true, true, false),
+    ] {
+        let (_temp, result) = run("restore-data", fault, vec![ProfileName::User]);
+        assert_eq!(
+            result.report.outcome,
+            RunOutcome::Incomplete,
+            "{fault}: {:#?}",
+            result.report
+        );
+        let s = &result.report.scenarios[0];
+        if matches!(fault, "incomplete-baseline" | "incomplete-install") {
+            assert!(
+                stage(s, "base_installed").commands.is_empty(),
+                "unverified prerequisite must block check commands: {fault}"
+            );
+        }
+        for (name, expected) in [
+            ("backup", backup),
+            ("attempt_upgrade", candidate),
+            ("rollback", rollback),
+            ("exercise_rolled_back", false),
+            ("cleanup_backup", backup),
+            ("uninstall", true),
+        ] {
+            assert_eq!(
+                !stage(s, name).commands.is_empty(),
+                expected,
+                "{fault}/{name}"
+            );
+        }
+        assert!(
+            stage(s, "before_rollback")
+                .snapshots
+                .iter()
+                .all(|snapshot| matches!(
+                    snapshot.completeness,
+                    theseus::snapshot::ObservationStatus::Complete
+                )),
+            "later complete capture cannot reauthorize {fault}"
+        );
+    }
 }
+
 #[test]
 #[ignore = "requires Docker"]
 fn real_timeout_and_cancel_at_every_mutation_skip_forward_steps() {

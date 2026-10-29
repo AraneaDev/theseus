@@ -871,8 +871,10 @@ fn incomplete_repeat_reference_cannot_pass() {
     for scenario in &result.report.scenarios {
         assert_eq!(
             stage(scenario, "reinstalled").checks[0].outcome,
-            CheckOutcome::Incomplete
+            CheckOutcome::Skipped
         );
+        // The unverified reference now blocks the repeated mutation itself.
+        assert!(stage(scenario, "reinstall").commands.is_empty());
     }
 }
 #[test]

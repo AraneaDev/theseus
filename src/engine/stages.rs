@@ -28,6 +28,7 @@ pub(super) struct State {
     pub(super) resource: OwnedResource,
     pub(super) availability: Availability,
     pub(super) forward: bool,
+    observations_verified: bool,
     pub(super) baseline: Vec<Snapshot>,
     pub(super) previous: Vec<Snapshot>,
     pub(super) configured: Option<Vec<Snapshot>>,
@@ -63,6 +64,7 @@ pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
         resource,
         availability: Availability::Running,
         forward: true,
+        observations_verified: true,
         baseline: vec![],
         previous: vec![],
         configured: None,
@@ -74,11 +76,9 @@ pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
         before_attempt: None,
         rollback_backup_authorized: false,
     };
-    let baseline = c.observation(&state);
-    state.baseline = baseline.clone();
-    state.previous = baseline.clone();
     let mut stage = StageReport::new("baseline");
-    stage.snapshots = baseline;
+    c.capture(&mut state, &mut stage);
+    state.baseline = stage.snapshots.clone();
     c.finish(stage)?;
     let kind = c.report.scenarios[c.index].scenario;
     match kind {
@@ -210,8 +210,24 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                     .collect()
             })
     }
-    pub(super) fn capture(&mut self, state: &mut State, stage: &mut StageReport) {
+    pub(super) fn capture(&mut self, state: &mut State, stage: &mut StageReport) -> bool {
         stage.snapshots = self.observation(state);
+        let complete = !stage.snapshots.is_empty()
+            && stage.snapshots.iter().all(|snapshot| {
+                !matches!(
+                    snapshot.completeness,
+                    snapshot::ObservationStatus::Incomplete { .. }
+                )
+            });
+        // Every observation-bearing phase is a sticky prerequisite. In particular,
+        // a later complete checkpoint/reference cannot authorize missing evidence.
+        state.observations_verified &= complete;
+        state.forward &= state.observations_verified;
+        if stage.snapshots.is_empty() {
+            stage
+                .errors
+                .push("required observation capture was empty".into());
+        }
         for current in &stage.snapshots {
             if let Some(before) = state.baseline.iter().find(|b| b.root == current.root) {
                 stage.baseline_diff.extend(snapshot::diff(before, current));
@@ -221,6 +237,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
             }
         }
         state.previous = stage.snapshots.clone();
+        complete
     }
     pub(super) fn request(
         &self,
@@ -403,8 +420,15 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
         let mut stage = StageReport::new(checkpoint.to_string());
         stage.checkpoint = Some(checkpoint);
         self.start(&stage)?;
-        self.capture(state, &mut stage);
+        let complete = self.capture(state, &mut stage);
+        let cleanup = matches!(
+            checkpoint,
+            Checkpoint::BackupRemoved | Checkpoint::Uninstalled
+        );
+        let blocked = blocked || !complete || (!state.observations_verified && !cleanup);
         if configured
+            && complete
+            && state.observations_verified
             && state.availability == Availability::Running
             && self.report.scenarios[self.index]
                 .stages

@@ -275,6 +275,9 @@ sys.exit(subprocess.run(['docker',*args]).returncode)
 "#,marker=marker.to_str().unwrap(),incomplete=incomplete.to_str().unwrap(),calls=trace_path.to_str().unwrap())).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if fault == "incomplete-baseline" {
+        std::fs::write(&incomplete, "fail exactly one cp").unwrap();
+    }
     let monitor = if matches!(fault, "cancel-during-restart" | "cancel-check") {
         let signal = signal.clone();
         let monitored_fault = fault.to_owned();
@@ -296,6 +299,10 @@ sys.exit(subprocess.run(['docker',*args]).returncode)
     let started = std::time::Instant::now();
     let result = engine::run_with(&recipe, options, cancel, &mut docker, move |event| {
         let incomplete_stage = match fault {
+            "incomplete-install" => Some(("install_base", EventKind::StageStarted)),
+            "incomplete-exercise" => Some(("exercise_before_upgrade", EventKind::StageStarted)),
+            "incomplete-backup" => Some(("backup", EventKind::StageStarted)),
+            "incomplete-rollback" => Some(("rollback", EventKind::StageStarted)),
             "incomplete-reference" => Some(("known_good", EventKind::StageFinished)),
             "incomplete-checkpoint" => Some(("known_good", EventKind::StageStarted)),
             "incomplete-after-checks" => Some(("interrupted", EventKind::StageFinished)),
@@ -476,8 +483,87 @@ pub fn prerequisites(s: &ScenarioReport) {
 }
 
 /// Focus a repaired fault row without repeating already-passed Docker rows.
-/// Unset in CI: every declared row executes.
-pub fn enabled(fault: &str) -> bool {
-    std::env::var("THESEUS_ACCEPTANCE_CASES")
-        .map_or(true, |cases| cases.split(',').any(|case| case == fault))
+/// Unset in CI: every declared row executes. Each invoked group must match all
+/// requested names and execute at least one row before it can pass.
+pub struct CaseFilter {
+    requested: Option<std::collections::BTreeSet<String>>,
+    remaining: std::collections::BTreeSet<String>,
+    matched: usize,
+}
+impl CaseFilter {
+    fn parse(value: Option<&str>) -> Result<Self, String> {
+        if value.is_some_and(|value| value.split(',').any(|name| name.trim().is_empty())) {
+            return Err("THESEUS_ACCEPTANCE_CASES requires nonempty comma-separated names".into());
+        }
+        let requested = value.map(|value| value.split(',').map(str::to_owned).collect());
+        Ok(Self {
+            remaining: requested.clone().unwrap_or_default(),
+            requested,
+            matched: 0,
+        })
+    }
+    pub fn from_env() -> Self {
+        let value = std::env::var("THESEUS_ACCEPTANCE_CASES").ok();
+        Self::parse(value.as_deref()).unwrap_or_else(|error| panic!("{error}"))
+    }
+    pub fn enabled(&mut self, fault: &str) -> bool {
+        let enabled = self
+            .requested
+            .as_ref()
+            .is_none_or(|cases| cases.contains(fault));
+        if enabled {
+            self.remaining.remove(fault);
+            self.matched += 1;
+        }
+        enabled
+    }
+    fn validate(&self) -> Result<(), String> {
+        if self.requested.is_some() && (self.matched == 0 || !self.remaining.is_empty()) {
+            return Err(format!(
+                "THESEUS_ACCEPTANCE_CASES selected {} rows; unknown names in this group: {:?}",
+                self.matched, self.remaining
+            ));
+        }
+        Ok(())
+    }
+    pub fn finish(self) {
+        self.validate().unwrap_or_else(|error| panic!("{error}"));
+    }
+}
+
+#[cfg(test)]
+mod case_filter_tests {
+    use super::CaseFilter;
+    #[test]
+    fn case_filter_rejects_empty_names_without_global_environment_changes() {
+        for value in ["", " ", ",", "known,", ",known", "known,,other"] {
+            assert!(
+                CaseFilter::parse(Some(value)).is_err(),
+                "accepted {value:?}"
+            );
+        }
+    }
+    #[test]
+    fn case_filter_rejects_unknown_names_and_zero_selected_group() {
+        for value in ["typo", "known,typo"] {
+            let mut filter = CaseFilter::parse(Some(value)).unwrap();
+            filter.enabled("known");
+            filter.enabled("other");
+            assert!(filter.validate().is_err(), "accepted {value:?}");
+        }
+        let filter = CaseFilter::parse(Some("known")).unwrap();
+        assert!(filter.validate().is_err(), "selected no rows");
+    }
+    #[test]
+    fn case_filter_preserves_unset_and_valid_focused_selections() {
+        let mut all = CaseFilter::parse(None).unwrap();
+        assert!(all.enabled("known"));
+        assert!(all.enabled("other"));
+        assert!(all.validate().is_ok());
+        let mut focused = CaseFilter::parse(Some("known,other")).unwrap();
+        assert!(focused.enabled("known"));
+        assert!(!focused.enabled("unselected"));
+        assert!(focused.enabled("other"));
+        assert!(focused.validate().is_ok());
+    }
 }

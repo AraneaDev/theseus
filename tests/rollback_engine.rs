@@ -93,6 +93,9 @@ impl Environment for Evidence {
         let mut status = 0;
         match phase {
             "install_base" => {
+                if self.fault == "install-fails" {
+                    status = 1;
+                }
                 self.put("/workspace/tool", "good");
                 self.files
                     .insert("/workspace/data".into(), entry(FileKind::Directory, ""));
@@ -228,6 +231,12 @@ impl Environment for Evidence {
         _: &CancellationToken,
     ) -> Result<Vec<Snapshot>> {
         self.observations += 1;
+        if self.fault == format!("empty:{}", self.observations) {
+            return Ok(vec![]);
+        }
+        if self.fault == format!("error:{}", self.observations) {
+            anyhow::bail!("capture transport failed");
+        }
         if self.fault == format!("incomplete:{}", self.observations) {
             return Ok(roots
                 .iter()
@@ -890,4 +899,197 @@ fn incomplete_checkpoint_observations_revoke_forward_authorization_permanently()
         violations.is_empty(),
         "incomplete observation authorized forbidden commands: {violations:#?}"
     );
+}
+
+#[test]
+fn every_required_capture_revokes_forward_authorization_permanently() {
+    // Removing the central observation gate must expose actual forbidden commands.
+    // Literal positions/order come from the independently reviewed lifecycle contract.
+    let mut violations = vec![];
+    for (capture, stage_name, backup, candidate, rollback, exercise, cleanup) in [
+        (1, "baseline", false, false, false, false, false),
+        (2, "install_base", false, false, false, false, false),
+        (3, "base_installed", false, false, false, false, false),
+        (
+            4,
+            "base_installed:after_checks",
+            false,
+            false,
+            false,
+            false,
+            false,
+        ),
+        (5, "configure", false, false, false, false, false),
+        (6, "configured", false, false, false, false, false),
+        (
+            7,
+            "configured:after_checks",
+            false,
+            false,
+            false,
+            false,
+            false,
+        ),
+        (
+            8,
+            "exercise_before_upgrade",
+            false,
+            false,
+            false,
+            false,
+            false,
+        ),
+        (9, "known_good", false, false, false, false, false),
+        (
+            10,
+            "known_good:after_checks",
+            false,
+            false,
+            false,
+            false,
+            false,
+        ),
+        (11, "before_upgrade", false, false, false, false, false),
+        (12, "backup", true, false, false, false, true),
+        (13, "backup_created", true, false, false, false, true),
+        (
+            14,
+            "backup_created:after_checks",
+            true,
+            false,
+            false,
+            false,
+            true,
+        ),
+        (15, "before_attempt", true, false, false, false, true),
+        (16, "attempt_upgrade", true, true, false, false, true),
+        (17, "upgrade_failed", true, true, false, false, true),
+        (
+            18,
+            "upgrade_failed:after_checks",
+            true,
+            true,
+            false,
+            false,
+            true,
+        ),
+        (19, "before_rollback", true, true, false, false, true),
+        (20, "rollback", true, true, true, false, true),
+        (21, "rolled_back", true, true, true, false, true),
+        (
+            22,
+            "rolled_back:after_checks",
+            true,
+            true,
+            true,
+            false,
+            true,
+        ),
+        (23, "exercise_rolled_back", true, true, true, true, true),
+        (24, "cleanup_backup", true, true, true, true, true),
+        (25, "backup_removed", true, true, true, true, true),
+        (
+            26,
+            "backup_removed:after_checks",
+            true,
+            true,
+            true,
+            true,
+            true,
+        ),
+        (27, "uninstall", true, true, true, true, true),
+        (28, "uninstalled", true, true, true, true, true),
+        (29, "uninstalled:after_checks", true, true, true, true, true),
+        (30, "final", true, true, true, true, true),
+    ] {
+        for fault in ["incomplete", "empty", "error"] {
+            let (_temp, result, env) = run(
+                &format!("{fault}:{capture}"),
+                false,
+                ProfileName::User,
+                None,
+            );
+            let scenario = &result.report.scenarios[0];
+            let target = scenario
+                .stages
+                .iter()
+                .find(|s| s.name == stage_name)
+                .unwrap();
+            assert!(
+                if fault == "empty" {
+                    target.snapshots.is_empty()
+                } else {
+                    target
+                        .snapshots
+                        .iter()
+                        .any(|s| matches!(s.completeness, ObservationStatus::Incomplete { .. }))
+                },
+                "{fault} {stage_name}: injection missed target"
+            );
+            for (phase, expected) in [
+                ("resolve:base", capture > 3),
+                ("check:base", capture > 3),
+                ("check:known", capture > 9),
+                ("backup", backup),
+                ("attempt_upgrade", candidate),
+                ("rollback", rollback),
+                ("exercise_rolled_back", exercise),
+                ("cleanup_backup", cleanup),
+                ("uninstall", true),
+                ("configure", capture >= 5),
+                ("exercise_before_upgrade", capture >= 8),
+                ("install_base", capture >= 2),
+            ] {
+                let executed = env.calls.iter().any(|q| q.phase == phase);
+                if executed != expected {
+                    violations.push(format!("{fault} {stage_name} capture={capture}: {phase} executed={executed}, expected={expected}"));
+                }
+            }
+            for (kind, outcome) in [
+                ("live", result.report.outcome),
+                (
+                    "offline",
+                    theseus::report::load(&result.report_path).unwrap().outcome,
+                ),
+            ] {
+                if outcome != RunOutcome::Incomplete {
+                    violations.push(format!(
+                        "{fault} {stage_name}: {kind} outcome={outcome:?}, expected=Incomplete"
+                    ));
+                }
+            }
+            if stage_name != "final" {
+                let later = scenario.stages.iter().find(|s| s.name == "final").unwrap();
+                assert!(!later.snapshots.is_empty());
+                assert!(
+                    later
+                        .snapshots
+                        .iter()
+                        .all(|s| s.completeness == ObservationStatus::Complete)
+                );
+            }
+            assert_eq!(scenario.teardown, TeardownStatus::Complete);
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "unverified capture authorized forbidden commands or lost Incomplete: {violations:#?}"
+    );
+}
+
+#[test]
+fn verified_observations_preserve_diagnostics_after_known_install_failure() {
+    let (_temp, result, env) = run("install-fails", false, ProfileName::User, None);
+    assert_eq!(result.report.outcome, RunOutcome::Failed);
+    assert!(env.calls.iter().any(|q| q.phase == "check:base"));
+    assert!(env.calls.iter().any(|q| q.phase == "uninstall"));
+    assert!(!env.calls.iter().any(|q| matches!(
+        q.phase.as_str(),
+        "backup"
+            | "attempt_upgrade"
+            | "interrupt_upgrade"
+            | "rollback"
+            | "exercise_rolled_back"
+            | "cleanup_backup"
+    )));
 }
