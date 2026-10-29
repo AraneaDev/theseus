@@ -820,3 +820,74 @@ fn required_runtime_records_reject_impossible_resolver_and_execution_arguments()
         assert_eq!(report.outcome, RunOutcome::Incomplete, "{role} {argv:?}");
     }
 }
+
+#[test]
+fn incomplete_checkpoint_observations_revoke_forward_authorization_permanently() {
+    // Literal capture positions include command, checkpoint and after-check snapshots.
+    // Each row independently states which forward commands were already authorized.
+    let mut violations = vec![];
+    for (capture, stage_name, backup, candidate, rollback, cleanup) in [
+        (10, "known_good:after_checks", false, false, false, false),
+        (14, "backup_created:after_checks", true, false, false, true),
+        (18, "upgrade_failed:after_checks", true, true, false, true),
+        (22, "rolled_back:after_checks", true, true, true, true),
+        (9, "known_good", false, false, false, false),
+    ] {
+        let (_temp, result, env) = run(
+            &format!("incomplete:{capture}"),
+            false,
+            ProfileName::User,
+            None,
+        );
+        assert_eq!(
+            result.report.outcome,
+            RunOutcome::Incomplete,
+            "{stage_name}"
+        );
+        let scenario = &result.report.scenarios[0];
+        let incomplete = scenario
+            .stages
+            .iter()
+            .find(|s| s.name == stage_name)
+            .unwrap();
+        assert!(matches!(
+            incomplete.snapshots[0].completeness,
+            ObservationStatus::Incomplete { .. }
+        ));
+        // Later complete observations must never re-enable a failed prerequisite.
+        let fresh = scenario
+            .stages
+            .iter()
+            .find(|s| s.name == "before_rollback")
+            .unwrap();
+        assert!(!fresh.snapshots.is_empty());
+        assert!(
+            fresh
+                .snapshots
+                .iter()
+                .all(|s| s.completeness == ObservationStatus::Complete)
+        );
+        for (phase, expected) in [
+            ("backup", backup),
+            ("attempt_upgrade", candidate),
+            ("rollback", rollback),
+            ("exercise_rolled_back", false),
+            ("cleanup_backup", cleanup),
+            ("uninstall", true),
+        ] {
+            let executed = env.calls.iter().any(|q| q.phase == phase);
+            if executed != expected {
+                violations.push(format!("{stage_name} capture={capture}: {phase} executed={executed}, expected={expected}"));
+            }
+        }
+        assert_eq!(
+            theseus::report::load(&result.report_path).unwrap().outcome,
+            RunOutcome::Incomplete,
+            "{stage_name}"
+        );
+    }
+    assert!(
+        violations.is_empty(),
+        "incomplete observation authorized forbidden commands: {violations:#?}"
+    );
+}

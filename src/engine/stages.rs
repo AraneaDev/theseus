@@ -509,9 +509,16 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
             self.update(&stage)?;
         }
         Self::outcome(&mut stage);
+        state.forward &=
+            stage.aggregate_outcome() == RunOutcome::Passed && !stage.snapshots.is_empty();
         self.update(&stage)?;
         let mut after = StageReport::new(format!("{checkpoint}:after_checks"));
         self.capture(state, &mut after);
+        Self::outcome(&mut after);
+        // Required observations are sticky prerequisites, including check side effects.
+        // Later complete references cannot authorize forward work after missing evidence.
+        state.forward &=
+            after.aggregate_outcome() == RunOutcome::Passed && !after.snapshots.is_empty();
         self.finish(after)
     }
     fn command_expectation(
