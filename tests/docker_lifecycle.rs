@@ -1022,7 +1022,7 @@ fn real_interruption_retains_partial_state_and_restarts_without_setup_or_copy() 
         // evidence that restart only starts the original idle entrypoint.
         boundary.ordinary(
             "mutate-inputs",
-            "printf retained > /inputs/target/retained; chmod 711 /workspace; chown 0:0 /workspace",
+            "printf retained > /inputs/target/retained; printf changed-input > /inputs/target/sample-cli; chmod 711 /workspace; chown 0:0 /workspace",
             ExecutionIdentity::root(),
         );
         let request = InterruptionBoundary::request(
@@ -1101,6 +1101,7 @@ printf '\n'
 stat -c '%u:%g:%a' "$HOME/partial"
 test ! -e "$HOME/continued"
 a=$(wc -c < "$HOME/writer"); sleep 0.15; b=$(wc -c < "$HOME/writer"); test "$a" = "$b"
+test "$(cat /inputs/target/sample-cli)" = changed-input
 cat /inputs/target/retained
 printf '\n'
 stat -c '%u:%g:%a' /workspace

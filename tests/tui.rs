@@ -490,6 +490,15 @@ fn interruption_preview_and_offline_proof_remain_explicit_and_narrow() {
         app.options.as_ref().unwrap().scenarios,
         [ScenarioKind::InterruptedInstall]
     );
+    let install_preview = app.preview_text();
+    assert!(
+        install_preview.contains("before initial installation"),
+        "{install_preview}"
+    );
+    assert!(!install_preview.contains("after first exercise"));
+    key(&mut app, KeyCode::Char('s'));
+    let upgrade_preview = app.preview_text();
+    assert!(upgrade_preview.contains("after first exercise"));
     key(&mut app, KeyCode::Char('r'));
     assert!(app.start_requested);
     let mut report = RunReport::new("proof");

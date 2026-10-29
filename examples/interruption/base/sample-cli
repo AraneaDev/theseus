@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+case "${1:---version}" in
+--version) echo 'sample-cli 1.0.0' ;;
+configure) mkdir -p "$XDG_CONFIG_HOME/sample-cli" "$XDG_DATA_HOME/sample-cli"; printf 'colour=blue\n' > "$XDG_CONFIG_HOME/sample-cli/settings"; printf 'keep me\n' > "$XDG_DATA_HOME/sample-cli/notes" ;;
+smoke) test "$(cat "$XDG_CONFIG_HOME/sample-cli/settings")" = colour=blue; test "$(cat "$XDG_DATA_HOME/sample-cli/notes")" = 'keep me'; echo healthy ;;
+*) exit 2 ;;
+esac

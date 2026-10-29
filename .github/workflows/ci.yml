@@ -18,3 +18,6 @@ jobs:
           docker pull ubuntu:24.04
       - name: Real Docker lifecycle acceptance (required)
         run: cargo test --locked --test docker_lifecycle -- --ignored --test-threads=1
+
+      - name: Real Docker interruption acceptance (required)
+        run: cargo test --locked --test interruption_lifecycle -- --ignored --test-threads=1

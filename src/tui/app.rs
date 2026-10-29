@@ -146,7 +146,7 @@ impl App {
                         ScenarioKind::InterruptedInstall | ScenarioKind::InterruptedUpgrade
                     )
                 }) {
-                    text += "Interruption: ContainerSigkill at synchronous THESEUS_INTERRUPT_BARRIER; abrupt whole-container stop, same-ID restart without setup or input copying.\nPartial interrupted checks run after restart and before explicit recovery.\nUnchanged compares before_interrupt (after first exercise) -> interrupted/recovered (before checks). Preserved uses configured.\n";
+                    text += "Interruption: ContainerSigkill at synchronous THESEUS_INTERRUPT_BARRIER; abrupt whole-container stop, same-ID restart without setup or input copying.\nPartial interrupted checks run after restart and before explicit recovery.\nUnchanged compares before_interrupt -> interrupted/recovered (before checks). Preserved uses configured.\n";
                     for (kind, interrupt, recover) in [
                         (
                             ScenarioKind::InterruptedInstall,
@@ -160,6 +160,15 @@ impl App {
                         ),
                     ] {
                         if options.scenarios.contains(&kind) {
+                            text += match kind {
+                                ScenarioKind::InterruptedInstall => {
+                                    "before_interrupt: before initial installation.\n"
+                                }
+                                ScenarioKind::InterruptedUpgrade => {
+                                    "before_interrupt: after first exercise.\n"
+                                }
+                                _ => unreachable!(),
+                            };
                             if let Some(command) = profile.steps.get(&interrupt) {
                                 text += &format!(
                                     "{kind} barrier/stop budget: {}s\n",

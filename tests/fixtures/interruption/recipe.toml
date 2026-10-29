@@ -1,0 +1,209 @@
+schema_version = 3
+scenarios = ["interrupted_install", "interrupted_upgrade"]
+name = "sample-cli interruption and forward recovery"
+image = "ubuntu:24.04"
+network = "none"
+observe = ["/home/theseus", "/usr/local/bin", "/workspace"]
+[artifacts]
+base = "base"
+target = "target"
+
+[profiles.user.steps.install_base]
+script = "sh /inputs/base/install.sh user"
+timeout_seconds = 15
+
+[profiles.user.steps.interrupt_install]
+script = "sh /inputs/target/install.sh user interrupt"
+timeout_seconds = 15
+
+[profiles.user.steps.interrupt_upgrade]
+script = "sh /inputs/target/install.sh user interrupt"
+timeout_seconds = 15
+
+[profiles.user.steps.recover_install]
+script = "sh /inputs/target/install.sh user recover"
+timeout_seconds = 15
+
+[profiles.user.steps.recover_upgrade]
+script = "sh /inputs/target/install.sh user recover"
+timeout_seconds = 15
+
+[profiles.user.steps.configure]
+script = "sample-cli configure"
+timeout_seconds = 15
+
+[profiles.user.steps.exercise]
+script = "sample-cli smoke"
+timeout_seconds = 15
+
+[profiles.user.steps.uninstall]
+script = "sh /inputs/target/uninstall.sh user"
+timeout_seconds = 15
+
+[[profiles.user.checks]]
+id = "interrupted-partial"
+checkpoint = "interrupted"
+kind = "present"
+path = "/home/theseus/.local/bin/sample-cli.partial"
+
+[[profiles.user.checks]]
+id = "recovered-partial"
+checkpoint = "recovered"
+kind = "absent"
+path = "/home/theseus/.local/bin/sample-cli.partial"
+
+[[profiles.user.checks]]
+id = "recovered-version"
+checkpoint = "recovered"
+kind = "executable"
+expected_exit = 0
+name = "sample-cli"
+resolved_path = "/home/theseus/.local/bin/sample-cli"
+args = ["--version"]
+stdout_contains = "sample-cli 2.0.0"
+
+[[profiles.user.checks]]
+id = "data-contract"
+checkpoint = "recovered"
+kind = "command"
+expected_exit = 0
+script = "if test -f /home/theseus/.config/sample-cli/settings; then sample-cli smoke; else echo healthy-fresh-install; fi"
+stdout_contains = "healthy"
+
+[[profiles.user.checks]]
+id = "writer-stopped"
+checkpoint = "interrupted"
+kind = "command"
+expected_exit = 0
+script = 'a=$(wc -c < /workspace/writer); sleep 0.2; b=$(wc -c < /workspace/writer); test "$a" = "$b"; echo stopped'
+stdout_contains = "stopped"
+
+[[profiles.user.checks]]
+id = "binary-removed"
+checkpoint = "uninstalled"
+kind = "absent"
+path = "/home/theseus/.local/bin/sample-cli"
+
+[[profiles.user.checks]]
+id = "configuration-retained"
+checkpoint = "uninstalled"
+kind = "preserved"
+path = "/home/theseus/.config/sample-cli/settings"
+
+[[profiles.user.checks]]
+id = "notes-retained"
+checkpoint = "uninstalled"
+kind = "preserved"
+path = "/home/theseus/.local/share/sample-cli/notes"
+
+[profiles.system.steps.install_base]
+script = "sh /inputs/base/install.sh system"
+timeout_seconds = 15
+
+[profiles.system.steps.interrupt_install]
+script = "sh /inputs/target/install.sh system interrupt"
+timeout_seconds = 15
+
+[profiles.system.steps.interrupt_upgrade]
+script = "sh /inputs/target/install.sh system interrupt"
+timeout_seconds = 15
+
+[profiles.system.steps.recover_install]
+script = "sh /inputs/target/install.sh system recover"
+timeout_seconds = 15
+
+[profiles.system.steps.recover_upgrade]
+script = "sh /inputs/target/install.sh system recover"
+timeout_seconds = 15
+
+[profiles.system.steps.configure]
+script = "sample-cli configure"
+timeout_seconds = 15
+
+[profiles.system.steps.exercise]
+script = "sample-cli smoke"
+timeout_seconds = 15
+
+[profiles.system.steps.uninstall]
+script = "sh /inputs/target/uninstall.sh system"
+timeout_seconds = 15
+
+[[profiles.system.checks]]
+id = "interrupted-partial"
+checkpoint = "interrupted"
+kind = "present"
+path = "/usr/local/bin/sample-cli.partial"
+
+[[profiles.system.checks]]
+id = "recovered-partial"
+checkpoint = "recovered"
+kind = "absent"
+path = "/usr/local/bin/sample-cli.partial"
+
+[[profiles.system.checks]]
+id = "recovered-version"
+checkpoint = "recovered"
+kind = "executable"
+expected_exit = 0
+name = "sample-cli"
+resolved_path = "/usr/local/bin/sample-cli"
+args = ["--version"]
+stdout_contains = "sample-cli 2.0.0"
+
+[[profiles.system.checks]]
+id = "data-contract"
+checkpoint = "recovered"
+kind = "command"
+expected_exit = 0
+script = "if test -f /home/theseus/.config/sample-cli/settings; then sample-cli smoke; else echo healthy-fresh-install; fi"
+stdout_contains = "healthy"
+
+[[profiles.system.checks]]
+id = "writer-stopped"
+checkpoint = "interrupted"
+kind = "command"
+expected_exit = 0
+script = 'a=$(wc -c < /workspace/writer); sleep 0.2; b=$(wc -c < /workspace/writer); test "$a" = "$b"; echo stopped'
+stdout_contains = "stopped"
+
+[[profiles.system.checks]]
+id = "binary-removed"
+checkpoint = "uninstalled"
+kind = "absent"
+path = "/usr/local/bin/sample-cli"
+
+[[profiles.system.checks]]
+id = "configuration-retained"
+checkpoint = "uninstalled"
+kind = "preserved"
+path = "/home/theseus/.config/sample-cli/settings"
+
+[[profiles.system.checks]]
+id = "notes-retained"
+checkpoint = "uninstalled"
+kind = "preserved"
+path = "/home/theseus/.local/share/sample-cli/notes"
+
+[[profiles.user.checks]]
+id = "interrupted-cache-stable"
+checkpoint = "interrupted"
+kind = "unchanged"
+path = "/home/theseus/.cache"
+
+[[profiles.user.checks]]
+id = "recovered-cache-stable"
+checkpoint = "recovered"
+kind = "unchanged"
+path = "/home/theseus/.cache"
+
+[[profiles.system.checks]]
+id = "interrupted-cache-stable"
+checkpoint = "interrupted"
+kind = "unchanged"
+path = "/home/theseus/.cache"
+
+[[profiles.system.checks]]
+id = "recovered-cache-stable"
+checkpoint = "recovered"
+kind = "unchanged"
+path = "/home/theseus/.cache"

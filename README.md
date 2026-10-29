@@ -2,8 +2,8 @@
 
 Know what your tool leaves behind.
 
-Theseus rehearses CLI installation, configuration, upgrade, reinstall, runtime
-checks, and uninstall in disposable Linux containers. A Ratatui workbench and
+Theseus rehearses CLI installation, configuration, upgrade, reinstall,
+interrupted installation/upgrade, forward recovery, runtime checks, and uninstall in disposable Linux containers. A Ratatui workbench and
 headless CLI use one scenario engine. Evidence includes commands, private logs, file fingerprints,
 declared check outcomes, and remaining files that need review.
 
@@ -53,6 +53,22 @@ No base artifact is needed. A passing run establishes these declared observation
 for two installer invocations; it does not prove universal idempotency or stability
 across arbitrary repetitions, remote effects, or unobserved state.
 
+Schema 3 provides a self-contained interruption example for both profiles:
+
+```sh
+theseus validate --recipe examples/interruption/theseus.toml
+theseus run --headless --recipe examples/interruption/theseus.toml
+theseus run --recipe examples/interruption/theseus.toml  # preview, then r
+theseus run --headless --recipe examples/interruption/theseus.toml --profile user --scenario interrupted-upgrade
+```
+
+It copies a real target executable to `.partial`, starts a background writer,
+reaches a cooperative barrier, and deliberately stops the whole container with
+SIGKILL. Theseus verifies the stop, restarts the same container without setup,
+input copying or chown, observes partial state, then runs explicit recovery. The
+example verifies the writer stopped, promotes the partial executable, checks the
+target version and retained data, and uninstalls.
+
 Create your own starter with `theseus init`. It refuses to overwrite an existing
 recipe. Replace the failing placeholder commands **and** the `.` artifact paths
 before running it. `theseus validate --recipe PATH` validates without Docker.
@@ -88,7 +104,8 @@ without them, use headless or JSON output.
 ## Recipe contract
 
 See [the working recipe](examples/standalone/theseus.toml) and its `base/` and
-`target/` installers, or the [reinstall recipe](examples/reinstall/theseus.toml).
+`target/` installers, or the [reinstall recipe](examples/reinstall/theseus.toml) and
+[interruption recipe](examples/interruption/theseus.toml).
 Recipes reject unknown fields and define a name, image, network (`none` by default
 or explicit `bridge`), artifacts, profiles, and nonoverlapping absolute observation
 roots. Inputs resolve inside the recipe project, are materialized and hashed, then copied into
@@ -104,9 +121,28 @@ explicit `reinstall` step and at least one `unchanged` assertion for every selec
 profile. There is no automatic fallback to `install_target`. A reinstall-only
 recipe requires neither `artifacts.base`, `install_base`, nor `upgrade`.
 
+Schema 3 adds `interrupted_install` and `interrupted_upgrade`, steps
+`interrupt_install`/`recover_install` and `interrupt_upgrade`/`recover_upgrade`,
+and checkpoints `interrupted`/`recovered`. Schemas 1/2 reject these identifiers.
+Interruption steps must call the runner-supplied helper synchronously after the
+intended partial mutation:
+
+```sh
+cp /inputs/target/sample-cli "$prefix/sample-cli.partial"
+/bin/sh "$THESEUS_INTERRUPT_BARRIER"
+```
+
+The helper never returns normally. Do not background it or declare its private
+variable in `env`/`pass_env`. The command timeout covers barrier setup, readiness,
+and verified stop. Both scenarios require an interrupted filesystem assertion,
+an explicit recovery command, and a recovered executable check with a nonempty
+version/behavior expectation. Interrupted upgrade additionally requires an
+explicit recovered data contract; use scoped unchanged/preserved assertions or a
+command that reads real data and expects nonempty output.
+
 Both `user` and `system` profiles run configure/exercise/checks as UID/GID
-10001:10001. User installation/upgrade/reinstall/uninstall uses that same identity;
-system installation/upgrade/reinstall/uninstall uses 0:0 **inside the disposable
+10001:10001. User installation/upgrade/reinstall/interruption/recovery/uninstall
+uses that same identity; system installer commands use 0:0 **inside the disposable
 container**.
 Steps are `/bin/sh -c` scripts with `/workspace` as working directory. Each step
 is a new shell: files persist, shell variables and working-directory changes do
@@ -120,7 +156,11 @@ redaction is promised.
 
 The image must supply `/bin/sh`, `/usr/bin/env`, `sleep`, `mkdir`, `chown`, `chmod`,
 `tar`, `cp`, `rm`, `cat`, `id`, and `awk`, with compatible UID/GID 10001
-assignments. Image-declared volumes are rejected. Ubuntu 24.04 is exercised by acceptance; other images must satisfy
+assignments. Interruption additionally requires GNU-compatible `mv -T` and
+`dd iflag=nofollow,nonblock` for atomic readiness and bounded no-follow reads;
+the example also uses `cmp`, `wc`, and `stat`. Unsupported tools fail closed as
+failed/incomplete interruption evidence; Theseus installs no packages.
+Image-declared volumes are rejected. Ubuntu 24.04 is exercised by acceptance; other images must satisfy
 preflight and supported tar observations. Tests do not prove systemd, GUI, kernel,
 macOS, or Windows behavior.
 
@@ -144,6 +184,21 @@ before checkpoint checks or the second exercise can mutate state. Those later
 side effects remain visible in separate evidence. The configured reference used
 by `preserved` stays independent of the before_reinstall reference.
 
+Interrupted install executes before_interrupt reference → interrupt_install →
+verified same-ID restart → interrupted checks → recover_install → recovered
+checks → configure → configured checks → exercise_after_recovery → uninstall →
+uninstalled checks. Interrupted upgrade executes install_base → base_installed
+checks → configure → configured checks → exercise_before_interrupt →
+before_interrupt reference → interrupt_upgrade → verified same-ID restart →
+interrupted checks → recover_upgrade → recovered checks → exercise_after_recovery
+→ uninstall → uninstalled checks. No observations run while stopped. Partial and
+recovered snapshots precede their checkpoint checks; after-check snapshots retain
+check side effects. At interrupted/recovered, `unchanged` compares before_interrupt;
+`preserved` still compares configured and therefore applies only to interrupted
+upgrade at these checkpoints. An ordinary interrupted install has not configured
+anything yet. Recovery can intentionally migrate data using behavioral readers
+rather than claiming byte equality.
+
 Checks have unique IDs and named checkpoints. `command` expects a shell exit and
 optional literal stdout substring. An application exit is evaluated only after a
 fresh in-container completion receipt is verified through a separate bounded
@@ -152,11 +207,13 @@ control operation; Docker control failures leave the application status unknown.
 path, version argv, exit status, and optional literal output. `present` and
 `absent` inspect paths (including dangling links); `preserved` compares an exact
 path's content hash, kind, link, ownership and mode with configured evidence.
-Preservation is valid at upgrade target_installed, reinstalled, or uninstalled;
+Preservation is valid at upgrade target_installed, reinstalled, uninstalled,
+or interrupted/recovered in interrupted upgrade;
 use an explicit command check for intentional migrations. File checks must fall
 within observed roots. Hashes establish observed bytes, not arbitrary semantic correctness.
 
-`unchanged` is valid only at `reinstalled` in schema 2 declaring reinstall. A file
+`unchanged` is valid at `reinstalled` in schema 2 declaring reinstall, and at
+`interrupted`/`recovered` in schema 3 declaring interruption scenarios. A file
 compares its hash, size, kind, UID/GID, and mode; a directory compares its own
 metadata and all observed descendants, including added/removed children. A
 symlink compares its observed link target and metadata without following it.
@@ -187,6 +244,22 @@ Closing a live/offline TUI returns the displayed run outcome. `report --json`
 returns 0 when the saved report was read successfully.
 
 Headless SIGINT/SIGTERM requests cancellation and returns the saved partial report.
+A verified planned interruption has outcome `interrupted`, no application exit
+status, and independent readiness/stopped proof. Restart evidence records the
+same container ID and independently verified running state. Exit 137 alone,
+stdout markers, or an ordinary timeout cannot establish deliberate interruption.
+Early ordinary completion (even exit 0) fails the barrier contract and skips
+recovery. Missing/stale/symlink receipts, control errors, timeouts and unverified
+restart are incomplete; recovery/data failures are failed expectations. Cancellation
+wins, returns 130 and prevents later recovery. Running application failures still
+permit declared uninstall; unavailable containers cannot provide uninstall evidence.
+
+This models an abrupt whole-container stop at one cooperative pause point. It
+does not establish host power-loss durability/fsync behavior, arbitrary installer
+interleavings, service-manager behavior, downgrade or rollback. Recovery is an
+explicit forward application command; ordinary timeout/cancellation never retries
+or recovers automatically.
+
 Timeout/cancellation removes the owned scenario container, including descendants;
 it cannot promise application uninstall observations after that removal. If the
 daemon is unavailable, separately bounded cleanup may fail and leave journaled
@@ -200,11 +273,11 @@ Acquisition errors, unsupported archives, symlinked observed-root ancestors and
 observation overflow remain incomplete rather than silently passing.
 
 Runs are saved under the recipe project's `.theseus-runs/<id>/`, using private
-0700 directories and 0600 files: atomic `report.json` (schema 2), `journal.json`
-(schema 1), and separate bounded logs. Readers accept report schemas 1 and 2; schema 1
+0700 directories and 0600 files: atomic `report.json` (schema 3), `journal.json`
+(schema 1), and separate bounded logs. Readers accept report schemas 1, 2 and 3; schema 1
 continues to represent clean/upgrade evidence, while reinstall/comparison evidence
-requires schema 2. Recovery journals remain version 1. No observed file contents
-are retained except explicit command output; metadata/hashes and diffs are stored.
+requires schema 2 or later. Interruption/proof/restart evidence requires schema 3.
+Recovery journals remain version 1. No observed file contents are retained except explicit command output; metadata/hashes and diffs are stored.
 Reports can be large (load limit 64 MiB), and UI reloads parse saved metadata on progress notifications.
 
 ```sh
@@ -227,6 +300,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --locked --release
 cargo test --locked --test docker_lifecycle -- --ignored --test-threads=1
+cargo test --locked --test interruption_lifecycle -- --ignored --test-threads=1
 ```
 
 Regular tests include wide/narrow TestBackend behavior and actual Unix PTY
@@ -236,7 +310,11 @@ Healthy and broken fixtures exercise all profiles/scenarios, stale PATH,
 permissions, preservation, leftovers, baseline deletion, limits, and cancellation.
 Reinstall acceptance covers both profiles, reset/duplicate settings, changed mode,
 added/removed children, an installer rejecting an existing installation, timeout,
-and cancellation during the second invocation. Actual PTYs exercise narrow live
+and cancellation during the second invocation. Interruption acceptance covers the
+four profile/scenario combinations, actual partial bytes and retained data, descendant stop, same-ID restart without setup or
+input recopy, invalid readiness, early completion, recovery failures, transport
+errors, timeout and cancellation before readiness, while stopped and during restart.
+Both ignored Docker test binaries are explicitly required in CI. Actual PTYs exercise narrow live
 selection, new-report comparison visibility, offline viewing, and terminal recovery.
 
 A separate real Phrourion 0.8.1 → 0.8.2 rehearsal passed all four matrix entries
