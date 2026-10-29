@@ -649,3 +649,174 @@ fn rollback_preserves_normal_nonzero_checks_and_configured_retention_reference()
         .unwrap();
     assert_eq!(retention.outcome, CheckOutcome::Failed);
 }
+
+#[test]
+fn required_rollback_commands_reject_the_twelve_reviewed_malformed_records() {
+    let (_temp, valid, _) = run("", false, ProfileName::User, None);
+    assert_eq!(valid.report.outcome, RunOutcome::Passed);
+    let mut accepted = vec![];
+    for (stage_name, phase) in [
+        ("known_good", "check:known"),
+        ("rolled_back", "check:reader"),
+        ("rollback", "rollback"),
+        ("attempt_upgrade", "attempt_upgrade"),
+    ] {
+        for argv in [vec![], vec!["/bin/true"], vec!["/bin/sh", "-c", ""]] {
+            let mut report = valid.report.clone();
+            let command = report.scenarios[0]
+                .stages
+                .iter_mut()
+                .find(|s| s.name == stage_name)
+                .unwrap()
+                .commands
+                .iter_mut()
+                .find(|c| c.phase == phase)
+                .unwrap();
+            command.argv = argv.iter().map(|s| (*s).into()).collect();
+            report.recompute_outcome();
+            if report.outcome != RunOutcome::Incomplete {
+                accepted.push(format!("{stage_name}/{phase} {argv:?}: {}", report.outcome));
+            }
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "malformed required records accepted: {accepted:#?}"
+    );
+}
+
+#[test]
+fn required_shell_roles_reject_invalid_script_shapes_and_accept_valid_author_scripts() {
+    for binary in [false, true] {
+        let (_temp, valid, _) = run("", binary, ProfileName::User, None);
+        assert_eq!(valid.report.outcome, RunOutcome::Passed);
+        let mut roles = vec![
+            ("known_good", "check:known"),
+            ("rolled_back", "check:reader"),
+            ("install_base", "install_base"),
+            ("configure", "configure"),
+            ("exercise_before_upgrade", "exercise_before_upgrade"),
+            ("attempt_upgrade", "attempt_upgrade"),
+            ("rollback", "rollback"),
+            ("exercise_rolled_back", "exercise_rolled_back"),
+            ("uninstall", "uninstall"),
+        ];
+        if !binary {
+            roles.extend([("backup", "backup"), ("cleanup_backup", "cleanup_backup")]);
+        }
+        for (stage_name, phase) in roles {
+            for argv in [
+                vec![],
+                vec!["/bin/true"],
+                vec!["/bin/sh", "-c", ""],
+                vec!["/bin/sh", "-c", " \t\n"],
+                vec!["/bin/sh", "-c", "echo ok\0ignored"],
+                vec!["/bin/sh", "-c", "true", "extra"],
+            ] {
+                let mut report = valid.report.clone();
+                report.scenarios[0]
+                    .stages
+                    .iter_mut()
+                    .find(|s| s.name == stage_name)
+                    .unwrap()
+                    .commands
+                    .iter_mut()
+                    .find(|c| c.phase == phase)
+                    .unwrap()
+                    .argv = argv.iter().map(|s| (*s).into()).collect();
+                report.recompute_outcome();
+                assert_eq!(
+                    report.outcome,
+                    RunOutcome::Incomplete,
+                    "{binary}/{stage_name} {argv:?}"
+                );
+            }
+            for script in [
+                "printf '%s\\n' readable",
+                "# author script\n: \"$variable\"\nexit 0",
+                " true\n",
+            ] {
+                let mut report = valid.report.clone();
+                report.scenarios[0]
+                    .stages
+                    .iter_mut()
+                    .find(|s| s.name == stage_name)
+                    .unwrap()
+                    .commands
+                    .iter_mut()
+                    .find(|c| c.phase == phase)
+                    .unwrap()
+                    .argv = vec!["/bin/sh".into(), "-c".into(), script.into()];
+                report.recompute_outcome();
+                assert_eq!(
+                    report.outcome,
+                    RunOutcome::Passed,
+                    "{binary}/{stage_name} {script:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn required_runtime_records_reject_impossible_resolver_and_execution_arguments() {
+    let (_temp, valid, _) = run("", false, ProfileName::User, None);
+    assert_eq!(valid.report.outcome, RunOutcome::Passed);
+    for (role, argv) in [
+        ("resolve", vec![]),
+        ("resolve", vec!["/bin/true"]),
+        (
+            "resolve",
+            vec!["/bin/sh", "-c", "command -v \"$1\"", "theseus-resolve", ""],
+        ),
+        (
+            "resolve",
+            vec![
+                "/bin/sh",
+                "-c",
+                "command -v \"$1\"",
+                "theseus-resolve",
+                "tool\0ignored",
+            ],
+        ),
+        (
+            "resolve",
+            vec![
+                "/bin/sh",
+                "-c",
+                "command -v \"$1\"",
+                "theseus-resolve",
+                "tool name",
+            ],
+        ),
+        (
+            "resolve",
+            vec![
+                "/bin/sh",
+                "-c",
+                "command -v \"$1\"",
+                "theseus-resolve",
+                "/workspace/tool",
+            ],
+        ),
+        ("check", vec![]),
+        ("check", vec!["/workspace/tool", "bad\0argument"]),
+    ] {
+        let mut report = valid.report.clone();
+        // Mutate both signatures so matching base/restored argv cannot mask the malformed shape.
+        for (stage, id) in [("base_installed", "base"), ("rolled_back", "runtime")] {
+            report.scenarios[0]
+                .stages
+                .iter_mut()
+                .find(|s| s.name == stage)
+                .unwrap()
+                .commands
+                .iter_mut()
+                .find(|c| c.phase == format!("{role}:{id}"))
+                .unwrap()
+                .argv = argv.iter().map(|s| (*s).into()).collect();
+        }
+        report.recompute_outcome();
+        assert_eq!(report.outcome, RunOutcome::Incomplete, "{role} {argv:?}");
+    }
+}

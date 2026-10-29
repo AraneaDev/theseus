@@ -23,7 +23,8 @@ impl StageReport {
             && self.errors.is_empty()
             && self.commands.len() == 1
             && self.commands.iter().all(|c| {
-                c.phase == "attempt_upgrade"
+                valid_invocation(&c.argv, Invocation::ShellScript)
+                    && c.phase == "attempt_upgrade"
                     && c.outcome == CommandOutcome::ExpectedFailure
                     && !c.cancelled
                     && !c.timed_out
@@ -229,7 +230,8 @@ impl ScenarioReport {
                     }
                 } else if stage.commands.len() != 1
                     || stage.commands.iter().any(|c| {
-                        c.phase != stage.name
+                        !valid_invocation(&c.argv, Invocation::ShellScript)
+                            || c.phase != stage.name
                             || c.exit_status != Some(0)
                             || c.outcome != CommandOutcome::Succeeded
                             || c.expected_failure.is_some()
@@ -502,28 +504,26 @@ impl ScenarioReport {
             .iter()
             .find(|s| s.checkpoint == Some(Checkpoint::RolledBack))
             .unwrap();
-        let executable = |stage: &StageReport,
-                          check: &CheckResult|
-         -> Option<(Vec<String>, Vec<String>)> {
-            if check.command_ids.len() != 2 {
-                return None;
-            }
-            let resolve = stage.commands.iter().find(|c| {
-                c.id == check.command_ids[0] && c.phase == format!("resolve:{}", check.id)
-            })?;
-            let run = stage.commands.iter().find(|c| {
-                c.id == check.command_ids[1] && c.phase == format!("check:{}", check.id)
-            })?;
-            if resolve.exit_status != Some(0)
-                || run.exit_status != Some(0)
-                || resolve.argv.len() != 5
-                || resolve.argv[0..4] != ["/bin/sh", "-c", "command -v \"$1\"", "theseus-resolve"]
-                || run.argv.first().is_none_or(|p| !p.starts_with('/'))
-            {
-                return None;
-            }
-            Some((resolve.argv.clone(), run.argv.clone()))
-        };
+        let executable =
+            |stage: &StageReport, check: &CheckResult| -> Option<(Vec<String>, Vec<String>)> {
+                if check.command_ids.len() != 2 {
+                    return None;
+                }
+                let resolve = stage.commands.iter().find(|c| {
+                    c.id == check.command_ids[0] && c.phase == format!("resolve:{}", check.id)
+                })?;
+                let run = stage.commands.iter().find(|c| {
+                    c.id == check.command_ids[1] && c.phase == format!("check:{}", check.id)
+                })?;
+                if resolve.exit_status != Some(0)
+                    || run.exit_status != Some(0)
+                    || !valid_invocation(&resolve.argv, Invocation::Resolve)
+                    || !valid_invocation(&run.argv, Invocation::Executable)
+                {
+                    return None;
+                }
+                Some((resolve.argv.clone(), run.argv.clone()))
+            };
         policy.runtime_checks.iter().all(|id| {
             let Some(check) = restored.checks.iter().find(|c| &c.id == id) else {
                 return false;
@@ -543,10 +543,37 @@ impl ScenarioReport {
         })
     }
 }
+/// The normal executor records one of these generated argv shapes. This checks
+/// structural executability, not equality to an unavailable original author script.
+enum Invocation {
+    ShellScript,
+    Resolve,
+    Executable,
+}
+fn valid_invocation(argv: &[String], role: Invocation) -> bool {
+    if argv.is_empty() || argv.iter().any(|arg| arg.contains('\0')) {
+        return false;
+    }
+    match role {
+        Invocation::ShellScript => matches!(argv, [shell, flag, script]
+            if shell == "/bin/sh" && flag == "-c" && !script.trim().is_empty()),
+        Invocation::Resolve => matches!(argv, [shell, flag, script, label, name]
+            if shell == "/bin/sh" && flag == "-c" && script == "command -v \"$1\""
+                && label == "theseus-resolve" && !name.is_empty()
+                && !name.contains('/') && !name.chars().any(char::is_whitespace)),
+        Invocation::Executable => {
+            let path = &argv[0];
+            path != "/"
+                && crate::recipe::normalize_container_path(path)
+                    .is_ok_and(|normalized| &normalized == path)
+        }
+    }
+}
 fn reader_evidence(stage: &StageReport, check: &CheckResult) -> bool {
     check.command_ids.len() == 1
         && stage.commands.iter().any(|c| {
-            c.id == check.command_ids[0]
+            valid_invocation(&c.argv, Invocation::ShellScript)
+                && c.id == check.command_ids[0]
                 && c.phase == format!("check:{}", check.id)
                 && c.exit_status == Some(0)
                 && c.outcome == CommandOutcome::Succeeded
