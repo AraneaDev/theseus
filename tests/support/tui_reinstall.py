@@ -13,6 +13,9 @@ import tempfile
 import termios
 import time
 
+sys.dont_write_bytecode = True
+from docker_absence import require_container_absent
+
 binary = str(pathlib.Path(sys.argv[1]).resolve())
 repo = pathlib.Path(__file__).resolve().parents[2]
 docker_environment = dict(os.environ)
@@ -73,7 +76,9 @@ def session(root, args, live, saved=None):
         assert journal['schema_version'] == 1
         assert all(r['removed'] for r in journal['resources'])
         for resource in journal['resources']:
-            assert subprocess.run(['docker', 'inspect', resource['container_id']], capture_output=True, env=docker_environment).returncode != 0
+            inspected = subprocess.run(['docker', 'inspect', resource['container_id']],
+                                       capture_output=True, text=True, timeout=10, env=docker_environment)
+            require_container_absent(resource['container_id'], inspected)
         print(f'PTY {"live" if live else "offline"} reinstall: user-only selection, comparison visible, terminal restored, owned cleanup verified')
         return saved
     finally:

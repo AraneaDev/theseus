@@ -548,6 +548,82 @@ fn real_pty_active_signals_cleanup_and_cancel_browsing() {
     println!("{}", String::from_utf8_lossy(&output.stdout));
 }
 
+fn container_is_absent(id: &str, output: &std::process::Output) -> bool {
+    let error = String::from_utf8_lossy(&output.stderr)
+        .trim()
+        .to_ascii_lowercase();
+    output.status.code() == Some(1)
+        && [
+            format!("error: no such object: {id}"),
+            format!("error response from daemon: no such container: {id}"),
+        ]
+        .contains(&error)
+}
+
+#[test]
+fn docker_absence_requires_missing_target_and_expected_exit() {
+    use std::os::unix::process::ExitStatusExt;
+    for (status, error, absent) in [
+        (1, "error: no such object: owned-id\n", true),
+        (1, "Error: No such object: owned-id\n", true),
+        (
+            1,
+            "Error response from daemon: No such container: owned-id\n",
+            true,
+        ),
+        (
+            1,
+            "Cannot connect to the Docker daemon at unix:///missing.sock",
+            false,
+        ),
+        (
+            1,
+            "permission denied while trying to connect to the docker API",
+            false,
+        ),
+        (1, "error: no such object: another-id", false),
+        (
+            1,
+            "error: no such object: owned-id\ntransport disconnected",
+            false,
+        ),
+        (0, "error: no such object: owned-id", false),
+        (125, "error: no such object: owned-id", false),
+        (1, "", false),
+    ] {
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(status << 8),
+            stdout: b"[]\n".to_vec(),
+            stderr: error.as_bytes().to_vec(),
+        };
+        assert_eq!(
+            container_is_absent("owned-id", &output),
+            absent,
+            "{status}: {error}"
+        );
+    }
+    let signalled = std::process::Output {
+        status: std::process::ExitStatus::from_raw(9),
+        stdout: vec![],
+        stderr: b"error: no such object: owned-id".to_vec(),
+    };
+    assert!(!container_is_absent("owned-id", &signalled));
+}
+
+#[test]
+fn python_docker_absence_requires_missing_target_and_expected_exit() {
+    let output = std::process::Command::new("python3")
+        .arg("tests/support/docker_absence_test.py")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn run_reinstall(fault: &str) -> (tempfile::TempDir, engine::RunResult) {
     let temp = tempfile::tempdir().unwrap();
     let mut recipe =
@@ -592,13 +668,22 @@ fn run_reinstall(fault: &str) -> (tempfile::TempDir, engine::RunResult) {
     for s in &result.report.scenarios {
         assert_eq!(s.teardown, TeardownStatus::Complete);
         if let Some(id) = &s.container_id {
+            let output = std::process::Command::new("docker")
+                .args(["inspect", id])
+                .output()
+                .unwrap();
             assert!(
-                !std::process::Command::new("docker")
-                    .args(["inspect", id])
-                    .output()
-                    .unwrap()
-                    .status
-                    .success()
+                container_is_absent(id, &output),
+                "Docker inspect did not prove {id} absent: status={:?}, stdout={:?}, stderr={:?}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout)
+                    .chars()
+                    .take(1024)
+                    .collect::<String>(),
+                String::from_utf8_lossy(&output.stderr)
+                    .chars()
+                    .take(1024)
+                    .collect::<String>(),
             );
         }
     }

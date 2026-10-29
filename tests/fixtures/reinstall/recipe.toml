@@ -1,4 +1,4 @@
-# Run: theseus run --headless --recipe tests/fixtures/lifecycle/recipe.toml
+# Run: theseus run --headless --recipe tests/fixtures/reinstall/recipe.toml
 schema_version = 2
 scenarios = ["reinstall"]
 name = "sample-cli reinstall"
