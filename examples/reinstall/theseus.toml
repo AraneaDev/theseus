@@ -1,0 +1,167 @@
+# Run: theseus run --headless --recipe examples/reinstall/theseus.toml
+schema_version = 2
+scenarios = ["reinstall"]
+name = "sample-cli reinstall"
+image = "ubuntu:24.04"
+network = "none"
+observe = ["/home/theseus", "/usr/local/bin"]
+[artifacts]
+target = "target"
+
+[profiles.user.steps.install_target]
+script = "sh /inputs/target/install.sh user"
+
+[profiles.user.steps.configure]
+script = "sample-cli configure"
+
+[profiles.user.steps.reinstall]
+script = "sh /inputs/target/install.sh user"
+
+[profiles.user.steps.exercise]
+script = "sample-cli smoke"
+
+[profiles.user.steps.uninstall]
+script = "sh /inputs/target/uninstall.sh user"
+
+[[profiles.user.checks]]
+id = "target_installed-version"
+checkpoint = "target_installed"
+kind = "executable"
+name = "sample-cli"
+resolved_path = "/home/theseus/.local/bin/sample-cli"
+args = ["--version"]
+expected_exit = 0
+stdout_contains = "sample-cli 2.0.0"
+
+[[profiles.user.checks]]
+id = "binary-removed"
+checkpoint = "uninstalled"
+kind = "absent"
+path = "/home/theseus/.local/bin/sample-cli"
+
+[[profiles.user.checks]]
+id = "configuration-retained"
+checkpoint = "uninstalled"
+kind = "preserved"
+path = "/home/theseus/.config/sample-cli/settings"
+
+[[profiles.user.checks]]
+id = "retained-data-retained"
+checkpoint = "uninstalled"
+kind = "preserved"
+path = "/home/theseus/.local/share/sample-cli/notes"
+
+[[profiles.user.checks]]
+id = "retained-directory-0"
+checkpoint = "uninstalled"
+kind = "present"
+path = "/home/theseus/.config/sample-cli"
+expected_kind = "directory"
+
+[[profiles.user.checks]]
+id = "retained-directory-1"
+checkpoint = "uninstalled"
+kind = "present"
+path = "/home/theseus/.local/share/sample-cli"
+expected_kind = "directory"
+
+[profiles.system.steps.install_target]
+script = "sh /inputs/target/install.sh system"
+
+[profiles.system.steps.configure]
+script = "sample-cli configure"
+
+[profiles.system.steps.reinstall]
+script = "sh /inputs/target/install.sh system"
+
+[profiles.system.steps.exercise]
+script = "sample-cli smoke"
+
+[profiles.system.steps.uninstall]
+script = "sh /inputs/target/uninstall.sh system"
+
+[[profiles.system.checks]]
+id = "target_installed-version"
+checkpoint = "target_installed"
+kind = "executable"
+name = "sample-cli"
+resolved_path = "/usr/local/bin/sample-cli"
+args = ["--version"]
+expected_exit = 0
+stdout_contains = "sample-cli 2.0.0"
+
+[[profiles.system.checks]]
+id = "binary-removed"
+checkpoint = "uninstalled"
+kind = "absent"
+path = "/usr/local/bin/sample-cli"
+
+[[profiles.system.checks]]
+id = "configuration-retained"
+checkpoint = "uninstalled"
+kind = "preserved"
+path = "/home/theseus/.config/sample-cli/settings"
+
+[[profiles.system.checks]]
+id = "retained-data-retained"
+checkpoint = "uninstalled"
+kind = "preserved"
+path = "/home/theseus/.local/share/sample-cli/notes"
+
+[[profiles.system.checks]]
+id = "retained-directory-0"
+checkpoint = "uninstalled"
+kind = "present"
+path = "/home/theseus/.config/sample-cli"
+expected_kind = "directory"
+
+[[profiles.system.checks]]
+id = "retained-directory-1"
+checkpoint = "uninstalled"
+kind = "present"
+path = "/home/theseus/.local/share/sample-cli"
+expected_kind = "directory"
+
+[[profiles.user.checks]]
+id = "configuration-stable"
+checkpoint = "reinstalled"
+kind = "unchanged"
+path = "/home/theseus/.config/sample-cli"
+
+[[profiles.user.checks]]
+id = "binary-stable"
+checkpoint = "reinstalled"
+kind = "unchanged"
+path = "/home/theseus/.local/bin/sample-cli"
+
+[[profiles.user.checks]]
+id = "reinstalled-version"
+checkpoint = "reinstalled"
+kind = "executable"
+name = "sample-cli"
+resolved_path = "/home/theseus/.local/bin/sample-cli"
+args = ["--version"]
+expected_exit = 0
+stdout_contains = "sample-cli 2.0.0"
+
+[[profiles.system.checks]]
+id = "configuration-stable"
+checkpoint = "reinstalled"
+kind = "unchanged"
+path = "/home/theseus/.config/sample-cli"
+
+[[profiles.system.checks]]
+id = "binary-stable"
+checkpoint = "reinstalled"
+kind = "unchanged"
+path = "/usr/local/bin/sample-cli"
+
+[[profiles.system.checks]]
+id = "reinstalled-version"
+checkpoint = "reinstalled"
+kind = "executable"
+name = "sample-cli"
+resolved_path = "/usr/local/bin/sample-cli"
+args = ["--version"]
+expected_exit = 0
+stdout_contains = "sample-cli 2.0.0"

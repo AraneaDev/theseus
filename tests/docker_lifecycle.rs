@@ -547,3 +547,293 @@ fn real_pty_active_signals_cleanup_and_cancel_browsing() {
     );
     println!("{}", String::from_utf8_lossy(&output.stdout));
 }
+
+fn run_reinstall(fault: &str) -> (tempfile::TempDir, engine::RunResult) {
+    let temp = tempfile::tempdir().unwrap();
+    let mut recipe =
+        recipe::load(std::path::Path::new("tests/fixtures/reinstall/recipe.toml")).unwrap();
+    for profile in recipe.recipe.profiles.values_mut() {
+        let repeat = profile.steps.get_mut(&StepName::Reinstall).unwrap();
+        repeat
+            .env
+            .insert("THESEUS_FIXTURE_FAULT".into(), fault.into());
+        if fault == "timeout_child" {
+            repeat.timeout_seconds = 1;
+        }
+    }
+    let cancel = CancellationToken::default();
+    let signal = cancel.clone();
+    let cancellation = fault == "cancellation";
+    let result = engine::run(
+        &recipe,
+        RunOptions {
+            output_root: temp.path().join("runs"),
+            ..RunOptions::all(&recipe)
+        },
+        cancel,
+        move |event| {
+            if cancellation
+                && event.kind == EventKind::StageStarted
+                && event.stage.as_deref() == Some("reinstall")
+            {
+                let signal = signal.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    signal.cancel();
+                });
+            }
+        },
+    )
+    .unwrap();
+    assert!(result.report.errors.is_empty(), "{:#?}", result.report);
+    let journal = theseus::report::load_journal(result.report_path.parent().unwrap()).unwrap();
+    assert!(!journal.resources.is_empty());
+    assert!(journal.resources.iter().all(|r| r.removed));
+    for s in &result.report.scenarios {
+        assert_eq!(s.teardown, TeardownStatus::Complete);
+        if let Some(id) = &s.container_id {
+            assert!(
+                !std::process::Command::new("docker")
+                    .args(["inspect", id])
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+    }
+    (temp, result)
+}
+
+#[test]
+#[ignore = "requires Docker"]
+fn healthy_reinstall_passes_both_profiles_with_same_container_and_verified_completions() {
+    let (_temp, result) = run_reinstall("");
+    assert_eq!(
+        result.report.outcome,
+        RunOutcome::Passed,
+        "{:#?}",
+        result.report
+    );
+    assert_eq!(result.report.scenarios.len(), 2);
+    assert_eq!(result.report.artifacts.len(), 1);
+    assert_eq!(result.report.counts().review_findings, 0);
+    assert_eq!(result.report.counts().passed_checks, 18);
+    for scenario in &result.report.scenarios {
+        assert_eq!(scenario.scenario, ScenarioKind::Reinstall);
+        for (phase, marker) in [
+            ("install_target", "installation=1"),
+            ("reinstall", "installation=2"),
+            ("exercise_before_reinstall", "healthy"),
+            ("exercise_after_reinstall", "healthy"),
+        ] {
+            let command = scenario
+                .stages
+                .iter()
+                .flat_map(|s| &s.commands)
+                .find(|c| c.phase == phase)
+                .unwrap();
+            assert_eq!(command.outcome, CommandOutcome::Succeeded);
+            assert_eq!(
+                command.exit_status,
+                Some(0),
+                "completion receipt missing for {phase}"
+            );
+            assert_eq!(
+                command.identity.uid,
+                if matches!(phase, "install_target" | "reinstall")
+                    && scenario.profile == ProfileName::System
+                {
+                    0
+                } else {
+                    10001
+                }
+            );
+            let stdout = command.stdout.as_ref().unwrap();
+            let text =
+                std::fs::read_to_string(result.report_path.parent().unwrap().join(&stdout.path))
+                    .unwrap();
+            assert!(text.contains(marker), "{phase}: {text}");
+        }
+        for check in scenario
+            .stages
+            .iter()
+            .flat_map(|s| &s.checks)
+            .filter(|c| c.id.ends_with("-stable"))
+        {
+            assert_eq!(check.outcome, CheckOutcome::Passed);
+            assert_eq!(check.checkpoint, Checkpoint::Reinstalled);
+            assert_eq!(check.comparison, Some(ComparisonReference::reinstall()));
+        }
+        assert_eq!(
+            scenario
+                .stages
+                .iter()
+                .find(|s| s.step == Some(StepName::Uninstall))
+                .unwrap()
+                .outcome,
+            StageOutcome::Passed
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires Docker"]
+fn reinstall_only_faults_reveal_changed_children_and_continue_uninstall() {
+    for (fault, child) in [
+        ("reset_settings", "settings"),
+        ("duplicate_settings", "settings"),
+        ("change_mode", "settings"),
+        ("add_child", "unexpected"),
+        ("remove_child", "settings"),
+    ] {
+        let (_temp, result) = run_reinstall(fault);
+        assert_eq!(
+            result.report.outcome,
+            RunOutcome::Failed,
+            "{fault}: {:#?}",
+            result.report
+        );
+        for s in &result.report.scenarios {
+            let first = s
+                .stages
+                .iter()
+                .find(|s| s.step == Some(StepName::InstallTarget))
+                .unwrap();
+            assert_eq!(first.outcome, StageOutcome::Passed);
+            assert_eq!(
+                first.commands[0]
+                    .environment
+                    .get("THESEUS_FIXTURE_FAULT")
+                    .unwrap(),
+                ""
+            );
+            let exercise = s
+                .stages
+                .iter()
+                .find(|s| s.name == "exercise_before_reinstall")
+                .unwrap();
+            assert_eq!(exercise.outcome, StageOutcome::Passed);
+            let repeat = s
+                .stages
+                .iter()
+                .find(|s| s.step == Some(StepName::Reinstall))
+                .unwrap();
+            assert_eq!(
+                repeat.commands[0]
+                    .environment
+                    .get("THESEUS_FIXTURE_FAULT")
+                    .unwrap(),
+                fault
+            );
+            assert_eq!(repeat.commands[0].exit_status, Some(0));
+            let checkpoint = s.stages.iter().find(|s| s.name == "reinstalled").unwrap();
+            let stable = checkpoint
+                .checks
+                .iter()
+                .find(|c| c.id == "configuration-stable")
+                .unwrap();
+            assert_eq!(stable.outcome, CheckOutcome::Failed, "{fault}");
+            assert_eq!(stable.checkpoint, Checkpoint::Reinstalled);
+            assert_eq!(stable.comparison, Some(ComparisonReference::reinstall()));
+            let path = format!("/home/theseus/.config/sample-cli/{child}");
+            assert!(
+                repeat.stage_diff.iter().any(|c| c.path == path),
+                "{fault}: {:?}",
+                repeat.stage_diff
+            );
+            assert_eq!(
+                s.stages
+                    .iter()
+                    .find(|s| s.step == Some(StepName::Uninstall))
+                    .unwrap()
+                    .outcome,
+                StageOutcome::Passed
+            );
+        }
+    }
+    let (_temp, result) = run_reinstall("reject_existing");
+    assert_eq!(
+        result.report.outcome,
+        RunOutcome::Failed,
+        "{:#?}",
+        result.report
+    );
+    for s in &result.report.scenarios {
+        let repeat = s
+            .stages
+            .iter()
+            .find(|s| s.step == Some(StepName::Reinstall))
+            .unwrap();
+        assert_eq!(repeat.commands[0].outcome, CommandOutcome::Failed);
+        assert_eq!(repeat.commands[0].exit_status, Some(9));
+        assert!(
+            repeat.commands[0].error.is_none(),
+            "an application rejection has a valid receipt"
+        );
+        assert_eq!(
+            s.stages
+                .iter()
+                .find(|s| s.step == Some(StepName::Uninstall))
+                .unwrap()
+                .outcome,
+            StageOutcome::Passed
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires Docker"]
+fn real_reinstall_timeout_and_cancellation_remove_journaled_container() {
+    for (fault, outcome) in [
+        ("timeout_child", RunOutcome::Incomplete),
+        ("cancellation", RunOutcome::Cancelled),
+    ] {
+        let (_temp, result) = run_reinstall(fault);
+        assert_eq!(
+            result.report.outcome, outcome,
+            "{fault}: {:#?}",
+            result.report
+        );
+        let s = &result.report.scenarios[0];
+        assert_eq!(
+            s.stages
+                .iter()
+                .find(|s| s.name == "exercise_before_reinstall")
+                .unwrap()
+                .outcome,
+            StageOutcome::Passed
+        );
+        let repeat = s
+            .stages
+            .iter()
+            .find(|s| s.step == Some(StepName::Reinstall))
+            .unwrap();
+        assert!(repeat.commands.iter().any(|c| c.timed_out || c.cancelled));
+        assert_eq!(
+            s.stages
+                .iter()
+                .find(|s| s.step == Some(StepName::Uninstall))
+                .unwrap()
+                .outcome,
+            StageOutcome::Skipped
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires Docker and a Unix PTY"]
+fn real_pty_reinstall_selection_and_new_report_comparison_visibility() {
+    let output = std::process::Command::new("python3")
+        .arg("tests/support/tui_reinstall.py")
+        .arg(env!("CARGO_BIN_EXE_theseus"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+}

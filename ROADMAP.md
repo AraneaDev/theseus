@@ -1,14 +1,20 @@
 # Theseus roadmap
 
-Theseus V1 ships a shared Docker lifecycle engine, Ratatui workbench, headless
+Theseus 0.2 ships a shared Docker lifecycle engine, Ratatui workbench, headless
 CLI, versioned recipes/reports, private bounded logs, user/system profiles,
-clean/upgrade scenarios, explicit assertions, cancellation and verified recovery.
+clean/upgrade/reinstall scenarios, explicit assertions, cancellation and verified
+recovery.
 The standalone fixture and a real Phrourion binary-copy rehearsal establish those
-boundaries. The following capabilities are planned, not available features.
+boundaries. Reinstall uses explicit schema-2 declarations and stable path/subtree
+contracts across two installer invocations, with report-2 evidence and version-1
+recovery journals. Both profiles pass real healthy/broken Docker acceptance and
+live/offline PTY comparison browsing. This observes declared stability rather
+than proving universal idempotency.
+
+The following capabilities are planned, not available features.
 
 ## Additional lifecycle scenarios
 
-- Reinstallation and idempotency.
 - Interrupted installation/upgrade, downgrade and rollback with explicit data
   compatibility contracts.
 - Comparisons between installation methods and image versions.
