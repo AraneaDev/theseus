@@ -5,7 +5,7 @@ use crate::{
     recipe, report,
     runner::Docker,
 };
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::{fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt, path::PathBuf};
 #[derive(Debug, Parser)]
@@ -54,12 +54,15 @@ pub enum ScenarioSelection {
     Upgrade,
     All,
 }
-/// Task 3 may replace interactive dispatch; these headless handlers are reusable.
+/// Dispatch interactive and headless interfaces through the shared engine.
 pub fn execute(cli: Cli) -> Result<i32> {
     match cli.command {
-        None => bail!(
-            "interactive interface is not available yet; use run --headless, validate, or report --json"
-        ),
+        None => {
+            crate::tui::terminal::require_tty()?;
+            let recipe = recipe::load(std::path::Path::new("theseus.toml"))?;
+            let options = RunOptions::all(&recipe);
+            crate::tui::run(crate::tui::App::preview(recipe, options))
+        }
         Some(Action::Init) => {
             init()?;
             println!(
@@ -82,7 +85,7 @@ pub fn execute(cli: Cli) -> Result<i32> {
         }) => {
             let report = report::load(&run_directory)?;
             if !json {
-                bail!("interactive report interface is not available yet; use --json");
+                return crate::tui::run(crate::tui::App::offline(report, run_directory));
             }
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(0)
@@ -100,7 +103,7 @@ pub fn execute(cli: Cli) -> Result<i32> {
             pull,
         }) => {
             if !headless {
-                bail!("interactive run interface is not available yet; use --headless");
+                crate::tui::terminal::require_tty()?;
             }
             let recipe = recipe::load(&recipe)?;
             let mut options = RunOptions::all(&recipe);
@@ -115,6 +118,9 @@ pub fn execute(cli: Cli) -> Result<i32> {
                 ScenarioSelection::Upgrade => vec![ScenarioKind::Upgrade],
                 ScenarioSelection::All => options.scenarios,
             };
+            if !headless {
+                return crate::tui::run(crate::tui::App::preview(recipe, options));
+            }
             let cancel = CancellationToken::default();
             let sigint = signal_hook::flag::register(signal_hook::consts::SIGINT, cancel.flag())?;
             let sigterm =

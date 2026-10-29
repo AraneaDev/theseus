@@ -115,3 +115,14 @@ fn unavailable_profile_and_upgrade_inputs_fail_before_docker() {
         assert!(!temp.path().join(".theseus-runs").exists());
     }
 }
+
+#[test]
+fn non_terminal_default_launch_explains_headless_and_emits_no_escapes() {
+    let output = cli().output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("requires a terminal"));
+    assert!(error.contains("--headless"));
+    assert!(!output.stdout.contains(&0x1b));
+    assert!(!output.stderr.contains(&0x1b));
+}

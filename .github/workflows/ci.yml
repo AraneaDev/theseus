@@ -1,0 +1,20 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --locked --release
+      - name: Prepare Docker acceptance image
+        run: |
+          docker info
+          docker pull ubuntu:24.04
+      - name: Real Docker lifecycle acceptance (required)
+        run: cargo test --locked --test docker_lifecycle -- --ignored --test-threads=1

@@ -7,3 +7,4 @@ pub mod recipe;
 pub mod report;
 pub mod runner;
 pub mod snapshot;
+pub mod tui;
