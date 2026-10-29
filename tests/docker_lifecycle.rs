@@ -386,3 +386,164 @@ fn cleanup_refuses_mismatching_ownership_and_is_idempotent_for_missing_resources
             .removed
     );
 }
+
+#[test]
+#[ignore = "requires Docker"]
+fn real_application_exit_one_and_docker_control_exit_one_are_distinct() {
+    use std::collections::BTreeMap;
+    use theseus::runner::{CommandRequest, Docker, Environment};
+    let recipe =
+        recipe::load(std::path::Path::new("tests/fixtures/lifecycle/recipe.toml")).unwrap();
+    let cancel = CancellationToken::default();
+    let mut docker = Docker::default();
+    docker.prepare(&recipe, false, &cancel).unwrap();
+    let resource = docker
+        .create("completion-proof", "user-clean", &recipe)
+        .unwrap();
+    struct Cleanup(OwnedResource);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            Docker::default().remove(&self.0).unwrap();
+        }
+    }
+    let _cleanup = Cleanup(resource.clone());
+    docker.setup(&resource, &recipe, &cancel).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let store = theseus::report::create(&temp.path().join("run")).unwrap();
+    let request = |id: &str, expected_exit| CommandRequest {
+        id: id.into(),
+        phase: "check:negative".into(),
+        identity: ExecutionIdentity::runtime(),
+        argv: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf 'real stdout'; printf 'real stderr' >&2; exit 1".into(),
+        ],
+        env: BTreeMap::new(),
+        pass_env: vec![],
+        timeout_seconds: 10,
+        expected_exit,
+        log_limit: 1024,
+    };
+    let check = recipe::Check {
+        id: "negative".into(),
+        checkpoint: Checkpoint::Configured,
+        expectation: recipe::Expectation::Command {
+            script: "exit 1".into(),
+            timeout_seconds: 10,
+            env: BTreeMap::new(),
+            pass_env: vec![],
+            expected_exit: 1,
+            stdout_contains: Some("real stdout".into()),
+        },
+    };
+    let executed = docker
+        .execute(&resource, request("real-negative", 1), &store, &cancel)
+        .unwrap();
+    assert_eq!(executed.record.outcome, CommandOutcome::Succeeded);
+    assert_eq!(executed.record.exit_status, Some(1));
+    assert_eq!(executed.stdout, "real stdout");
+    assert_eq!(
+        std::fs::read_to_string(store.root().join(executed.record.stderr.unwrap().path)).unwrap(),
+        "real stderr"
+    );
+    let evaluate = |executed: &theseus::runner::ExecutedCommand| {
+        theseus::checks::evaluate_command(
+            &check,
+            &theseus::checks::CommandObservation {
+                exit_status: executed.record.exit_status,
+                stdout: executed.stdout.clone(),
+                complete: executed.stdout_complete,
+                error: executed.record.error.clone(),
+            },
+        )
+        .outcome
+    };
+    // A real negative exit passes the production checker.
+    let executed = docker
+        .execute(&resource, request("real-checker", 1), &store, &cancel)
+        .unwrap();
+    assert_eq!(evaluate(&executed), CheckOutcome::Passed);
+    let mut missing = resource.clone();
+    missing.container_id = "0".repeat(64);
+    let executed = docker
+        .execute(&missing, request("missing-control", 1), &store, &cancel)
+        .unwrap();
+    assert_eq!(evaluate(&executed), CheckOutcome::Incomplete);
+    assert_eq!(executed.record.exit_status, None);
+    assert!(executed.record.error.unwrap().contains("Some(1)"));
+    // Exercise both shell checks and resolved executable/version checks through
+    // the shared engine as well as the direct production adapter boundary.
+    let (_, result) = run_custom(
+        "",
+        vec![ProfileName::User],
+        vec![ScenarioKind::Clean],
+        |recipe| {
+            let checks = &mut recipe
+                .recipe
+                .profiles
+                .get_mut(&ProfileName::User)
+                .unwrap()
+                .checks;
+            checks.push(recipe::Check {
+                id: "intentional-command-one".into(),
+                checkpoint: Checkpoint::Configured,
+                expectation: recipe::Expectation::Command {
+                    script: "printf negative-one; exit 1".into(),
+                    timeout_seconds: 10,
+                    env: BTreeMap::new(),
+                    pass_env: vec![],
+                    expected_exit: 1,
+                    stdout_contains: Some("negative-one".into()),
+                },
+            });
+            checks.push(recipe::Check {
+                id: "intentional-version-one".into(),
+                checkpoint: Checkpoint::Configured,
+                expectation: recipe::Expectation::Executable {
+                    name: "sh".into(),
+                    resolved_path: "/usr/bin/sh".into(),
+                    args: vec!["-c".into(), "printf version-one; exit 1".into()],
+                    timeout_seconds: 10,
+                    env: BTreeMap::new(),
+                    pass_env: vec![],
+                    expected_exit: 1,
+                    stdout_contains: Some("version-one".into()),
+                },
+            });
+        },
+    );
+    assert_eq!(
+        result.report.outcome,
+        RunOutcome::Passed,
+        "{:#?}",
+        result.report
+    );
+    for id in ["intentional-command-one", "intentional-version-one"] {
+        let check = result.report.scenarios[0]
+            .stages
+            .iter()
+            .flat_map(|s| &s.checks)
+            .find(|c| c.id == id)
+            .unwrap();
+        assert_eq!(check.outcome, CheckOutcome::Passed);
+    }
+}
+
+#[test]
+#[ignore = "requires Docker and a Unix PTY"]
+fn real_pty_active_signals_cleanup_and_cancel_browsing() {
+    let output = std::process::Command::new("python3")
+        .arg("tests/support/tui_signals.py")
+        .arg(env!("CARGO_BIN_EXE_theseus"))
+        .arg("--docker")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+}

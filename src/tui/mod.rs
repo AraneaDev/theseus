@@ -23,7 +23,8 @@ pub fn run(mut app: App) -> Result<i32> {
     terminal::require_tty()?;
     let runtime = tokio::runtime::Runtime::new()?;
     let cancel = CancellationToken::default();
-    let signals = Signals::register(&cancel)?;
+    let terminate = CancellationToken::default();
+    let signals = Signals::register(&terminate)?;
     let (guard, mut terminal) = terminal::Guard::enter()?;
     let (events_tx, mut events_rx) = mpsc::channel(32);
     let mut result_rx: Option<oneshot::Receiver<Result<RunResult>>> = None;
@@ -61,8 +62,11 @@ pub fn run(mut app: App) -> Result<i32> {
                     Err(oneshot::error::TryRecvError::Empty) => {}
                 }
             }
-            if cancel.is_cancelled() && app.active {
-                app.cancel_requested = true;
+            if terminate.is_cancelled() {
+                app.quit_requested = true;
+                if app.active {
+                    app.cancel_requested = true;
+                }
             }
             if app.cancel_requested && app.active {
                 cancel.cancel();

@@ -74,6 +74,8 @@ pub enum TeardownStatus {
 pub struct ExecutionIdentity {
     pub uid: u32,
     pub gid: u32,
+    /// Account home used for defaults; effective HOME is recorded in environment
+    /// or identified by name in forwarded_environment.
     pub home: String,
 }
 impl ExecutionIdentity {
@@ -105,6 +107,9 @@ pub struct CommandRecord {
     pub identity: ExecutionIdentity,
     /// Only public literals and public execution defaults. Never forwarded secret values.
     pub environment: std::collections::BTreeMap<String, String>,
+    /// Explicitly forwarded names; values are never saved as metadata.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forwarded_environment: Vec<String>,
     pub workdir: String,
     /// Structured argv; a recipe shell script is one argument to /bin/sh -c.
     pub argv: Vec<String>,
@@ -126,6 +131,7 @@ impl CommandRecord {
             phase: phase.into(),
             identity: ExecutionIdentity::runtime(),
             environment: Default::default(),
+            forwarded_environment: Vec::new(),
             workdir: "/workspace".into(),
             argv: Vec::new(),
             started_at: String::new(),

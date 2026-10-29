@@ -219,6 +219,7 @@ fn files_and_commands_show_literal_metadata_for_the_selected_stage() {
         after: Some(entry),
     });
     stage.commands[0].argv = vec!["sample-cli".into(), "--version".into()];
+    stage.commands[0].forwarded_environment = vec!["PATH".into()];
     app.stage_index = 1;
     app.tab = Tab::Files;
     let text = screen(&app, 120, 40);
@@ -228,6 +229,7 @@ fn files_and_commands_show_literal_metadata_for_the_selected_stage() {
     app.tab = Tab::Commands;
     let text = screen(&app, 120, 40);
     assert!(text.contains("sample-cli"));
+    assert!(text.contains("forwarded env (values hidden): [\"PATH\"]"));
     assert!(text.contains("--version"));
     assert!(text.contains("10001:10001"));
     app.focus = Focus::Stage;
@@ -310,4 +312,20 @@ fn selection_stays_visible_after_word_wrapped_and_wide_records() {
             "Unicode selection disappeared at {width} columns"
         );
     }
+}
+
+#[test]
+fn actual_pty_idle_preview_and_offline_signals_restore_terminal() {
+    let output = std::process::Command::new("python3")
+        .arg("tests/support/tui_signals.py")
+        .arg(env!("CARGO_BIN_EXE_theseus"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    println!("{}", String::from_utf8_lossy(&output.stdout));
 }

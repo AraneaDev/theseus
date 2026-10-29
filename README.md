@@ -57,9 +57,11 @@ During live or saved report viewing:
 - Left/right in evidence focus switches Stages, Findings, Files, Commands, Logs.
 - `/` edits a case-insensitive evidence filter; Enter applies it, Esc ends editing.
   Press `/` and Enter to clear it. Page Up/Down scrolls details.
-- `c` requests cancellation. `q` exits when idle; during a run it cancels and waits
-  up to five seconds for worker completion. If cleanup remains unresolved, exit 2
+- `c` requests cancellation and retains results for browsing. `q` exits when idle;
+  during a run it cancels and waits up to five seconds for worker completion. If cleanup remains unresolved, exit 2
   identifies the report/journal and resources requiring inspection and recovery.
+  SIGINT/SIGTERM follows the same exit path in preview, live, completed, and
+  offline views.
 
 Resize preserves selections and uses stacked panels on narrow terminals. Logs
 show one selected stream, at most 64 KiB; truncation is visible and terminal
@@ -86,13 +88,14 @@ is a new shell: files persist, shell variables and working-directory changes do
 not. HOME, XDG directories and PATH are set explicitly. Runtime PATH defaults to
 `/home/theseus/.local/bin:/usr/local/bin:/usr/bin:/bin`. Step/check `env` contains
 public literal values; `pass_env` explicitly opts in named host variables. Values
-from `pass_env` are not serialized as metadata, but applications can print secrets
-into logs. No credentials are forwarded automatically and no general secret
+from `pass_env` are not serialized as metadata. Command evidence records forwarded
+names separately and omits overridden defaults; effective public literals remain
+visible. Applications can print secrets into logs. No credentials are forwarded automatically and no general secret
 redaction is promised.
 
 The image must supply `/bin/sh`, `/usr/bin/env`, `sleep`, `mkdir`, `chown`, `chmod`,
-and `tar`, with compatible UID/GID 10001 assignments. Image-declared volumes are
-rejected. Ubuntu 24.04 is exercised by acceptance; other images must satisfy
+`tar`, `cp`, `rm`, `cat`, `id`, and `awk`, with compatible UID/GID 10001
+assignments. Image-declared volumes are rejected. Ubuntu 24.04 is exercised by acceptance; other images must satisfy
 preflight and supported tar observations. Tests do not prove systemd, GUI, kernel,
 macOS, or Windows behavior.
 
@@ -106,7 +109,10 @@ ordinary failed install still permits declared partial-install uninstall cleanup
 dependent forward mutations are skipped explicitly.
 
 Checks have unique IDs and named checkpoints. `command` expects a shell exit and
-optional literal stdout substring. `executable` verifies PATH resolution, absolute
+optional literal stdout substring. An application exit is evaluated only after a
+fresh in-container completion receipt is verified through a separate bounded
+control operation; Docker control failures leave the application status unknown.
+`executable` verifies PATH resolution, absolute
 path, version argv, exit status, and optional literal output. `present` and
 `absent` inspect paths (including dangling links); `preserved` compares an exact
 path's content hash, kind, link, ownership and mode with configured evidence.

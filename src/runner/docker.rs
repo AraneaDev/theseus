@@ -7,7 +7,12 @@ use crate::{
     recipe::Network,
 };
 use anyhow::{Context, Result, bail, ensure};
-use std::{collections::BTreeMap, path::Path, process::Command, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    process::Command,
+    time::{Duration, Instant},
+};
 
 pub const OWNER_LABEL: &str = "io.theseus.owner";
 pub const RUN_LABEL: &str = "io.theseus.run";
@@ -17,6 +22,7 @@ pub struct Docker {
     executable: std::ffi::OsString,
     inputs: Option<Inputs>,
     image_id: Option<String>,
+    observed_roots: Vec<String>,
 }
 impl Default for Docker {
     fn default() -> Self {
@@ -24,6 +30,7 @@ impl Default for Docker {
             executable: "docker".into(),
             inputs: None,
             image_id: None,
+            observed_roots: Vec::new(),
         }
     }
 }
@@ -62,6 +69,50 @@ impl Docker {
             ])
             .args(args);
         process::utility(&mut command, cancel)
+    }
+    fn control(
+        &mut self,
+        resource: &OwnedResource,
+        script: &str,
+        args: &[&str],
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<String> {
+        let mut command = self.command();
+        command
+            .args([
+                "exec",
+                "--user",
+                "0:0",
+                &resource.container_id,
+                "/bin/sh",
+                "-c",
+                script,
+                "theseus-control",
+            ])
+            .args(args);
+        let output = process::run(
+            &mut command,
+            deadline.saturating_duration_since(Instant::now()),
+            cancel,
+            None,
+            512,
+            || self.stop(resource),
+        )?;
+        ensure!(
+            !output.cancelled && !output.timed_out && output.error.is_none(),
+            "Docker completion control interrupted"
+        );
+        ensure!(
+            output.status == Some(0),
+            "Docker completion control failed (status {:?})",
+            output.status
+        );
+        ensure!(
+            !output.stdout.truncated,
+            "application receipt exceeds limit"
+        );
+        Ok(String::from_utf8(output.stdout.bytes)?)
     }
     fn validate_resource(resource: &OwnedResource) -> Result<()> {
         ensure!(
@@ -185,6 +236,12 @@ impl Docker {
         )
     }
 }
+fn fresh_nonce() -> Result<String> {
+    use std::io::Read;
+    let mut bytes = [0; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
 impl Environment for Docker {
     fn prepare(
         &mut self,
@@ -255,6 +312,7 @@ impl Environment for Docker {
         let inputs = artifacts::materialize(recipe, cancel)?;
         let artifacts = inputs.manifests.clone();
         self.inputs = Some(inputs);
+        self.observed_roots = recipe.recipe.observe.clone();
         self.image_id = Some(image_id.clone());
         Ok(PreparedEnvironment {
             image_id,
@@ -389,6 +447,7 @@ chmod 755 /home/theseus /workspace /inputs
         let mut actual: BTreeMap<std::ffi::OsString, std::ffi::OsString> =
             public.iter().map(|(k, v)| (k.into(), v.into())).collect();
         for name in &request.pass_env {
+            public.remove(name);
             actual.insert(
                 name.into(),
                 std::env::var_os(name)
@@ -401,16 +460,45 @@ chmod 755 /home/theseus /workspace /inputs
             store.create_log(&stdout_path)?,
             store.create_log(&stderr_path)?,
         );
+        let mut record = CommandRecord::new(&request.id, &request.phase);
+        record.identity = request.identity.clone();
+        record.environment = public;
+        record.forwarded_environment = request.pass_env.clone();
+        record.argv = request.argv.clone();
+        record.started_at = now();
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(request.timeout_seconds);
+        // Fresh, exclusive control storage outside every observed root. A receipt
+        // is separate from application streams and is never inferred from CLI text.
+        let nonce = fresh_nonce()?;
+        let directory = format!("/.theseus-{nonce}");
+        ensure!(
+            self.observed_roots
+                .iter()
+                .all(|root| !crate::recipe::validate::contained(&directory, root)
+                    && !crate::recipe::validate::contained(root, &directory)),
+            "control directory overlaps observed roots"
+        );
+        let receipt = format!("{directory}/completion");
+        let prepared = self.control(
+            resource,
+            "umask 077; mkdir \"$1\" && chown \"$2\" \"$1\"",
+            &[
+                &directory,
+                &format!("{}:{}", request.identity.uid, request.identity.gid),
+            ],
+            deadline,
+            cancel,
+        );
         let mut command = self.command();
         command.args([
-            "exec",
-            "--user",
-            &format!("{}:{}", request.identity.uid, request.identity.gid),
-            "--workdir",
-            "/workspace",
-            &resource.container_id,
-            "/usr/bin/env",
-            "-i",
+            "exec", "--user", &format!("{}:{}", request.identity.uid, request.identity.gid),
+            "--workdir", "/workspace", &resource.container_id,
+            "/bin/sh", "-c",
+            // The wrapper's environment stays independent of forwarded PATH/HOME.
+            // Requested argv (including shell scripts) runs in its own child.
+            "receipt=$1; nonce=$2; shift 2; \"$@\"; status=$?; printf '%s:%s\\n' \"$nonce\" \"$status\" > \"$receipt\" || exit 125; exit 0",
+            "theseus-command", &receipt, &nonce, "/usr/bin/env", "-i",
         ]);
         for (key, value) in actual {
             let mut pair = key;
@@ -419,30 +507,90 @@ chmod 755 /home/theseus /workspace /inputs
             command.arg(pair);
         }
         command.args(&request.argv);
-        let mut record = CommandRecord::new(&request.id, &request.phase);
-        record.identity = request.identity;
-        record.environment = public;
-        record.argv = request.argv;
-        record.started_at = now();
+        if let Err(error) = prepared {
+            record.error = Some(format!("application completion unverified: {error:#}"));
+            record.cancelled = cancel.is_cancelled();
+            record.timed_out = !record.cancelled && Instant::now() >= deadline;
+            record.duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            record.outcome = if record.cancelled {
+                CommandOutcome::Cancelled
+            } else if record.timed_out {
+                CommandOutcome::TimedOut
+            } else {
+                CommandOutcome::Error
+            };
+            record.stdout = Some(LogReference {
+                path: stdout_path,
+                bytes: 0,
+                truncated: false,
+            });
+            record.stderr = Some(LogReference {
+                path: stderr_path,
+                bytes: 0,
+                truncated: false,
+            });
+            return Ok(ExecutedCommand {
+                record,
+                stdout: String::new(),
+                stdout_complete: false,
+            });
+        }
         let output = process::run(
             &mut command,
-            Duration::from_secs(request.timeout_seconds),
+            deadline.saturating_duration_since(Instant::now()),
             cancel,
             Some(files),
             request.log_limit.min(crate::recipe::DEFAULT_LOG_LIMIT) as usize,
             || self.stop(resource),
         )?;
         record.error = output.error;
-        record.duration_ms = output.duration_ms;
-        record.exit_status = output.status;
         record.timed_out = output.timed_out;
         record.cancelled = output.cancelled;
         record.skip_reason = None;
-        record.outcome = if output.cancelled {
+        let completion = (|| -> Result<i32> {
+            ensure!(
+                !output.cancelled && !output.timed_out && record.error.is_none(),
+                "application execution interrupted"
+            );
+            ensure!(
+                output.status == Some(0),
+                "Docker command control failed (status {:?}); application completion unknown",
+                output.status
+            );
+            let text = self.control(
+                resource,
+                "test -f \"$1\" && test ! -L \"$1\" && cat \"$1\" && rm -f \"$1\"",
+                &[&receipt],
+                deadline,
+                cancel,
+            )?;
+            let status = text
+                .strip_prefix(&format!("{nonce}:"))
+                .and_then(|value| value.strip_suffix('\n'))
+                .filter(|value| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|value| value.parse::<i32>().ok())
+                .filter(|status| (0..=255).contains(status));
+            status.context("missing or invalid application completion receipt")
+        })();
+        match completion {
+            Ok(status) => record.exit_status = Some(status),
+            Err(error) if record.error.is_none() && !record.timed_out && !record.cancelled => {
+                record.error = Some(format!("application completion unverified: {error:#}"))
+            }
+            Err(_) => {}
+        }
+        // Cancellation/deadlines apply to preparation and receipt acquisition too.
+        record.cancelled |= cancel.is_cancelled();
+        record.timed_out |= !record.cancelled && Instant::now() >= deadline;
+        record.duration_ms =
+            (started.elapsed().as_millis().min(u64::MAX as u128) as u64).max(output.duration_ms);
+        record.outcome = if record.cancelled {
             CommandOutcome::Cancelled
-        } else if output.timed_out {
+        } else if record.timed_out {
             CommandOutcome::TimedOut
-        } else if output.status == Some(request.expected_exit) {
+        } else if record.error.is_some() {
+            CommandOutcome::Error
+        } else if record.exit_status == Some(request.expected_exit) {
             CommandOutcome::Succeeded
         } else {
             CommandOutcome::Failed
@@ -457,10 +605,14 @@ chmod 755 /home/theseus /workspace /inputs
             bytes: output.stderr.stored,
             truncated: output.stderr.truncated,
         });
+        let stdout_complete = !output.stdout.truncated
+            && record.error.is_none()
+            && !record.cancelled
+            && !record.timed_out;
         Ok(ExecutedCommand {
             record,
             stdout: String::from_utf8_lossy(&output.stdout.bytes).into_owned(),
-            stdout_complete: !output.stdout.truncated,
+            stdout_complete,
         })
     }
     fn observe(
@@ -496,6 +648,278 @@ chmod 755 /home/theseus /workspace /inputs
 mod tests {
     use super::*;
     use std::{os::unix::fs::PermissionsExt, thread, time::Instant};
+    fn probe_request(id: &str, expected_exit: i32) -> CommandRequest {
+        CommandRequest {
+            id: id.into(),
+            phase: "check:probe".into(),
+            identity: ExecutionIdentity::runtime(),
+            argv: vec!["/bin/sh".into(), "-c".into(), "exit 1".into()],
+            env: BTreeMap::new(),
+            pass_env: vec![],
+            timeout_seconds: 2,
+            expected_exit,
+            log_limit: 1024,
+        }
+    }
+    fn probe_check(executed: &ExecutedCommand, expected_exit: i32) -> CheckOutcome {
+        let check = crate::recipe::Check {
+            id: "probe".into(),
+            checkpoint: Checkpoint::Configured,
+            expectation: crate::recipe::Expectation::Command {
+                script: "exit 1".into(),
+                timeout_seconds: 2,
+                env: BTreeMap::new(),
+                pass_env: vec![],
+                expected_exit,
+                stdout_contains: None,
+            },
+        };
+        crate::checks::evaluate_command(
+            &check,
+            &crate::checks::CommandObservation {
+                exit_status: executed.record.exit_status,
+                stdout: executed.stdout.clone(),
+                complete: executed.stdout_complete,
+                error: executed.record.error.clone(),
+            },
+        )
+        .outcome
+    }
+    #[test]
+    fn docker_control_exit_one_cannot_satisfy_application_expectation() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("docker-failure");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\necho 'control failure' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = crate::report::create(&temp.path().join("run")).unwrap();
+        let resource = OwnedResource {
+            container_id: "a".repeat(64),
+            labels: BTreeMap::new(),
+            removed: false,
+        };
+        for expected in [1, 0] {
+            let result = Docker::new(executable.as_os_str())
+                .execute(
+                    &resource,
+                    probe_request(&format!("infra-{expected}"), expected),
+                    &store,
+                    &CancellationToken::default(),
+                )
+                .unwrap();
+            assert_eq!(probe_check(&result, expected), CheckOutcome::Incomplete);
+            assert_eq!(result.record.exit_status, None);
+            assert!(result.record.error.is_some());
+        }
+    }
+    #[test]
+    fn absent_stale_invalid_or_transport_failed_receipts_are_incomplete() {
+        for mode in [
+            "absent",
+            "stale",
+            "invalid",
+            "overflow",
+            "transport",
+            "read-error",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let executable = temp.path().join("docker-controlled");
+            std::fs::write(
+                &executable,
+                format!(
+                    r#"#!/usr/bin/python3
+import sys
+args = sys.argv[1:]
+script = args[args.index('-c')+1]
+if script.startswith('umask'): sys.exit(0)
+if script.startswith('receipt='):
+    print('application stdout')
+    print('application stderr', file=sys.stderr)
+    sys.exit(1 if '{mode}' == 'transport' else 0)
+if script.startswith('test -f'):
+    nonce = args[-1].split('/')[1].removeprefix('.theseus-')
+    mode = '{mode}'
+    if mode == 'stale': print('old-nonce:1')
+    if mode == 'invalid': print(nonce + ':999')
+    if mode == 'overflow': print(nonce + ':1' + 'x'*1024)
+    if mode == 'read-error': print(nonce + ':1'); sys.exit(1)
+    sys.exit(0)
+sys.exit(99)
+"#
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let store = crate::report::create(&temp.path().join("run")).unwrap();
+            let resource = OwnedResource {
+                container_id: "a".repeat(64),
+                labels: BTreeMap::new(),
+                removed: false,
+            };
+            let result = Docker::new(executable.as_os_str())
+                .execute(
+                    &resource,
+                    probe_request(mode, 1),
+                    &store,
+                    &CancellationToken::default(),
+                )
+                .unwrap();
+            assert_eq!(probe_check(&result, 1), CheckOutcome::Incomplete, "{mode}");
+            assert_eq!(result.record.exit_status, None, "{mode}");
+            assert_eq!(result.stdout, "application stdout\n");
+            assert_eq!(
+                std::fs::read_to_string(store.root().join(result.record.stderr.unwrap().path))
+                    .unwrap(),
+                "application stderr\n"
+            );
+        }
+    }
+    #[test]
+    fn command_deadline_and_cancellation_cover_completion_control() {
+        for phase in ["prepare", "receipt"] {
+            for cancelled in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let marker = temp.path().join("control-started");
+                let executable = temp.path().join("docker-control-wait");
+                std::fs::write(
+                    &executable,
+                    format!(
+                        r#"#!/usr/bin/python3
+import sys, time, pathlib
+args = sys.argv[1:]
+if args[0] == 'container':
+    print('No such container:', file=sys.stderr)
+    sys.exit(1)
+script = args[args.index('-c')+1]
+waiting = script.startswith('umask') if '{phase}' == 'prepare' else script.startswith('test -f')
+if waiting:
+    pathlib.Path('{marker}').touch()
+    time.sleep(600)
+sys.exit(0)
+"#,
+                        marker = marker.display()
+                    ),
+                )
+                .unwrap();
+                std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                let cancel = CancellationToken::default();
+                let trigger = cancel.clone();
+                let signal = cancelled.then(|| {
+                    thread::spawn(move || {
+                        let deadline = Instant::now() + Duration::from_secs(2);
+                        while !marker.exists() && Instant::now() < deadline {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        trigger.cancel();
+                    })
+                });
+                let store = crate::report::create(&temp.path().join("run")).unwrap();
+                let resource = OwnedResource {
+                    container_id: "a".repeat(64),
+                    labels: BTreeMap::from([
+                        (OWNER_LABEL.into(), "v1".into()),
+                        (RUN_LABEL.into(), "probe".into()),
+                        (SCENARIO_LABEL.into(), "control".into()),
+                    ]),
+                    removed: false,
+                };
+                let mut request = probe_request("deadline", 1);
+                request.timeout_seconds = 1;
+                let started = Instant::now();
+                let result = Docker::new(executable.as_os_str())
+                    .execute(&resource, request, &store, &cancel)
+                    .unwrap();
+                if let Some(signal) = signal {
+                    signal.join().unwrap();
+                }
+                assert!(started.elapsed() < Duration::from_secs(2), "{phase}");
+                assert_eq!(result.record.exit_status, None);
+                assert_eq!(result.record.cancelled, cancelled, "{phase}");
+                assert_eq!(result.record.timed_out, !cancelled, "{phase}");
+                assert_eq!(probe_check(&result, 1), CheckOutcome::Incomplete);
+            }
+        }
+    }
+    #[test]
+    fn forwarded_default_values_are_not_claimed_in_serialized_evidence() {
+        if std::env::var_os("THESEUS_METADATA_PROBE").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "runner::docker::tests::forwarded_default_values_are_not_claimed_in_serialized_evidence", "--nocapture"])
+                .env("THESEUS_METADATA_PROBE", "1").env("PATH", "/synthetic/private-forwarded-path")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("docker-argv");
+        // Capture the actual adapter argv without mutating the process environment.
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nexit 0\n",
+                temp.path().join("argv").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = crate::report::create(&temp.path().join("run")).unwrap();
+        let resource = OwnedResource {
+            container_id: "a".repeat(64),
+            labels: BTreeMap::new(),
+            removed: false,
+        };
+        let mut request = probe_request("env", 0);
+        request.pass_env = vec!["PATH".into()];
+        request
+            .env
+            .insert("PUBLIC_LITERAL".into(), "visible".into());
+        let result = Docker::new(executable.as_os_str())
+            .execute(&resource, request, &store, &CancellationToken::default())
+            .unwrap();
+        assert!(!result.record.environment.contains_key("PATH"));
+        let serialized = serde_json::to_value(&result.record).unwrap();
+        assert_eq!(
+            serialized["forwarded_environment"],
+            serde_json::json!(["PATH"])
+        );
+        assert_eq!(serialized["environment"]["PUBLIC_LITERAL"], "visible");
+        let actual = std::env::var("PATH").unwrap();
+        assert!(
+            std::fs::read_to_string(temp.path().join("argv"))
+                .unwrap()
+                .contains(&format!("PATH={actual}"))
+        );
+        assert!(
+            !serde_json::to_string(&result.record)
+                .unwrap()
+                .contains(&actual)
+        );
+        let mut old = serialized;
+        old.as_object_mut().unwrap().remove("forwarded_environment");
+        assert!(serde_json::from_value::<CommandRecord>(old).is_ok());
+        let mut literal = probe_request("literal", 0);
+        literal.env.insert("HOME".into(), "/public/home".into());
+        let result = Docker::new(executable.as_os_str())
+            .execute(&resource, literal, &store, &CancellationToken::default())
+            .unwrap();
+        assert_eq!(result.record.environment["HOME"], "/public/home");
+        assert!(result.record.forwarded_environment.is_empty());
+        assert!(
+            serde_json::to_value(result.record)
+                .unwrap()
+                .get("forwarded_environment")
+                .is_none()
+        );
+    }
     #[test]
     fn archive_cancellation_still_applies_after_cli_exit_with_open_descriptors() {
         let temp = tempfile::tempdir().unwrap();

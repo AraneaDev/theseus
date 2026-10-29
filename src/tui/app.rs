@@ -239,7 +239,7 @@ impl App {
                 }
             }
             Tab::Commands => {
-                items.extend(stage.commands.iter().map(|c|format!("{} {}: {}\nargv: {:?}\nUID:GID {}:{} HOME={} cwd={}\nenv: {:?}\nUTC {} | {}ms | exit {:?} | timeout={} cancelled={}\nstdout: {:?}\nstderr: {:?}\nerror: {:?} skipped: {:?}",c.id,c.phase,c.outcome,c.argv,c.identity.uid,c.identity.gid,c.identity.home,c.workdir,c.environment,c.started_at,c.duration_ms,c.exit_status,c.timed_out,c.cancelled,c.stdout,c.stderr,c.error,c.skip_reason)));
+                items.extend(stage.commands.iter().map(|c|format!("{} {}: {}\nargv: {:?}\nUID:GID {}:{} account home={} cwd={}\nenv: {:?}\nforwarded env (values hidden): {:?}\nUTC {} | {}ms | exit {:?} | timeout={} cancelled={}\nstdout: {:?}\nstderr: {:?}\nerror: {:?} skipped: {:?}",c.id,c.phase,c.outcome,c.argv,c.identity.uid,c.identity.gid,c.identity.home,c.workdir,c.environment,c.forwarded_environment,c.started_at,c.duration_ms,c.exit_status,c.timed_out,c.cancelled,c.stdout,c.stderr,c.error,c.skip_reason)));
             }
             Tab::Logs => {
                 for command in &stage.commands {
