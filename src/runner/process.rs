@@ -7,7 +7,7 @@ use crate::{
 use anyhow::{Context, Result, anyhow};
 use rustix::{
     fs::{OFlags, fcntl_getfl, fcntl_setfl},
-    process::{Pid, Signal, kill_process_group},
+    process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid},
 };
 use std::{
     fs::File,
@@ -107,11 +107,29 @@ impl HostProcess {
             armed: true,
         })
     }
+    /// Observe exit while retaining the waitable leader. Its unreaped identity
+    /// reserves this PID/PGID until every group signal has finished.
+    fn exited_without_reaping(&mut self) -> Result<bool> {
+        match waitid(
+            WaitId::Pid(self.group),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        ) {
+            Ok(status) => Ok(status.is_some()),
+            Err(rustix::io::Errno::CHILD) => {
+                // An external reaper/SIGCHLD policy consumed ownership. Never
+                // send a signal to the now unreserved numeric process/group ID.
+                self.armed = false;
+                anyhow::bail!("host child identity is no longer reserved");
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
     fn terminate(&mut self) -> Result<()> {
         self.stop.store(true, Ordering::SeqCst);
         if self.armed {
+            self.exited_without_reaping()?;
             match kill_process_group(self.group, Signal::KILL) {
-                Ok(()) | Err(rustix::io::Errno::SRCH) => self.armed = false,
+                Ok(()) | Err(rustix::io::Errno::SRCH) => {}
                 Err(error) => {
                     let _ = self.child.kill();
                     return Err(error.into());
@@ -119,6 +137,13 @@ impl HostProcess {
             }
         }
         Ok(())
+    }
+    fn reap_and_disarm(&mut self) -> Result<ExitStatus> {
+        // All group signalling must precede this consuming wait. Disarm even if
+        // wait fails; no later Drop path may target an unreserved numeric ID.
+        let result = self.child.wait();
+        self.armed = false;
+        result.context("reap owned host child after group cleanup")
     }
     fn monitor(
         &mut self,
@@ -128,52 +153,46 @@ impl HostProcess {
         failed_reader: impl Fn() -> bool,
         mut abort: impl FnMut() -> Result<()>,
     ) -> Completion {
-        let mut status = None;
+        let mut exited = false;
         let mut timed_out;
         let mut cancelled;
         let mut error = None;
         loop {
-            if status.is_none() {
-                match self.child.try_wait() {
-                    Ok(value) => status = value,
-                    Err(failure) => {
-                        error = Some(failure.to_string());
-                    }
+            if !exited {
+                match self.exited_without_reaping() {
+                    Ok(value) => exited = value,
+                    Err(failure) => error = Some(format!("observe host child: {failure:#}")),
                 }
             }
             cancelled = cancel.is_cancelled();
             timed_out = self.started.elapsed() >= timeout;
             if cancelled || timed_out || error.is_some() {
-                // Stop readers immediately, then abort the owned container before
-                // killing the host Docker group. The abort has its own deadlines.
                 self.stop.store(true, Ordering::SeqCst);
+                // The exited leader stays unreaped throughout container abort,
+                // so even its control-operation deadlines cannot expose reuse.
                 if let Err(failure) = abort() {
                     error = Some(format!("abort owned environment: {failure:#}"));
                 }
-                if let Err(failure) = self.terminate() {
-                    error = Some(format!("terminate host process group: {failure:#}"));
-                }
-                if status.is_none() {
-                    status = self.child.wait().ok();
-                }
                 break;
             }
-            if failed_reader() {
-                // Parser rejection stops only archive acquisition; the container
-                // remains available for independent observations and uninstall.
-                if let Err(failure) = self.terminate() {
-                    error = Some(format!("terminate archive acquisition: {failure:#}"));
-                }
-                if status.is_none() {
-                    status = self.child.wait().ok();
-                }
-                break;
-            }
-            if status.is_some() && readers_done() {
+            // Parser rejection stops only acquisition, preserving the container.
+            if failed_reader() || (exited && readers_done()) {
                 break;
             }
             thread::sleep(Duration::from_millis(5));
         }
+        // Normal completion, timeout/cancel, parser rejection and errors all share
+        // the same ownership order: signal while reserved, reap, then disarm.
+        if let Err(failure) = self.terminate() {
+            error = Some(format!("terminate host process group: {failure:#}"));
+        }
+        let status = match self.reap_and_disarm() {
+            Ok(status) => Some(status),
+            Err(failure) => {
+                error = Some(format!("{failure:#}"));
+                None
+            }
+        };
         Completion {
             status,
             timed_out,
@@ -185,13 +204,14 @@ impl HostProcess {
 }
 impl Drop for HostProcess {
     fn drop(&mut self) {
-        let _ = self.terminate();
-        if !matches!(self.child.try_wait(), Ok(Some(_))) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+        if self.armed {
+            // Early setup/read errors retain the same signal-before-reap order.
+            let _ = self.terminate();
+            let _ = self.reap_and_disarm();
         }
     }
 }
+
 fn drain(mut reader: impl Read, mut file: Option<File>, limit: usize) -> Result<Drain> {
     let mut output = Drain::empty();
     let mut buffer = [0; 32768];
@@ -359,6 +379,34 @@ pub(super) fn utility(command: &mut Command, cancel: &CancellationToken) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exited_leader_stays_reserved_until_deferred_group_cleanup_then_is_reaped() {
+        let temp = tempfile::tempdir().unwrap();
+        let identities = temp.path().join("identities");
+        let mut leader = 0u32;
+        let mut reserved_during_abort = false;
+        let mut holder_in_other_group = false;
+        let output = run(Command::new("/bin/sh").args(["-c", "/usr/bin/setsid /bin/sleep 0.3 & printf '%s %s\n' \"$$\" \"$!\" > \"$1\"; exit 0", "identity-wrapper"]).arg(&identities), Duration::from_millis(50), &CancellationToken::default(), None, 32, || {
+            let text = std::fs::read_to_string(&identities)?; let ids: Vec<u32> = text.split_whitespace().map(str::parse).collect::<std::result::Result<_, _>>()?; leader = ids[0];
+            reserved_during_abort = std::fs::read_to_string(format!("/proc/{leader}/stat")).is_ok_and(|s| s.rsplit_once(')').unwrap().1.trim_start().starts_with('Z'));
+            holder_in_other_group = std::fs::read_to_string(format!("/proc/{}/stat", ids[1])).is_ok_and(|s| { let fields: Vec<_> = s.rsplit_once(')').unwrap().1.split_whitespace().collect(); fields[2].parse::<u32>().unwrap() != leader });
+            Ok(())
+        }).unwrap();
+        assert!(
+            holder_in_other_group,
+            "regression requires a descriptor holder in a different group"
+        );
+        assert!(
+            reserved_during_abort,
+            "exited leader {leader} was reaped before deferred group signalling"
+        );
+        assert_eq!(output.status, Some(0));
+        assert!(output.timed_out);
+        assert!(
+            !std::path::Path::new(&format!("/proc/{leader}")).exists(),
+            "leader was not reaped after group cleanup"
+        );
+    }
     #[test]
     fn deadline_includes_inherited_descriptors_after_direct_child_exit() {
         let temp = tempfile::tempdir().unwrap();
