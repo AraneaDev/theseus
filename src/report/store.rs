@@ -619,7 +619,7 @@ mod durability_tests {
     }
     #[cfg(target_os = "macos")]
     #[test]
-    fn strict_root_rejects_macos_invalid_utf8_ancestry_with_eilseq() {
+    fn strict_root_macos_invalid_utf8_creation_is_rejected_with_eilseq() {
         use std::os::unix::ffi::OsStringExt;
         let temp = tempfile::tempdir().unwrap();
         let invalid = std::ffi::OsString::from_vec(b"native-\xff".to_vec());
@@ -629,16 +629,34 @@ mod durability_tests {
             .unwrap()
             .join(invalid)
             .join("run");
-        for create in [false, true] {
-            let error = ReportStore::safe_root(&root, create).unwrap_err();
-            assert_eq!(
-                error
-                    .downcast_ref::<std::io::Error>()
-                    .unwrap()
-                    .raw_os_error(),
-                Some(rustix::io::Errno::ILSEQ.raw_os_error())
-            );
-        }
+        let error = ReportStore::safe_root(&root, true).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(rustix::io::Errno::ILSEQ.raw_os_error()),
+            "invalid UTF-8 creation must preserve the native EILSEQ failure"
+        );
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn strict_root_macos_absent_invalid_utf8_ancestry_returns_enoent() {
+        use std::os::unix::ffi::OsStringExt;
+        let temp = tempfile::tempdir().unwrap();
+        let absent = std::ffi::OsString::from_vec(b"native-\xff".to_vec());
+        let root = temp.path().canonicalize().unwrap().join(absent).join("run");
+        let error = ReportStore::safe_root(&root, false).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(rustix::io::Errno::NOENT.raw_os_error()),
+            "lookup of absent ancestry reports ENOENT, not creation validation"
+        );
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
     }
     struct PreparationObserver {
         called: bool,

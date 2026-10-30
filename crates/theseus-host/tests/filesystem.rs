@@ -239,7 +239,7 @@ fn native_child_names_preserve_identity_and_directory_sync_profile() -> io::Resu
 
 #[cfg(target_os = "macos")]
 #[test]
-fn macos_native_components_reject_invalid_utf8_with_eilseq() -> io::Result<()> {
+fn macos_native_invalid_utf8_creation_is_rejected_with_eilseq() -> io::Result<()> {
     use std::os::unix::ffi::OsStringExt;
     let temp = tempfile::tempdir()?;
     let root = HostDir::create_private(&temp.path().join("root"))?;
@@ -248,13 +248,28 @@ fn macos_native_components_reject_invalid_utf8_with_eilseq() -> io::Result<()> {
         root.create_child(&invalid).unwrap_err().raw_os_error(),
         Some(libc::EILSEQ)
     );
-    assert_eq!(
-        root.open_child_name(&invalid).unwrap_err().raw_os_error(),
-        Some(libc::EILSEQ)
-    );
     assert!(
         root.entries()?.is_empty(),
         "rejected creation must leave no entry"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_native_absent_invalid_utf8_lookup_returns_enoent() -> io::Result<()> {
+    use std::os::unix::ffi::OsStringExt;
+    let temp = tempfile::tempdir()?;
+    let root = HostDir::create_private(&temp.path().join("root"))?;
+    let absent = std::ffi::OsString::from_vec(b"native-\xff".to_vec());
+    assert_eq!(
+        root.open_child_name(&absent).unwrap_err().raw_os_error(),
+        Some(libc::ENOENT),
+        "lookup of a never-created name reports absence, not creation validation"
+    );
+    assert!(
+        root.entries()?.is_empty(),
+        "lookup must not create an entry"
     );
     Ok(())
 }
