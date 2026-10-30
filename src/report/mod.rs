@@ -3,4 +3,7 @@ mod bounded;
 mod store;
 pub(crate) use bounded::json_bytes;
 pub(crate) use store::decode_report;
-pub use store::{LogRead, ReportStore, create, load, load_journal, open_existing, read_log};
+pub use store::{
+    LogFingerprint, LogPage, LogRead, ReportStore, create, load, load_journal, open_existing,
+    read_log, read_log_page,
+};

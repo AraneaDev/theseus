@@ -12,7 +12,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::{
     fs::{self, DirBuilder, File},
     io::{BufWriter, Read, Write},
-    os::unix::fs::DirBuilderExt,
+    os::unix::fs::{DirBuilderExt, FileExt, MetadataExt},
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -28,6 +28,41 @@ pub struct ReportStore {
 pub struct LogRead {
     pub bytes: Vec<u8>,
     pub truncated: bool,
+}
+
+/// Raw stored-byte window, bounded by both the published reference and file length.
+#[derive(Debug, Clone)]
+pub struct LogPage {
+    pub bytes: Vec<u8>,
+    pub offset: u64,
+    pub readable_total: u64,
+    pub recorded_bytes: u64,
+    pub current_bytes: u64,
+    pub next_offset: Option<u64>,
+    pub fingerprint: LogFingerprint,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogFingerprint {
+    pub device: u64,
+    pub inode: u64,
+    pub size: u64,
+    pub mtime_seconds: i64,
+    pub mtime_nanos: i64,
+    pub ctime_seconds: i64,
+    pub ctime_nanos: i64,
+}
+impl From<&fs::Metadata> for LogFingerprint {
+    fn from(m: &fs::Metadata) -> Self {
+        Self {
+            device: m.dev(),
+            inode: m.ino(),
+            size: m.len(),
+            mtime_seconds: m.mtime(),
+            mtime_nanos: m.mtime_nsec(),
+            ctime_seconds: m.ctime(),
+            ctime_nanos: m.ctime_nsec(),
+        }
+    }
 }
 
 /// Create exactly this run directory, never reusing an existing directory.
@@ -154,6 +189,15 @@ impl ReportStore {
         })
     }
     pub fn read_log(&self, relative: &str, limit: usize) -> Result<LogRead> {
+        let file = self.open_log(relative)?;
+        let limit = limit.min(DEFAULT_LOG_LIMIT as usize);
+        let mut bytes = Vec::new();
+        file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+        let truncated = bytes.len() > limit;
+        bytes.truncate(limit);
+        Ok(LogRead { bytes, truncated })
+    }
+    fn open_log(&self, relative: &str) -> Result<File> {
         let parts = log_components(relative)?;
         let parent = self.log_parent(&parts[..parts.len() - 1], false)?;
         let file = File::from(
@@ -169,12 +213,51 @@ impl ReportStore {
             file.metadata()?.is_file(),
             "log reference is not a regular file"
         );
-        let limit = limit.min(DEFAULT_LOG_LIMIT as usize);
-        let mut bytes = Vec::new();
-        file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
-        let truncated = bytes.len() > limit;
-        bytes.truncate(limit);
-        Ok(LogRead { bytes, truncated })
+        Ok(file)
+    }
+    /// Read a raw page without reading its prefix. EOF itself is a valid offset.
+    pub fn read_log_page(
+        &self,
+        reference: &LogReference,
+        offset: u64,
+        limit: usize,
+    ) -> Result<LogPage> {
+        ensure!(
+            (1..=65536).contains(&limit),
+            "log page limit must be 1..=65536"
+        );
+        ensure!(
+            reference.bytes <= DEFAULT_LOG_LIMIT,
+            "published log exceeds capture limit"
+        );
+        offset
+            .checked_add(limit as u64)
+            .context("log page offset overflow")?;
+        let file = self.open_log(&reference.path)?;
+        let before = LogFingerprint::from(&file.metadata()?);
+        let total = reference.bytes.min(before.size).min(DEFAULT_LOG_LIMIT);
+        ensure!(offset <= total, "log page offset exceeds readable length");
+        let length = (total - offset).min(limit as u64) as usize;
+        let mut bytes = vec![0; length];
+        file.read_exact_at(&mut bytes, offset)
+            .context("read log page (file may have changed)")?;
+        let after = LogFingerprint::from(&file.metadata()?);
+        // Re-open via the pinned directory too: a renamed/replaced path is not a fresh page.
+        let current = LogFingerprint::from(&self.open_log(&reference.path)?.metadata()?);
+        ensure!(
+            before == after && before == current,
+            "log changed while reading page"
+        );
+        let end = offset + length as u64;
+        Ok(LogPage {
+            bytes,
+            offset,
+            readable_total: total,
+            recorded_bytes: reference.bytes,
+            current_bytes: before.size,
+            next_offset: (end < total).then_some(end),
+            fingerprint: before,
+        })
     }
     fn log_parent(&self, parts: &[&str], create: bool) -> Result<File> {
         let mut directory = self.directory.try_clone()?;
@@ -524,6 +607,14 @@ fn validate_journal(journal: &RunJournal) -> Result<()> {
 }
 pub fn read_log(root: &Path, relative: &str, limit: usize) -> Result<LogRead> {
     open_store(root)?.read_log(relative, limit)
+}
+pub fn read_log_page(
+    root: &Path,
+    reference: &LogReference,
+    offset: u64,
+    limit: usize,
+) -> Result<LogPage> {
+    open_store(root)?.read_log_page(reference, offset, limit)
 }
 fn report_root(path: &Path, filename: &str) -> Result<PathBuf> {
     if fs::symlink_metadata(path)?.is_dir() {

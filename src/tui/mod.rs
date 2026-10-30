@@ -2,7 +2,9 @@
 mod animation;
 mod app;
 mod comparison;
+pub mod evidence;
 mod input;
+pub mod paging;
 mod render;
 pub mod terminal;
 use crate::{
