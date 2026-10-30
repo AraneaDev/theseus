@@ -874,6 +874,20 @@ fn real_reinstall_timeout_and_cancellation_remove_journaled_container() {
 }
 
 #[test]
+fn python_reinstall_visibility_requires_current_terminal_cells() {
+    let output = std::process::Command::new("python3")
+        .arg("tests/support/tui_reinstall_test.py")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 #[ignore = "requires Docker and a Unix PTY"]
 fn real_pty_reinstall_selection_and_new_report_comparison_visibility() {
     let output = std::process::Command::new("python3")

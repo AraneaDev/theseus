@@ -69,6 +69,23 @@ class Screen:
                          for row in range(self.rows)).encode()
 
 
+class TerminalOutput:
+    """Retain bounded control bytes separately from currently displayed cells."""
+
+    def __init__(self, rows, columns):
+        self.data = bytearray()
+        self.screen = Screen(rows, columns)
+
+    def feed(self, chunk):
+        self.data.extend(chunk)
+        self.screen.feed(chunk)
+        assert len(self.data) <= 4 * 1024 * 1024, 'PTY evidence exceeded 4 MiB'
+
+    def has(self, *texts):
+        current = self.screen.text()
+        return all(text in current for text in texts)
+
+
 def check_screen_reconstruction():
     # Literal controls independently establish positions, overwrites, erasure,
     # and a sequence split across reads. Old characters must not remain visible.
