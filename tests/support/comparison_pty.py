@@ -106,6 +106,21 @@ class Session:
         (evidence/(self.name+'.terminal.json')).write_text(json.dumps({'exit':self.proc.returncode,'before':self.before,'after':termios.tcgetattr(self.slave)}, default=lambda value: list(value)))
         os.close(self.master);os.close(self.slave)
 
+def evidence_navigation(s):
+    # Exercise the public cell/list/detail focus boundary, rather than relying
+    # on the former flattened pane keeping every source/command visible.
+    s.until(lambda:s.has('Variant: archive | user/clean | Stage: configured'))
+    s.until(lambda:s.has('Scope user-binary: /home/theseus/.local/bin/comparison-cli'))
+    s.key(b'\t\x1b[F')
+    s.until(lambda:s.has('Complete evidence: theseus comparison'))
+    s.until(lambda:s.has('--json'))
+    s.snapshot('json-detail')
+    s.key(b'\x1b[H')
+    s.until(lambda:s.has('Detail — record 1 /'))
+    s.until(lambda:s.has('archive vs copy | user | clean | configured'))
+    s.snapshot('cell-detail')
+    s.key(b'\t')  # restore cell focus for the existing j/k assertions
+
 def pty_cases():
     root=fixture('preview')
     s=Session(root,'preview',['compare','--suite','methods.toml'],True,True)
@@ -128,13 +143,13 @@ def pty_cases():
         s.key(b'r');s.until(lambda:s.has('Comparison rows'))
         s.key(b'jj');s.until(lambda:s.has('archive vs copy | user | clean | configured'));s.snapshot('selected')
         wait(lambda:bool(list(root.glob('.theseus-comparisons/*/comparison.json'))) and json.loads(next(root.glob('.theseus-comparisons/*/comparison.json')).read_text())['finished'],s.pump,90)
-        s.until(lambda:s.has('Equivalent'));s.key(b'k');s.key(b'\x1b[6~');s.key(b'\x1b[5~');s.snapshot('complete');s.key(b'q');s.finish(0)
+        s.until(lambda:s.has('Equivalent'));evidence_navigation(s);s.key(b'k');s.key(b'\x1b[6~');s.key(b'\x1b[5~');s.snapshot('complete');s.key(b'q');s.finish(0)
     finally:s.close()
     report=offline(root,'live');assert report['outcome']=='passed'
     saved=suite_root(root);before=(saved/'comparison.json').read_bytes()
     s=Session(root,'offline',['comparison',str(saved)],read_only=True)
     try:
-        s.until(lambda:s.has('Equivalent'));s.key(b'jj');s.until(lambda:s.has('archive vs copy | user | clean | configured'));s.key(b'\x1b[6~');s.key(b'\x1b[5~');s.snapshot('selected');s.key(b'r');s.key(b'q');s.finish(0)
+        s.until(lambda:s.has('Equivalent'));s.key(b'jj');s.until(lambda:s.has('archive vs copy | user | clean | configured'));evidence_navigation(s);s.key(b'\x1b[6~');s.key(b'\x1b[5~');s.snapshot('selected');s.key(b'r');s.key(b'q');s.finish(0)
         assert (saved/'comparison.json').read_bytes()==before,'offline r mutated suite'
     finally:s.close()
     root=fixture('active-cancel');slow(root)

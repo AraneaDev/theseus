@@ -158,10 +158,17 @@ bypass the exit scene and preserve the actual outcome and terminal restoration.
 During live or saved report viewing:
 
 - `Tab` / `Enter` cycles scenario, stage, and evidence focus; `Esc` goes back.
-- Arrows or `j/k` select a scenario, stage, or evidence record.
+- Arrows or `j/k` select a scenario, stage, or evidence record; Home/End selects
+  the first/last record in the focused list.
 - Left/right in evidence focus switches Stages, Findings, Files, Commands, Logs.
-- `/` edits a case-insensitive evidence filter; Enter applies it, Esc ends editing.
-  Press `/` and Enter to clear it. Page Up/Down scrolls details.
+- `/` edits a case-insensitive evidence filter; Enter or Esc applies the draft.
+  Press `/` and Enter to clear it. Matches include full stored record details.
+- `[` / `]` loads the previous/next detail or log chunk. Page Up/Down scrolls
+  inside the current chunk; it does not change the selected record.
+- Ctrl-Home/Ctrl-End jumps to the first/last stored log chunk. `m` toggles a
+  selected log between raw output and its full reference metadata, including its
+  path; either mode change resets to the first chunk. Log selection is typed,
+  even when stdout/stderr paths resemble one another.
 - `c` requests cancellation and retains results for browsing. `q` exits when idle;
   during a run it cancels and waits up to five seconds for worker completion. If cleanup remains unresolved, exit 2
   identifies the report/journal and resources requiring inspection and recovery.
@@ -379,7 +386,7 @@ Reports identify both comparison stages and retain changed-child evidence on the
 comparison checkpoint. Use exact-path `preserved` for retention against configured state;
 it does not recursively assert a directory’s children.
 
-## Comparison suites (0.7)
+## Comparison suites
 
 Compare declared installation methods or actual image IDs through the same engine:
 
@@ -416,8 +423,11 @@ Legitimate large comparisons can reach this conservative byte limit before the
 count caps. Private JSON writes stream with a 64 MiB limit and preserve the prior
 file on serialization failure; comparison CLI JSON is staged within 32 MiB before
 emission.
-The UI labels its 100-difference display prefix and 512-character text elision;
-use the displayed safely quoted JSON command for complete bounded stored evidence.
+The comparison UI starts with cell selection; Tab switches between cells and
+evidence records. Home/End reaches either list’s first/last item. The same filter,
+chunk and local-scroll controls apply. Every retained difference and full source
+field is reachable; source-report, recovery and full-JSON commands remain safely
+quoted in selected detail records.
 
 ## Outcomes, limits, and recovery
 
@@ -518,13 +528,33 @@ Downgrade policy, checkpoints and rejection proof require schema 4. Rollback
 policy, failure proof, Changed checks and backup metadata require schema 5.
 Interrupted rollback and its typed command expectations require schema 6. Recovery
 journals and ownership labels remain version 1. No observed file contents are retained except explicit command output; metadata/hashes and diffs are stored.
-Reports can be large (load limit 64 MiB), and UI reloads parse saved metadata on progress notifications.
+Reports can be large (load limit 64 MiB). Live progress schedules read-only
+refreshes with at most one read in flight and one coalesced latest request; stale
+reads cannot replace final results. Input, cancellation and the existing five-second
+active-quit deadline continue while a refresh reads. Each refresh still parses
+bounded saved metadata; initial filtering may scan all records.
 
 ```sh
 theseus report .theseus-runs/RUN_ID            # offline TUI; no Docker
 theseus report .theseus-runs/RUN_ID --json     # offline machine-readable evidence
 theseus cleanup .theseus-runs/RUN_ID          # verified journaled resources only
 ```
+
+Browsing in 0.8 uses bounded windows: at most 64 evidence summaries and 64 rows
+per selector, one 16 KiB detail chunk, and at most 65,536 cached filter match or
+checkpoint positions. Larger result sets remain reachable. Summaries may show an
+explicit ellipsis; successive detail chunks expose all retained text, including
+Unicode. The compatibility log mirror retains only the current bounded body.
+Log APIs read at most 64 KiB at an explicit raw-byte offset; the UI reads 4 KiB
+plus at most four UTF-8 guard bytes. The footer shows the actual byte range and
+whether more bytes are stored. File identity/size/time checks invalidate changed
+cached logs; these checks establish freshness, not authorship.
+
+Pagination exposes stored evidence only. A last stored log chunk can still be
+labelled capture truncated; a shortened file is incomplete current storage, and
+unpublished appended bytes stay hidden. Capture limits and comparison-budget
+omissions are unchanged and cannot be recovered by paging. Preview remains
+read-only; interactive preview editing is deferred.
 
 Log references are confined to the run directory with bounded reads and no
 symlink following. Treat all logs as sensitive local output. Recovery verifies
@@ -543,7 +573,11 @@ cargo test --offline --locked --test docker_lifecycle --test interruption_lifecy
 ```
 
 Regular tests include wide/narrow TestBackend behavior and actual Unix PTY
-startup/error/restoration. Docker acceptance is opt-in locally and explicitly
+startup/error/restoration. Synthetic large-report public CLI PTYs reach records
+beyond 65,535, filter-cache overflow, full Unicode detail, comparison difference
+101 and logs beyond 64 KiB while checking offline Docker sentinels and unchanged
+source bytes. These are UI fixtures, not a claim of a real 70,000-file installation.
+Docker acceptance is opt-in locally and explicitly
 required in CI; missing Docker is a failed prerequisite, never a passing skip.
 Healthy and broken fixtures exercise all profiles/scenarios, stale PATH,
 permissions, preservation, leftovers, baseline deletion, limits, and cancellation.

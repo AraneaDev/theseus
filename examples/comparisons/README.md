@@ -6,7 +6,7 @@ and system profiles. `copy.toml` copies the executable; `archive.toml` extracts
 its deterministic USTAR archive. Both inputs contain exactly the same executable
 bytes. No downloads, credentials or host configuration changes are used.
 
-From the repository root, with Theseus 0.7 installed and Docker available:
+From the repository root, with Theseus 0.8 installed and Docker available:
 
 ```sh
 docker pull ubuntu:24.04
@@ -40,7 +40,10 @@ theseus report 'examples/comparisons/.theseus-comparisons/ID/sources/copy/RUN_ID
 
 The suite view gives exact source report paths. In interactive preview, r starts,
 q exits, and the manifest fixes profiles/scenarios; p/s do not edit it. Live and
-offline Up/Down or j/k select rows and PgUp/PgDn scroll evidence. Active q cancels
+offline Up/Down or j/k select cells initially. Tab switches to evidence-record
+selection and back; Home/End selects the first/last item in either list. `/` edits
+a filter applied by Enter/Esc; `[`/`]` loads detail chunks, and PgUp/PgDn scrolls
+inside the current chunk. Active q cancels
 the current source, prevents later variants, and bypasses the exit animation;
 c also requests cancellation. Existing animation opt-outs and Space skips apply.
 Offline r cannot rerun. Source logs remain private local output; inspect them as
@@ -76,9 +79,13 @@ outcomes stay accurate; validated run IDs, declared recipe digests and contained
 recovery paths survive. Full source reports retain the original evidence. Large
 valid suites may become Incomplete before reaching count caps. JSON file writes
 stream up to 64 MiB; failed serialization leaves the last valid file and cleanup
-usable. CLI comparison JSON stages a complete document within 32 MiB. The UI shows
-a labelled prefix of at most 100 differences and elides long text at 512 characters;
-JSON retains the complete bounded stored evidence. Saved comparison schema is 1;
+usable. CLI comparison JSON stages a complete document within 32 MiB. The UI
+pages through every retained difference and complete stored text; summaries
+may show an explicit ellipsis. It projects at most 64 record summaries and one
+16 KiB detail chunk, with at most 65,536 cached filter positions and bounded
+rescanning beyond that cache. Paging cannot recover budget-omitted or uncaptured
+evidence. JSON also retains the complete bounded stored evidence. Saved comparison
+schema is 1;
 source lifecycle schema stays 6 and journals/ownership stay 1.
 
 These observations cover these scopes, stages, inputs and image IDs. They do not
