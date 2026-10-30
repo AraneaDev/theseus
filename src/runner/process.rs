@@ -1,10 +1,15 @@
 //! Deadlines cover child processes and pipe lifetime, including inherited handles.
+// Task 3 adds the production caller for this independently tested transport.
+#[allow(dead_code)]
+mod duplex;
 use crate::{
     engine::CancellationToken,
     recipe::Limits,
     snapshot::{self, Snapshot},
 };
 use anyhow::{Context, Result, anyhow};
+#[allow(unused_imports)]
+pub(super) use duplex::{DuplexDriver, DuplexOutput, run_duplex};
 use rustix::{
     fs::{OFlags, fcntl_getfl, fcntl_setfl},
     process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid},
@@ -54,6 +59,20 @@ impl Drain {
             truncated: false,
         }
     }
+    fn record(&mut self, bytes: &[u8], file: &mut Option<File>, limit: usize) -> Result<()> {
+        let keep = bytes.len().min(limit.saturating_sub(self.bytes.len()));
+        self.truncated |= keep < bytes.len();
+        self.bytes.extend_from_slice(&bytes[..keep]);
+        self.stored += keep as u64;
+        if keep > 0
+            && let Some(writer) = file.as_mut()
+            && let Err(failure) = writer.write_all(&bytes[..keep])
+        {
+            *file = None;
+            return Err(failure.into());
+        }
+        Ok(())
+    }
 }
 
 // A group is necessary to terminate owned CLI wrappers/helpers. Interruptible
@@ -85,6 +104,14 @@ impl<R: Read> Read for PipeReader<R> {
         }
     }
 }
+enum StdinMode {
+    Null,
+    Piped,
+}
+enum MonitorPolicy<'a> {
+    Immediate,
+    Duplex(&'a duplex::Signals),
+}
 struct HostProcess {
     child: Child,
     group: Pid,
@@ -102,8 +129,14 @@ struct Completion {
 }
 impl HostProcess {
     fn spawn(command: &mut Command) -> Result<Self> {
+        Self::spawn_with_stdin(command, StdinMode::Null)
+    }
+    fn spawn_with_stdin(command: &mut Command, stdin: StdinMode) -> Result<Self> {
         command
-            .stdin(Stdio::null())
+            .stdin(match stdin {
+                StdinMode::Null => Stdio::null(),
+                StdinMode::Piped => Stdio::piped(),
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
@@ -162,6 +195,7 @@ impl HostProcess {
         cancel: &CancellationToken,
         readers_done: impl Fn() -> bool,
         failed_reader: impl Fn() -> bool,
+        policy: MonitorPolicy<'_>,
         mut control: impl FnMut(SupervisionEvent) -> Result<SupervisionDecision>,
     ) -> Completion {
         let mut exited = false;
@@ -170,6 +204,8 @@ impl HostProcess {
         let mut supervised_stop = false;
         let mut last_poll: Option<Instant> = None;
         let mut error = None;
+        let mut closing_at = None;
+        let mut exchange_expired = false;
         loop {
             if !exited {
                 match self.exited_without_reaping() {
@@ -179,7 +215,29 @@ impl HostProcess {
             }
             cancelled = cancel.is_cancelled();
             timed_out = self.started.elapsed() >= timeout;
-            if !cancelled && !timed_out && error.is_none() {
+            let mut cancellation_requires_abort = cancelled;
+            let mut grace_expired = false;
+            if let MonitorPolicy::Duplex(signals) = &policy {
+                if cancelled {
+                    signals.cancel.store(true, Ordering::SeqCst);
+                }
+                if closing_at.is_none()
+                    && !signals.close.load(Ordering::SeqCst)
+                    && self.started.elapsed() >= timeout.saturating_sub(Duration::from_secs(1))
+                {
+                    exchange_expired = true;
+                    signals.close.store(true, Ordering::SeqCst);
+                }
+                if cancelled || signals.close.load(Ordering::SeqCst) {
+                    let at = closing_at.get_or_insert_with(Instant::now);
+                    grace_expired = at.elapsed() >= Duration::from_secs(1);
+                }
+                cancellation_requires_abort = cancelled && grace_expired;
+                if signals.failed.load(Ordering::SeqCst) {
+                    append_error(&mut error, "duplex worker failed".into());
+                }
+            }
+            if !cancellation_requires_abort && !timed_out && !grace_expired && error.is_none() {
                 // Parser rejection stops only acquisition, preserving the container.
                 if failed_reader() || (exited && readers_done()) {
                     break;
@@ -191,6 +249,9 @@ impl HostProcess {
                     last_poll = Some(Instant::now());
                     cancelled = cancel.is_cancelled();
                     timed_out = self.started.elapsed() >= timeout;
+                    if matches!(policy, MonitorPolicy::Immediate) {
+                        cancellation_requires_abort = cancelled;
+                    }
                     match decision {
                         Err(failure) => {
                             error = Some(format!("supervise owned environment: {failure:#}"))
@@ -203,7 +264,7 @@ impl HostProcess {
                     }
                 }
             }
-            if cancelled || timed_out || error.is_some() {
+            if cancellation_requires_abort || timed_out || grace_expired || error.is_some() {
                 self.stop.store(true, Ordering::SeqCst);
                 // The exited leader stays unreaped throughout container abort,
                 // so even its control-operation deadlines cannot expose reuse.
@@ -222,19 +283,22 @@ impl HostProcess {
         // Normal completion, timeout/cancel, parser rejection and errors all share
         // the same ownership order: signal while reserved, reap, then disarm.
         if let Err(failure) = self.terminate() {
-            error = Some(format!("terminate host process group: {failure:#}"));
+            append_error(
+                &mut error,
+                format!("terminate host process group: {failure:#}"),
+            );
         }
         let status = match self.reap_and_disarm() {
             Ok(status) => Some(status),
             Err(failure) => {
-                error = Some(format!("{failure:#}"));
+                append_error(&mut error, format!("{failure:#}"));
                 None
             }
         };
         Completion {
             status,
-            timed_out,
-            cancelled,
+            timed_out: timed_out || exchange_expired,
+            cancelled: cancelled || cancel.is_cancelled(),
             supervised_stop: supervised_stop && error.is_none(),
             error,
             duration_ms: self.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
@@ -251,33 +315,52 @@ impl Drop for HostProcess {
     }
 }
 
-fn drain(mut reader: impl Read, mut file: Option<File>, limit: usize) -> Result<Drain> {
+fn append_error(errors: &mut Option<String>, error: String) {
+    match errors {
+        Some(prior) => {
+            prior.push_str("; ");
+            prior.push_str(&error);
+        }
+        None => *errors = Some(error),
+    }
+}
+
+fn drain(reader: impl Read, file: Option<File>, limit: usize) -> Result<Drain> {
+    drain_reported(reader, file, limit, || {})
+}
+fn drain_reported(
+    mut reader: impl Read,
+    mut file: Option<File>,
+    limit: usize,
+    failed: impl Fn(),
+) -> Result<Drain> {
     let mut output = Drain::empty();
-    let mut buffer = [0; 32768];
+    let mut buffer = [0; 4096];
     let mut error = None;
     loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        let keep = read.min(limit.saturating_sub(output.stored as usize));
-        output.truncated |= keep < read;
-        if keep > 0 {
-            output.bytes.extend_from_slice(&buffer[..keep]);
-            if let Some(f) = file.as_mut()
-                && let Err(failure) = f.write_all(&buffer[..keep])
-            {
-                error = Some(failure);
-                file = None;
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                if let Err(failure) = output.record(&buffer[..read], &mut file, limit) {
+                    append_error(&mut error, format!("write stream log: {failure:#}"));
+                    failed();
+                }
             }
-            output.stored += keep as u64;
+            Err(failure) => {
+                append_error(&mut error, format!("read stream: {failure}"));
+                failed();
+                break;
+            }
         }
+    }
+    if let Some(file) = file
+        && let Err(failure) = file.sync_all()
+    {
+        append_error(&mut error, format!("sync stream log: {failure}"));
+        failed();
     }
     if let Some(error) = error {
-        return Err(error.into());
-    }
-    if let Some(file) = file {
-        file.sync_all()?;
+        return Err(anyhow!(error));
     }
     Ok(output)
 }
@@ -338,6 +421,7 @@ pub(super) fn run_supervised(
         cancel,
         || stdout.is_finished() && stderr.is_finished(),
         || false,
+        MonitorPolicy::Immediate,
         control,
     );
     // Monitor either established completion or interrupted the nonblocking pipe
@@ -413,6 +497,7 @@ pub(super) fn archive(
         cancel,
         || parser.is_finished() && stderr.is_finished(),
         || failed.load(Ordering::SeqCst),
+        MonitorPolicy::Immediate,
         |event| match event {
             SupervisionEvent::Poll => Ok(SupervisionDecision::Continue),
             SupervisionEvent::Abort => abort().map(|()| SupervisionDecision::Continue),
