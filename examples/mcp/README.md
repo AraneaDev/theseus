@@ -145,3 +145,6 @@ bindings, not authenticated reconstruction of raw logs. MCP recipe/report fields
 require schema 8; recipes 1–7 retain semantics and reports 1–8 remain readable.
 The shared-engine Theseus MCP interface and controller/native OS portability are
 separate roadmap milestones.
+
+Keep the preparation script and private `examples/_client_input.py` helper in
+the same checkout; the command may run from another working directory.

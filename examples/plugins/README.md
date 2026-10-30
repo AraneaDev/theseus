@@ -84,3 +84,6 @@ Windows preparation requires Python 3.12+ and checks regular, nonreparse source
 identity before/after opening; Unix retains no-follow acquisition. The guest copies
 the client to `/home/theseus/.local/bin/theseus-client`, compares it with the staged
 input, and applies explicit execute permission in its user-owned destination.
+
+Keep the preparation script and private `examples/_client_input.py` helper in
+the same checkout; the command may run from another working directory.

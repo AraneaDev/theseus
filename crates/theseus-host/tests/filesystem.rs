@@ -200,11 +200,13 @@ fn enumeration_handles_multiple_batches_and_concurrent_readers() -> io::Result<(
 #[test]
 fn native_child_names_preserve_identity_and_directory_sync_profile() -> io::Result<()> {
     use std::ffi::{OsStr, OsString};
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     let native = {
         use std::os::unix::ffi::OsStringExt;
         OsString::from_vec(b"native-\xff".to_vec())
     };
+    #[cfg(target_os = "macos")]
+    let native = OsString::from("native-λ");
     #[cfg(windows)]
     let native = {
         use std::os::windows::ffi::OsStringExt;
@@ -232,5 +234,27 @@ fn native_child_names_preserve_identity_and_directory_sync_profile() -> io::Resu
         std::os::unix::fs::symlink(&native, temp.path().join("root/alias"))?;
         assert!(root.open_child_name(OsStr::new("alias")).is_err());
     }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_native_components_reject_invalid_utf8_with_eilseq() -> io::Result<()> {
+    use std::os::unix::ffi::OsStringExt;
+    let temp = tempfile::tempdir()?;
+    let root = HostDir::create_private(&temp.path().join("root"))?;
+    let invalid = std::ffi::OsString::from_vec(b"native-\xff".to_vec());
+    assert_eq!(
+        root.create_child(&invalid).unwrap_err().raw_os_error(),
+        Some(libc::EILSEQ)
+    );
+    assert_eq!(
+        root.open_child_name(&invalid).unwrap_err().raw_os_error(),
+        Some(libc::EILSEQ)
+    );
+    assert!(
+        root.entries()?.is_empty(),
+        "rejected creation must leave no entry"
+    );
     Ok(())
 }

@@ -26,6 +26,11 @@ class PortableGuestBytes(unittest.TestCase):
             self.assertTrue(result.stdout.rstrip().endswith(b': eol: lf'), result.stdout)
             self.assertNotIn(b'\r\n', (ROOT / name).read_bytes(), name)
 
+    def test_both_preparers_import_one_checkout_acquisition_policy(self):
+        acquisitions = [runpy.run_path(str(ROOT / 'examples' / kind / 'prepare.py'))['open_client'] for kind in ['plugins', 'mcp']]
+        self.assertIs(acquisitions[0], acquisitions[1])
+        self.assertEqual(Path(acquisitions[0].__code__.co_filename).resolve(), ROOT / 'examples/_client_input.py')
+
     def test_source_acquisition_rejects_nonregular_reparse_and_changed_identity(self):
         for kind in ['plugins', 'mcp']:
             acquire = runpy.run_path(str(ROOT / 'examples' / kind / 'prepare.py'))['open_client']
@@ -49,9 +54,20 @@ class PortableGuestBytes(unittest.TestCase):
                     values = dict(st_mode=info.st_mode, st_dev=info.st_dev, st_ino=info.st_ino + 1)
                     if hasattr(info, 'st_file_attributes'): values['st_file_attributes'] = info.st_file_attributes
                     return SimpleNamespace(**values)
-                with patch('os.fstat', side_effect=changed):
-                    with self.assertRaisesRegex(ValueError, 'identity changed'):
-                        acquire(source)
+                policy = acquire.__module__
+                original_open = os.open
+                opened = []
+                def record_open(*args, **kwargs):
+                    fd = original_open(*args, **kwargs)
+                    opened.append(fd)
+                    return fd
+                with patch(policy + '.os.open', side_effect=record_open):
+                    with patch(policy + '.os.fstat', side_effect=changed):
+                        with self.assertRaisesRegex(ValueError, 'identity changed'):
+                            acquire(source)
+                self.assertTrue(opened)
+                for fd in opened:
+                    with self.assertRaises(OSError): original_fstat(fd)
                 if os.name == 'nt':
                     for bad in ['missing attributes', 'zero identity']:
                         def unavailable(fd):
@@ -59,11 +75,14 @@ class PortableGuestBytes(unittest.TestCase):
                             values = dict(st_mode=info.st_mode, st_dev=info.st_dev, st_ino=info.st_ino)
                             if bad == 'zero identity': values.update(st_ino=0, st_file_attributes=info.st_file_attributes)
                             return SimpleNamespace(**values)
-                        with patch('os.fstat', side_effect=unavailable):
+                        with patch(policy + '.os.fstat', side_effect=unavailable):
                             with self.assertRaisesRegex(ValueError, 'attributes|identity is unavailable'):
                                 acquire(source)
                 with acquire(source) as stream:
+                    fd = stream.fileno()
+                    self.assertFalse(os.get_inheritable(fd))
                     self.assertEqual(stream.read(), b'\x7fELF\r\n\x1a\x00\xff')
+                with self.assertRaises(OSError): original_fstat(fd)
 
     def test_prepared_variants_preserve_opaque_elf_and_emit_raw_lf(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -87,7 +106,7 @@ class PortableGuestBytes(unittest.TestCase):
                 with self.subTest(kind=kind, options=options):
                     output = root / str(index)
                     version = 'codex-cli 0.166.0' if 'codex-cli-0.166.0' in options else '2.1.312 (Claude Code)'
-                    result = subprocess.run([sys.executable, str(ROOT / 'examples' / kind / 'prepare.py'), '--client', str(supplied), '--client-version', version, '--output', str(output)] + options, capture_output=True)
+                    result = subprocess.run([sys.executable, str(ROOT / 'examples' / kind / 'prepare.py'), '--client', str(supplied), '--client-version', version, '--output', str(output)] + options, capture_output=True, cwd=root)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual((output / 'target/client/claude').read_bytes(), opaque)
                     manifest = json.loads((output / 'input-manifest.json').read_bytes())

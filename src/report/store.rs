@@ -591,12 +591,14 @@ mod durability_tests {
         snapshot::Snapshot,
     };
     #[test]
-    fn strict_root_creation_and_reopen_preserve_native_non_utf8_ancestry() {
-        #[cfg(unix)]
+    fn strict_root_creation_and_reopen_preserve_native_ancestry() {
+        #[cfg(all(unix, not(target_os = "macos")))]
         let name = {
             use std::os::unix::ffi::OsStringExt;
             std::ffi::OsString::from_vec(b"native-\xff".to_vec())
         };
+        #[cfg(target_os = "macos")]
+        let name = std::ffi::OsString::from("native-λ");
         #[cfg(windows)]
         let name = {
             use std::os::windows::ffi::OsStringExt;
@@ -614,6 +616,29 @@ mod durability_tests {
                 .run_id,
             "native-ancestry"
         );
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn strict_root_rejects_macos_invalid_utf8_ancestry_with_eilseq() {
+        use std::os::unix::ffi::OsStringExt;
+        let temp = tempfile::tempdir().unwrap();
+        let invalid = std::ffi::OsString::from_vec(b"native-\xff".to_vec());
+        let root = temp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join(invalid)
+            .join("run");
+        for create in [false, true] {
+            let error = ReportStore::safe_root(&root, create).unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(rustix::io::Errno::ILSEQ.raw_os_error())
+            );
+        }
     }
     struct PreparationObserver {
         called: bool,
