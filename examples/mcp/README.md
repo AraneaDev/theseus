@@ -63,8 +63,17 @@ means scalar command, each args index and absence at the next index. Unknown
 normalize them. Plugin delivery retains every ordinary PluginContract proof from
 `examples/plugins`, adds native plugin-list cardinality matched by ID alone, and
 detects only the declared target, rather than arbitrary aliases across unrelated
-plugins, and binds `${CLAUDE_PLUGIN_ROOT}` to the actual `readFromFolder` source rather than the
-cache. The example installs the plugin companion first and asserts target index 1
+plugins, and binds `${CLAUDE_PLUGIN_ROOT}` to the actual `readFromFolder` source
+rather than the cache. V1 supports a source-bearing code path only as executable argv0
+`${CLAUDE_PLUGIN_ROOT}/<relative code path>`, or script argv1 with argv0 exactly
+`/bin/sh`. The relative code path must be nonempty and have no empty, `.` or `..`
+components. A placeholder only in data or another argument, a fixed external
+launcher, and other interpreter layouts do not establish this binding; use generic
+checks for those layouts. Disabled registration retains the same requirement and
+must resolve to the last active concrete launch. The identity-only global count
+and unique indexed ID guard both select the exact PluginContract ID, including
+marketplace, so a same-name plugin in another marketplace cannot substitute.
+The example installs the plugin companion first and asserts target index 1
 with its exact ID guard. Unexpected native reordering fails closed; the fixture
 does not promise order-independent inventory processing. Other assertions may
 prove another guarded index without changing the adapter.

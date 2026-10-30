@@ -517,3 +517,157 @@ pub fn upgrade_declaration() -> Value {
     }
     value
 }
+
+/// Adversarial declarations keep exact argv/health bindings internally coherent;
+/// the lifecycle validator must independently establish source-bearing code.
+pub fn plugin_launch_declaration(raw_argv: &[&str], source: &str) -> Value {
+    let mut value = plugin_declaration();
+    let concrete = raw_argv
+        .iter()
+        .map(|v| v.replace("${CLAUDE_PLUGIN_ROOT}", source))
+        .collect::<Vec<_>>();
+    for c in value["profiles"]["user"]["checks"].as_array_mut().unwrap() {
+        let id = c["id"].as_str().unwrap().to_owned();
+        if id.ends_with("-registration") && c["checkpoint"] != "uninstalled" {
+            let a = c["assertions"].as_array_mut().unwrap();
+            a.iter_mut()
+                .find(|a| a["pointer"] == "/plugins/0/readFromFolder")
+                .unwrap()["equals_json"] = json!(source).to_string().into();
+            a.retain(|a| {
+                !a["pointer"]
+                    .as_str()
+                    .is_some_and(|p| p.starts_with("/plugins/0/mcpServers/probe/"))
+            });
+            a.push(eq(
+                "/plugins/0/mcpServers/probe/command",
+                json!(raw_argv[0]),
+            ));
+            for (i, arg) in raw_argv[1..].iter().enumerate() {
+                a.push(eq(
+                    &format!("/plugins/0/mcpServers/probe/args/{i}"),
+                    json!(arg),
+                ));
+            }
+            a.push(absent(&format!(
+                "/plugins/0/mcpServers/probe/args/{}",
+                raw_argv.len() - 1
+            )));
+        } else if c["kind"] == "mcp_stdio" {
+            c["probe"]["argv"] = json!(concrete);
+        } else if id.ends_with("-activation")
+            && c["checkpoint"] != "plugin_disabled"
+            && c["checkpoint"] != "uninstalled"
+        {
+            c["assertions"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|a| a["pointer"] == "/source")
+                .unwrap()["equals_json"] = json!(concrete.join(" ")).to_string().into();
+        }
+    }
+    value
+}
+pub fn plugin_other_market_declaration() -> Value {
+    let mut value = plugin_launch_declaration(
+        &["/bin/sh", "${CLAUDE_PLUGIN_ROOT}/server.sh"],
+        "/other-market/probe",
+    );
+    for c in value["profiles"]["user"]["checks"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .filter(|c| c["id"].as_str().unwrap().ends_with("-registration"))
+    {
+        let a = c["assertions"].as_array_mut().unwrap();
+        let original = a
+            .iter()
+            .find(|a| a["kind"] == "array_match")
+            .unwrap()
+            .clone();
+        for a in a.iter_mut() {
+            if a["kind"] == "array_match" {
+                a["identity"][0]["equals_json"] = "\"probe@other-market\"".into();
+            } else if a["pointer"] == "/plugins/0/id" {
+                a["equals_json"] = "\"probe@other-market\"".into();
+            }
+        }
+        a.push(original);
+    }
+    value
+}
+/// Mutate finite retained observations consistently with their assertions. This
+/// is deliberately not authenticated raw-log proof: generic proof must remain
+/// valid while the stronger lifecycle identity/source binding rejects it.
+pub fn rewrite_plugin_report(report: &mut RunReport, value: &Value) {
+    use theseus::{
+        model::{JsonAssertionObservation as O, JsonValueObservation as V},
+        recipe::{Check, Expectation, JsonAssertion},
+    };
+    let declarations: Vec<Check> =
+        serde_json::from_value(value["profiles"]["user"]["checks"].clone()).unwrap();
+    for stage in &mut report.scenarios[0].stages {
+        for check in &mut stage.checks {
+            let Some(declaration) = declarations.iter().find(|c| c.id == check.id) else {
+                continue;
+            };
+            if !(check.id.ends_with("-registration")
+                || check.id.ends_with("-activation")
+                || check.mcp_required)
+            {
+                continue;
+            }
+            match &declaration.expectation {
+                Expectation::JsonCommand { assertions, .. } => {
+                    let proof = check.json_expectation.as_mut().unwrap();
+                    proof.assertions = assertions.clone();
+                    proof.observations = assertions
+                        .iter()
+                        .map(|a| match a {
+                            JsonAssertion::Equals { equals_json, .. } => O::Equals {
+                                actual: V::Scalar {
+                                    value: serde_json::from_str(equals_json).unwrap(),
+                                },
+                            },
+                            JsonAssertion::Absent { .. } => O::Absent {
+                                parent_valid: true,
+                                leaf_exists: false,
+                            },
+                            JsonAssertion::ArrayMatch { count, values, .. } => O::ArrayMatch {
+                                array_valid: true,
+                                matched_count: *count,
+                                values: values
+                                    .iter()
+                                    .map(|v| V::Scalar {
+                                        value: serde_json::from_str(&v.equals_json).unwrap(),
+                                    })
+                                    .collect(),
+                            },
+                        })
+                        .collect();
+                    assert!(
+                        proof.verified_pass(),
+                        "generic proof must remain consistent: {}",
+                        check.id
+                    );
+                }
+                Expectation::McpStdio { probe } => {
+                    check.mcp.as_mut().unwrap().probe = probe.clone();
+                    let cmd = stage
+                        .commands
+                        .iter_mut()
+                        .find(|c| Some(&c.id) == check.command_ids.first())
+                        .unwrap();
+                    cmd.argv = probe.argv.clone();
+                    assert!(check.mcp.as_ref().unwrap().verified_pass());
+                }
+                _ => panic!("unexpected mutation role"),
+            }
+        }
+        assert_eq!(
+            stage.aggregate_outcome(),
+            RunOutcome::Passed,
+            "mutations must keep local stage proof valid"
+        );
+    }
+}

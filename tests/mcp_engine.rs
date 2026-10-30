@@ -257,3 +257,85 @@ fn retained_unbound_probe_cannot_be_added_at_removed_checkpoint() {
     report.recompute_outcome();
     assert_eq!(report.outcome, RunOutcome::Incomplete);
 }
+
+#[test]
+fn retained_plugin_launch_rejects_non_source_bearing_or_escaping_code() {
+    let (run, _) = fixture::run("plugin:");
+    assert_eq!(run.report.outcome, RunOutcome::Passed);
+    let mut accepted = vec![];
+    for raw in [
+        vec!["/bin/sh", "/market/probe/server.sh"],
+        vec![
+            "/bin/sh",
+            "/fixed/server.sh",
+            "${CLAUDE_PLUGIN_ROOT}/data.json",
+        ],
+        vec!["/usr/bin/python3", "${CLAUDE_PLUGIN_ROOT}/server.py"],
+        vec!["/bin/sh", "${CLAUDE_PLUGIN_ROOT}/../server.sh"],
+        vec!["/bin/sh", "${CLAUDE_PLUGIN_ROOT}/./server.sh"],
+        vec!["/bin/sh", "${CLAUDE_PLUGIN_ROOT}//server.sh"],
+        vec!["/bin/sh", "${CLAUDE_PLUGIN_ROOT}/server.sh/"],
+        vec!["/bin/sh", "${CLAUDE_PLUGIN_ROOT}/"],
+    ] {
+        let value = fixture::plugin_launch_declaration(&raw, "/unrelated/source");
+        let mut report = run.report.clone();
+        fixture::rewrite_plugin_report(&mut report, &value);
+        report.recompute_outcome();
+        if report.outcome != RunOutcome::Incomplete {
+            accepted.push(raw);
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "retained source-independent/unnormalized launches passed: {accepted:?}"
+    );
+}
+#[test]
+fn retained_plugin_launch_accepts_direct_and_shell_source_layouts() {
+    let (run, _) = fixture::run("plugin:");
+    for raw in [
+        vec!["${CLAUDE_PLUGIN_ROOT}/bin/server"],
+        vec!["/bin/sh", "${CLAUDE_PLUGIN_ROOT}/scripts/server.sh", "mode"],
+    ] {
+        let mut report = run.report.clone();
+        fixture::rewrite_plugin_report(
+            &mut report,
+            &fixture::plugin_launch_declaration(&raw, "/different/proven/source"),
+        );
+        report.recompute_outcome();
+        assert_eq!(report.outcome, RunOutcome::Passed, "{raw:?}");
+    }
+}
+#[test]
+fn retained_plugin_selection_cannot_switch_marketplaces() {
+    let (run, _) = fixture::run("plugin:");
+    let mut report = run.report;
+    fixture::rewrite_plugin_report(&mut report, &fixture::plugin_other_market_declaration());
+    report.recompute_outcome();
+    assert_eq!(report.outcome, RunOutcome::Incomplete);
+}
+#[test]
+fn retained_disabled_registration_requires_source_bearing_launch() {
+    let (run, _) = fixture::run("plugin:");
+    let mut report = run.report;
+    let mut value = fixture::plugin_declaration();
+    let bad = fixture::plugin_launch_declaration(
+        &["/bin/sh", "/market/probe/server.sh"],
+        "/unrelated/source",
+    );
+    let bad = bad["profiles"]["user"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "plugin_disabled-registration")
+        .unwrap();
+    *value["profiles"]["user"]["checks"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|c| c["id"] == "plugin_disabled-registration")
+        .unwrap() = bad.clone();
+    fixture::rewrite_plugin_report(&mut report, &value);
+    report.recompute_outcome();
+    assert_eq!(report.outcome, RunOutcome::Incomplete);
+}

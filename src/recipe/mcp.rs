@@ -227,6 +227,22 @@ fn native_argv(a: &[JsonAssertion], root: &str) -> Result<Vec<String>> {
     }
     bail!("MCP argv exceeds finite contract bound")
 }
+fn source_bearing_launch(args: &[String]) -> Result<()> {
+    const ROOT: &str = "${CLAUDE_PLUGIN_ROOT}/";
+    const SHAPE: &str = "v1 plugin MCP code must launch ${CLAUDE_PLUGIN_ROOT}/<normalized nonempty relative code path> directly or as /bin/sh argv[1]";
+    let code = match args {
+        [command, ..] if command.starts_with(ROOT) => command,
+        [command, script, ..] if command == "/bin/sh" => script,
+        _ => bail!(SHAPE),
+    };
+    ensure!(
+        code.strip_prefix(ROOT).is_some_and(|suffix| suffix
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")),
+        SHAPE
+    );
+    Ok(())
+}
 fn array(
     a: &[JsonAssertion],
     pointer: &str,
@@ -289,6 +305,7 @@ fn registration(
     a: &[JsonAssertion],
     probe: Option<&McpProbe>,
     last: &[String],
+    plugin_id: Option<&str>,
 ) -> Result<Vec<String>> {
     let state = p.checkpoints[&cp].state;
     let removed = state == McpRegistrationState::Removed;
@@ -337,32 +354,13 @@ fn registration(
     }
     // Plugin root remains raw native array. Bind an asserted array index back to
     // the id-only cardinality check before using indexed scalar/absence fields.
-    let plugin = p
-        .client_alias
-        .strip_prefix("plugin:")
-        .and_then(|v| v.strip_suffix(&format!(":{}", p.server_id)))
-        .ok_or_else(|| anyhow::anyhow!("invalid plugin alias"))?;
-    let inventory_id = a
-        .iter()
-        .find_map(|a| match a {
-            JsonAssertion::ArrayMatch {
-                pointer, identity, ..
-            } if pointer == "/plugins" => identity.iter().find_map(|v| {
-                let id = scalar(&v.equals_json).ok()?.as_str()?.to_owned();
-                (v.pointer == "/id"
-                    && id
-                        .strip_prefix(&format!("{plugin}@"))
-                        .is_some_and(|suffix| !suffix.is_empty()))
-                .then_some(id)
-            }),
-            _ => None,
-        })
-        .ok_or_else(|| anyhow::anyhow!("plugin inventory identity must match client alias"))?;
+    let inventory_id =
+        plugin_id.ok_or_else(|| anyhow::anyhow!("plugin MCP requires exact PluginContract.id"))?;
     array(
         a,
         "/plugins",
         "/id",
-        &inventory_id,
+        inventory_id,
         if removed { 0 } else { 1 },
         &if removed {
             vec![]
@@ -407,6 +405,7 @@ fn registration(
         "unsafe plugin source"
     );
     let args = native_argv(a, &format!("{root}/mcpServers/{id}"))?;
+    source_bearing_launch(&args)?;
     let resolved = args
         .iter()
         .map(|s| s.replace("${CLAUDE_PLUGIN_ROOT}", &source))
@@ -439,7 +438,12 @@ fn preservation(p: &McpLifecycleContract, a: &[JsonAssertion]) -> Result<()> {
         require(a, "/client/hasCompletedOnboarding", true)
     }
 }
-pub(crate) fn bindings(p: &McpLifecycleContract, s: ScenarioKind, checks: &[Check]) -> Result<()> {
+pub(crate) fn bindings(
+    p: &McpLifecycleContract,
+    s: ScenarioKind,
+    checks: &[Check],
+    plugin_id: Option<&str>,
+) -> Result<()> {
     validate_contract(p, s)?;
     let cps = checkpoints(s)?;
     let first = cps[0].0;
@@ -461,7 +465,7 @@ pub(crate) fn bindings(p: &McpLifecycleContract, s: ScenarioKind, checks: &[Chec
             None
         };
         let a = json(resolve(checks, &c.registration, cp)?)?;
-        let launch = registration(p, cp, a, probe, &last)?;
+        let launch = registration(p, cp, a, probe, &last, plugin_id)?;
         if !launch.is_empty() {
             last = launch;
         }
@@ -521,7 +525,12 @@ pub(crate) fn bindings(p: &McpLifecycleContract, s: ScenarioKind, checks: &[Chec
 }
 pub fn validate_mcp_contract(profile: &Profile, scenario: ScenarioKind) -> Result<()> {
     let Some(p) = &profile.mcp else { return Ok(()) };
-    bindings(p, scenario, &profile.checks)?;
+    bindings(
+        p,
+        scenario,
+        &profile.checks,
+        profile.plugin.as_ref().map(|p| p.id.as_str()),
+    )?;
     for step in profile.steps.values() {
         ensure!(step.pass_env.is_empty(), "MCP forbids pass_env");
     }
@@ -553,21 +562,6 @@ pub fn validate_mcp_contract(profile: &Profile, scenario: ScenarioKind) -> Resul
                 && plugin.client_version == p.client_version,
             "incompatible plugin MCP contract"
         );
-        for (cp, c) in &p.checkpoints {
-            let a = json(resolve(&profile.checks, &c.registration, *cp)?)?;
-            array(
-                a,
-                "/plugins",
-                "/id",
-                &plugin.id,
-                if c.state == McpRegistrationState::Removed {
-                    0
-                } else {
-                    1
-                },
-                &[],
-            )?;
-        }
         let plugin_ids = std::iter::once(&plugin.client_check)
             .chain(plugin.checkpoints.values().flat_map(|c| {
                 std::iter::once(&c.inventory)

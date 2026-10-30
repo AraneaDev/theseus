@@ -266,3 +266,100 @@ fn plugin_alias_must_name_the_same_plugin_as_plugin_contract() {
     }
     assert!(f.validate(&v).is_err());
 }
+
+#[test]
+fn plugin_launch_requires_source_bearing_normalized_code_path() {
+    let f = fixture::Fixture::new();
+    let mut accepted = vec![];
+    for (raw, source) in [
+        (
+            vec!["/bin/sh", "/market/probe/server.sh"],
+            "/unrelated/source",
+        ),
+        (
+            vec![
+                "/bin/sh",
+                "/fixed/server.sh",
+                "${CLAUDE_PLUGIN_ROOT}/data.json",
+            ],
+            "/market/probe",
+        ),
+        (
+            vec!["/usr/bin/python3", "${CLAUDE_PLUGIN_ROOT}/server.py"],
+            "/market/probe",
+        ),
+        (
+            vec!["/bin/sh", "${CLAUDE_PLUGIN_ROOT}/../server.sh"],
+            "/market/probe",
+        ),
+        (
+            vec!["/bin/sh", "${CLAUDE_PLUGIN_ROOT}/./server.sh"],
+            "/market/probe",
+        ),
+        (
+            vec!["/bin/sh", "${CLAUDE_PLUGIN_ROOT}//server.sh"],
+            "/market/probe",
+        ),
+        (
+            vec!["/bin/sh", "${CLAUDE_PLUGIN_ROOT}/server.sh/"],
+            "/market/probe",
+        ),
+        (vec!["/bin/sh", "${CLAUDE_PLUGIN_ROOT}/"], "/market/probe"),
+    ] {
+        let value = fixture::plugin_launch_declaration(&raw, source);
+        if f.validate(&value).is_ok() {
+            accepted.push(raw);
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "accepted source-independent/unnormalized launches: {accepted:?}"
+    );
+}
+#[test]
+fn plugin_launch_accepts_direct_and_shell_code_from_proven_source() {
+    let f = fixture::Fixture::new();
+    for raw in [
+        vec!["${CLAUDE_PLUGIN_ROOT}/bin/server"],
+        vec!["/bin/sh", "${CLAUDE_PLUGIN_ROOT}/scripts/server.sh", "mode"],
+    ] {
+        assert!(
+            f.validate(&fixture::plugin_launch_declaration(
+                &raw,
+                "/different/proven/source"
+            ))
+            .is_ok(),
+            "{raw:?}"
+        );
+    }
+}
+#[test]
+fn plugin_registration_selects_exact_marketplace_identity() {
+    let f = fixture::Fixture::new();
+    assert!(
+        f.validate(&fixture::plugin_other_market_declaration())
+            .is_err()
+    );
+}
+#[test]
+fn disabled_plugin_registration_still_requires_source_bearing_launch() {
+    let f = fixture::Fixture::new();
+    let mut value = fixture::plugin_declaration();
+    let bad = fixture::plugin_launch_declaration(
+        &["/bin/sh", "/market/probe/server.sh"],
+        "/unrelated/source",
+    );
+    let bad = bad["profiles"]["user"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "plugin_disabled-registration")
+        .unwrap();
+    *value["profiles"]["user"]["checks"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|c| c["id"] == "plugin_disabled-registration")
+        .unwrap() = bad.clone();
+    assert!(f.validate(&value).is_err());
+}
