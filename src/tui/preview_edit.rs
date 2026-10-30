@@ -204,9 +204,9 @@ fn save(app: &mut App) {
             );
             app.edit_session = None;
         }
-        Err(error) => session
-            .editor
-            .set_diagnostic(&format!("Save Copy failed: {error:#}")),
+        Err(error) => session.editor.set_diagnostic(&format!(
+            "Save Copy failed: {name} adjacent to accepted source: {error:#}"
+        )),
     }
     app.start_requested = false;
 }

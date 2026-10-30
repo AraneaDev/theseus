@@ -938,6 +938,28 @@ mod comparison_tests {
         assert!(screen(&app).contains("UNSAVED"));
     }
     #[test]
+    fn failed_save_copy_names_attempted_leaf_even_under_long_source_path() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("a".repeat(140)).join("b".repeat(140));
+        std::fs::create_dir_all(&root).unwrap();
+        fixtures::recipe_suite(&root);
+        let recipe = crate::recipe::load(&root.join("copy.toml")).unwrap();
+        let mut app = App::preview(recipe.clone(), engine::RunOptions::all(&recipe));
+        std::fs::write(root.join("copy.edited.toml"), b"existing").unwrap();
+        input(&mut app, KeyCode::Char('e').into());
+        input(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        );
+        input(&mut app, KeyCode::Enter.into());
+        assert!(screen(&app).contains("Save Copy failed: copy.edited.toml"));
+        assert_eq!(app.recipe.as_ref().unwrap().path, recipe.path);
+        assert_eq!(
+            std::fs::read(root.join("copy.edited.toml")).unwrap(),
+            b"existing"
+        );
+    }
+    #[test]
     fn dirty_preview_labels_accepted_document_and_offline_preview_cannot_edit() {
         let t = tempfile::tempdir().unwrap();
         fixtures::recipe_suite(t.path());
