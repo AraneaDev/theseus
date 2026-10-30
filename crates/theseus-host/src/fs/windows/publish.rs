@@ -236,4 +236,149 @@ mod probes {
     fn win32_absolute_rename_working_control() -> io::Result<()> {
         rename_with_documented_buffer(false)
     }
+    #[test]
+    fn native_retained_root_rename_control() -> io::Result<()> {
+        use windows_sys::{
+            Wdk::Storage::FileSystem::{
+                FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
+            },
+            Win32::{
+                Foundation::{RtlNtStatusToDosError, STATUS_PENDING},
+                System::IO::IO_STATUS_BLOCK,
+            },
+        };
+        // Retain all storage and the private directory itself if the unexpected
+        // pending branch cannot establish completion. No destructor may race it.
+        struct NativeCall {
+            status: IO_STATUS_BLOCK,
+            buffer: RenameBuffer,
+            root: HostDir,
+            source: File,
+            _temporary: tempfile::TempDir,
+        }
+        let temp = tempfile::tempdir()?;
+        let root = HostDir::create_private(&temp.path().join("probe"))?;
+        let mut source = root.create_file(&RelativePath::parse("source")?)?;
+        source.write_all(b"completed native probe bytes")?;
+        flush_file(&source)?;
+        let before: FILE_ID_INFO = super::super::identity::query(&source, FileIdInfo)?;
+        let units: Vec<u16> = OsStr::new("target").encode_wide().collect();
+        let payload = units
+            .len()
+            .checked_mul(2)
+            .ok_or_else(|| io::Error::other("probe size overflow"))?;
+        let capacity = size_of::<FILE_RENAME_INFORMATION>()
+            .checked_add(payload)
+            .and_then(|n| n.checked_add(2))
+            .ok_or_else(|| io::Error::other("probe size overflow"))?;
+        let layout = Layout::from_size_align(capacity, align_of::<FILE_RENAME_INFORMATION>())
+            .map_err(io::Error::other)?;
+        let length = u32::try_from(capacity).map_err(io::Error::other)?;
+        let payload_length = u32::try_from(payload).map_err(io::Error::other)?;
+        let buffer = RenameBuffer {
+            pointer: NonNull::new(unsafe { alloc_zeroed(layout) })
+                .ok_or_else(|| io::Error::other("probe allocation failed"))?,
+            layout,
+            length,
+        };
+        let mut call = Box::new(NativeCall {
+            status: unsafe { std::mem::zeroed() },
+            buffer,
+            root,
+            source,
+            _temporary: temp,
+        });
+        // SAFETY: the whole operation owner is boxed before pointers are given to
+        // NT. Its aligned allocation contains the native record and complete tail.
+        unsafe {
+            let record = call
+                .buffer
+                .pointer
+                .as_ptr()
+                .cast::<FILE_RENAME_INFORMATION>();
+            (*record).Anonymous.ReplaceIfExists = true;
+            (*record).RootDirectory = call.root.directory.as_raw_handle();
+            (*record).FileNameLength = payload_length;
+            std::ptr::copy_nonoverlapping(
+                units.as_ptr(),
+                call.buffer
+                    .pointer
+                    .as_ptr()
+                    .add(offset_of!(FILE_RENAME_INFORMATION, FileName))
+                    .cast::<u16>(),
+                units.len(),
+            );
+        }
+        let status = unsafe {
+            NtSetInformationFile(
+                call.source.as_raw_handle(),
+                &mut call.status,
+                call.buffer.pointer.as_ptr().cast(),
+                call.buffer.length,
+                FileRenameInformation,
+            )
+        };
+        // Do not read storage potentially still being written after STATUS_PENDING.
+        // The selected synchronous handle contract supplies terminal return status;
+        // there is no speculative wait or cancellation protocol in this probe.
+        let completed_status = if status == STATUS_PENDING {
+            None
+        } else {
+            Some(unsafe { call.status.Anonymous.Status })
+        };
+        let unresolved = status == STATUS_PENDING || completed_status == Some(STATUS_PENDING);
+        let observation = format!(
+            "case=native-retained-root\nrecord_size={}\nrecord_alignment={}\nfilename_offset={}\nfilename_bytes={}\nbuffer_bytes={}\nclass={}\nroot_nonnull=true\nntstatus={:#010x}\ncompleted_iosb_status={:?}\npublication_state={}\n",
+            size_of::<FILE_RENAME_INFORMATION>(),
+            align_of::<FILE_RENAME_INFORMATION>(),
+            offset_of!(FILE_RENAME_INFORMATION, FileName),
+            payload,
+            capacity,
+            FileRenameInformation,
+            status as u32,
+            completed_status,
+            if unresolved {
+                "UNKNOWN; entire operation and fixture retained"
+            } else {
+                "terminal status observed"
+            }
+        );
+        let record_observation = || -> io::Result<()> {
+            eprintln!("{observation}");
+            if let Some(evidence) = std::env::var_os("THESEUS_HOST_EVIDENCE") {
+                std::fs::write(
+                    std::path::Path::new(&evidence).join("native-rename-probe-root.txt"),
+                    &observation,
+                )?;
+            }
+            Ok(())
+        };
+        if unresolved {
+            std::mem::forget(call);
+            let evidence_error = record_observation().err();
+            return Err(io::Error::other(format!(
+                "UNKNOWN publication state: native probe operation and private fixture retained until process exit; evidence error: {evidence_error:?}"
+            )));
+        }
+        record_observation()?;
+        if status < 0 {
+            return Err(io::Error::from_raw_os_error(
+                unsafe { RtlNtStatusToDosError(status) } as i32,
+            ));
+        }
+        if let Some(status) = completed_status.filter(|s| *s < 0) {
+            return Err(io::Error::from_raw_os_error(
+                unsafe { RtlNtStatusToDosError(status) } as i32,
+            ));
+        }
+        let mut target = call.root.open_file(&RelativePath::parse("target")?)?;
+        let mut bytes = Vec::new();
+        target.read_to_end(&mut bytes)?;
+        assert_eq!(bytes, b"completed native probe bytes");
+        assert_eq!(call.root.entries()?, vec!["target"]);
+        let after: FILE_ID_INFO = super::super::identity::query(&target, FileIdInfo)?;
+        assert_eq!(before.VolumeSerialNumber, after.VolumeSerialNumber);
+        assert_eq!(before.FileId.Identifier, after.FileId.Identifier);
+        Ok(())
+    }
 }
