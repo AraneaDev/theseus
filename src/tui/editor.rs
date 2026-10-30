@@ -1,7 +1,7 @@
 use crate::preview::MAX_DRAFT_BYTES;
 use anyhow::{Result, ensure};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::{Frame, layout::Rect, style::Style, text::Line};
+use ratatui::{Frame, layout::Rect, style::Style, text::Span};
 use std::cell::{Cell, RefCell};
 
 #[cfg(test)]
@@ -43,7 +43,7 @@ struct Viewport {
     frame_height: u16,
     line_index: usize,
     column: usize,
-    elided_marks: bool,
+    elided_display: bool,
     rows: Vec<String>,
     cursor: Option<(usize, usize)>,
 }
@@ -248,10 +248,10 @@ impl Editor {
             draw_row(frame, area.x, area.y + 1, width, &source_row);
         }
         if area.height > 3 {
-            if view.elided_marks && self.diagnostic.is_empty() {
-                draw_row(frame, area.x, area.y + 2, width, "Marks elided");
-            } else if view.elided_marks {
-                let message = format!("Marks elided | {}", self.diagnostic);
+            if view.elided_display && self.diagnostic.is_empty() {
+                draw_row(frame, area.x, area.y + 2, width, "Display elided");
+            } else if view.elided_display {
+                let message = format!("Display elided | {}", self.diagnostic);
                 draw_row(frame, area.x, area.y + 2, width, &message);
             } else {
                 draw_row(frame, area.x, area.y + 2, width, &self.diagnostic);
@@ -292,7 +292,7 @@ impl Editor {
             frame_height,
             line_index,
             column,
-            elided_marks: false,
+            elided_display: false,
             rows: Vec::new(),
             cursor: None,
         };
@@ -309,7 +309,7 @@ impl Editor {
         };
         self.top_line.set(top);
         let current = &self.text[self.line_start()..self.line_end()];
-        let cursor_cell = cell_width(&current[..self.cursor - self.line_start()]);
+        let cursor_cell = cursor_cell(current, self.cursor - self.line_start());
         let left = self.left_cell.get();
         let left = if cursor_cell < left {
             cursor_cell
@@ -321,7 +321,7 @@ impl Editor {
         self.left_cell.set(left);
         for line in self.text.split('\n').skip(top).take(body_height) {
             let (row, elided) = visible_line(line, left, width);
-            view.elided_marks |= elided;
+            view.elided_display |= elided;
             view.rows.push(row);
         }
         if cursor_cell >= left && cursor_cell - left < width {
@@ -354,92 +354,96 @@ fn bounded_safe(text: &str, max_bytes: usize) -> String {
     result
 }
 
-fn scalar_width(s: &str) -> usize {
-    Line::raw(s).width()
+/// Width of a complete source grapheme after display-only tab/control handling.
+fn grapheme_width(symbol: &str) -> usize {
+    match symbol {
+        "\t" => 4,
+        _ if symbol.chars().any(char::is_control) => 1,
+        _ => Span::raw(symbol).width(),
+    }
 }
 
-fn cell_width(line: &str) -> usize {
+fn cursor_cell(line: &str, cursor: usize) -> usize {
+    let span = Span::raw(line);
+    let mut bytes = 0;
     let mut cells = 0;
-    for (at, c) in line.char_indices() {
-        source_visit(c.len_utf8());
-        cells += if c == '\t' {
-            4
-        } else if c.is_control() {
-            1
-        } else {
-            scalar_width(&line[at..at + c.len_utf8()])
-        };
+    for grapheme in span.styled_graphemes(Style::default()) {
+        if bytes >= cursor {
+            break;
+        }
+        source_visit(grapheme.symbol.len());
+        bytes += grapheme.symbol.len();
+        // A scalar position inside a cluster shares its trailing display edge.
+        cells += grapheme_width(grapheme.symbol);
     }
     cells
 }
 
 fn visible_line(line: &str, left: usize, width: usize) -> (String, bool) {
-    let mut projected = String::with_capacity(width.saturating_mul(4));
+    // Fixed row allowance keeps ordinary multi-person ZWJ emoji intact even
+    // in a two-cell viewport. It cannot grow with source or cluster length.
+    let max_bytes = width.saturating_mul(8).saturating_add(64);
+    let mut projected = String::with_capacity(max_bytes);
+    let mut separated = false;
     let mut cell = 0;
     let mut written = 0;
-    let mut decoration_bytes = 0;
-    let mut elided_marks = false;
-    // Keep at most two display bytes of zero-cell marks per terminal cell.
-    // Positive-width scalars retain a separate budget and their true positions.
-    let decoration_budget = width.saturating_mul(2);
-    let max_bytes = width.saturating_mul(8).max(8);
+    let mut elided_display = false;
     let right = left.saturating_add(width);
-    for (at, c) in line.char_indices() {
-        source_visit(c.len_utf8());
-        let cells = if c == '\t' {
-            4
-        } else if c.is_control() {
-            1
-        } else {
-            scalar_width(&line[at..at + c.len_utf8()])
-        };
+    let span = Span::raw(line);
+    for grapheme in span.styled_graphemes(Style::default()) {
+        let symbol = grapheme.symbol;
+        source_visit(symbol.len());
+        let cells = grapheme_width(symbol);
         if cells == 0 {
+            // Standalone zero-cell clusters cannot occupy a terminal cell.
             if cell >= left && cell <= right {
-                if written == 0 || decoration_bytes + c.len_utf8() > decoration_budget {
-                    elided_marks = true;
-                } else {
-                    projected.push(c);
-                    decoration_bytes += c.len_utf8();
-                }
+                elided_display = true;
+                separated = written > 0;
             }
             continue;
         }
-        if cell >= right && cells > 0 {
+        if cell >= right {
             break;
         }
-        if c == '\t' {
-            for offset in 0..4 {
-                let at_cell = cell + offset;
-                if at_cell >= left && at_cell < right {
-                    while written < at_cell - left {
-                        projected.push(' ');
-                        written += 1;
-                    }
-                    projected.push(' ');
-                    written += 1;
-                }
+        let end = cell.saturating_add(cells);
+        if end > left {
+            if separated {
+                // Retain a zero-cell boundary when eliding standalone marks;
+                // otherwise adjacent emoji could become a new joined cluster.
+                projected.push('\u{200b}');
+                separated = false;
             }
-        } else if cell >= left && cell.saturating_add(cells) <= right {
-            while written < cell - left {
+            let start = cell.max(left) - left;
+            while written < start {
                 projected.push(' ');
                 written += 1;
             }
-            let c = safe(c);
-            if projected.len() + c.len_utf8() > max_bytes {
-                break;
+            let until = end.min(right) - left;
+            if cell >= left && end <= right && symbol != "\t" {
+                let display = if symbol.chars().any(char::is_control) {
+                    "�"
+                } else {
+                    symbol
+                };
+                // Reserve a blank plus a possible three-byte zero-cell boundary
+                // per remaining cell, so later printable tails always fit.
+                if projected.len() + display.len() + 4 * (width - until) <= max_bytes {
+                    projected.push_str(display);
+                    written = until;
+                } else {
+                    elided_display = true;
+                }
             }
-            projected.push(c);
-            written += cells;
-        } else if cells > 0 && cell < right && cell + cells > left {
-            let until = cell.saturating_add(cells).min(right) - left;
+            // Tabs, clipped clusters and elided clusters retain their full
+            // visible cell footprint without emitting a partial grapheme.
             while written < until {
                 projected.push(' ');
                 written += 1;
             }
         }
-        cell += cells;
+        cell = end;
     }
-    (projected, elided_marks)
+    (projected, elided_display)
 }
 
 #[cfg(test)]
@@ -621,6 +625,115 @@ mod tests {
     }
 
     #[test]
+    fn grapheme_end_carets_match_rendered_emoji_and_printable_tail() {
+        for glyph in ["👩‍💻", "👨‍👩‍👧‍👦", "👍🏽", "🇳🇱", "1\u{fe0f}\u{20e3}", "❤\u{fe0f}"]
+        {
+            let raw = format!("{glyph}x");
+            let editor = Editor::new(raw.clone()).unwrap();
+            let (_, mut backend) = screen(&editor, 30, 8);
+            assert_eq!(backend.buffer()[(0, 3)].symbol(), glyph);
+            assert_eq!(backend.buffer()[(2, 3)].symbol(), "x");
+            backend.assert_cursor_position((3, 3));
+            assert_eq!(editor.text(), raw);
+        }
+    }
+
+    #[test]
+    fn grapheme_interior_scalar_carets_use_trailing_edge_and_raw_column() {
+        for glyph in ["👩‍💻", "👨‍👩‍👧‍👦", "👍🏽", "🇳🇱", "1\u{fe0f}\u{20e3}", "❤\u{fe0f}"]
+        {
+            let mut editor = Editor::new(format!("{glyph}x")).unwrap();
+            editor.key(ctrl(KeyCode::Home));
+            let (_, mut backend) = screen(&editor, 40, 8);
+            backend.assert_cursor_position((0, 3));
+            for (index, (at, c)) in glyph.char_indices().enumerate() {
+                editor.key(key(KeyCode::Right));
+                let (text, mut backend) = screen(&editor, 40, 8);
+                assert_eq!(editor.cursor(), at + c.len_utf8());
+                assert!(text.contains(&format!("Ln 1 Col {}", index + 2)));
+                assert_eq!(backend.buffer()[(0, 3)].symbol(), glyph);
+                assert_eq!(backend.buffer()[(2, 3)].symbol(), "x");
+                backend.assert_cursor_position((2, 3));
+            }
+        }
+    }
+
+    #[test]
+    fn grapheme_horizontal_windows_clip_whole_clusters_and_keep_tail_aligned() {
+        for glyph in ["👩‍💻", "👨‍👩‍👧‍👦", "👍🏽", "🇳🇱", "1\u{fe0f}\u{20e3}", "❤\u{fe0f}"]
+        {
+            let mut editor = Editor::new(format!("{glyph}x")).unwrap();
+            let (_, mut backend) = screen(&editor, 3, 8);
+            assert_eq!(backend.buffer()[(0, 3)].symbol(), " ");
+            assert_eq!(backend.buffer()[(1, 3)].symbol(), "x");
+            backend.assert_cursor_position((2, 3));
+            editor.key(ctrl(KeyCode::Home));
+            let (_, mut backend) = screen(&editor, 2, 8);
+            assert_eq!(backend.buffer()[(0, 3)].symbol(), glyph);
+            backend.assert_cursor_position((0, 3));
+            editor.key(key(KeyCode::Right));
+            let (_, mut backend) = screen(&editor, 2, 8);
+            assert_eq!(backend.buffer()[(0, 3)].symbol(), " ");
+            assert_eq!(backend.buffer()[(1, 3)].symbol(), "x");
+            backend.assert_cursor_position((1, 3));
+            editor.key(ctrl(KeyCode::Home));
+            let (_, mut backend) = screen(&editor, 1, 8);
+            assert_eq!(backend.buffer()[(0, 3)].symbol(), " ");
+            backend.assert_cursor_position((0, 3));
+        }
+    }
+
+    #[test]
+    fn grapheme_zero_cell_separator_does_not_join_neighboring_emoji() {
+        let editor = Editor::new("👍\u{200b}🏽x".into()).unwrap();
+        let (_, mut backend) = screen(&editor, 30, 8);
+        assert_eq!(backend.buffer()[(0, 3)].symbol(), "👍");
+        assert_eq!(backend.buffer()[(2, 3)].symbol(), "🏽");
+        assert_eq!(backend.buffer()[(4, 3)].symbol(), "x");
+        backend.assert_cursor_position((5, 3));
+    }
+
+    #[test]
+    fn grapheme_pathological_cluster_keeps_footprint_tail_and_bounded_allocation() {
+        let raw = format!("👩{}x", "\u{200d}💻".repeat((MAX_DRAFT_BYTES - 5) / 7));
+        let editor = Editor::new(raw.clone()).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        LARGEST_ALLOCATION.with(|largest| largest.set(0));
+        TRACK_ALLOCATIONS.with(|active| active.set(true));
+        terminal
+            .draw(|frame| editor.draw(frame, Rect::new(0, 0, 40, 8), "source.toml", true))
+            .unwrap();
+        TRACK_ALLOCATIONS.with(|active| active.set(false));
+        assert!(LARGEST_ALLOCATION.with(Cell::get) < 64 * 1024);
+        assert_eq!(terminal.backend().buffer()[(0, 3)].symbol(), " ");
+        assert_eq!(terminal.backend().buffer()[(1, 3)].symbol(), " ");
+        assert_eq!(terminal.backend().buffer()[(2, 3)].symbol(), "x");
+        terminal.backend_mut().assert_cursor_position((3, 3));
+        assert_eq!(editor.text(), raw);
+        assert!(screen(&editor, 40, 8).0.contains("Display elided"));
+        SOURCE_VISITS.with(|visits| visits.set(0));
+        for _ in 0..3 {
+            terminal
+                .draw(|frame| editor.draw(frame, Rect::new(0, 0, 40, 8), "source.toml", true))
+                .unwrap();
+        }
+        assert_eq!(SOURCE_VISITS.with(Cell::get), 0);
+    }
+
+    #[test]
+    fn grapheme_scalar_deletion_keeps_raw_joiners_and_modifiers_editable() {
+        let mut editor = Editor::new("👩‍💻👍🏽".into()).unwrap();
+        editor.key(key(KeyCode::Backspace));
+        assert_eq!(editor.text(), "👩‍💻👍");
+        editor.key(ctrl(KeyCode::Home));
+        editor.key(key(KeyCode::Right));
+        editor.key(key(KeyCode::Delete));
+        assert_eq!(editor.text(), "👩💻👍");
+        let (_, mut backend) = screen(&editor, 30, 8);
+        backend.assert_cursor_position((2, 3));
+    }
+
+    #[test]
     fn repeated_large_source_draws_never_allocate_a_full_copy() {
         let editor = Editor::new(format!("HEAD{}TAIL", "x".repeat(MAX_DRAFT_BYTES - 8))).unwrap();
         let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
@@ -719,7 +832,7 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(first.contains("Marks elided"));
+        assert!(first.contains("Display elided"));
         assert!(first.contains('Z'));
         terminal.backend_mut().assert_cursor_position((2, 3));
         assert_eq!(editor.text(), raw);
@@ -741,7 +854,7 @@ mod tests {
         let raw = format!("{}Z", "\u{301}".repeat((MAX_DRAFT_BYTES - 1) / 2));
         let editor = Editor::new(raw.clone()).unwrap();
         let (text, mut backend) = screen(&editor, 40, 8);
-        assert!(text.contains("Marks elided"));
+        assert!(text.contains("Display elided"));
         assert!(text.contains('Z'));
         backend.assert_cursor_position((1, 3));
         assert_eq!(editor.text(), raw);

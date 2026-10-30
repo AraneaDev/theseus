@@ -141,6 +141,8 @@ class Session:
         assert termios.tcgetattr(self.slave) == self.before, 'termios not restored'
         assert b'\x1b[?1049h' in self.raw and b'\x1b[?1049l' in self.raw, 'alternate screen not restored'
         assert b'\x1b[?2004h' in self.raw and b'\x1b[?2004l' in self.raw, 'bracketed paste not restored'
+        assert self.raw.rfind(b'\x1b[?1049l') > self.raw.rfind(b'\x1b[?1049h'), 'alternate screen re-entered after leave'
+        assert self.raw.rfind(b'\x1b[?2004l') > self.raw.rfind(b'\x1b[?2004h'), 'bracketed paste re-enabled after disable'
         assert not self.sentinel.exists(), 'preview invoked Docker'
 
     def close(self):

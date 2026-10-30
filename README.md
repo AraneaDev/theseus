@@ -157,9 +157,10 @@ keeps the draft. Ctrl-C and SIGINT/SIGTERM exit immediately without saving.
 
 The editor accepts at most 1 MiB of UTF-8 source and rejects an oversized
 insertion or paste as one operation. This limit applies to editing, not existing
-recipe loading. A pathological sequence of combining marks may be abbreviated
-on screen; the raw draft and saved bytes remain exact. Save Copy validates the
-whole draft and creates only a new file adjacent to the accepted source in its
+recipe loading. Pathological combining or joined-glyph sequences may be replaced
+by spaces of the same display width, with a `Display elided` notice; the raw draft
+and saved bytes remain exact. Save Copy validates the whole draft and creates
+only a new file adjacent to the accepted source in its
 canonical directory, so relative artifact and variant paths keep their meaning.
 The basename must be 1–128 ASCII bytes using letters, digits, `.`, `_` or `-`
 and end in `.toml`. Existing files and symlinks are never overwritten. A failed
