@@ -404,7 +404,7 @@ pub(in crate::fs) fn entries(directory: &File) -> io::Result<Vec<OsString>> {
                 .and_then(|n| n.checked_add(length))
                 .filter(|n| *n <= capacity)
                 .ok_or_else(|| io::Error::other("directory name exceeds buffer"))?;
-            if length % 2 != 0 {
+            if !length.is_multiple_of(2) {
                 return Err(io::Error::other("invalid UTF-16 name length"));
             }
             let mut name = Vec::with_capacity(length / 2);
