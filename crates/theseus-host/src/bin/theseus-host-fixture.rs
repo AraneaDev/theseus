@@ -45,6 +45,10 @@ use std::time::Duration;
 
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
 
+// The main fixture thread retains typed spawn failures and their cleanup owners.
+// io::Error's Send+Sync payload bound is unnecessary for this private boundary.
+type FixtureResult = Result<(), Box<dyn std::error::Error>>;
+
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
@@ -149,7 +153,7 @@ fn descendant_marker(ready: &OsStr, late: &OsStr) -> io::Result<()> {
     Ok(())
 }
 
-fn nested_launch(path: &OsStr) -> io::Result<()> {
+fn nested_launch(path: &OsStr) -> FixtureResult {
     use theseus_host::process::{ChildEnvironment, NativeCommand, OwnedChild};
     let command = NativeCommand {
         program: env::current_exe()?.into(),
@@ -157,26 +161,25 @@ fn nested_launch(path: &OsStr) -> io::Result<()> {
         cwd: None,
         environment: ChildEnvironment::Inherit,
     };
-    let mut child =
-        OwnedChild::spawn_files(&command, None, None, None).map_err(io::Error::other)?;
+    let mut child = OwnedChild::spawn_files(&command, None, None, None)?;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !child.exited_reserved()? {
         if std::time::Instant::now() >= deadline {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "nested fixture"));
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "nested fixture").into());
         }
         std::thread::sleep(Duration::from_millis(2));
     }
     if child.reap_and_release()?.success() {
         Ok(())
     } else {
-        Err(io::Error::other("nested launch failed"))
+        Err(io::Error::other("nested launch failed").into())
     }
 }
 
 // Exiting the owning process bypasses Rust Drop. Its non-inherited job handle is
 // closed by the kernel, independently proving KILL_ON_JOB_CLOSE for the child.
 #[cfg(windows)]
-fn close_job_owner(ready: &OsStr, late: &OsStr) -> io::Result<()> {
+fn close_job_owner(ready: &OsStr, late: &OsStr) -> FixtureResult {
     use theseus_host::process::{ChildEnvironment, NativeCommand, OwnedChild};
     let command = NativeCommand {
         program: env::current_exe()?.into(),
@@ -184,14 +187,11 @@ fn close_job_owner(ready: &OsStr, late: &OsStr) -> io::Result<()> {
         cwd: None,
         environment: ChildEnvironment::Inherit,
     };
-    let _child = OwnedChild::spawn_files(&command, None, None, None).map_err(io::Error::other)?;
+    let _child = OwnedChild::spawn_files(&command, None, None, None)?;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !std::path::Path::new(ready).exists() {
         if std::time::Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "nested ready marker",
-            ));
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "nested ready marker").into());
         }
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -235,17 +235,17 @@ fn read_until_eof(maximum: u64) -> io::Result<()> {
     io::stdout().lock().write_all(&bytes)
 }
 
-fn run(args: &[OsString]) -> io::Result<()> {
+fn run(args: &[OsString]) -> FixtureResult {
     let (mode, args) = args
         .split_first()
         .ok_or_else(|| invalid("missing command"))?;
     match (mode.to_str(), args) {
         (Some("launch-marker"), [path]) => marker(path),
-        (Some("nested-launch"), [path]) => nested_launch(path),
+        (Some("nested-launch"), [path]) => return nested_launch(path),
         (Some("delayed-marker"), [ready, late]) => delayed_marker(ready, late),
         (Some("descendant-marker"), [ready, late]) => descendant_marker(ready, late),
         #[cfg(windows)]
-        (Some("close-job-owner"), [ready, late]) => close_job_owner(ready, late),
+        (Some("close-job-owner"), [ready, late]) => return close_job_owner(ready, late),
         #[cfg(windows)]
         (Some("probe-handle"), [value, forbidden]) => probe_handle(value, forbidden),
         (Some("publication-interruption"), [root, gate]) => publication_interruption(root, gate),
@@ -264,7 +264,7 @@ fn run(args: &[OsString]) -> io::Result<()> {
                     .iter()
                     .any(|b| matches!(b, b'=' | 0))
             {
-                return Err(invalid("invalid environment name"));
+                return Err(invalid("invalid environment name").into());
             }
             let value = env::var_os(name).ok_or_else(|| invalid("named variable is absent"))?;
             record(&mut io::stdout().lock(), &value)
@@ -274,7 +274,7 @@ fn run(args: &[OsString]) -> io::Result<()> {
                 .to_str()
                 .ok_or_else(|| invalid("expected hexadecimal bytes"))?;
             if hex.len() % 2 != 0 || hex.len() as u64 / 2 > MAX_BYTES {
-                return Err(invalid("invalid hexadecimal byte count"));
+                return Err(invalid("invalid hexadecimal byte count").into());
             }
             let bytes = hex
                 .as_bytes()
@@ -327,12 +327,16 @@ fn run(args: &[OsString]) -> io::Result<()> {
             writeln!(io::stderr().lock(), "stdin EOF received")
         }
         _ => Err(invalid("unknown command or wrong argument count")),
-    }
+    }?;
+    Ok(())
 }
 
 fn main() {
     if let Err(error) = run(&env::args_os().skip(1).collect::<Vec<_>>()) {
         eprintln!("theseus-host-fixture: {error}");
+        // Ordinary failure runs retained cleanup destructors before process exit.
+        // close-job-owner's intentional successful exit remains a separate proof.
+        drop(error);
         std::process::exit(2);
     }
 }
