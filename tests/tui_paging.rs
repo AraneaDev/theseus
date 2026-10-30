@@ -266,6 +266,166 @@ fn comparison_cell_heading_keeps_each_context_field_visible_with_a_long_variant(
         assert!(text.contains(field), "heading omitted {field}");
     }
 }
+fn narrow_selected_heading(app: &App, height: u16) -> (String, String) {
+    let width = 40;
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal.draw(|frame| render(frame, app)).unwrap();
+    let lines = terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks(width as usize)
+        .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+        .collect::<Vec<_>>();
+    let first = lines
+        .iter()
+        .position(|line| line.contains("Selected cell"))
+        .unwrap();
+    let last = lines[first + 1..]
+        .iter()
+        .position(|line| line.starts_with('└'))
+        .unwrap()
+        + first
+        + 1;
+    (lines[first + 1..last].join("\n"), lines.join("\n"))
+}
+#[test]
+fn narrow_comparison_heading_identifies_selected_difference_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = comparison::saved(temp.path());
+    let mut doc = theseus::comparison::load_document(&root).unwrap();
+    let cell = &mut doc.report.cells[0];
+    cell.comparison.status = theseus::comparison::ComparisonStatus::Different;
+    cell.comparison
+        .differences
+        .push(theseus::snapshot::FileChange {
+            path: "bin/tool".into(),
+            kind: theseus::snapshot::ChangeKind::Added,
+            before: None,
+            after: None,
+        });
+    let mut app = App::comparison_offline(doc, root);
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::End);
+    let (heading, screen) = narrow_selected_heading(&app, 30);
+    for field in [
+        "Variant: archive",
+        "Profile: user",
+        "Scenario: clean",
+        "Stage: configured",
+        "Scope: app",
+        "Path: /app",
+        "Different",
+    ] {
+        assert!(
+            heading.contains(field),
+            "heading omitted {field}: {heading}"
+        );
+    }
+    assert!(
+        screen.contains("bin/tool"),
+        "difference pane hidden: {screen}"
+    );
+}
+#[test]
+fn narrow_comparison_heading_keeps_long_valid_labels_separately_visible() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = comparison::saved(temp.path());
+    let mut doc = theseus::comparison::load_document(&root).unwrap();
+    let variant = format!("VARIANT_{}", "x".repeat(56));
+    let stage = format!("STAGE_{}", "y".repeat(110));
+    let scope = format!("SCOPE_{}", "z".repeat(57));
+    let path = format!("/app/{}", "p".repeat(120));
+    doc.manifest.variants[1].id = variant.clone();
+    doc.manifest.stages[0] = stage.clone();
+    doc.manifest.scopes[0].id = scope.clone();
+    doc.manifest.scopes[0].path = path;
+    doc.manifest.scenarios[0] = ScenarioKind::InterruptedRollback;
+    let cell = &mut doc.report.cells[0];
+    cell.variant_id = variant;
+    cell.scenario = ScenarioKind::InterruptedRollback;
+    cell.stage = stage;
+    cell.scope_id = scope;
+    cell.comparison.status = theseus::comparison::ComparisonStatus::Different;
+    cell.comparison
+        .differences
+        .push(theseus::snapshot::FileChange {
+            path: "tail-difference".into(),
+            kind: theseus::snapshot::ChangeKind::Added,
+            before: None,
+            after: None,
+        });
+    let mut app = App::comparison_offline(doc, root);
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::End);
+    let (heading, screen) = narrow_selected_heading(&app, 30);
+    for field in [
+        "Variant: VARIANT_",
+        "Profile: user",
+        "Scenario: interrupted_rollback",
+        "Stage: STAGE_",
+        "Scope: SCOPE_",
+        "Path: /app/",
+        "Different",
+    ] {
+        assert!(
+            heading.contains(field),
+            "heading omitted {field}: {heading}"
+        );
+    }
+    assert!(
+        heading.contains('…'),
+        "long context was not visibly elided: {heading}"
+    );
+    assert!(
+        screen.contains("tail-difference"),
+        "difference pane hidden: {screen}"
+    );
+}
+#[test]
+fn tiny_comparison_uses_compact_context_and_keeps_cell_detail_accessible() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = comparison::saved(temp.path());
+    let mut doc = theseus::comparison::load_document(&root).unwrap();
+    let cell = &mut doc.report.cells[0];
+    cell.comparison.status = theseus::comparison::ComparisonStatus::Different;
+    cell.comparison
+        .differences
+        .push(theseus::snapshot::FileChange {
+            path: "bin/tool".into(),
+            kind: theseus::snapshot::ChangeKind::Added,
+            before: None,
+            after: None,
+        });
+    let mut app = App::comparison_offline(doc, root);
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::End);
+    let (heading, screen) = narrow_selected_heading(&app, 18);
+    for field in [
+        "V:archive",
+        "P:user",
+        "C:clean",
+        "T:configured",
+        "S:app",
+        "Different",
+    ] {
+        assert!(
+            heading.contains(field),
+            "compact heading omitted {field}: {heading}"
+        );
+    }
+    assert!(screen.contains("full in Cell detail"));
+    assert!(
+        screen.contains("bin/tool"),
+        "difference detail hidden: {screen}"
+    );
+    key(&mut app, KeyCode::Home);
+    let (_, screen) = narrow_selected_heading(&app, 18);
+    assert!(
+        screen.contains("archive vs copy"),
+        "Cell detail hidden: {screen}"
+    );
+}
 #[test]
 fn width_and_context_reset_local_scroll_and_filter_commit_resets_chunks() {
     let mut report = browsing::metadata_report(1, 0);

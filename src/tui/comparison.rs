@@ -144,6 +144,13 @@ fn bounded(text: &str) -> String {
 fn panel(title: &str) -> Block<'_> {
     Block::default().title(title).borders(Borders::ALL)
 }
+fn heading_field(label: &str, value: &str, width: usize, limit: usize) -> String {
+    let available = width.saturating_sub(label.len());
+    let value = super::render::projection(value, available.min(limit).max(4));
+    // A saved stage can contain a newline. Keep each projected field on its
+    // reserved row, with the complete original still available in Cell detail.
+    format!("{label}{}", value.replace(['\n', '\t'], " "))
+}
 pub(super) fn render(frame: &mut Frame, app: &App) {
     let view = app.comparison.as_ref().unwrap();
     let m = &view.manifest;
@@ -175,7 +182,11 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
     if let Some(report) = &view.report {
         let narrow = frame.area().width < 100;
         let parts = if narrow {
-            Layout::vertical([Constraint::Length(6), Constraint::Min(1)]).split(layout[1])
+            // At minimum terminal height, give the selected Cell detail room
+            // even though the cell selector itself cannot fit on screen.
+            let selector_height = if layout[1].height < 18 { 0 } else { 6 };
+            Layout::vertical([Constraint::Length(selector_height), Constraint::Min(1)])
+                .split(layout[1])
         } else {
             Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
                 .split(layout[1])
@@ -210,7 +221,8 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
             parts[0],
             &mut state,
         );
-        let detail = Layout::vertical([Constraint::Length(4), Constraint::Min(1)]).split(parts[1]);
+        let heading_width = parts[1].width.saturating_sub(2) as usize;
+        let compact = parts[1].height < 16;
         let heading = report
             .cells
             .get(view.row)
@@ -220,23 +232,61 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
                     .iter()
                     .find(|s| s.id == c.scope_id)
                     .map_or("<unknown scope>", |s| s.path.as_str());
-                let project = super::render::projection;
-                format!(
-                    "Variant: {} | {}/{} | Stage: {}\nScope {}: {} | {:?}",
-                    project(&c.variant_id, 32),
-                    c.profile,
-                    c.scenario,
-                    project(&c.stage, 32),
-                    project(&c.scope_id, 24),
-                    project(path, 48),
-                    c.comparison.status
-                )
+                if compact {
+                    format!(
+                        "V:{} P:{} C:{}\nT:{} S:{} {:?}",
+                        super::render::projection(&c.variant_id, 8),
+                        c.profile,
+                        super::render::projection(&c.scenario.to_string(), 10),
+                        super::render::projection(&c.stage, 10).replace(['\n', '\t'], " "),
+                        super::render::projection(&c.scope_id, 8),
+                        c.comparison.status
+                    )
+                } else if heading_width < 68 {
+                    let identity = format!("Profile: {} | Scenario: {}", c.profile, c.scenario);
+                    let identity = if identity.len() <= heading_width {
+                        identity
+                    } else {
+                        format!("Profile: {}\nScenario: {}", c.profile, c.scenario)
+                    };
+                    format!(
+                        "{}\n{}\n{}\n{}\n{}\n{:?}",
+                        heading_field("Variant: ", &c.variant_id, heading_width, 32),
+                        identity,
+                        heading_field("Stage: ", &c.stage, heading_width, 32),
+                        heading_field("Scope: ", &c.scope_id, heading_width, 24),
+                        heading_field("Path: ", path, heading_width, 48),
+                        c.comparison.status
+                    )
+                } else {
+                    let project = super::render::projection;
+                    format!(
+                        "Variant: {} | {}/{} | Stage: {}\nScope {}: {} | {:?}",
+                        project(&c.variant_id, 32),
+                        c.profile,
+                        c.scenario,
+                        project(&c.stage, 32),
+                        project(&c.scope_id, 24),
+                        project(path, 48),
+                        c.comparison.status
+                    )
+                }
             })
             .unwrap_or_default();
+        let lines = Paragraph::new(heading.as_str())
+            .wrap(Wrap { trim: false })
+            .line_count(parts[1].width.saturating_sub(2));
+        let heading_height = u16::try_from(lines.saturating_add(2)).unwrap_or(u16::MAX);
+        let detail = Layout::vertical([Constraint::Length(heading_height), Constraint::Min(1)])
+            .split(parts[1]);
         frame.render_widget(
             Paragraph::new(heading)
                 .wrap(Wrap { trim: false })
-                .block(panel("Selected cell")),
+                .block(panel(if compact {
+                    "Selected cell — full in Cell detail"
+                } else {
+                    "Selected cell"
+                })),
             detail[0],
         );
         super::render::record_panes(frame, app, detail[1], view.evidence_focus);

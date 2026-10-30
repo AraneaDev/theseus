@@ -176,11 +176,11 @@ During live or saved report viewing:
   offline views.
 
 Resize preserves selections and uses stacked panels on narrow terminals. Logs
-show one selected stream, at most 64 KiB; truncation is visible and terminal
-control bytes are replaced. A finished session remains available for browsing;
-launch a new session for another run. Raw mode and alternate screen are restored
-on exit, errors, and panic. Interactive mode requires stdin and stdout terminals;
-without them, use headless or JSON output.
+show one selected stream in bounded pageable chunks; stored and capture limits
+are visible, and terminal control bytes are replaced. A finished session remains
+available for browsing; launch a new session for another run. Raw mode and
+alternate screen are restored on exit, errors, and panic. Interactive mode
+requires stdin and stdout terminals; without them, use headless or JSON output.
 
 ## Recipe contract
 
