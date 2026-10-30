@@ -42,7 +42,12 @@ fn wide(text: &OsStr) -> io::Result<Vec<u16>> {
     value.push(0);
     Ok(value)
 }
-pub(super) fn open_root(path: &Path, policy: RootPolicy) -> io::Result<File> {
+pub(in crate::fs) fn open_root(path: &Path, policy: RootPolicy) -> io::Result<File> {
+    if matches!(policy, RootPolicy::AllComponentsNoFollow)
+        && path.components().any(|c| c == Component::ParentDir)
+    {
+        return Err(invalid("unsafe directory path"));
+    }
     // Normalize redundant trailing separators/dots, so a leaf alias cannot become
     // an ancestor alias by spelling it `alias/` or `alias/.`.
     let path: std::path::PathBuf = path.components().collect();
@@ -79,7 +84,7 @@ pub(super) fn open_root(path: &Path, policy: RootPolicy) -> io::Result<File> {
     local_ntfs(&file)?;
     Ok(file)
 }
-pub(super) fn open_creation_parent(path: &Path) -> io::Result<File> {
+pub(in crate::fs) fn open_creation_parent(path: &Path) -> io::Result<File> {
     let file = bootstrap(&std::path::absolute(path)?, false)?;
     local_ntfs(&file)?;
     Ok(file)
@@ -241,16 +246,16 @@ fn relative_open(parent: &File, name: &OsStr, directory: bool, create: bool) -> 
     let _: FILE_ID_INFO = query(&file, FileIdInfo)?;
     Ok(file)
 }
-pub(super) fn open_dir(parent: &File, name: &OsStr) -> io::Result<File> {
+pub(in crate::fs) fn open_dir(parent: &File, name: &OsStr) -> io::Result<File> {
     relative(parent, name, true, false)
 }
-pub(super) fn create_dir(parent: &File, name: &OsStr) -> io::Result<File> {
+pub(in crate::fs) fn create_dir(parent: &File, name: &OsStr) -> io::Result<File> {
     relative(parent, name, true, true)
 }
-pub(super) fn open_file(parent: &File, name: &OsStr, create: bool) -> io::Result<File> {
+pub(in crate::fs) fn open_file(parent: &File, name: &OsStr, create: bool) -> io::Result<File> {
     relative(parent, name, false, create)
 }
-pub(super) fn validate(file: &File, directory: bool) -> io::Result<()> {
+pub(in crate::fs) fn validate(file: &File, directory: bool) -> io::Result<()> {
     let info: FILE_ATTRIBUTE_TAG_INFO = query(file, FileAttributeTagInfo)?;
     if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(invalid("reparse points are not permitted"));
@@ -351,7 +356,7 @@ fn supported_profile(
     identity
 }
 
-pub(super) fn entries(directory: &File) -> io::Result<Vec<OsString>> {
+pub(in crate::fs) fn entries(directory: &File) -> io::Result<Vec<OsString>> {
     // A new relative '.' handle gets an independent enumeration cursor. A duplicated
     // handle shares a cursor and would race another entries() call.
     let directory = enumeration_handle(directory)?;

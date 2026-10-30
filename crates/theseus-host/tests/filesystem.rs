@@ -115,13 +115,11 @@ fn unix_private_modes_and_fifo_rejection() -> io::Result<()> {
             & 0o777,
         0o700
     );
-    rustix::fs::mknodat(
-        rustix::fs::CWD,
-        parent.path().join("run/fifo"),
-        rustix::fs::FileType::Fifo,
-        rustix::fs::Mode::RUSR,
-        0,
-    )?;
+    // Darwin has no mknodat binding; both Unix runners provide mkfifo.
+    let status = std::process::Command::new("mkfifo")
+        .arg(parent.path().join("run/fifo"))
+        .status()?;
+    assert!(status.success(), "could not create the real FIFO fixture");
     assert!(root.open_file(&RelativePath::parse("fifo")?).is_err());
     Ok(())
 }
@@ -145,5 +143,42 @@ fn private_creation_accepts_existing_parent_alias() -> io::Result<()> {
     std::os::unix::fs::symlink("real", temp.path().join("alias"))?;
     HostDir::create_private(&temp.path().join("alias/new"))?;
     assert!(temp.path().join("real/new").is_dir());
+    Ok(())
+}
+
+#[test]
+fn strict_root_rejects_parent_components() -> io::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let trusted = temp.path().canonicalize()?;
+    let root = HostDir::create_private(&trusted.join("run"))?;
+    root.create_child("child".as_ref())?;
+    assert!(
+        HostDir::open(
+            &trusted.join("run/child/.."),
+            RootPolicy::AllComponentsNoFollow
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn enumeration_handles_multiple_batches_and_concurrent_readers() -> io::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = HostDir::create_private(&temp.path().join("run"))?;
+    let mut expected = Vec::new();
+    // Exceed a native 64KiB directory buffer, including variable UTF-16 names.
+    for index in 0..360 {
+        let name = format!("{index:04}-é-{}", "x".repeat(96));
+        root.create_file(&RelativePath::parse(&name)?)?;
+        expected.push(std::ffi::OsString::from(name));
+    }
+    std::thread::scope(|scope| {
+        let a = scope.spawn(|| root.entries());
+        let b = scope.spawn(|| root.entries());
+        assert_eq!(a.join().unwrap()?, expected);
+        assert_eq!(b.join().unwrap()?, expected);
+        Ok::<_, io::Error>(())
+    })?;
     Ok(())
 }

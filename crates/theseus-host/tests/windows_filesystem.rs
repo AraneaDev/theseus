@@ -292,3 +292,84 @@ fn junctions_and_substituted_ancestors_are_rejected() -> io::Result<()> {
     assert!(!temp.path().join("escape").exists());
     Ok(())
 }
+
+fn native_identity(file: &File) -> io::Result<FILE_ID_INFO> {
+    let mut info = FILE_ID_INFO::default();
+    checked(unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            (&mut info as *mut FILE_ID_INFO).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    })?;
+    Ok(info)
+}
+fn basic_info(file: &File) -> io::Result<FILE_BASIC_INFO> {
+    let mut info = FILE_BASIC_INFO::default();
+    checked(unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            (&mut info as *mut FILE_BASIC_INFO).cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    })?;
+    Ok(info)
+}
+#[test]
+fn identity_distinguishes_equal_bytes_size_and_all_timestamps() -> io::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = HostDir::create_private(&temp.path().join("run"))?;
+    let name = RelativePath::parse("evidence")?;
+    let mut old = root.create_file(&name)?;
+    old.write_all(b"identical")?;
+    old.sync_all()?;
+    let original_id = native_identity(&old)?;
+    std::fs::rename(
+        temp.path().join("run/evidence"),
+        temp.path().join("run/old"),
+    )?;
+    let mut new = root.create_file(&name)?;
+    new.write_all(b"identical")?;
+    new.sync_all()?;
+    // Match creation/access/write/change stamps, so only native identity can
+    // distinguish the two equal-size files. Query back the kernel result.
+    let old_basic = basic_info(&old)?;
+    checked(unsafe {
+        SetFileInformationByHandle(
+            new.as_raw_handle(),
+            FileBasicInfo,
+            (&old_basic as *const FILE_BASIC_INFO).cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    })?;
+    let new_basic = basic_info(&new)?;
+    assert_eq!(
+        (
+            old_basic.CreationTime,
+            old_basic.LastAccessTime,
+            old_basic.LastWriteTime,
+            old_basic.ChangeTime
+        ),
+        (
+            new_basic.CreationTime,
+            new_basic.LastAccessTime,
+            new_basic.LastWriteTime,
+            new_basic.ChangeTime
+        )
+    );
+    assert_eq!(old.metadata()?.len(), new.metadata()?.len());
+    let retained_id = native_identity(&old)?;
+    assert_eq!(
+        original_id.VolumeSerialNumber,
+        retained_id.VolumeSerialNumber
+    );
+    assert_eq!(original_id.FileId.Identifier, retained_id.FileId.Identifier);
+    assert_ne!(
+        original_id.FileId.Identifier,
+        native_identity(&new)?.FileId.Identifier
+    );
+    assert_ne!(fingerprint(&old)?, fingerprint(&root.open_file(&name)?)?);
+    Ok(())
+}
