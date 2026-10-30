@@ -373,3 +373,33 @@ fn identity_distinguishes_equal_bytes_size_and_all_timestamps() -> io::Result<()
     assert_ne!(fingerprint(&old)?, fingerprint(&root.open_file(&name)?)?);
     Ok(())
 }
+
+#[test]
+fn native_directory_names_preserve_unpaired_utf16() -> io::Result<()> {
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+    let temp = tempfile::tempdir()?;
+    let name = OsString::from_wide(&[0x64, 0xd800, 0x69, 0x72]);
+    let root_path = temp.path().join(&name);
+    let root = HostDir::create_private(&root_path)?;
+    let child = root.create_child(&name)?;
+    child
+        .create_file(&RelativePath::parse("data")?)?
+        .write_all(b"native")?;
+    assert_eq!(root.entries()?, vec![name.clone()]);
+    let reopened = HostDir::open(&root_path.join(&name), RootPolicy::AllComponentsNoFollow)?;
+    assert_eq!(
+        fingerprint(&reopened.open_file(&RelativePath::parse("data")?)?)?.len,
+        6
+    );
+    for forbidden in [
+        vec![0xd800, 0x3a],
+        vec![0xd800, 0],
+        vec![0xd800, 0x2e],
+        vec![0xd800, 0x20],
+        vec![0xd800, 0x5c, 0x78],
+    ] {
+        assert!(root.create_child(&OsString::from_wide(&forbidden)).is_err());
+    }
+    assert_eq!(root.entries()?, vec![name]);
+    Ok(())
+}

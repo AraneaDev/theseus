@@ -42,6 +42,45 @@ fn wide(text: &OsStr) -> io::Result<Vec<u16>> {
     value.push(0);
     Ok(value)
 }
+/// Check native code units without replacing unpaired surrogates. Forbidden
+/// syntax is ASCII (plus the explicitly reserved superscript device suffixes),
+/// so a non-Unicode name cannot hide a separator, stream or alias through decoding.
+pub(in crate::fs) fn validate_native_name(name: &OsStr) -> io::Result<()> {
+    let units: Vec<u16> = name.encode_wide().collect();
+    if units.is_empty()
+        || units == [46]
+        || units == [46, 46]
+        || matches!(units.last(), Some(46 | 32))
+        || units
+            .iter()
+            .any(|unit| *unit <= 31 || matches!(*unit, 34 | 42 | 47 | 58 | 60 | 62 | 63 | 92 | 124))
+    {
+        return Err(invalid("invalid Windows component"));
+    }
+    // ASCII-only case folding is exactly the device-alias rule; preserve all
+    // other code units, including unpaired surrogates, for the actual native open.
+    let stem: Vec<u16> = units
+        .iter()
+        .take_while(|u| **u != 46)
+        .map(|u| if (97..=122).contains(u) { *u - 32 } else { *u })
+        .collect();
+    let reserved = matches!(
+        stem.as_slice(),
+        [67, 79, 78]
+            | [80, 82, 78]
+            | [65, 85, 88]
+            | [78, 85, 76]
+            | [67, 79, 78, 73, 78, 36]
+            | [67, 79, 78, 79, 85, 84, 36]
+    ) || (stem.len() == 4
+        && (stem[..3] == [67, 79, 77] || stem[..3] == [76, 80, 84])
+        && matches!(stem[3], 49..=57 | 185 | 178 | 179));
+    if reserved {
+        return Err(invalid("reserved Windows device component"));
+    }
+    Ok(())
+}
+
 pub(in crate::fs) fn open_root(path: &Path, policy: RootPolicy) -> io::Result<File> {
     if matches!(policy, RootPolicy::AllComponentsNoFollow)
         && path.components().any(|c| c == Component::ParentDir)

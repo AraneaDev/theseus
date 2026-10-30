@@ -163,10 +163,7 @@ fn validate_name(name: &OsStr) -> io::Result<()> {
     }
     #[cfg(windows)]
     {
-        let text = name
-            .to_str()
-            .ok_or_else(|| invalid("non-Unicode Windows component"))?;
-        RelativePath::parse(text)?;
+        platform::validate_native_name(name)?;
     }
     Ok(())
 }
