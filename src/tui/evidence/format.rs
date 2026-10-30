@@ -210,10 +210,13 @@ fn check(c: &CheckResult, out: &mut dyn Write) -> fmt::Result {
             for line in &p.response_lines {
                 if let Ok(frame) = crate::strict_json::parse(line) {
                     let result = &frame["result"];
-                    if let Some(identity) = result
-                        .get("serverInfo")
-                        .or_else(|| result.pointer("/_meta/io.modelcontextprotocol~1serverInfo"))
-                    {
+                    let identity = match p.probe.protocol {
+                        crate::mcp::McpProtocol::Modern20260728 => {
+                            result.pointer("/_meta/io.modelcontextprotocol~1serverInfo")
+                        }
+                        crate::mcp::McpProtocol::Legacy20251125 => result.get("serverInfo"),
+                    };
+                    if let Some(identity) = identity {
                         write!(
                             out,
                             "\nObserved server: name={:?} version={:?}",
