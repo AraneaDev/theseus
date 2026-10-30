@@ -158,23 +158,92 @@ fn pending_write_owns_copy_and_validates_retry_before_acknowledgment() {
     });
 }
 #[test]
-fn failed_pending_write_never_acknowledges_delivery() {
+fn peer_close_pending_write_matches_native_completion() {
     let (mut writer, peer) = writer().unwrap();
     let bytes = vec![0; BUFFER];
     fill(&mut writer, &bytes);
     drop(peer);
-    let until = Instant::now() + Duration::from_secs(5);
-    loop {
-        match writer.try_write(&bytes) {
-            Ok(n) => panic!("failed pending write acknowledged {n}"),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                assert!(Instant::now() < until);
-                std::thread::yield_now();
-            }
-            Err(_) => break,
-        }
-    }
+    // Peer closure alone does not establish whether this write succeeded.
+    let native = native_pending_write_result(&writer, "peer-close");
+    let public = writer
+        .try_write(&bytes)
+        .map_err(|error| error.raw_os_error());
+    writeln!(
+        io::stdout().lock(),
+        "pending-write-control case=peer-close public={public:?}"
+    )
+    .unwrap();
+    assert_eq!(public, native.map_err(Some));
     writer.close().unwrap();
+}
+fn native_pending_write_result(writer: &PipeWriter, case: &str) -> Result<usize, i32> {
+    let operation = writer.endpoint.operation.as_ref().unwrap().get();
+    assert!(operation.pending.get());
+    // Observe the real operation independently of Operation::result. Retain its
+    // owner and handles, do not touch its native buffer or pending metadata, and
+    // leave the completed status for the public same-prefix retry to consume.
+    let wait = unsafe { WaitForSingleObject(operation.event.as_raw_handle(), 5000) };
+    let wait_error = if wait == WAIT_FAILED {
+        io::Error::last_os_error().raw_os_error()
+    } else {
+        None
+    };
+    writeln!(io::stdout().lock(), "pending-write-control case={case} source={}:{} WaitForSingleObject={wait} error={wait_error:?}", file!(), line!()).unwrap();
+    assert_eq!(wait, WAIT_OBJECT_0, "pending write must complete");
+    let mut count = 0;
+    let success = unsafe {
+        GetOverlappedResult(
+            operation.handle.as_raw_handle(),
+            operation.overlapped.get(),
+            &mut count,
+            0,
+        )
+    };
+    let error = if success == 0 {
+        io::Error::last_os_error().raw_os_error()
+    } else {
+        None
+    };
+    writeln!(io::stdout().lock(), "pending-write-control case={case} source={}:{} GetOverlappedResult={success} count={count} error={error:?}", file!(), line!()).unwrap();
+    if success != 0 {
+        Ok(count as usize)
+    } else {
+        let error = error.expect("failed native completion must have an OS error");
+        assert_ne!(error, ERROR_IO_INCOMPLETE as i32);
+        assert_ne!(error, ERROR_IO_PENDING as i32);
+        Err(error)
+    }
+}
+#[test]
+fn failed_pending_write_never_acknowledges_delivery() {
+    let (mut writer, peer) = writer().unwrap();
+    let bytes = vec![0; BUFFER];
+    fill(&mut writer, &bytes);
+    let operation = writer.endpoint.operation.as_ref().unwrap().get();
+    assert!(operation.pending.get());
+    let cancelled =
+        unsafe { CancelIoEx(operation.handle.as_raw_handle(), operation.overlapped.get()) };
+    let cancel_error = if cancelled == 0 {
+        io::Error::last_os_error().raw_os_error()
+    } else {
+        None
+    };
+    writeln!(io::stdout().lock(), "pending-write-control case=cancel source={}:{} CancelIoEx={cancelled} error={cancel_error:?}", file!(), line!()).unwrap();
+    // Keep the peer alive and unread throughout. A successful completion racing
+    // cancellation fails this precondition; it cannot prove the failure branch.
+    let native = native_pending_write_result(&writer, "cancel");
+    assert_ne!(cancelled, 0, "cancellation request must succeed");
+    assert_eq!(
+        native,
+        Err(ERROR_OPERATION_ABORTED as i32),
+        "requires an actual failed native write before testing acknowledgment"
+    );
+    let error = writer
+        .try_write(&bytes)
+        .expect_err("failed pending write must never acknowledge delivery");
+    assert_eq!(error.raw_os_error(), Some(ERROR_OPERATION_ABORTED as i32));
+    writer.close().unwrap();
+    drop(peer);
 }
 #[test]
 fn pending_connect_failure_guard_owns_setup_even_without_child() {
