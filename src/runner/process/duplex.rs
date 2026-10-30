@@ -677,6 +677,7 @@ mod tests {
             "{error}"
         );
         assert!(out.forced_abort && error.contains("cleanup failed too"));
+        assert_eq!(out.process.status, None);
     }
     // An EOF on stdout must start shutdown even if inherited stderr is still held.
     #[test]
@@ -931,5 +932,79 @@ mod tests {
                 && error.contains("setup cleanup refused")
         );
         assert!(!std::path::Path::new(&format!("/proc/{leader}")).exists());
+    }
+    // Publish the final failure only when the monitor observes worker completion:
+    // its first failure sample has already happened, so accepting completion here
+    // would bypass owned abort and kill the local descriptor holder first.
+    #[test]
+    fn final_worker_failure_aborts_before_cleanup_after_completion_observation() {
+        let temp = tempfile::tempdir().unwrap();
+        let identities = temp.path().join("identities");
+        let mut command = shell("sleep 30 & printf '%s %s\\n' \"$$\" \"$!\" > \"$1\"; exit 17");
+        command.arg("completion-race").arg(&identities);
+        let mut process = HostProcess::spawn(&mut command).unwrap();
+        let began = Instant::now();
+        while !process.exited_without_reaping().unwrap() {
+            assert!(began.elapsed() < Duration::from_secs(2));
+            thread::sleep(Duration::from_millis(5));
+        }
+        let ids = std::fs::read_to_string(identities).unwrap();
+        let ids: Vec<u32> = ids
+            .split_whitespace()
+            .map(|id| id.parse().unwrap())
+            .collect();
+        let leader = ids[0];
+        let holder = ids[1];
+        let state = |pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .map(|stat| {
+                    stat.rsplit_once(')')
+                        .unwrap()
+                        .1
+                        .trim_start()
+                        .chars()
+                        .next()
+                        .unwrap()
+                })
+        };
+        let signals = Signals::default();
+        let mut forced_abort = false;
+        let completion = process.monitor(
+            Duration::from_secs(3),
+            &CancellationToken::default(),
+            || {
+                assert!(!signals.failed.swap(true, Ordering::SeqCst));
+                true
+            },
+            || false,
+            MonitorPolicy::Duplex(&signals),
+            |event| match event {
+                SupervisionEvent::Poll => panic!("leader is already exited"),
+                SupervisionEvent::Abort => {
+                    assert_eq!(state(leader), Some('Z'), "leader must remain reserved");
+                    assert!(
+                        state(holder).is_some_and(|state| !matches!(state, 'Z' | 'X')),
+                        "local group must remain alive until owned abort"
+                    );
+                    forced_abort = true;
+                    anyhow::bail!("owned abort diagnostic")
+                }
+            },
+        );
+        assert!(forced_abort, "late worker failure must invoke owned abort");
+        let error = completion.error.unwrap();
+        assert!(
+            error.contains("duplex worker failed") && error.contains("owned abort diagnostic"),
+            "{error}"
+        );
+        assert_eq!(state(leader), None, "leader must be reaped after abort");
+        for _ in 0..100 {
+            if state(holder).is_none_or(|state| matches!(state, 'Z' | 'X')) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("owned descriptor holder survived group cleanup");
     }
 }

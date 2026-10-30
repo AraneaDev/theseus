@@ -239,8 +239,20 @@ impl HostProcess {
             }
             if !cancellation_requires_abort && !timed_out && !grace_expired && error.is_none() {
                 // Parser rejection stops only acquisition, preserving the container.
-                if failed_reader() || (exited && readers_done()) {
+                if failed_reader() {
                     break;
+                }
+                if exited && readers_done() {
+                    // A worker can publish failure after the first flag sample
+                    // and then finish. Recheck after observing completion while
+                    // the leader is still reserved, before choosing normal exit.
+                    if let MonitorPolicy::Duplex(signals) = &policy
+                        && signals.failed.load(Ordering::SeqCst)
+                    {
+                        append_error(&mut error, "duplex worker failed".into());
+                    } else {
+                        break;
+                    }
                 }
                 // Never turn an already-exited child into an intentional stop.
                 // Slow control calls space their successors from completion too.
