@@ -421,3 +421,26 @@ fn long_log_path_metadata_toggle_restores_raw_at_first_chunk_and_keeps_filter_ty
     key(&mut app, KeyCode::Esc);
     assert_eq!(app.filter, "m");
 }
+
+#[test]
+fn same_length_log_replacement_discards_old_tail_cursor_and_navigation_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("run");
+    let mut old = vec![b'a'; 100_000];
+    old.extend(b"OLD_TAIL");
+    let mut app = log_app(&root, &old, false);
+    input(&mut app, KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL));
+    assert!(screen(&app).contains("OLD_TAIL"));
+    let mut replacement = vec![b'n'; old.len()];
+    replacement[..11].copy_from_slice(b"NEW_ID_HEAD");
+    std::fs::write(root.join("logs/replacement"), &replacement).unwrap();
+    std::fs::rename(root.join("logs/replacement"), root.join("logs/out")).unwrap();
+    key(&mut app, KeyCode::Char('['));
+    assert!(screen(&app).contains("NEW_ID_HEAD"));
+    assert!(app.log_text.starts_with("raw bytes 0..4096 /"));
+    assert!(!body(&app).contains("OLD_TAIL"));
+    key(&mut app, KeyCode::Char(']'));
+    assert!(app.log_text.starts_with("raw bytes 4096..8192 /"));
+    key(&mut app, KeyCode::Char('['));
+    assert!(body(&app).starts_with("NEW_ID_HEAD"));
+}

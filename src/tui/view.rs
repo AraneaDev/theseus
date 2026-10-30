@@ -200,31 +200,21 @@ impl View {
         let result = if let Some(reference) = selected.record.log_reference()
             && !self.log_metadata
         {
-            log_body(
+            let stop = match self.position {
+                Position::Raw(_, stop) => stop,
+                _ => None,
+            };
+            let page = log_body(
                 &app.root,
                 reference,
                 match self.position {
                     Position::Raw(offset, _) => offset,
                     _ => 0,
                 },
-                match self.position {
-                    Position::Raw(_, stop) => stop,
-                    _ => None,
-                },
-            )
-            .map(|page| {
-                self.position = Position::Raw(
-                    page.start,
-                    match self.position {
-                        Position::Raw(_, stop) => stop,
-                        _ => None,
-                    },
-                );
-                self.next = page.next.map(|next| Position::Raw(next, None));
-                self.log = Some((reference.clone(), page.fingerprint));
-                self.label = format!("{} | m metadata", page.label);
-                self.body = page.text;
-            })
+                stop,
+            );
+            self.accept_log_page(reference, page, stop);
+            Ok(())
         } else {
             selected
                 .record
@@ -269,6 +259,40 @@ impl View {
         }
         self.dirty = false;
     }
+    fn accept_log_page(
+        &mut self,
+        reference: &LogReference,
+        result: anyhow::Result<LogBody>,
+        stop: Option<u64>,
+    ) {
+        // The metadata freshness check and the read are separate operations.
+        // Do not carry an old cursor into a stable page from a new identity.
+        let result = result.and_then(|page| {
+            anyhow::ensure!(
+                self.log
+                    .as_ref()
+                    .is_none_or(|(_, expected)| *expected == page.fingerprint),
+                "log changed during navigation"
+            );
+            Ok(page)
+        });
+        match result {
+            Ok(page) => {
+                self.position = Position::Raw(page.start, stop);
+                self.next = page.next.map(|next| Position::Raw(next, None));
+                self.log = Some((reference.clone(), page.fingerprint));
+                self.label = format!("{} | m metadata", page.label);
+                self.body = page.text;
+            }
+            Err(error) => {
+                self.reset_page(self.last_scroll);
+                self.body = read_error(&error, "log");
+                self.label = "unavailable evidence".into();
+            }
+        }
+        self.dirty = false;
+    }
+
     pub fn next(&mut self, app: &App) {
         self.update(app, None);
         self.scroll = 0;
@@ -310,27 +334,13 @@ impl View {
                 Position::Raw(offset, _) => offset,
                 _ => 0,
             };
-            match log_body(
+            let page = log_body(
                 &app.root,
                 reference,
                 end.saturating_sub(LOG_BYTES as u64),
                 Some(end),
-            ) {
-                Ok(page) => {
-                    self.position = Position::Raw(page.start, Some(end));
-                    self.next = Some(Position::Raw(end, None));
-                    self.body = page.text;
-                    self.label = format!("{} | m metadata", page.label);
-                    self.log = Some((reference.clone(), page.fingerprint));
-                }
-                Err(error) => {
-                    self.body = read_error(&error, "log");
-                    self.label = "unavailable evidence".into();
-                    self.next = None;
-                    self.log = None;
-                    self.previous.clear();
-                }
-            }
+            );
+            self.accept_log_page(reference, page, Some(end));
         } else {
             let current = match self.position {
                 Position::Text(offset) => offset,
@@ -372,7 +382,7 @@ impl View {
             self.update(app, None);
             return;
         }
-        match report::read_log_page(&app.root, reference, 0, 1)
+        let page = report::read_log_page(&app.root, reference, 0, 1)
             .map(|page| (page.readable_total, page.fingerprint))
             .and_then(|(total, fingerprint)| {
                 let page = log_body(
@@ -386,22 +396,9 @@ impl View {
                     "log changed while selecting final chunk"
                 );
                 Ok(page)
-            }) {
-            Ok(page) => {
-                self.position = Position::Raw(page.start, Some(page.end));
-                self.next = None;
-                self.body = page.text;
-                self.label = format!("{} | m metadata", page.label);
-                self.log = Some((reference.clone(), page.fingerprint));
-            }
-            Err(error) => {
-                self.body = read_error(&error, "log");
-                self.label = "unavailable evidence".into();
-                self.next = None;
-                self.log = None;
-                self.previous.clear();
-            }
-        }
+            });
+        let stop = page.as_ref().ok().map(|page| page.end);
+        self.accept_log_page(reference, page, stop);
     }
 }
 struct LogBody {
@@ -428,8 +425,35 @@ fn log_body(
         0
     };
     let page = report::read_log_page(root, reference, offset - prefix as u64, LOG_BYTES + 4)?;
-    let end = stop.unwrap_or(page.readable_total).min(page.readable_total);
-    let available = (end - page.offset).min(page.bytes.len() as u64) as usize;
+    project_log_page(reference, page, offset, stop)
+}
+fn project_log_page(
+    reference: &LogReference,
+    page: report::LogPage,
+    offset: u64,
+    stop: Option<u64>,
+) -> anyhow::Result<LogBody> {
+    // A stable API read may still be shorter than the geometry chosen before
+    // it (including an empty read exactly at the newly shortened EOF).
+    anyhow::ensure!(
+        offset <= page.readable_total
+            && stop.is_none_or(|end| offset <= end && end <= page.readable_total),
+        "log changed: requested range exceeds current stored bytes"
+    );
+    let prefix = offset
+        .checked_sub(page.offset)
+        .ok_or_else(|| anyhow::anyhow!("log page starts after requested offset"))?;
+    anyhow::ensure!(prefix <= 3, "log page look-behind exceeds guard bound");
+    let prefix = prefix as usize;
+    let end = stop.unwrap_or(page.readable_total);
+    let available = end
+        .checked_sub(page.offset)
+        .ok_or_else(|| anyhow::anyhow!("log page range changed"))?
+        .min(page.bytes.len() as u64) as usize;
+    anyhow::ensure!(
+        prefix <= available,
+        "log changed: returned page is shorter than look-behind"
+    );
     let bytes = &page.bytes[..available];
     let mut begin = 0;
     while begin < prefix {
@@ -510,4 +534,122 @@ fn read_error(error: &anyhow::Error, kind: &str) -> String {
     )
     .expect("valid error projection")
     .text
+}
+
+#[cfg(test)]
+mod changed_log_tests {
+    use super::*;
+    fn fingerprint(inode: u64) -> LogFingerprint {
+        LogFingerprint {
+            device: 1,
+            inode,
+            size: 10_000,
+            mtime_seconds: 1,
+            mtime_nanos: 0,
+            ctime_seconds: 1,
+            ctime_nanos: 0,
+        }
+    }
+    fn reference() -> LogReference {
+        LogReference {
+            path: "logs/out".into(),
+            bytes: 10_000,
+            truncated: false,
+        }
+    }
+    #[test]
+    fn returned_pages_shorter_than_lookbehind_are_unavailable_without_decoding() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("run");
+        let store = report::create(&root).unwrap();
+        let reference = store
+            .write_log("logs/out", &vec![b'a'; 10_000], 10_000)
+            .unwrap();
+        for current_bytes in 5901..=5903 {
+            std::fs::write(root.join("logs/out"), vec![b'a'; current_bytes]).unwrap();
+            let page = store
+                .read_log_page(&reference, 5901, LOG_BYTES + 4)
+                .unwrap();
+            assert_eq!(page.bytes.len(), current_bytes - 5901);
+            let result = project_log_page(&reference, page, 5904, Some(10_000));
+            assert!(
+                result.is_err(),
+                "logical offset past actual returned EOF must be unavailable"
+            );
+        }
+        // Validate actual returned slice length independently of total length.
+        std::fs::write(root.join("logs/out"), vec![b'a'; 10_000]).unwrap();
+        for limit in 1..=2 {
+            let page = store.read_log_page(&reference, 5901, limit).unwrap();
+            assert!(project_log_page(&reference, page, 5904, Some(10_000)).is_err());
+        }
+    }
+    #[test]
+    fn lookbehind_ending_exactly_at_current_eof_remains_a_valid_empty_page() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = report::create(&temp.path().join("run")).unwrap();
+        let reference = store
+            .write_log("logs/out", &vec![b'a'; 5904], 5904)
+            .unwrap();
+        let page = store
+            .read_log_page(&reference, 5901, LOG_BYTES + 4)
+            .unwrap();
+        let projected = project_log_page(&reference, page, 5904, Some(5904)).unwrap();
+        assert!(projected.text.is_empty());
+        assert_eq!(projected.start, 5904);
+        assert_eq!(projected.end, 5904);
+        assert!(projected.next.is_none());
+    }
+    #[test]
+    fn changed_page_identity_cannot_adopt_previous_offsets_or_history() {
+        let reference = reference();
+        let mut view = View {
+            log: Some((reference.clone(), fingerprint(1))),
+            position: Position::Raw(10_000, None),
+            ..Default::default()
+        };
+        view.previous.push_back(Position::Raw(5904, None));
+        view.next = Some(Position::Raw(10_000, None));
+        view.accept_log_page(
+            &reference,
+            Ok(LogBody {
+                text: "NEW_IDENTITY_AT_OLD_OFFSET".into(),
+                label: "raw bytes 5904..10000".into(),
+                start: 5904,
+                end: 10_000,
+                next: None,
+                fingerprint: fingerprint(2),
+            }),
+            Some(10_000),
+        );
+        assert!(matches!(view.position, Position::Text(0)));
+        assert!(view.previous.is_empty());
+        assert!(view.next.is_none());
+        assert!(view.log.is_none());
+        assert_eq!(view.label, "unavailable evidence");
+        assert!(!view.body.contains("NEW_IDENTITY_AT_OLD_OFFSET"));
+        assert!(view.body.contains("changed"));
+    }
+    #[test]
+    fn failed_page_read_clears_the_old_raw_cursor_and_range() {
+        let reference = reference();
+        let mut view = View {
+            log: Some((reference.clone(), fingerprint(1))),
+            position: Position::Raw(10_000, None),
+            ..Default::default()
+        };
+        view.previous.push_back(Position::Raw(5904, None));
+        view.next = Some(Position::Raw(10_000, None));
+        view.label = "raw bytes 5904..10000".into();
+        view.accept_log_page(
+            &reference,
+            Err(anyhow::anyhow!("log changed during navigation")),
+            Some(10_000),
+        );
+        assert!(matches!(view.position, Position::Text(0)));
+        assert!(view.previous.is_empty());
+        assert!(view.next.is_none());
+        assert!(view.log.is_none());
+        assert_eq!(view.label, "unavailable evidence");
+    }
 }
