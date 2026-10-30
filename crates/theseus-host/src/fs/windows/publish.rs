@@ -107,3 +107,133 @@ pub(in crate::fs) fn remove_temporary(
         )
     })
 }
+
+#[cfg(test)]
+mod probes {
+    use super::*;
+    use crate::fs::{HostDir, RelativePath};
+    use std::io::{Read, Write};
+
+    // Causal calibration only: production keeps the selected retained-root call.
+    // Each case owns a fresh private root, source and target. The absolute path
+    // in the working control is test-only and never authorizes publication.
+    fn rename_with_documented_buffer(relative: bool) -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root_path = temp.path().join("probe");
+        let root = HostDir::create_private(&root_path)?;
+        let mut source = root.create_file(&RelativePath::parse("source")?)?;
+        source.write_all(b"completed probe bytes")?;
+        flush_file(&source)?;
+        let absolute_target = root_path.join("target");
+        let target = if relative {
+            OsStr::new("target")
+        } else {
+            absolute_target.as_os_str()
+        };
+        let units: Vec<u16> = target.encode_wide().collect();
+        let payload = units
+            .len()
+            .checked_mul(2)
+            .ok_or_else(|| io::Error::other("probe size overflow"))?;
+        // Deliberately satisfy the conservative documented sizeof + name size
+        // requirement as well as the actual flexible-tail bounds and spare NUL.
+        let capacity = size_of::<FILE_RENAME_INFO>()
+            .checked_add(payload)
+            .and_then(|n| n.checked_add(2))
+            .ok_or_else(|| io::Error::other("probe size overflow"))?;
+        let layout = Layout::from_size_align(capacity, align_of::<FILE_RENAME_INFO>())
+            .map_err(io::Error::other)?;
+        let length = u32::try_from(capacity).map_err(io::Error::other)?;
+        let buffer = RenameBuffer {
+            pointer: NonNull::new(unsafe { alloc_zeroed(layout) })
+                .ok_or_else(|| io::Error::other("probe allocation failed"))?,
+            layout,
+            length,
+        };
+        // SAFETY: independently checked/aligned owned storage, full initialized
+        // header plus native UTF-16 payload and spare NUL; source/root remain live.
+        unsafe {
+            let record = buffer.pointer.as_ptr().cast::<FILE_RENAME_INFO>();
+            (*record).Anonymous.ReplaceIfExists = true;
+            (*record).RootDirectory = if relative {
+                root.directory.as_raw_handle()
+            } else {
+                std::ptr::null_mut()
+            };
+            (*record).FileNameLength = u32::try_from(payload).map_err(io::Error::other)?;
+            std::ptr::copy_nonoverlapping(
+                units.as_ptr(),
+                buffer
+                    .pointer
+                    .as_ptr()
+                    .add(offset_of!(FILE_RENAME_INFO, FileName))
+                    .cast::<u16>(),
+                units.len(),
+            );
+        }
+        if relative {
+            // B varies only allocation/call length. Check every existing header,
+            // tail and padding byte against the unchanged production builder.
+            let baseline = RenameBuffer::new(&root.directory, target)?;
+            let baseline_bytes = unsafe {
+                std::slice::from_raw_parts(baseline.pointer.as_ptr(), baseline.length as usize)
+            };
+            let oversized_prefix = unsafe {
+                std::slice::from_raw_parts(buffer.pointer.as_ptr(), baseline.length as usize)
+            };
+            assert_eq!(baseline_bytes, oversized_prefix);
+        }
+        let result = checked(unsafe {
+            SetFileInformationByHandle(
+                source.as_raw_handle(),
+                FileRenameInfo,
+                buffer.pointer.as_ptr().cast(),
+                buffer.length,
+            )
+        });
+        let observation = format!(
+            "case={}\nrecord_size={}\nrecord_alignment={}\nfilename_offset={}\nfilename_bytes={}\nbuffer_bytes={}\nclass={}\nroot_nonnull={}\nresult={:?}\n",
+            if relative {
+                "relative-oversize"
+            } else {
+                "absolute-working-control"
+            },
+            size_of::<FILE_RENAME_INFO>(),
+            align_of::<FILE_RENAME_INFO>(),
+            offset_of!(FILE_RENAME_INFO, FileName),
+            payload,
+            capacity,
+            FileRenameInfo,
+            relative,
+            result
+        );
+        eprintln!("{observation}");
+        // CI owns this exact evidence directory. Preserve successful controls as
+        // raw artifacts too, since the Rust harness hides successful stdout.
+        if let Some(evidence) = std::env::var_os("THESEUS_HOST_EVIDENCE") {
+            std::fs::write(
+                std::path::Path::new(&evidence).join(if relative {
+                    "win32-rename-probe-relative.txt"
+                } else {
+                    "win32-rename-probe-absolute.txt"
+                }),
+                observation,
+            )?;
+        }
+        result?;
+        let mut bytes = Vec::new();
+        root.open_file(&RelativePath::parse("target")?)?
+            .read_to_end(&mut bytes)?;
+        assert_eq!(bytes, b"completed probe bytes");
+        assert_eq!(root.entries()?, vec!["target"]);
+        Ok(())
+    }
+    #[test]
+    fn win32_relative_rename_with_documented_oversize_buffer() -> io::Result<()> {
+        rename_with_documented_buffer(true)
+    }
+    #[test]
+    fn win32_absolute_rename_working_control() -> io::Result<()> {
+        rename_with_documented_buffer(false)
+    }
+}
