@@ -654,6 +654,19 @@ fn real_timeout_and_cancel_at_every_mutation_skip_forward_steps() {
     cases.finish();
 }
 #[test]
+fn interrupted_rollback_pty_current_detail_regressions() {
+    let output = Command::new("python3")
+        .arg("tests/support/tui_interrupted_rollback_test.py")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+#[test]
 #[ignore = "requires Docker and Unix PTY"]
 fn real_interrupted_rollback_live_offline_narrow_pty_both_policies() {
     let output = Command::new("python3")
