@@ -167,3 +167,304 @@ fn validate_name(name: &OsStr) -> io::Result<()> {
     }
     Ok(())
 }
+
+/// The completed persistence barrier. Windows makes no directory-entry power-loss claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitScope {
+    FileAndDirectorySynced,
+    FileFlushedAtomicReplace,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublishStage {
+    Reserve,
+    Write,
+    Flush,
+    Replace,
+    ParentSync,
+}
+
+/// Payload of publication's `io::Error`, available through `get_ref().downcast_ref()`.
+/// A ParentSync failure means the new entry is already published; retry is not rollback.
+#[derive(Debug)]
+pub struct PublicationError {
+    stage: PublishStage,
+    source: io::Error,
+    cleanup: Option<io::Error>,
+}
+impl PublicationError {
+    pub fn stage(&self) -> PublishStage {
+        self.stage
+    }
+    pub fn replaced(&self) -> bool {
+        self.stage == PublishStage::ParentSync
+    }
+    /// Failure to remove the owned temporary, in addition to the primary failure.
+    pub fn cleanup_error(&self) -> Option<&io::Error> {
+        self.cleanup.as_ref()
+    }
+}
+impl std::fmt::Display for PublicationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.replaced() {
+            write!(
+                f,
+                "publication occurred but directory durability failed: {}",
+                self.source
+            )?;
+        } else {
+            write!(
+                f,
+                "publication failed before replacement at {:?}: {}",
+                self.stage, self.source
+            )?;
+        }
+        if let Some(error) = &self.cleanup {
+            write!(f, "; owned temporary cleanup failed: {error}")?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for PublicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+fn publication_error(
+    stage: PublishStage,
+    source: io::Error,
+    cleanup: Option<io::Error>,
+) -> io::Error {
+    io::Error::new(
+        source.kind(),
+        PublicationError {
+            stage,
+            source,
+            cleanup,
+        },
+    )
+}
+fn publication_step<T>(
+    stage: PublishStage,
+    operation: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    #[cfg(test)]
+    publication_tests::checkpoint(stage)?;
+    #[cfg(not(test))]
+    let _ = stage;
+    operation()
+}
+
+struct PendingPublication<'a> {
+    directory: &'a File,
+    name: OsString,
+    file: File,
+    temporary: bool,
+}
+impl PendingPublication<'_> {
+    fn cleanup(&mut self) -> io::Result<()> {
+        if self.temporary {
+            self.temporary = false;
+            platform::remove_temporary(self.directory, &self.name, &self.file)?;
+        }
+        Ok(())
+    }
+}
+impl Drop for PendingPublication<'_> {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+impl HostDir {
+    /// Reserve an exclusive private sibling, call the caller's bounded serializer,
+    /// flush the completed file and atomically replace this single native basename.
+    /// All errors carry `PublicationError`; inspect it before claiming rollback.
+    pub fn publish(
+        &self,
+        name: &OsStr,
+        write: &mut dyn FnMut(&mut File) -> io::Result<()>,
+    ) -> io::Result<CommitScope> {
+        let mut pending = publication_step(PublishStage::Reserve, || {
+            validate_name(name)?;
+            self.reserve_publication()
+        })
+        .map_err(|e| publication_error(PublishStage::Reserve, e, None))?;
+        let result = (|| {
+            publication_step(PublishStage::Write, || {
+                // Keep the exclusive owned object as rename/flush/cleanup authority.
+                // A callback may replace its mutable File slot; only its duplicate
+                // is exposed. Cloning failure is still before replacement.
+                let mut writer = pending.file.try_clone()?;
+                write(&mut writer)
+            })
+            .map_err(|e| (PublishStage::Write, e))?;
+            publication_step(PublishStage::Flush, || platform::flush_file(&pending.file))
+                .map_err(|e| (PublishStage::Flush, e))?;
+            publication_step(PublishStage::Replace, || {
+                platform::replace(&self.directory, &pending.name, &pending.file, name)
+            })
+            .map_err(|e| (PublishStage::Replace, e))?;
+            // Ownership of the temporary name ends exactly at successful replacement.
+            pending.temporary = false;
+            #[cfg(unix)]
+            {
+                publication_step(PublishStage::ParentSync, || self.directory.sync_all())
+                    .map_err(|e| (PublishStage::ParentSync, e))?;
+                Ok(CommitScope::FileAndDirectorySynced)
+            }
+            #[cfg(windows)]
+            {
+                Ok(CommitScope::FileFlushedAtomicReplace)
+            }
+        })();
+        result.map_err(|(stage, source)| {
+            let cleanup = pending.cleanup().err();
+            publication_error(stage, source, cleanup)
+        })
+    }
+    fn reserve_publication(&self) -> io::Result<PendingPublication<'_>> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        self.reserve_publication_names(
+            std::iter::repeat_with(|| {
+                let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                OsString::from(format!(".theseus-publish-{}-{serial}", std::process::id()))
+            })
+            .take(128),
+        )
+    }
+    fn reserve_publication_names(
+        &self,
+        names: impl Iterator<Item = OsString>,
+    ) -> io::Result<PendingPublication<'_>> {
+        for name in names {
+            match platform::open_file(&self.directory, &name, true) {
+                Ok(file) => {
+                    return Ok(PendingPublication {
+                        directory: &self.directory,
+                        name,
+                        file,
+                        temporary: true,
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not reserve private publication temporary",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use std::{
+        cell::Cell,
+        io::{Read, Write},
+    };
+    thread_local! { static FAIL: Cell<Option<PublishStage>> = const { Cell::new(None) }; }
+    pub(super) fn checkpoint(stage: PublishStage) -> io::Result<()> {
+        if FAIL.get() == Some(stage) {
+            Err(io::Error::other("injected publication stage failure"))
+        } else {
+            Ok(())
+        }
+    }
+    fn content(root: &HostDir) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        root.open_file(&RelativePath::parse("report")?)?
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+    fn failure(root: &HostDir, stage: PublishStage) -> io::Result<io::Error> {
+        FAIL.set(Some(stage));
+        let result = root.publish(OsStr::new("report"), &mut |f| {
+            f.write_all(b"complete new bytes")
+        });
+        FAIL.set(None);
+        Ok(result.unwrap_err())
+    }
+    #[test]
+    fn reservation_collisions_never_delete_unowned_entries() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = HostDir::create_private(&temp.path().join("run"))?;
+        root.create_file(&RelativePath::parse("collision")?)?
+            .write_all(b"unowned")?;
+        let error = root
+            .reserve_publication_names([OsString::from("collision")].into_iter())
+            .err()
+            .expect("collision must fail");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(temp.path().join("run/collision"))?,
+            b"unowned"
+        );
+        {
+            let mut reserved = root.reserve_publication_names(
+                [OsString::from("collision"), OsString::from("owned")].into_iter(),
+            )?;
+            reserved.file.write_all(b"temporary")?;
+            assert_eq!(root.entries()?, vec!["collision", "owned"]);
+        }
+        assert_eq!(root.entries()?, vec!["collision"]);
+        assert_eq!(
+            std::fs::read(temp.path().join("run/collision"))?,
+            b"unowned"
+        );
+        Ok(())
+    }
+    #[test]
+    fn injected_pre_replace_failures_preserve_old_and_remove_only_owned_temporary() -> io::Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let root = HostDir::create_private(&temp.path().join("run"))?;
+        root.publish(OsStr::new("report"), &mut |f| f.write_all(b"old"))?;
+        root.create_file(&RelativePath::parse("unrelated")?)?
+            .write_all(b"leave alone")?;
+        for stage in [
+            PublishStage::Reserve,
+            PublishStage::Write,
+            PublishStage::Flush,
+            PublishStage::Replace,
+        ] {
+            let error = failure(&root, stage)?;
+            let detail = error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<PublicationError>()
+                .unwrap();
+            assert_eq!(detail.stage(), stage);
+            assert!(!detail.replaced());
+            assert!(detail.cleanup_error().is_none());
+            assert_eq!(content(&root)?, b"old");
+            assert_eq!(root.entries()?, vec!["report", "unrelated"]);
+            assert_eq!(
+                std::fs::read(temp.path().join("run/unrelated"))?,
+                b"leave alone"
+            );
+        }
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn parent_sync_failure_reports_publication_occurred_without_rollback() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = HostDir::create_private(&temp.path().join("run"))?;
+        root.publish(OsStr::new("report"), &mut |f| f.write_all(b"old"))?;
+        let error = failure(&root, PublishStage::ParentSync)?;
+        let detail = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<PublicationError>()
+            .unwrap();
+        assert_eq!(detail.stage(), PublishStage::ParentSync);
+        assert!(detail.replaced());
+        assert!(error.to_string().contains("publication occurred"));
+        assert_eq!(content(&root)?, b"complete new bytes");
+        assert_eq!(root.entries()?, vec!["report"]);
+        Ok(())
+    }
+}

@@ -105,3 +105,22 @@ pub fn fingerprint(file: &File) -> io::Result<FileFingerprint> {
 pub fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<()> {
     file.read_exact_at(bytes, offset)
 }
+
+pub(super) fn flush_file(file: &File) -> io::Result<()> {
+    file.sync_all()
+}
+pub(super) fn replace(
+    parent: &File,
+    temporary: &OsStr,
+    _file: &File,
+    name: &OsStr,
+) -> io::Result<()> {
+    Ok(rustix::fs::renameat(parent, temporary, parent, name)?)
+}
+pub(super) fn remove_temporary(parent: &File, name: &OsStr, _file: &File) -> io::Result<()> {
+    Ok(rustix::fs::unlinkat(
+        parent,
+        name,
+        rustix::fs::AtFlags::empty(),
+    )?)
+}

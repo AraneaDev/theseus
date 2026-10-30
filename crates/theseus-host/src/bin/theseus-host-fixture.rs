@@ -15,6 +15,12 @@
 //! - `read-until-eof MAX_BYTES`: read until EOF, then echo the exact input bytes;
 //!   fail without stdout if input exceeds the bound.
 //!
+//! - `publication-interruption ROOT before|after`: publish fixed bounded bytes to
+//!   ROOT/report.json through HostDir. Before gates inside the writer callback;
+//!   after gates only after publish returns, and prints the completed scope.
+//!   Each gate prints/flushed readiness, then reads exactly one byte from stdin.
+//!   Only byte `!` releases it; EOF/errors abort. The owning test kills/reaps it.
+//!
 //! Counts are decimal, at most 64 MiB; durations are at most 60,000 ms.
 //! Hex output is at most 64 MiB. No mode reads unrelated environment variables.
 
@@ -75,11 +81,44 @@ fn descendant(millis: u64) -> io::Result<()> {
     writeln!(io::stdout().lock(), "{}", child.id())
 }
 
+fn publication_gate(label: &str) -> io::Result<()> {
+    let mut output = io::stdout().lock();
+    writeln!(output, "{label}")?;
+    output.flush()?;
+    let mut release = [0];
+    io::stdin().lock().read_exact(&mut release)?;
+    if release != *b"!" {
+        return Err(invalid("publication gate requires explicit release"));
+    }
+    Ok(())
+}
+fn publication_interruption(root: &OsStr, gate: &OsStr) -> io::Result<()> {
+    use theseus_host::fs::{HostDir, RootPolicy};
+    let before = match gate.to_str() {
+        Some("before") => true,
+        Some("after") => false,
+        _ => return Err(invalid("expected before or after publication gate")),
+    };
+    let root = HostDir::open(std::path::Path::new(root), RootPolicy::LeafNoFollow)?;
+    let scope = root.publish(OsStr::new("report.json"), &mut |file| {
+        file.write_all(b"complete new bytes")?;
+        if before {
+            publication_gate("before:writer-callback")?;
+        }
+        Ok(())
+    })?;
+    if !before {
+        publication_gate(&format!("after:{scope:?}"))?;
+    }
+    Ok(())
+}
+
 fn run(args: &[OsString]) -> io::Result<()> {
     let (mode, args) = args
         .split_first()
         .ok_or_else(|| invalid("missing command"))?;
     match (mode.to_str(), args) {
+        (Some("publication-interruption"), [root, gate]) => publication_interruption(root, gate),
         (Some("echo-argv"), args) => {
             let mut output = io::stdout().lock();
             for arg in args {
