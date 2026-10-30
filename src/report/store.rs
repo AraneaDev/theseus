@@ -1,3 +1,4 @@
+use super::bounded::LimitedWriter;
 use crate::{
     model::{
         Checkpoint, JOURNAL_SCHEMA_VERSION, LogReference, RunJournal, RunReport, ScenarioKind,
@@ -10,7 +11,7 @@ use rustix::fs::{AtFlags, Mode, OFlags, mkdirat, open, openat, renameat, unlinka
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
     fs::{self, DirBuilder, File},
-    io::{Read, Write},
+    io::{BufWriter, Read, Write},
     os::unix::fs::DirBuilderExt,
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -85,11 +86,9 @@ impl ReportStore {
         self.atomic_json("journal.json", journal)
     }
     pub(crate) fn atomic_json(&self, name: &str, value: &impl Serialize) -> Result<()> {
-        let bytes = serde_json::to_vec_pretty(value)?;
-        ensure!(
-            bytes.len() as u64 <= MAX_REPORT_BYTES,
-            "report/journal exceeds size limit"
-        );
+        self.atomic_json_with_limit(name, value, MAX_REPORT_BYTES)
+    }
+    fn atomic_json_with_limit(&self, name: &str, value: &impl Serialize, limit: u64) -> Result<()> {
         let mut temporary = None;
         for _ in 0..32 {
             let name = format!(
@@ -114,7 +113,10 @@ impl ReportStore {
         let (temporary, mut file) =
             temporary.context("could not reserve atomic report temporary file")?;
         let result = (|| {
-            file.write_all(&bytes)?;
+            let mut writer = LimitedWriter::new(BufWriter::new(&mut file), limit);
+            serde_json::to_writer_pretty(&mut writer, value)?;
+            writer.flush()?;
+            drop(writer);
             file.sync_all()?;
             renameat(&self.directory, temporary.as_str(), &self.directory, name)?;
             self.directory.sync_all()?;
@@ -612,5 +614,79 @@ mod durability_tests {
             !temp.path().join("docker-boundary.called").exists(),
             "environment preparation must not run"
         );
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+    use serde::ser::SerializeSeq;
+    use std::cell::Cell;
+    struct Many<'a>(&'a Cell<usize>);
+    impl Serialize for Many<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let mut seq = serializer.serialize_seq(Some(10000))?;
+            for _ in 0..10000 {
+                self.0.set(self.0.get() + 1);
+                seq.serialize_element("\u{0001}\u{0001}\u{0001}")?;
+            }
+            seq.end()
+        }
+    }
+    #[test]
+    fn atomic_serialization_stops_early_preserves_previous_and_removes_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = create(&temp.path().join("run")).unwrap();
+        use crate::comparison::{ComparisonArtifact, ComparisonReport, SuiteManifest};
+        use sha2::{Digest, Sha256};
+        let manifest: SuiteManifest =
+            toml::from_str(include_str!("../../examples/comparisons/methods.toml")).unwrap();
+        let artifact = ComparisonArtifact {
+            schema_version: 1,
+            suite_id: "previous".into(),
+            manifest_digest: format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&manifest).unwrap())
+            ),
+            recipe_digests: manifest
+                .variants
+                .iter()
+                .map(|v| (v.id.clone(), "a".repeat(64)))
+                .collect(),
+            manifest,
+            sources: vec![],
+            report: ComparisonReport {
+                sources: vec![],
+                cells: vec![],
+                outcome: crate::model::RunOutcome::Incomplete,
+                diagnostics: vec![],
+            },
+            cancelled: false,
+            finished: false,
+        };
+        store.atomic_json("comparison.json", &artifact).unwrap();
+        crate::comparison::load_report(store.root()).unwrap();
+        let previous = fs::read(store.root().join("comparison.json")).unwrap();
+        let visited = Cell::new(0);
+        assert!(
+            store
+                .atomic_json_with_limit("comparison.json", &Many(&visited), 512)
+                .is_err()
+        );
+        assert!(
+            visited.get() < 100,
+            "serialization visited {} entries after the limit",
+            visited.get()
+        );
+        assert_eq!(
+            fs::read(store.root().join("comparison.json")).unwrap(),
+            previous
+        );
+        assert_eq!(fs::read_dir(store.root()).unwrap().count(), 1);
+        crate::comparison::load_report(store.root()).unwrap();
+        crate::comparison::cleanup(store.root()).unwrap();
+        store
+            .atomic_json("journal.json", &vec!["cleanup remains usable"])
+            .unwrap();
     }
 }

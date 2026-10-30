@@ -6,7 +6,7 @@ use crate::{
 
 /// The outer Result distinguishes unobserved evidence from an observed missing path.
 pub(super) fn observed<'a>(
-    path: &str,
+    path: &'a str,
     snapshots: &'a [Snapshot],
 ) -> Result<Option<&'a FileEntry>, String> {
     let snapshot = observed_snapshot(path, snapshots)?;
@@ -19,15 +19,33 @@ pub(super) fn observed<'a>(
 
 /// Resolve unique coverage and reject incomplete or no-follow ancestor evidence.
 pub(super) fn observed_snapshot<'a>(
-    path: &str,
+    path: &'a str,
     snapshots: &'a [Snapshot],
 ) -> Result<&'a Snapshot, String> {
+    observed_snapshot_reason(path, snapshots).map_err(|error| error.0.concat())
+}
+/// Borrowed error pieces let comparison accounting precede diagnostic allocation.
+pub(crate) struct ObservationError<'a>(pub [&'a str; 5]);
+fn observed_snapshot_reason<'a>(
+    path: &'a str,
+    snapshots: &'a [Snapshot],
+) -> Result<&'a Snapshot, ObservationError<'a>> {
     let mut matching = snapshots.iter().filter(|s| contained(path, &s.root));
-    let snapshot = matching
-        .next()
-        .ok_or_else(|| format!("no observed root covers {path}"))?;
+    let snapshot = matching.next().ok_or(ObservationError([
+        "no observed root covers ",
+        path,
+        "",
+        "",
+        "",
+    ]))?;
     if matching.next().is_some() {
-        return Err(format!("ambiguous overlapping observations cover {path}"));
+        return Err(ObservationError([
+            "ambiguous overlapping observations cover ",
+            path,
+            "",
+            "",
+            "",
+        ]));
     }
     match &snapshot.completeness {
         ObservationStatus::Complete => {
@@ -41,36 +59,53 @@ pub(super) fn observed_snapshot<'a>(
                     .get(ancestor)
                     .is_some_and(|entry| entry.kind != FileKind::Directory)
                 {
-                    return Err(format!(
-                        "cannot observe {path} through non-directory ancestor {ancestor}"
-                    ));
+                    return Err(ObservationError([
+                        "cannot observe ",
+                        path,
+                        " through non-directory ancestor ",
+                        ancestor,
+                        "",
+                    ]));
                 }
             }
             Ok(snapshot)
         }
         ObservationStatus::Missing => Ok(snapshot),
-        ObservationStatus::Incomplete { reason } => Err(format!(
-            "observation of {} is incomplete: {reason}",
-            snapshot.root
-        )),
+        ObservationStatus::Incomplete { reason } => Err(ObservationError([
+            "observation of ",
+            &snapshot.root,
+            " is incomplete: ",
+            reason,
+            "",
+        ])),
     }
 }
 
 /// A recursive scope additionally rejects observations nested beneath it.
 pub(crate) fn observed_scope<'a>(
-    path: &str,
+    path: &'a str,
     snapshots: &'a [Snapshot],
 ) -> Result<&'a Snapshot, String> {
-    let snapshot = observed_snapshot(path, snapshots)?;
+    observed_scope_reason(path, snapshots).map_err(|error| error.0.concat())
+}
+pub(crate) fn observed_scope_reason<'a>(
+    path: &'a str,
+    snapshots: &'a [Snapshot],
+) -> Result<&'a Snapshot, ObservationError<'a>> {
+    let snapshot = observed_snapshot_reason(path, snapshots)?;
     // Exact lookup detects roots covering the path. A recursive scope must also
     // reject extra observations nested beneath it, including incomplete ones.
     if snapshots
         .iter()
         .any(|other| other.root != snapshot.root && contained(&other.root, path))
     {
-        return Err(format!(
-            "ambiguous overlapping observations cover stable scope {path}"
-        ));
+        return Err(ObservationError([
+            "ambiguous overlapping observations cover stable scope ",
+            path,
+            "",
+            "",
+            "",
+        ]));
     }
     Ok(snapshot)
 }

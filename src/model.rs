@@ -482,6 +482,9 @@ impl ScenarioReport {
         }
     }
     pub fn recompute_outcome(&mut self) {
+        self.outcome = self.aggregate_outcome();
+    }
+    pub fn aggregate_outcome(&self) -> RunOutcome {
         let mut outcomes = self
             .stages
             .iter()
@@ -643,7 +646,7 @@ impl ScenarioReport {
         {
             outcomes.push(RunOutcome::Incomplete);
         }
-        self.outcome = RunOutcome::aggregate(outcomes);
+        RunOutcome::aggregate(outcomes)
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -702,7 +705,14 @@ impl RunReport {
         for scenario in &mut self.scenarios {
             scenario.recompute_outcome();
         }
-        let mut outcomes = self.scenarios.iter().map(|s| s.outcome).collect::<Vec<_>>();
+        self.outcome = self.aggregate_outcome();
+    }
+    pub fn aggregate_outcome(&self) -> RunOutcome {
+        let mut outcomes = self
+            .scenarios
+            .iter()
+            .map(ScenarioReport::aggregate_outcome)
+            .collect::<Vec<_>>();
         if self.cancelled {
             outcomes.push(RunOutcome::Cancelled);
         }
@@ -718,7 +728,7 @@ impl RunReport {
         if self.scenarios.is_empty() || !self.errors.is_empty() || missing_matrix_entry {
             outcomes.push(RunOutcome::Incomplete);
         }
-        self.outcome = RunOutcome::aggregate(outcomes);
+        RunOutcome::aggregate(outcomes)
     }
     pub fn counts(&self) -> ResultCounts {
         let mut counts = ResultCounts::default();

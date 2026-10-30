@@ -1,10 +1,12 @@
 //! Explicit comparison suites and pure evidence derivation.
+mod budget;
 mod environment;
 mod manifest;
 mod model;
 mod run;
 mod scope;
 mod store;
+pub use budget::MAX_DERIVED_BYTES;
 pub use manifest::{ValidatedSuite, ValidatedVariant, load, validate_manifest};
 pub use model::*;
 pub use run::{ComparisonEvent, ComparisonResult, SuiteRunOptions, run, run_with};
@@ -12,7 +14,7 @@ pub use scope::compare_scope;
 pub use store::{LoadedComparison, cleanup, cleanup_with, load_document, load_report};
 
 use crate::{
-    model::{ProfileName, RunOutcome, RunReport, ScenarioKind},
+    model::{ProfileName, RunOutcome, ScenarioKind},
     snapshot::Snapshot,
 };
 use std::collections::BTreeSet;
@@ -81,9 +83,7 @@ fn source_outcome(source: &SourceReport) -> RunOutcome {
     let Some(report) = &source.report else {
         return RunOutcome::Incomplete;
     };
-    let mut normalized: RunReport = report.clone();
-    normalized.recompute_outcome();
-    let mut outcomes = vec![report.outcome, normalized.outcome];
+    let mut outcomes = vec![report.outcome, report.aggregate_outcome()];
     if source.error.is_some() || report.finished_at.is_none() {
         outcomes.push(RunOutcome::Incomplete);
     }
@@ -95,20 +95,39 @@ fn source_outcome(source: &SourceReport) -> RunOutcome {
 /// schemas with the existing report reader before supplying persisted evidence.
 /// Invalid dimensions return Incomplete and no cells before matrix allocation.
 pub fn derive(suite: &SuiteManifest, sources: &[SourceReport]) -> ComparisonReport {
+    derive_with_limit(suite, sources, MAX_DERIVED_BYTES)
+}
+fn derive_with_limit(
+    suite: &SuiteManifest,
+    sources: &[SourceReport],
+    limit: usize,
+) -> ComparisonReport {
     let mut result = ComparisonReport {
         sources: vec![],
         cells: vec![],
         outcome: RunOutcome::Incomplete,
         diagnostics: vec![],
     };
-    if let Err(error) = validate_manifest(suite) {
-        result.diagnostics.push(format!("invalid suite: {error}"));
+    if validate_manifest(suite).is_err() {
+        result.diagnostics.push("invalid suite manifest".into());
         return result;
     }
     if sources.len() > 16 {
         result.diagnostics.push("more than 16 sources".into());
         return result;
     }
+    // Reserve fallback and recovery metadata before admitting variable evidence.
+    let reserved = (suite.variants.len() - 1)
+        .checked_mul(suite.scenarios.len())
+        .and_then(|n| n.checked_mul(suite.stages.len()))
+        .and_then(|n| n.checked_mul(suite.scopes.len()))
+        .and_then(|n| n.checked_mul(budget::CELL_RESERVE))
+        .and_then(|n| n.checked_add(suite.variants.len().checked_mul(budget::SOURCE_RESERVE)?))
+        .and_then(|n| n.checked_add(budget::REPORT_RESERVE));
+    let Some(mut bytes) = reserved.and_then(|n| budget::Budget::new(limit, n)) else {
+        result.diagnostics.push(budget::BYTE_LIMIT.into());
+        return result;
+    };
     let mut outcomes = sources.iter().map(source_outcome).collect::<Vec<_>>();
     for input in sources {
         if !suite.variants.iter().any(|v| v.id == input.variant_id) {
@@ -121,21 +140,71 @@ pub fn derive(suite: &SuiteManifest, sources: &[SourceReport]) -> ComparisonRepo
     for variant in &suite.variants {
         let source = source(sources, &variant.id).ok();
         let report = source.and_then(|s| s.report.as_ref());
-        result.sources.push(ComparisonSource {
+        let mut summary = ComparisonSource {
             variant_id: variant.id.clone(),
-            run_id: report.map(|r| r.run_id.clone()),
+            run_id: report
+                .filter(|r| store::safe_id(&r.run_id))
+                .map(|r| r.run_id.clone()),
             report_path: None,
-            recipe_digest: report.map(|r| r.recipe_digest.clone()),
-            image: report.map(|r| r.image.clone()),
-            image_id: report.and_then(|r| r.image_id.clone()),
-            artifacts: report.map(|r| r.artifacts.clone()).unwrap_or_default(),
+            recipe_digest: report
+                .filter(|r| store::valid_digest(&r.recipe_digest))
+                .map(|r| r.recipe_digest.clone()),
+            image: None,
+            image_id: None,
+            artifacts: vec![],
             outcome: source.map(source_outcome).unwrap_or(RunOutcome::Incomplete),
-            error: source.and_then(|s| s.error.clone()).or_else(|| {
+            error: None,
+        };
+        let unsupported_identity = report.is_some_and(|r| !store::safe_id(&r.run_id));
+        let cost = budget::strings(
+            256,
+            report
+                .into_iter()
+                .flat_map(|r| std::iter::once(r.image.as_str()).chain(r.image_id.as_deref())),
+        )
+        .and_then(|n| {
+            n.checked_add(budget::artifacts(
+                report.map(|r| r.artifacts.as_slice()).unwrap_or_default(),
+            )?)
+        })
+        .and_then(|n| {
+            n.checked_add(budget::strings(
+                64,
+                source.and_then(|s| s.error.as_deref()),
+            )?)
+        })
+        .and_then(|n| {
+            n.checked_add(budget::strings(
+                64,
+                report
+                    .filter(|r| !store::valid_digest(&r.recipe_digest))
+                    .map(|r| r.recipe_digest.as_str()),
+            )?)
+        });
+        if unsupported_identity {
+            bytes.exhausted = true;
+        }
+        if bytes.admit(cost) {
+            if summary.recipe_digest.is_none() {
+                summary.recipe_digest = report.map(|r| r.recipe_digest.clone());
+            }
+            summary.image = report.map(|r| r.image.clone());
+            summary.image_id = report.and_then(|r| r.image_id.clone());
+            summary.artifacts = report.map(|r| r.artifacts.clone()).unwrap_or_default();
+            summary.error = source.and_then(|s| s.error.clone()).or_else(|| {
                 report
                     .is_none()
                     .then(|| "source report is unavailable".into())
-            }),
-        });
+            });
+        } else {
+            summary.error = Some(if unsupported_identity {
+                "unsupported source run identity omitted; derived byte limit exhausted".into()
+            } else {
+                budget::BYTE_LIMIT.into()
+            });
+            outcomes.push(RunOutcome::Incomplete);
+        }
+        result.sources.push(summary);
         if let Err(reason) = self::source(sources, &variant.id) {
             result.diagnostics.push(reason);
             outcomes.push(RunOutcome::Incomplete);
@@ -147,7 +216,9 @@ pub fn derive(suite: &SuiteManifest, sources: &[SourceReport]) -> ComparisonRepo
             for scenario in &suite.scenarios {
                 for stage in &suite.stages {
                     for scope in suite.scopes.iter().filter(|s| s.profile == *profile) {
-                        let comparison = if differences >= MAX_SUITE_DIFFERENCES {
+                        let comparison = if bytes.exhausted {
+                            ScopeComparison::unknown(budget::BYTE_LIMIT)
+                        } else if differences >= MAX_SUITE_DIFFERENCES {
                             ScopeComparison::unknown("suite difference storage limit exhausted")
                         } else {
                             let evidence = (|| {
@@ -159,12 +230,19 @@ pub fn derive(suite: &SuiteManifest, sources: &[SourceReport]) -> ComparisonRepo
                                 ))
                             })();
                             match evidence {
-                                Err(reason) => ScopeComparison::unknown(reason),
+                                Err(reason) => {
+                                    if bytes.admit(budget::strings(64, [reason.as_str()])) {
+                                        ScopeComparison::unknown(reason)
+                                    } else {
+                                        ScopeComparison::unknown(budget::BYTE_LIMIT)
+                                    }
+                                }
                                 Ok((a, b)) => scope::compare_scope_bounded(
                                     a,
                                     b,
                                     &scope.path,
                                     MAX_CELL_DIFFERENCES.min(MAX_SUITE_DIFFERENCES - differences),
+                                    &mut bytes,
                                 ),
                             }
                         };
@@ -190,3 +268,6 @@ pub fn derive(suite: &SuiteManifest, sources: &[SourceReport]) -> ComparisonRepo
     result.outcome = RunOutcome::aggregate(outcomes);
     result
 }
+
+#[cfg(test)]
+mod budget_tests;

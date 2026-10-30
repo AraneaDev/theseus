@@ -66,7 +66,17 @@ bytes), nonempty unique profiles/scenarios supported by every recipe, at most
 8192 cells and a 1 MiB manifest. Scopes are normalized absolute non-root paths,
 explicit per profile, each covered by one observed root without overlapping roots.
 Unknown stage names remain Unknown rather than being skipped. Evidence bounds are
-10000 differences per cell and 100000 per suite; overflow is Unknown. The UI shows
+10000 differences per cell and 100000 per suite, plus a shared conservative
+32 MiB derived-report budget that accounts for JSON escaping before copying
+metadata, diagnostics and source summaries. Byte exhaustion retains a bounded
+prefix and makes the current and later cells Unknown, with an Incomplete suite
+(Cancelled still takes precedence). Oversized optional source identities, artifacts
+or errors are omitted together with an explicit diagnostic while source lifecycle
+outcomes stay accurate; validated run IDs, declared recipe digests and contained
+recovery paths survive. Full source reports retain the original evidence. Large
+valid suites may become Incomplete before reaching count caps. JSON file writes
+stream up to 64 MiB; failed serialization leaves the last valid file and cleanup
+usable. CLI comparison JSON stages a complete document within 32 MiB. The UI shows
 a labelled prefix of at most 100 differences and elides long text at 512 characters;
 JSON retains the complete bounded stored evidence. Saved comparison schema is 1;
 source lifecycle schema stays 6 and journals/ownership stay 1.

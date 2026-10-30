@@ -265,21 +265,24 @@ fn derive_bounds_matrix_before_allocation_and_stored_differences_across_suite() 
     s.variants.remove(1);
     let result = derive(&s, &sources);
     assert_eq!(result.cells.len(), 12);
-    assert_eq!(
-        result
-            .cells
+    let stored = result
+        .cells
+        .iter()
+        .map(|c| c.comparison.differences.len())
+        .sum::<usize>();
+    assert!(stored > 0 && stored <= 100_000);
+    let first_unknown = result
+        .cells
+        .iter()
+        .position(|c| c.comparison.status == ComparisonStatus::Unknown)
+        .unwrap();
+    assert!(
+        result.cells[first_unknown..]
             .iter()
-            .map(|c| c.comparison.differences.len())
-            .sum::<usize>(),
-        100_000
+            .all(|c| c.comparison.status == ComparisonStatus::Unknown)
     );
-    assert_eq!(
-        result.cells[10].comparison.status,
-        ComparisonStatus::Unknown
-    );
-    assert_eq!(
-        result.cells[11].comparison.status,
-        ComparisonStatus::Unknown
+    assert!(
+        serde_json::to_vec_pretty(&result).unwrap().len() <= theseus::comparison::MAX_DERIVED_BYTES
     );
     assert_eq!(result.outcome, RunOutcome::Incomplete);
 }

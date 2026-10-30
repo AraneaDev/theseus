@@ -404,6 +404,18 @@ compatibility. These are declared observations, not universal installer equivale
 Comparison manifests and saved artifacts use schema 1; source reports still write
 schema 6. Offline viewing/JSON recomputes results and checks contained source digests
 without Docker. JSON returns 0 for valid evidence regardless of suite outcome.
+Derivation uses a shared conservative 32 MiB budget, including JSON escaping,
+source summaries and diagnostics, before copying variable evidence. Limits also
+cap differences at 10,000 per cell and 100,000 per suite. Exhaustion retains a
+bounded prefix, makes the current and later cells Unknown and the suite Incomplete
+(unless Cancelled takes precedence). Oversized optional source identities/artifacts
+or errors are omitted atomically with a diagnostic; source lifecycle outcomes stay
+accurate. Validated run IDs, declared recipe digests and contained recovery paths
+remain available. Full source reports remain available for omitted evidence.
+Legitimate large comparisons can reach this conservative byte limit before the
+count caps. Private JSON writes stream with a 64 MiB limit and preserve the prior
+file on serialization failure; comparison CLI JSON is staged within 32 MiB before
+emission.
 The UI labels its 100-difference display prefix and 512-character text elision;
 use the displayed safely quoted JSON command for complete bounded stored evidence.
 

@@ -1,7 +1,10 @@
 //! Pure, no-follow scoped evidence comparison with bounded difference storage.
-use super::model::*;
+use super::{
+    budget::{self, Budget},
+    model::*,
+};
 use crate::{
-    checks::lookup::observed_scope,
+    checks::lookup::{ObservationError, observed_scope_reason},
     model::FileKind,
     recipe::{normalize_container_path, validate::contained},
     snapshot::{ChangeKind, FileChange, FileEntry, ObservationStatus, Snapshot},
@@ -10,33 +13,54 @@ use std::collections::BTreeMap;
 
 fn evidence<'a>(
     snapshots: &'a [Snapshot],
-    path: &str,
-) -> Result<BTreeMap<&'a str, &'a FileEntry>, String> {
-    let snapshot = observed_scope(path, snapshots)?;
+    path: &'a str,
+) -> Result<BTreeMap<&'a str, &'a FileEntry>, ObservationError<'a>> {
+    let snapshot = observed_scope_reason(path, snapshots)?;
     if snapshot.root == "/"
         || !normalize_container_path(&snapshot.root).is_ok_and(|p| p == snapshot.root)
     {
-        return Err("observation root must be a normalized absolute application path".into());
+        return Err(ObservationError([
+            "observation root must be a normalized absolute application path",
+            "",
+            "",
+            "",
+            "",
+        ]));
     }
     if snapshot.completeness == ObservationStatus::Missing {
         return if snapshot.entries.is_empty() {
             Ok(BTreeMap::new())
         } else {
-            Err("missing observation contains entries".into())
+            Err(ObservationError([
+                "missing observation contains entries",
+                "",
+                "",
+                "",
+                "",
+            ]))
         };
     }
     if !snapshot.entries.contains_key(&snapshot.root) {
-        return Err(format!(
-            "complete observation has no root entry: {}",
-            snapshot.root
-        ));
+        return Err(ObservationError([
+            "complete observation has no root entry: ",
+            &snapshot.root,
+            "",
+            "",
+            "",
+        ]));
     }
     // Reject malformed evidence rather than allowing an impossible tree to prove absence.
     for key in snapshot.entries.keys() {
         if !normalize_container_path(key).is_ok_and(|p| p == *key)
             || !contained(key, &snapshot.root)
         {
-            return Err(format!("invalid observation entry: {key}"));
+            return Err(ObservationError([
+                "invalid observation entry: ",
+                key,
+                "",
+                "",
+                "",
+            ]));
         }
         if key != &snapshot.root {
             let parent = key.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
@@ -45,7 +69,13 @@ fn evidence<'a>(
                 .get(parent)
                 .is_some_and(|e| e.kind == FileKind::Directory)
             {
-                return Err(format!("missing or non-directory parent for {key}"));
+                return Err(ObservationError([
+                    "missing or non-directory parent for ",
+                    key,
+                    "",
+                    "",
+                    "",
+                ]));
             }
         }
     }
@@ -65,24 +95,26 @@ fn evidence<'a>(
 }
 /// Compare complete subtree metadata, including verified absence, without reading disk.
 pub fn compare_scope(before: &[Snapshot], after: &[Snapshot], path: &str) -> ScopeComparison {
-    compare_scope_bounded(before, after, path, MAX_CELL_DIFFERENCES)
+    let mut bytes = Budget::new(budget::MAX_DERIVED_BYTES, budget::CELL_RESERVE).unwrap();
+    compare_scope_bounded(before, after, path, MAX_CELL_DIFFERENCES, &mut bytes)
 }
 pub(crate) fn compare_scope_bounded(
     before: &[Snapshot],
     after: &[Snapshot],
     path: &str,
     budget: usize,
+    bytes: &mut Budget,
 ) -> ScopeComparison {
     if path == "/" || !normalize_container_path(path).is_ok_and(|p| p == path) {
         return ScopeComparison::unknown("scope path must be normalized absolute application path");
     }
     let old = match evidence(before, path) {
         Ok(e) => e,
-        Err(e) => return ScopeComparison::unknown(format!("before: {e}")),
+        Err(e) => return diagnostic("before: ", e, bytes),
     };
     let new = match evidence(after, path) {
         Ok(e) => e,
-        Err(e) => return ScopeComparison::unknown(format!("after: {e}")),
+        Err(e) => return diagnostic("after: ", e, bytes),
     };
     let mut result = ScopeComparison {
         status: ComparisonStatus::Equivalent,
@@ -119,6 +151,14 @@ pub(crate) fn compare_scope_bounded(
                 .push("difference storage limit exceeded".into());
             return result;
         }
+        let cost = budget::strings(256, [key])
+            .and_then(|n| n.checked_add(budget::entry(a)?))
+            .and_then(|n| n.checked_add(budget::entry(b)?));
+        if !bytes.admit(cost) {
+            result.status = ComparisonStatus::Unknown;
+            result.diagnostics.push(budget::BYTE_LIMIT.into());
+            return result;
+        }
         result.status = ComparisonStatus::Different;
         result.differences.push(FileChange {
             path: key.into(),
@@ -132,4 +172,12 @@ pub(crate) fn compare_scope_bounded(
         });
     }
     result
+}
+
+fn diagnostic(prefix: &str, error: ObservationError<'_>, bytes: &mut Budget) -> ScopeComparison {
+    if bytes.admit(budget::strings(64, std::iter::once(prefix).chain(error.0))) {
+        ScopeComparison::unknown(format!("{prefix}{}", error.0.concat()))
+    } else {
+        ScopeComparison::unknown(budget::BYTE_LIMIT)
+    }
 }

@@ -15,14 +15,14 @@ pub(super) fn digest(bytes: &[u8]) -> String {
 pub(super) fn manifest_digest(manifest: &SuiteManifest) -> Result<String> {
     Ok(digest(&serde_json::to_vec(manifest)?))
 }
-fn safe_id(id: &str) -> bool {
+pub(super) fn safe_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
-fn valid_digest(value: &str) -> bool {
+pub(super) fn valid_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 pub(super) fn run_id(source: &SourceReference) -> Result<&str> {
@@ -183,7 +183,14 @@ pub(super) fn recompute(
     artifact: &ComparisonArtifact,
     sources: &[SourceReport],
 ) -> ComparisonReport {
-    let mut report = derive(&artifact.manifest, sources);
+    recompute_with_limit(artifact, sources, MAX_DERIVED_BYTES)
+}
+pub(super) fn recompute_with_limit(
+    artifact: &ComparisonArtifact,
+    sources: &[SourceReport],
+    limit: usize,
+) -> ComparisonReport {
+    let mut report = derive_with_limit(&artifact.manifest, sources, limit);
     for summary in &mut report.sources {
         if let Some(reference) = artifact
             .sources
@@ -218,8 +225,11 @@ pub struct LoadedComparison {
 }
 /// Load declaration context and evidence through the same pinned safe store.
 pub fn load_document(path: &Path) -> Result<LoadedComparison> {
+    load_document_with_limit(path, MAX_DERIVED_BYTES)
+}
+pub(super) fn load_document_with_limit(path: &Path, limit: usize) -> Result<LoadedComparison> {
     let (store, artifact) = open(path)?;
-    let report = recompute(&artifact, &read_sources(&store, &artifact)?);
+    let report = recompute_with_limit(&artifact, &read_sources(&store, &artifact)?, limit);
     Ok(LoadedComparison {
         manifest: artifact.manifest,
         report,

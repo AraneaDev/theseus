@@ -130,7 +130,11 @@ pub fn execute(cli: Cli) -> Result<i32> {
                     animation,
                 );
             }
-            println!("{}", serde_json::to_string_pretty(&document.report)?);
+            write_comparison_json(
+                &document.report,
+                &mut std::io::stdout().lock(),
+                comparison::MAX_DERIVED_BYTES,
+            )?;
             Ok(0)
         }
         Some(Action::Compare {
@@ -294,4 +298,42 @@ fn init() -> Result<()> {
     file.write_all(text.as_bytes())?;
     file.sync_all()?;
     Ok(())
+}
+
+fn write_comparison_json(
+    report: &comparison::ComparisonReport,
+    output: &mut impl std::io::Write,
+    limit: usize,
+) -> Result<()> {
+    let json_limit = limit
+        .checked_sub(1)
+        .ok_or_else(|| anyhow::anyhow!("JSON exceeds size limit"))?;
+    let bytes = report::json_bytes(report, json_limit)?;
+    output.write_all(&bytes)?;
+    output.write_all(b"\n")?;
+    Ok(())
+}
+#[cfg(test)]
+mod bounded_comparison_json_tests {
+    use super::*;
+    #[test]
+    fn oversized_comparison_json_emits_nothing_and_success_is_complete() {
+        let report = comparison::ComparisonReport {
+            sources: vec![],
+            cells: vec![],
+            outcome: crate::model::RunOutcome::Incomplete,
+            diagnostics: vec!["\u{0001}".repeat(256)],
+        };
+        let mut stdout = vec![];
+        assert!(write_comparison_json(&report, &mut stdout, 512).is_err());
+        assert!(stdout.is_empty(), "partial JSON must never reach stdout");
+        write_comparison_json(&report, &mut stdout, 4096).unwrap();
+        let decoded: comparison::ComparisonReport = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(decoded.diagnostics, report.diagnostics);
+        assert!(stdout.len() <= 4096);
+        let exact_size = stdout.len();
+        stdout.clear();
+        assert!(write_comparison_json(&report, &mut stdout, exact_size - 1).is_err());
+        assert!(stdout.is_empty());
+    }
 }
