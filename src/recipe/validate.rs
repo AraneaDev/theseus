@@ -666,7 +666,7 @@ fn validate_command(
     );
     Ok(())
 }
-fn valid_env_name(name: &str) -> bool {
+pub(crate) fn valid_env_name(name: &str) -> bool {
     let mut chars = name.chars();
     chars
         .next()

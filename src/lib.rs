@@ -12,3 +12,6 @@ pub mod snapshot;
 pub mod tui;
 
 pub(crate) mod shell;
+
+pub mod mcp;
+mod strict_json;
