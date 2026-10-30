@@ -4,6 +4,8 @@ mod command;
 mod completion;
 mod failure;
 mod files;
+mod json;
+pub use json::{JsonCommandObservation, evaluate_json_command};
 pub(crate) mod lookup;
 mod rejection;
 mod stability;
@@ -19,6 +21,11 @@ pub use rejection::{RejectionAssessment, assess_rejection};
 pub use stability::{StabilityResult, compare_unchanged};
 fn result(check: &Check, outcome: CheckOutcome, message: impl Into<String>) -> CheckResult {
     CheckResult {
+        json_expectation: None,
+        json_required: matches!(
+            check.expectation,
+            crate::recipe::Expectation::JsonCommand { .. }
+        ),
         command_expectation: None,
         id: check.id.clone(),
         checkpoint: check.checkpoint,

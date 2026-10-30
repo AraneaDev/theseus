@@ -27,7 +27,7 @@ fn real_interrupted_rollback_four_way_matrix_restores_runtime_and_reads_actual_d
             let before = stage(s, "before_upgrade");
             let failed = stage(s, "interrupted");
             let restored = stage(s, "rolled_back");
-            assert_eq!(result.report.schema_version, 6);
+            assert_eq!(result.report.schema_version, 7);
             assert!(s.rollback.is_none());
             for (phase, id, marker) in [
                 ("base_installed", "base-version", "sample-cli 1.0.0"),

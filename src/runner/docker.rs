@@ -478,6 +478,96 @@ mod tests {
         .outcome
     }
     #[test]
+    fn json_capture_distinguishes_invalid_source_bytes_from_valid_replacement_character() {
+        for interrupted in [false, true] {
+            for (valid, truncated) in [(false, false), (true, false), (false, true)] {
+                let temp = tempfile::tempdir().unwrap();
+                let executable = temp.path().join("docker-json-boundary");
+                std::fs::write(&executable, format!(r#"#!/usr/bin/python3
+import sys,json
+args=sys.argv[1:]
+if args[0]=='container':
+    print(json.dumps({{'Id':args[-1], 'Config':{{'Labels':{{'io.theseus.owner':'v1','io.theseus.run':'json','io.theseus.scenario':'capture'}}}},'State':{{'Running':True}}}}))
+    sys.exit(0)
+script=args[args.index('-c')+1]
+if script.startswith('umask') or 'command -v dd' in script: sys.exit(0)
+if 'printf waiting' in script: print('waiting',end=''); sys.exit(0)
+if script.startswith('receipt='):
+    sys.stdout.buffer.write(b'"' + (b'\xef\xbf\xbd' if {valid} else b'\xff') + b'"')
+    sys.exit(0)
+if script.startswith('test -f'):
+    nonce=args[-1].split('/')[1].removeprefix('.theseus-')
+    print(nonce+':0'); sys.exit(0)
+sys.exit(99)
+"#, valid=if valid {"True"} else {"False"})).unwrap();
+                std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                let store = crate::report::create(&temp.path().join("run")).unwrap();
+                let resource = OwnedResource {
+                    container_id: "a".repeat(64),
+                    labels: BTreeMap::from([
+                        (OWNER_LABEL.into(), "v1".into()),
+                        (RUN_LABEL.into(), "json".into()),
+                        (SCENARIO_LABEL.into(), "capture".into()),
+                    ]),
+                    removed: false,
+                };
+                let mut docker = Docker::new(executable);
+                let mut request = probe_request("json", 0);
+                request.log_limit = if truncated {
+                    2
+                } else if valid {
+                    5
+                } else {
+                    3
+                };
+                let cap = request.log_limit;
+                let executed = if interrupted {
+                    docker.execute_interrupted(
+                        &resource,
+                        request,
+                        &store,
+                        &CancellationToken::default(),
+                    )
+                } else {
+                    docker.execute(&resource, request, &store, &CancellationToken::default())
+                }
+                .unwrap();
+                assert_eq!(executed.stdout, if truncated { "\"�" } else { "\"�\"" });
+                assert_eq!(executed.stdout_utf8, valid);
+                assert_eq!(
+                    executed.stdout_complete, !truncated,
+                    "{:?}",
+                    executed.record
+                );
+                let check:crate::recipe::Check=serde_json::from_value(serde_json::json!({"id":"json","checkpoint":"target_installed","kind":"json_command","script":"fixture","expected_exit":0,"max_stdout_bytes":cap,"assertions":[{"kind":"equals","pointer":"","equals_json":"\"�\""}]})).unwrap();
+                let result = crate::checks::evaluate_json_command(
+                    &check,
+                    &crate::checks::JsonCommandObservation {
+                        exit_status: executed.record.exit_status,
+                        stdout: &executed.stdout,
+                        complete: executed.stdout_complete,
+                        utf8: executed.stdout_utf8,
+                        error: executed.record.error.as_deref(),
+                    },
+                );
+                assert_eq!(
+                    result.outcome,
+                    if truncated {
+                        CheckOutcome::Incomplete
+                    } else if valid {
+                        CheckOutcome::Passed
+                    } else {
+                        CheckOutcome::Failed
+                    }
+                );
+                let raw = std::fs::read(store.root().join(&executed.record.stdout.unwrap().path))
+                    .unwrap();
+                assert_eq!(std::str::from_utf8(&raw).is_ok(), valid);
+            }
+        }
+    }
+    #[test]
     fn docker_control_exit_one_cannot_satisfy_application_expectation() {
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("docker-failure");

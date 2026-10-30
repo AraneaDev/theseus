@@ -18,6 +18,8 @@ fn fixture(root: &Path) -> App {
     let mut second = StageReport::new("target_installed");
     second.outcome = StageOutcome::Incomplete;
     second.checks.push(CheckResult {
+        json_expectation: None,
+        json_required: false,
         command_expectation: None,
         id: "target-path".into(),
         checkpoint: Checkpoint::TargetInstalled,
@@ -441,6 +443,8 @@ fn reinstall_failed_directory_scope_and_comparison_references_are_browsable() {
     let mut stage = StageReport::new("reinstalled");
     stage.outcome = StageOutcome::Failed;
     stage.checks.push(CheckResult {
+        json_expectation: None,
+        json_required: false,
         command_expectation: None,
         id: "stable-config".into(),
         checkpoint: Checkpoint::Reinstalled,
@@ -728,6 +732,8 @@ fn rollback_offline_narrow_evidence_shows_failed_mutation_and_mapped_restore() {
     let mut stage = StageReport::new("rolled_back");
     stage.outcome = StageOutcome::Failed;
     stage.checks.push(CheckResult {
+        json_expectation: None,
+        json_required: false,
         command_expectation: None,
         id: "restored-data".into(),
         checkpoint: Checkpoint::RolledBack,
@@ -816,4 +822,45 @@ fn actual_pty_default_animation_controls_signals_and_restoration() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn json_check_evidence_renders_typed_proof_and_unexecuted_marker() {
+    let check:theseus::recipe::Check=serde_json::from_value(serde_json::json!({"id":"inventory","checkpoint":"target_installed","kind":"json_command","script":"printf true","expected_exit":0,"assertions":[{"kind":"equals","pointer":"","equals_json":"true"}]})).unwrap();
+    let result = theseus::checks::evaluate_json_command(
+        &check,
+        &theseus::checks::JsonCommandObservation {
+            exit_status: Some(0),
+            stdout: "true",
+            complete: true,
+            utf8: true,
+            error: None,
+        },
+    );
+    let mut stage = StageReport::new("target_installed");
+    stage.checks.push(result);
+    let mut scenario = ScenarioReport::new("user-clean", ProfileName::User, ScenarioKind::Clean);
+    scenario.stages.push(stage);
+    let mut report = RunReport::new("json-render");
+    report.scenarios.push(scenario);
+    let mut app = App::offline(report, Path::new("/tmp").into());
+    app.tab = Tab::Findings;
+    let text = app.items().join("\n");
+    for wanted in [
+        "JSON proof:",
+        "utf8=true",
+        "cap=262144",
+        "parse=Parsed",
+        "verified=true",
+        "Assertions:",
+        "Observations:",
+        "Scalar",
+        "Bool(true)",
+    ] {
+        assert!(text.contains(wanted), "missing {wanted}: {text}");
+    }
+    let result = &mut app.report.as_mut().unwrap().scenarios[0].stages[0].checks[0];
+    result.json_expectation = None;
+    result.outcome = CheckOutcome::Skipped;
+    assert!(app.items().join("\n").contains("JSON proof: unavailable"));
 }

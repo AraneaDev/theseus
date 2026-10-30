@@ -405,7 +405,7 @@ fn log_components(relative: &str) -> Result<Vec<&str>> {
 }
 fn validate_report(report: &RunReport) -> Result<()> {
     ensure!(
-        matches!(report.schema_version, 1..=6),
+        matches!(report.schema_version, 1..=7),
         "unsupported report schema version {}",
         report.schema_version
     );
@@ -570,6 +570,18 @@ fn validate_report(report: &RunReport) -> Result<()> {
     }
     for scenario in &report.scenarios {
         for stage in &scenario.stages {
+            ensure!(
+                report.schema_version >= 7
+                    || stage
+                        .checks
+                        .iter()
+                        .all(|check| !check.json_required && check.json_expectation.is_none()),
+                "JSON evidence requires report schema version 7"
+            );
+            ensure!(
+                stage.valid_json_checks(),
+                "invalid JSON check evidence or command binding"
+            );
             for command in &stage.commands {
                 for log in command.stdout.iter().chain(&command.stderr) {
                     log_components(&log.path)?;

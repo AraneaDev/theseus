@@ -249,6 +249,7 @@ impl Environment for Evidence {
         Ok(ExecutedCommand {
             record,
             stdout,
+            stdout_utf8: true,
             stdout_complete: !(self.fault == "truncated" && phase == "attempt_upgrade"),
         })
     }
@@ -307,6 +308,7 @@ impl Environment for Evidence {
         Ok(ExecutedCommand {
             record,
             stdout: String::new(),
+            stdout_utf8: true,
             stdout_complete: false,
         })
     }

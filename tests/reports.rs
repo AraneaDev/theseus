@@ -17,6 +17,8 @@ fn failed_contract_evidence_survives_cleanup_error_and_cancellation_wins() {
     let mut scenario = ScenarioReport::new("user-clean", ProfileName::User, ScenarioKind::Clean);
     let mut stage = StageReport::new("uninstalled");
     stage.checks.push(CheckResult {
+        json_expectation: None,
+        json_required: false,
         command_expectation: None,
         id: "binary-removed".into(),
         checkpoint: Checkpoint::Uninstalled,
@@ -350,14 +352,14 @@ fn frozen_schema_one_report_and_journal_remain_readable_and_writable() {
 }
 
 #[test]
-fn new_reports_write_schema_six_while_journals_stay_schema_one() {
+fn new_reports_write_schema_seven_while_journals_stay_schema_one() {
     let temp = tempfile::tempdir().unwrap();
     let store = report::create(&temp.path().join("run")).unwrap();
     store.save(&RunReport::new("new-run")).unwrap();
     let serialized: serde_json::Value =
         serde_json::from_slice(&fs::read(store.report_path()).unwrap()).unwrap();
-    assert_eq!(serialized["schema_version"], 6);
-    assert_eq!(report::load(store.root()).unwrap().schema_version, 6);
+    assert_eq!(serialized["schema_version"], 7);
+    assert_eq!(report::load(store.root()).unwrap().schema_version, 7);
     let journal = RunJournal {
         schema_version: 1,
         run_id: "new-run".into(),
@@ -378,13 +380,13 @@ fn new_reports_write_schema_six_while_journals_stay_schema_one() {
 fn report_versions_and_journal_versions_are_validated_independently() {
     let temp = tempfile::tempdir().unwrap();
     let store = report::create(&temp.path().join("run")).unwrap();
-    for version in [1, 2, 3, 4, 5, 6] {
+    for version in [1, 2, 3, 4, 5, 6, 7] {
         let mut run = RunReport::new("run");
         run.schema_version = version;
         store.save(&run).unwrap();
         assert_eq!(report::load(store.root()).unwrap().schema_version, version);
     }
-    for version in [0, 7, 999] {
+    for version in [0, 8, 999] {
         let mut run = RunReport::new("run");
         run.schema_version = version;
         assert!(store.save(&run).is_err());
@@ -698,6 +700,8 @@ fn rejected_downgrade_report() -> RunReport {
     checkpoint.outcome = StageOutcome::Passed;
     for id in ["binary", "data"] {
         checkpoint.checks.push(CheckResult {
+            json_expectation: None,
+            json_required: false,
             command_expectation: None,
             id: id.into(),
             checkpoint: Checkpoint::DowngradeRejected,
@@ -874,6 +878,8 @@ fn downgrade_each_feature_has_schema_four_floor_and_optional_fields_omit_none() 
                 "exercise" => stage.step = Some(StepName::ExerciseDowngraded),
                 "checkpoint" => stage.checkpoint = Some(Checkpoint::Downgraded),
                 "check" | "comparison" => stage.checks.push(CheckResult {
+                    json_expectation: None,
+                    json_required: false,
                     command_expectation: None,
                     id: "x".into(),
                     checkpoint: if feature == "check" {
@@ -1303,5 +1309,192 @@ fn report_six_floor_is_typed_scenario_policy_and_command_evidence_only() {
                 "{feature} reader {version}"
             );
         }
+    }
+}
+
+fn json_proof_report() -> RunReport {
+    let check: theseus::recipe::Check=serde_json::from_value(serde_json::json!({"id":"json", "checkpoint":"target_installed", "kind":"json_command", "script":"printf true", "expected_exit":0,"assertions":[{"kind":"equals","pointer":"","equals_json":"true"}]})).unwrap();
+    let mut result = theseus::checks::evaluate_json_command(
+        &check,
+        &theseus::checks::JsonCommandObservation {
+            exit_status: Some(0),
+            stdout: "true",
+            complete: true,
+            utf8: true,
+            error: None,
+        },
+    );
+    result.command_ids.push("json-command".into());
+    let mut command = CommandRecord::new("json-command", "check:json");
+    command.exit_status = Some(0);
+    command.outcome = CommandOutcome::Succeeded;
+    command.stdout = Some(LogReference {
+        path: "logs/json.stdout".into(),
+        bytes: 4,
+        truncated: false,
+    });
+    let mut stage = StageReport::new("target_installed");
+    stage.outcome = StageOutcome::Passed;
+    stage.checks.push(result);
+    stage.commands.push(command);
+    let mut scenario = ScenarioReport::new("user-clean", ProfileName::User, ScenarioKind::Clean);
+    scenario.stages.push(stage);
+    scenario.teardown = TeardownStatus::Complete;
+    let mut run = RunReport::new("json-proof");
+    run.scenarios.push(scenario);
+    run.recompute_outcome();
+    run
+}
+#[test]
+fn schema_seven_replays_json_proof_and_rejects_missing_or_unbound_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = report::create(&dir.path().join("run")).unwrap();
+    let good = json_proof_report();
+    assert_eq!(good.outcome, RunOutcome::Passed);
+    store.save(&good).unwrap();
+    assert_eq!(
+        report::load(store.root()).unwrap().outcome,
+        RunOutcome::Passed
+    );
+    for edit in 0..14 {
+        let mut bad = good.clone();
+        let stage = &mut bad.scenarios[0].stages[0];
+        match edit {
+            0 => stage.checks[0].json_expectation = None,
+            1 => stage.checks[0].json_required = false,
+            2 => stage.checks[0]
+                .json_expectation
+                .as_mut()
+                .unwrap()
+                .observations
+                .clear(),
+            3 => stage.commands[0].phase = "check:other".into(),
+            4 => stage.commands[0].exit_status = Some(1),
+            5 => stage.commands[0].timed_out = true,
+            6 => stage.commands[0].stdout.as_mut().unwrap().truncated = true,
+            7 => stage.commands.clear(),
+            8 => stage.commands.push(stage.commands[0].clone()),
+            9 => stage.checks[0].command_ids.push("json-command".into()),
+            10 => stage.commands[0].error = Some("lost receipt".into()),
+            11 => stage.commands[0].outcome = CommandOutcome::Failed,
+            12 => {
+                stage.checks[0]
+                    .json_expectation
+                    .as_mut()
+                    .unwrap()
+                    .diagnostic = Some("x".repeat(131073))
+            }
+            _ => {
+                stage.checks[0]
+                    .json_expectation
+                    .as_mut()
+                    .unwrap()
+                    .observations = vec![JsonAssertionObservation::Equals {
+                    actual: JsonValueObservation::NonScalar {
+                        kind: "invented".into(),
+                    },
+                }]
+            }
+        }
+        bad.recompute_outcome();
+        assert_ne!(bad.outcome, RunOutcome::Passed, "edit {edit}");
+        assert!(store.save(&bad).is_err(), "edit {edit}");
+        fs::write(store.report_path(), serde_json::to_vec(&bad).unwrap()).unwrap();
+        assert!(report::load(store.root()).is_err(), "edit {edit}");
+    }
+    let mut skipped = good.clone();
+    skipped.scenarios[0].stages[0].checks[0].json_expectation = None;
+    skipped.scenarios[0].stages[0].checks[0].outcome = CheckOutcome::Skipped;
+    store.save(&skipped).unwrap();
+    assert!(report::load(store.root()).is_ok());
+}
+#[test]
+fn historical_reports_reject_json_fields_but_load_original_fixtures() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = report::create(&dir.path().join("run")).unwrap();
+    for version in 1..=6 {
+        let fixture = fs::read(format!(
+            "tests/fixtures/reports/schema{version}-report.json"
+        ))
+        .unwrap();
+        fs::write(store.report_path(), fixture).unwrap();
+        let old = report::load(store.root()).unwrap();
+        assert_eq!(old.schema_version, version);
+        store.save(&old).unwrap();
+        for retain_proof in [false, true] {
+            let mut bad = json_proof_report();
+            bad.schema_version = version;
+            if !retain_proof {
+                bad.scenarios[0].stages[0].checks[0].json_expectation = None;
+                bad.scenarios[0].stages[0].checks[0].outcome = CheckOutcome::Skipped;
+            }
+            assert!(store.save(&bad).is_err());
+            fs::write(store.report_path(), serde_json::to_vec(&bad).unwrap()).unwrap();
+            assert!(report::load(store.root()).is_err());
+        }
+    }
+}
+
+#[test]
+fn failed_json_proofs_still_enforce_total_evidence_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = report::create(&dir.path().join("run")).unwrap();
+    for (values_per_observation, accepted) in [(8, true), (16, false)] {
+        let mut run = json_proof_report();
+        let check = &mut run.scenarios[0].stages[0].checks[0];
+        check.outcome = CheckOutcome::Failed;
+        let proof = check.json_expectation.as_mut().unwrap();
+        proof.assertions = (0..32)
+            .map(|_| theseus::recipe::JsonAssertion::ArrayMatch {
+                pointer: "".into(),
+                identity: vec![theseus::recipe::JsonPredicate {
+                    pointer: "/id".into(),
+                    equals_json: "1".into(),
+                }],
+                count: 1,
+                values: vec![theseus::recipe::JsonPredicate {
+                    pointer: "/value".into(),
+                    equals_json: "true".into(),
+                }],
+            })
+            .collect();
+        proof.observations = (0..32)
+            .map(|_| JsonAssertionObservation::ArrayMatch {
+                array_valid: true,
+                matched_count: 1,
+                values: vec![
+                    JsonValueObservation::Scalar {
+                        value: serde_json::Value::String("x".repeat(254))
+                    };
+                    values_per_observation
+                ],
+            })
+            .collect();
+        assert_eq!(serde_json::to_vec(proof).unwrap().len() <= 131072, accepted);
+        assert_eq!(store.save(&run).is_ok(), accepted);
+        fs::write(store.report_path(), serde_json::to_vec(&run).unwrap()).unwrap();
+        assert_eq!(report::load(store.root()).is_ok(), accepted);
+    }
+}
+#[test]
+fn json_proof_objects_reject_unknown_fields_during_decode() {
+    let value = serde_json::to_value(json_proof_report()).unwrap();
+    for pointer in [
+        "/scenarios/0/stages/0/checks/0/json_expectation",
+        "/scenarios/0/stages/0/checks/0/json_expectation/assertions/0",
+        "/scenarios/0/stages/0/checks/0/json_expectation/observations/0",
+        "/scenarios/0/stages/0/checks/0/json_expectation/observations/0/actual",
+    ] {
+        let mut invalid = value.clone();
+        invalid
+            .pointer_mut(pointer)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".into(), true.into());
+        assert!(
+            serde_json::from_value::<RunReport>(invalid).is_err(),
+            "{pointer}"
+        );
     }
 }

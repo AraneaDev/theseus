@@ -269,6 +269,9 @@ dd if="$1/ready/receipt" iflag=nofollow,nonblock bs=1 count=34 2>/dev/null
             && output.as_ref().is_some_and(|out| !out.stdout.truncated);
         Ok(ExecutedCommand {
             record,
+            stdout_utf8: output
+                .as_ref()
+                .is_some_and(|out| std::str::from_utf8(&out.stdout.bytes).is_ok()),
             stdout: output.map_or_else(String::new, |out| {
                 String::from_utf8_lossy(&out.stdout.bytes).into_owned()
             }),

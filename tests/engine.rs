@@ -49,6 +49,41 @@ impl Environment for Fake {
         _: &ReportStore,
         _: &CancellationToken,
     ) -> Result<ExecutedCommand> {
+        if request.phase == "check:json" {
+            assert_eq!(request.identity.uid, 10001);
+            assert_eq!(request.identity.gid, 10001);
+            assert_eq!(request.argv, vec!["/bin/sh", "-c", "printf true"]);
+            assert_eq!(
+                request.env.get("JSON_TEST_LITERAL").map(String::as_str),
+                Some("value")
+            );
+            assert_eq!(request.timeout_seconds, 7);
+            assert_eq!(
+                request.log_limit,
+                if self.fault == "json-small" { 2 } else { 4 }
+            );
+            let truncated = self.fault == "json-small";
+            let mut record = CommandRecord::new(&request.id, &request.phase);
+            record.identity = request.identity;
+            record.exit_status = Some(0);
+            record.outcome = CommandOutcome::Succeeded;
+            record.stdout = Some(LogReference {
+                path: "logs/json.stdout".into(),
+                bytes: if truncated { 2 } else { 4 },
+                truncated,
+            });
+            record.stderr = Some(LogReference {
+                path: "logs/json.stderr".into(),
+                bytes: 4,
+                truncated: true,
+            });
+            return Ok(ExecutedCommand {
+                record,
+                stdout: if truncated { "tr" } else { "true" }.into(),
+                stdout_complete: !truncated,
+                stdout_utf8: true,
+            });
+        }
         let mut record = CommandRecord::new(&request.id, &request.phase);
         record.identity = request.identity;
         record.argv = request.argv;
@@ -77,6 +112,7 @@ impl Environment for Fake {
         Ok(ExecutedCommand {
             record,
             stdout: "2.0".into(),
+            stdout_utf8: true,
             stdout_complete: true,
         })
     }
@@ -610,6 +646,7 @@ impl Environment for ReinstallEnvironment {
         Ok(ExecutedCommand {
             record,
             stdout: String::new(),
+            stdout_utf8: true,
             stdout_complete: true,
         })
     }
@@ -1065,6 +1102,7 @@ impl Environment for InterruptionEnvironment {
         Ok(ExecutedCommand {
             record,
             stdout: stdout.into(),
+            stdout_utf8: true,
             stdout_complete: true,
         })
     }
@@ -1110,6 +1148,7 @@ impl Environment for InterruptionEnvironment {
         Ok(ExecutedCommand {
             record,
             stdout: String::new(),
+            stdout_utf8: true,
             stdout_complete: false,
         })
     }
@@ -1638,6 +1677,7 @@ impl Environment for DowngradeEnvironment {
         Ok(ExecutedCommand {
             record,
             stdout,
+            stdout_utf8: true,
             stdout_complete: self.fault != "truncated" || q.phase != "downgrade",
         })
     }
@@ -1791,7 +1831,7 @@ fn downgrade_actual_flow_uses_declared_policy_same_container_and_persists_refusa
             );
         }
         let loaded = theseus::report::load(&result.report_path).unwrap();
-        assert_eq!(loaded.schema_version, 6);
+        assert_eq!(loaded.schema_version, 7);
         assert_eq!(loaded.outcome, RunOutcome::Passed);
         if rejection {
             assert_eq!(
@@ -2042,4 +2082,119 @@ fn downgrade_unperformed_evidence_excludes_the_other_policy_checkpoint() {
         );
         assert_eq!(result.report.outcome, RunOutcome::Cancelled);
     }
+}
+
+fn json_recipe() -> (tempfile::TempDir, ValidatedRecipe) {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("target")).unwrap();
+    let text = include_str!("fixtures/recipes/v2_clean.toml")
+        .replace("schema_version = 2", "schema_version = 7")
+        + r#"
+[[profiles.user.checks]]
+id = "json"
+checkpoint = "target_installed"
+kind = "json_command"
+script = "printf true"
+timeout_seconds = 7
+expected_exit = 0
+max_stdout_bytes = 4
+env = { JSON_TEST_LITERAL = "value" }
+assertions = [{kind = "equals", pointer = "", equals_json = "true"}]
+"#;
+    let path = temp.path().join("recipe.toml");
+    std::fs::write(&path, text).unwrap();
+    let loaded = load(&path).unwrap();
+    (temp, loaded)
+}
+#[test]
+fn json_runtime_uses_runtime_identity_minimum_log_bound_and_preserves_stderr_independence() {
+    for (limit, fault, want) in [
+        (1024, "", CheckOutcome::Passed),
+        (2, "json-small", CheckOutcome::Incomplete),
+        (1024, "timeout", CheckOutcome::Incomplete),
+        (1024, "install", CheckOutcome::Skipped),
+        (1024, "setup", CheckOutcome::Incomplete),
+    ] {
+        let (temp, mut recipe) = json_recipe();
+        if fault == "install" {
+            recipe
+                .recipe
+                .profiles
+                .get_mut(&ProfileName::User)
+                .unwrap()
+                .checks[0]
+                .checkpoint = Checkpoint::Configured;
+        }
+        let options = RunOptions {
+            output_root: temp.path().join("runs"),
+            log_limit: limit,
+            ..RunOptions::all(&recipe)
+        };
+        let result = engine::run_with(
+            &recipe,
+            options,
+            CancellationToken::default(),
+            &mut Fake { fault },
+            |_| {},
+        )
+        .unwrap();
+        let check = result
+            .report
+            .scenarios
+            .iter()
+            .flat_map(|s| &s.stages)
+            .flat_map(|s| &s.checks)
+            .find(|c| c.id == "json")
+            .unwrap();
+        assert!(check.json_required);
+        assert_eq!(check.outcome, want, "{fault}");
+        let loaded = theseus::report::load(&result.report_path).unwrap();
+        assert_eq!(loaded.outcome, result.report.outcome);
+        if fault.is_empty() {
+            assert!(check.json_expectation.as_ref().unwrap().verified_pass());
+            assert_eq!(result.report.outcome, RunOutcome::Passed);
+        }
+    }
+}
+#[test]
+fn json_preflight_collects_forwarded_environment_and_preview_exposes_definition() {
+    let (temp, mut recipe) = json_recipe();
+    let preview =
+        theseus::tui::App::preview(recipe.clone(), RunOptions::all(&recipe)).preview_text();
+    for text in [
+        "printf true",
+        "JSON command",
+        "stdout cap: 4 bytes",
+        "equals_json",
+        "true",
+    ] {
+        assert!(preview.contains(text), "{preview}");
+    }
+    let missing = format!("THESEUS_JSON_MISSING_{}", std::process::id());
+    assert!(std::env::var_os(&missing).is_none());
+    if let Expectation::JsonCommand { pass_env, .. } = &mut recipe
+        .recipe
+        .profiles
+        .get_mut(&ProfileName::User)
+        .unwrap()
+        .checks[0]
+        .expectation
+    {
+        pass_env.push(missing.clone());
+    }
+    let options = RunOptions {
+        output_root: temp.path().join("runs"),
+        ..RunOptions::all(&recipe)
+    };
+    let result = engine::run_with(
+        &recipe,
+        options,
+        CancellationToken::default(),
+        &mut Fake { fault: "" },
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(result.report.outcome, RunOutcome::Incomplete);
+    assert!(result.report.scenarios.is_empty());
+    assert!(result.report.errors.iter().any(|e| e.contains(&missing)));
 }

@@ -15,6 +15,8 @@ fn result(
     after: &str,
 ) -> CheckResult {
     CheckResult {
+        json_expectation: None,
+        json_required: false,
         command_expectation: None,
         id,
         checkpoint,

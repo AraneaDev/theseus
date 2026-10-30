@@ -1,8 +1,10 @@
 //! Typed recipes and offline validation. Environment forwarding is a run-preflight concern.
 mod downgrade;
 mod interrupted_rollback;
+pub(crate) mod json;
 mod rollback;
 mod types;
+pub use json::{JsonAssertion, JsonPredicate, validate_json_assertions};
 pub(crate) mod validate;
 pub use downgrade::{DowngradeContract, validate_downgrade_contract};
 pub use interrupted_rollback::{

@@ -106,6 +106,7 @@ impl Environment for Fake {
         Ok(ExecutedCommand {
             record,
             stdout: String::new(),
+            stdout_utf8: true,
             stdout_complete: true,
         })
     }

@@ -274,7 +274,8 @@ fn preflight_env(recipe: &ValidatedRecipe, options: &RunOptions) -> Result<()> {
         let mut names: Vec<&String> = profile.steps.values().flat_map(|c| &c.pass_env).collect();
         for check in &profile.checks {
             match &check.expectation {
-                Expectation::Command { pass_env, .. }
+                Expectation::JsonCommand { pass_env, .. }
+                | Expectation::Command { pass_env, .. }
                 | Expectation::Executable { pass_env, .. } => names.extend(pass_env),
                 _ => {}
             }
@@ -376,6 +377,8 @@ fn mark_remaining_checks(recipe: &ValidatedRecipe, scenario: &mut ScenarioReport
             continue;
         }
         stage.checks.push(CheckResult {
+            json_expectation: None,
+            json_required: matches!(check.expectation, Expectation::JsonCommand { .. }),
             command_expectation: None,
             id: check.id.clone(),
             checkpoint: check.checkpoint,

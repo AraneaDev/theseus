@@ -1,5 +1,9 @@
 //! Stable, serializable identifiers and evidence shared by every interface.
 mod interrupted_rollback;
+mod json;
+pub use json::{
+    JsonAssertionObservation, JsonCommandEvidence, JsonParseStatus, JsonValueObservation,
+};
 mod rollback;
 mod rollback_validation;
 pub use interrupted_rollback::{CommandExpectationEvidence, ExecutableExpectationEvidence};
@@ -99,6 +103,10 @@ named_enum!(CheckOutcome { Passed => "passed", Failed => "failed", Incomplete =>
 named_enum!(FindingKind { Leftover => "leftover", BaselineDeletion => "baseline_deletion", ChangedBaseline => "changed_baseline", ObservationIncomplete => "observation_incomplete" });
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_expectation: Option<JsonCommandEvidence>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub json_required: bool,
     pub id: String,
     pub checkpoint: Checkpoint,
     pub outcome: CheckOutcome,
@@ -154,7 +162,7 @@ pub struct Finding {
     pub message: String,
 }
 
-pub const REPORT_SCHEMA_VERSION: u32 = 6;
+pub const REPORT_SCHEMA_VERSION: u32 = 7;
 pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
 named_enum!(RunOutcome { Passed => "passed", Failed => "failed", Incomplete => "incomplete", Cancelled => "cancelled" });
 impl RunOutcome {
@@ -376,7 +384,7 @@ impl StageReport {
             _ => RunOutcome::Incomplete,
         };
         let mut outcomes = vec![initial];
-        if self.unmatched_rollback_evidence() {
+        if self.unmatched_rollback_evidence() || !self.valid_json_checks() {
             outcomes.push(RunOutcome::Incomplete);
         }
         if self.restart.as_ref().is_some_and(|proof| {

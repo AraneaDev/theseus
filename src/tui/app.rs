@@ -387,10 +387,26 @@ impl App {
                     );
                 }
                 for check in &profile.checks {
-                    text += &format!(
-                        "check {} @ {}: {:?}\n",
-                        check.id, check.checkpoint, check.expectation
-                    );
+                    if let Expectation::JsonCommand {
+                        script,
+                        timeout_seconds,
+                        expected_exit,
+                        max_stdout_bytes,
+                        env,
+                        pass_env,
+                        assertions,
+                    } = &check.expectation
+                    {
+                        text += &format!(
+                            "check {} @ {}: JSON command\nscript: {script}\nexpected exit: {expected_exit}; stdout cap: {max_stdout_bytes} bytes; timeout: {timeout_seconds}s\nenv: {env:?}; pass_env: {pass_env:?}\nassertions: {assertions:?}\n",
+                            check.id, check.checkpoint
+                        );
+                    } else {
+                        text += &format!(
+                            "check {} @ {}: {:?}\n",
+                            check.id, check.checkpoint, check.expectation
+                        );
+                    }
                 }
             }
         }

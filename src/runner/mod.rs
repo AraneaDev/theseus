@@ -35,6 +35,7 @@ pub struct ExecutedCommand {
     /// Bounded by log_limit; no unbounded command output in events.
     pub stdout: String,
     pub stdout_complete: bool,
+    pub stdout_utf8: bool,
 }
 /// Observation evidence and a separate infrastructure failure channel. Expected
 /// bounded/no-follow gaps stay in snapshots; transport errors must not disappear

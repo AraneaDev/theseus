@@ -1,0 +1,94 @@
+{
+  "schema_version": 6,
+  "run_id": "schema6-fixture",
+  "recipe_path": "theseus.toml",
+  "recipe_digest": "legacy-digest",
+  "image": "debian:bookworm-slim",
+  "image_id": "sha256:legacy-image",
+  "network": "none",
+  "artifacts": [],
+  "selected_profiles": [
+    "user"
+  ],
+  "selected_scenarios": [
+    "reinstall"
+  ],
+  "started_at": "",
+  "finished_at": null,
+  "outcome": "passed",
+  "cancelled": false,
+  "scenarios": [
+    {
+      "id": "user-reinstall",
+      "profile": "user",
+      "scenario": "reinstall",
+      "outcome": "passed",
+      "container_id": "legacy-container",
+      "stages": [
+        {
+          "name": "reinstalled",
+          "step": "reinstall",
+          "checkpoint": "reinstalled",
+          "outcome": "passed",
+          "commands": [
+            {
+              "id": "reinstall-1",
+              "phase": "reinstall",
+              "identity": {
+                "uid": 10001,
+                "gid": 10001,
+                "home": "/home/theseus"
+              },
+              "environment": {},
+              "workdir": "/workspace",
+              "argv": [
+                "/bin/sh",
+                "-c",
+                "true"
+              ],
+              "started_at": "",
+              "duration_ms": 1,
+              "exit_status": 0,
+              "timed_out": false,
+              "cancelled": false,
+              "outcome": "succeeded",
+              "stdout": {
+                "path": "logs/uninstall.stdout",
+                "bytes": 0,
+                "truncated": false
+              },
+              "stderr": null,
+              "error": null,
+              "skip_reason": null
+            }
+          ],
+          "checks": [
+            {
+              "id": "configuration-stable",
+              "checkpoint": "reinstalled",
+              "outcome": "passed",
+              "message": "configuration unchanged",
+              "path": "/home/theseus/.local/bin/tool",
+              "command_ids": [],
+              "comparison": {
+                "before_stage": "before_reinstall",
+                "after_stage": "reinstalled"
+              }
+            }
+          ],
+          "snapshots": [],
+          "baseline_diff": [],
+          "stage_diff": [],
+          "errors": [],
+          "skip_reason": null
+        }
+      ],
+      "findings": [],
+      "teardown": {
+        "status": "complete"
+      },
+      "errors": []
+    }
+  ],
+  "errors": []
+}

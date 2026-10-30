@@ -141,6 +141,29 @@ fn check(c: &CheckResult, out: &mut dyn Write) -> fmt::Result {
             write!(out, "; {} -> {} {:?}", e.name, e.resolved_path, e.args)?;
         }
     }
+    if c.json_required {
+        write!(out, "\nJSON proof:")?;
+        if let Some(proof) = &c.json_expectation {
+            write!(
+                out,
+                " exit={:?}/{} complete={} utf8={} cap={} parse={:?} verified={}\nAssertions: {:?}\nObservations: {:?}",
+                proof.observed_exit,
+                proof.expected_exit,
+                proof.complete,
+                proof.utf8,
+                proof.max_stdout_bytes,
+                proof.parse_status,
+                proof.verified_pass(),
+                proof.assertions,
+                proof.observations
+            )?;
+            if let Some(diagnostic) = &proof.diagnostic {
+                write!(out, "\n{diagnostic}")?;
+            }
+        } else {
+            write!(out, " unavailable")?;
+        }
+    }
     if let Some(p) = &c.path {
         write!(out, "\nScope: {p}")?;
     }

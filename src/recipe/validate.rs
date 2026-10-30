@@ -259,11 +259,11 @@ pub fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<ValidatedRecipe> {
             recipe.scenarios.is_none(),
             "scenarios requires recipe schema version 2"
         ),
-        2..=6 => {
+        2..=7 => {
             let scenarios = recipe
                 .scenarios
                 .as_ref()
-                .context("recipe schema version 2/3/4/5/6 requires an explicit scenarios list")?;
+                .context("recipe schema version 2/3/4/5/6/7 requires an explicit scenarios list")?;
             ensure!(!scenarios.is_empty(), "declare at least one scenario");
             let mut seen = BTreeSet::new();
             for scenario in scenarios {
@@ -471,6 +471,23 @@ pub fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<ValidatedRecipe> {
                 );
             }
             match &mut check.expectation {
+                Expectation::JsonCommand {
+                    script,
+                    timeout_seconds,
+                    env,
+                    pass_env,
+                    expected_exit,
+                    max_stdout_bytes,
+                    assertions,
+                } => {
+                    ensure!(
+                        recipe.schema_version >= 7,
+                        "json_command requires recipe schema version 7"
+                    );
+                    validate_command(script, *timeout_seconds, env, pass_env)?;
+                    validate_exit(*expected_exit)?;
+                    super::validate_json_assertions(assertions, *max_stdout_bytes)?;
+                }
                 Expectation::Command {
                     script,
                     timeout_seconds,

@@ -97,6 +97,19 @@ pub struct Check {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Expectation {
+    JsonCommand {
+        script: String,
+        #[serde(default = "default_timeout")]
+        timeout_seconds: u64,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+        #[serde(default)]
+        pass_env: Vec<String>,
+        expected_exit: i32,
+        #[serde(default = "default_json_limit")]
+        max_stdout_bytes: u64,
+        assertions: Vec<super::JsonAssertion>,
+    },
     Command {
         script: String,
         #[serde(default = "default_timeout")]
@@ -150,4 +163,8 @@ impl Expectation {
             _ => None,
         }
     }
+}
+
+const fn default_json_limit() -> u64 {
+    262144
 }

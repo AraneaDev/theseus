@@ -269,6 +269,7 @@ impl Docker {
             return Ok(ExecutedCommand {
                 record,
                 stdout: String::new(),
+                stdout_utf8: false,
                 stdout_complete: false,
             });
         }
@@ -333,6 +334,7 @@ impl Docker {
             && !record.timed_out;
         Ok(ExecutedCommand {
             record,
+            stdout_utf8: std::str::from_utf8(&output.stdout.bytes).is_ok(),
             stdout: String::from_utf8_lossy(&output.stdout.bytes).into_owned(),
             stdout_complete,
         })

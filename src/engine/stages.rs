@@ -279,6 +279,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
             ExecutedCommand {
                 record,
                 stdout: String::new(),
+                stdout_utf8: false,
                 stdout_complete: false,
             }
         } else {
@@ -298,6 +299,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                     ExecutedCommand {
                         record,
                         stdout: String::new(),
+                        stdout_utf8: false,
                         stdout_complete: false,
                     }
                 }
@@ -497,6 +499,8 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                 && (blocked || prerequisite_skipped || retention_without_configuration)
             {
                 CheckResult {
+                    json_expectation: None,
+                    json_required: matches!(check.expectation, Expectation::JsonCommand { .. }),
                     command_expectation: None,
                     id: check.id.clone(),
                     checkpoint,
@@ -509,6 +513,8 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                 }
             } else if state.availability != Availability::Running {
                 CheckResult {
+                    json_expectation: None,
+                    json_required: matches!(check.expectation, Expectation::JsonCommand { .. }),
                     command_expectation: None,
                     id: check.id.clone(),
                     checkpoint,
@@ -622,6 +628,44 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
         let command_start = stage.commands.len();
         let mut command_expectation = None;
         let mut result = match &check.expectation {
+            Expectation::JsonCommand {
+                script,
+                timeout_seconds,
+                env,
+                pass_env,
+                expected_exit,
+                max_stdout_bytes,
+                ..
+            } => {
+                let spec = CommandSpec {
+                    script: script.clone(),
+                    timeout_seconds: *timeout_seconds,
+                    env: env.clone(),
+                    pass_env: pass_env.clone(),
+                };
+                let mut request = self.request(
+                    state,
+                    format!("check:{}", check.id),
+                    &spec,
+                    ExecutionIdentity::runtime(),
+                    vec!["/bin/sh".into(), "-c".into(), script.clone()],
+                    *expected_exit,
+                );
+                request.log_limit = request.log_limit.min(*max_stdout_bytes);
+                let executed = self.execute(state, request, stage);
+                checks::evaluate_json_command(
+                    check,
+                    &checks::JsonCommandObservation {
+                        exit_status: executed.record.exit_status,
+                        stdout: &executed.stdout,
+                        complete: executed.stdout_complete
+                            && !executed.record.timed_out
+                            && !executed.record.cancelled,
+                        utf8: executed.stdout_utf8,
+                        error: executed.record.error.as_deref(),
+                    },
+                )
+            }
             Expectation::Command {
                 script,
                 timeout_seconds,
@@ -754,6 +798,8 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                         "binary scope must be a file or symlink before upgrade".into();
                 }
                 CheckResult {
+                    json_expectation: None,
+                    json_required: matches!(check.expectation, Expectation::JsonCommand { .. }),
                     command_expectation: None,
                     id: check.id.clone(),
                     checkpoint: check.checkpoint,
@@ -777,6 +823,8 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                     &stage.snapshots,
                 );
                 CheckResult {
+                    json_expectation: None,
+                    json_required: matches!(check.expectation, Expectation::JsonCommand { .. }),
                     command_expectation: None,
                     id: check.id.clone(),
                     checkpoint: check.checkpoint,
