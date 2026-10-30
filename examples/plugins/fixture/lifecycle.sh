@@ -5,7 +5,7 @@ export DISABLE_AUTOUPDATER=1
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 export CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1
 export LC_ALL=C
-client=/inputs/target/client/claude
+client=/home/theseus/.local/bin/theseus-client
 action=$1
 scope=$2
 case "$scope" in
@@ -15,8 +15,11 @@ case "$scope" in
     *) exit 64 ;;
 esac
 if test "$action" = install_base; then
-    mkdir -p "$HOME" "$CLAUDE_CONFIG_DIR" /workspace/plugin-project/.claude /workspace/local-market
+    mkdir -p "$HOME" "$CLAUDE_CONFIG_DIR" /workspace/plugin-project/.claude /workspace/local-market /home/theseus/.local/bin
+    cp /inputs/target/client/claude "$client"
+    chmod 0755 "$client"
 fi
+cmp /inputs/target/client/claude "$client"
 cd /workspace/plugin-project
 case "$action" in
     install_base)

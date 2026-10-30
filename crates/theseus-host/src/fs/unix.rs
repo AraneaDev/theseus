@@ -124,3 +124,24 @@ pub(super) fn remove_temporary(parent: &File, name: &OsStr, _file: &File) -> io:
         rustix::fs::AtFlags::empty(),
     )?)
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod directory_sync_tests {
+    use super::*;
+    #[test]
+    fn child_creation_mkdir_precedes_parent_sync_failure_and_prevents_child_open() {
+        let temp = tempfile::tempdir().unwrap();
+        // A real O_PATH descriptor permits mkdirat, but fsync returns EBADF.
+        // No child capability is returned after the entry barrier fails.
+        let parent =
+            File::from(open(temp.path(), OFlags::PATH | OFlags::DIRECTORY, Mode::empty()).unwrap());
+        for name in ["source", "output-parent"] {
+            let result = create_dir(&parent, OsStr::new(name));
+            assert!(temp.path().join(name).is_dir(), "mkdir must precede fsync");
+            assert_eq!(
+                result.unwrap_err().raw_os_error(),
+                Some(rustix::io::Errno::BADF.raw_os_error())
+            );
+        }
+    }
+}

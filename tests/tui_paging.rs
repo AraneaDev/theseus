@@ -604,3 +604,28 @@ fn same_length_log_replacement_discards_old_tail_cursor_and_navigation_history()
     key(&mut app, KeyCode::Char('['));
     assert!(body(&app).starts_with("NEW_ID_HEAD"));
 }
+
+#[test]
+fn equal_byte_native_replacement_discards_cached_cursor_and_navigation_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("run");
+    let bytes = vec![b'a'; 100_000];
+    let mut app = log_app(&root, &bytes, false);
+    input(&mut app, KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL));
+    assert!(!app.log_text.starts_with("raw bytes 0.."));
+    let path = root.join("logs/out");
+    let old = std::fs::File::open(&path).unwrap();
+    let times = std::fs::FileTimes::new().set_modified(old.metadata().unwrap().modified().unwrap());
+    std::fs::rename(&path, root.join("logs/retained")).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(times)
+        .unwrap();
+    key(&mut app, KeyCode::Char('['));
+    assert!(app.log_text.starts_with("raw bytes 0..4096 /"));
+    key(&mut app, KeyCode::Char(']'));
+    assert!(app.log_text.starts_with("raw bytes 4096..8192 /"));
+}

@@ -22,7 +22,8 @@ class GuestVersionAdapter(unittest.TestCase):
             adapter = root / 'adapter.sh'
             adapter.write_text(source.replace('/home/theseus/plugin-config', str(root))
                                .replace('/workspace/plugin-project', str(root))
-                               .replace('/inputs/target/client/claude', shlex.quote(str(producer))))
+                               .replace('/inputs/target/client/claude', shlex.quote(str(producer)))
+                               .replace('/home/theseus/.local/bin/theseus-client', shlex.quote(str(producer))))
             for output, status, accepted in [
                 (b'a' * 128, 0, True),
                 (b'a' * 128 + b'\n', 0, True),

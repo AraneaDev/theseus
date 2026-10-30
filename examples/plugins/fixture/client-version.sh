@@ -5,11 +5,12 @@ export DISABLE_AUTOUPDATER=1
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 export CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1
 export LC_ALL=C
+cmp /inputs/target/client/claude /home/theseus/.local/bin/theseus-client
 cd /workspace/plugin-project
 # File capture keeps trailing newlines observable and bounds memory. Reject
 # unexpected output; never sanitize an unknown version into a claimed one.
 version_file=$CLAUDE_CONFIG_DIR/client-version.capture
-/inputs/target/client/claude --version > "$version_file"
+/home/theseus/.local/bin/theseus-client --version > "$version_file"
 bytes=$(wc -c < "$version_file")
 test "$bytes" -ge 1
 test "$bytes" -le 129

@@ -3,11 +3,11 @@ use crate::{comparison, recipe};
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{File, OpenOptions},
+    fs::File,
     io::{Read, Write},
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
+use theseus_host::fs::{HostDir, RelativePath, RootPolicy};
 
 pub const MAX_DRAFT_BYTES: usize = 1_048_576;
 
@@ -108,11 +108,11 @@ impl DraftDocument {
             "preview source directory is no longer canonical"
         );
         let destination = parent.join(basename);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&destination)
+        let directory =
+            HostDir::open(parent, RootPolicy::LeafNoFollow).context("open Save Copy directory")?;
+        let name = RelativePath::parse(basename)?;
+        let mut file = directory
+            .create_file(&name)
             .with_context(|| format!("create Save Copy {}", destination.display()))?;
         // Once exclusive creation succeeds, every failure names the remaining copy.
         (|| -> Result<ValidatedDocument> {
@@ -120,9 +120,7 @@ impl DraftDocument {
                 .context("write Save Copy")?;
             file.sync_all().context("sync Save Copy")?;
             drop(file);
-            if let Err(error) = File::open(parent)
-                .context("open Save Copy directory")?
-                .sync_all()
+            if let Err(error) = directory.sync_directory()
                 && !matches!(
                     error.kind(),
                     std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
@@ -131,7 +129,8 @@ impl DraftDocument {
                 return Err(error).context("sync Save Copy directory");
             }
             let mut saved = Vec::new();
-            File::open(&destination)
+            directory
+                .open_file(&name)
                 .context("open saved copy for readback")?
                 .take((MAX_DRAFT_BYTES + 1) as u64)
                 .read_to_end(&mut saved)

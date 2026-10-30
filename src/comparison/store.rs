@@ -103,10 +103,9 @@ fn open(path: &Path) -> Result<(ReportStore, ComparisonArtifact)> {
     Ok((store, artifact))
 }
 fn missing(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<rustix::io::Errno>() == Some(&rustix::io::Errno::NOENT)
-        || error
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
 }
 pub(super) fn read_sources(
     store: &ReportStore,

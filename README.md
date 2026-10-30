@@ -456,8 +456,17 @@ names separately and omits overridden defaults; effective public literals remain
 visible. Applications can print secrets into logs. No credentials are forwarded automatically and no general secret
 redaction is promised.
 
+Materialization preserves artifact bytes and sorted POSIX `/` manifest references.
+Unix controllers preserve source execute bits when staging files. Windows staging
+uses explicit guest modes: files 0444 and directories 0755, without inferring
+executability from `.exe`, `.sh` or other extensions. Only the owned `/inputs/base`
+and `/inputs/target` roots are normalized after copying; archive contents stay
+unchanged. Inputs are root-owned. A recipe that needs executables copies or extracts
+into its user-owned guest directory and applies its declared `chmod`, as the copy
+and archive comparison examples do.
+
 The image must supply `/bin/sh`, `/usr/bin/env`, `sleep`, `mkdir`, `chown`, `chmod`,
-`tar`, `cp`, `rm`, `cat`, `id`, and `awk`, with compatible UID/GID 10001
+`tar`, `cp`, `rm`, `cat`, `id`, and `awk` (plus `find` for Windows input normalization), with compatible UID/GID 10001
 assignments. Interruption additionally requires GNU-compatible `mv -T` and
 `dd iflag=nofollow,nonblock` for atomic readiness and bounded no-follow reads;
 the example also uses `cmp`, `wc`, and `stat`. The downgrade examples also use

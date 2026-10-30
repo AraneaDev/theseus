@@ -8,7 +8,11 @@ use crate::{
 };
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use std::{fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt, path::PathBuf};
+use std::{
+    io::{Read, Write},
+    path::{Path, PathBuf},
+};
+use theseus_host::fs::{HostDir, RelativePath, RootPolicy};
 #[derive(Debug, Parser)]
 #[command(name = "theseus", version, about = "Installation lifecycle workbench")]
 pub struct Cli {
@@ -292,13 +296,20 @@ fn init() -> Result<()> {
             );
         }
     }
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open("theseus.toml")?;
+    let directory = HostDir::open(Path::new("."), RootPolicy::LeafNoFollow)?;
+    let name = RelativePath::parse("theseus.toml")?;
+    let mut file = directory.create_file(&name)?;
     file.write_all(text.as_bytes())?;
     file.sync_all()?;
+    let mut saved = Vec::new();
+    directory
+        .open_file(&name)?
+        .take(text.len() as u64 + 1)
+        .read_to_end(&mut saved)?;
+    anyhow::ensure!(
+        saved == text.as_bytes(),
+        "init bytes changed during persistence"
+    );
     Ok(())
 }
 

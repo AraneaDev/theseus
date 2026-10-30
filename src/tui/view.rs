@@ -8,7 +8,7 @@ use crate::{
     model::LogReference,
     report::{self, LogFingerprint},
 };
-use std::{collections::VecDeque, os::unix::fs::MetadataExt, path::PathBuf};
+use std::{collections::VecDeque, path::PathBuf};
 const LOG_BYTES: usize = 4096;
 #[derive(PartialEq, Eq)]
 struct Context {
@@ -166,17 +166,8 @@ impl View {
             self.rows.clear();
         }
         if let Some((reference, fingerprint)) = &self.log {
-            let current = std::fs::symlink_metadata(app.root.join(&reference.path)).ok();
-            if current.as_ref().is_none_or(|m| {
-                !m.is_file()
-                    || fingerprint.device != m.dev()
-                    || fingerprint.inode != m.ino()
-                    || fingerprint.size != m.size()
-                    || fingerprint.mtime_seconds != m.mtime()
-                    || fingerprint.mtime_nanos != m.mtime_nsec()
-                    || fingerprint.ctime_seconds != m.ctime()
-                    || fingerprint.ctime_nanos != m.ctime_nsec()
-            }) {
+            let current = report::log_fingerprint(&app.root, &reference.path).ok();
+            if current.as_ref() != Some(fingerprint) {
                 self.reset_page(app.scroll);
             }
         }
@@ -280,7 +271,7 @@ impl View {
             Ok(page) => {
                 self.position = Position::Raw(page.start, stop);
                 self.next = page.next.map(|next| Position::Raw(next, None));
-                self.log = Some((reference.clone(), page.fingerprint));
+                self.log = Some((reference.clone(), page.fingerprint.clone()));
                 self.label = format!("{} | m metadata", page.label);
                 self.body = page.text;
             }
@@ -539,16 +530,11 @@ fn read_error(error: &anyhow::Error, kind: &str) -> String {
 #[cfg(test)]
 mod changed_log_tests {
     use super::*;
-    fn fingerprint(inode: u64) -> LogFingerprint {
-        LogFingerprint {
-            device: 1,
-            inode,
-            size: 10_000,
-            mtime_seconds: 1,
-            mtime_nanos: 0,
-            ctime_seconds: 1,
-            ctime_nanos: 0,
-        }
+    fn fingerprint(identity: u64) -> LogFingerprint {
+        // Fingerprint an actual opened native object, without invented inode fields.
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(10_000 + identity).unwrap();
+        theseus_host::fs::fingerprint(&file).unwrap()
     }
     fn reference() -> LogReference {
         LogReference {

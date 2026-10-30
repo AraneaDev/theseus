@@ -7,22 +7,22 @@ use crate::{
     recipe::DEFAULT_LOG_LIMIT,
 };
 use anyhow::{Context, Result, bail, ensure};
-use rustix::fs::{AtFlags, Mode, OFlags, mkdirat, open, openat, renameat, unlinkat};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
-    fs::{self, DirBuilder, File},
+    fs::{self, File},
     io::{BufWriter, Read, Write},
-    os::unix::fs::{DirBuilderExt, FileExt, MetadataExt},
     path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
 };
+pub use theseus_host::fs::FileFingerprint as LogFingerprint;
+use theseus_host::fs::{HostDir, RelativePath, RootPolicy, fingerprint, read_exact_at};
 
 const MAX_REPORT_BYTES: u64 = 64 * 1024 * 1024;
-static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug)]
 pub struct ReportStore {
     root: PathBuf,
-    directory: File,
+    directory: HostDir,
+    #[cfg(test)]
+    fail_child_creation: bool,
 }
 #[derive(Debug, Clone)]
 pub struct LogRead {
@@ -41,62 +41,28 @@ pub struct LogPage {
     pub next_offset: Option<u64>,
     pub fingerprint: LogFingerprint,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LogFingerprint {
-    pub device: u64,
-    pub inode: u64,
-    pub size: u64,
-    pub mtime_seconds: i64,
-    pub mtime_nanos: i64,
-    pub ctime_seconds: i64,
-    pub ctime_nanos: i64,
-}
-impl From<&fs::Metadata> for LogFingerprint {
-    fn from(m: &fs::Metadata) -> Self {
-        Self {
-            device: m.dev(),
-            inode: m.ino(),
-            size: m.len(),
-            mtime_seconds: m.mtime(),
-            mtime_nanos: m.mtime_nsec(),
-            ctime_seconds: m.ctime(),
-            ctime_nanos: m.ctime_nsec(),
-        }
-    }
-}
-
 /// Create exactly this run directory, never reusing an existing directory.
 pub fn create(root: &Path) -> Result<ReportStore> {
-    if let Some(parent) = root.parent().filter(|p| !p.as_os_str().is_empty()) {
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)
-            .context("create report parent")?;
-    }
-    DirBuilder::new()
-        .mode(0o700)
-        .create(root)
+    let directory = HostDir::create_private(root)
         .context("create fresh run directory (existing runs are never overwritten)")?;
-    open_store(root)
+    Ok(ReportStore {
+        root: root.canonicalize()?,
+        directory,
+        #[cfg(test)]
+        fail_child_creation: false,
+    })
 }
 /// Reopen a run directory for atomic recovery-journal updates; refuses symlinks.
 pub fn open_existing(root: &Path) -> Result<ReportStore> {
     open_store(root)
 }
 fn open_store(root: &Path) -> Result<ReportStore> {
-    // Reject a symlink at the user-facing directory before canonicalizing its parent.
-    let directory = File::from(
-        open(
-            root,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .context("open run directory")?,
-    );
+    let directory = HostDir::open(root, RootPolicy::LeafNoFollow).context("open run directory")?;
     Ok(ReportStore {
         root: root.canonicalize()?,
         directory,
+        #[cfg(test)]
+        fail_child_creation: false,
     })
 }
 impl ReportStore {
@@ -124,58 +90,23 @@ impl ReportStore {
         self.atomic_json_with_limit(name, value, MAX_REPORT_BYTES)
     }
     fn atomic_json_with_limit(&self, name: &str, value: &impl Serialize, limit: u64) -> Result<()> {
-        let mut temporary = None;
-        for _ in 0..32 {
-            let name = format!(
-                ".pending-{}-{}",
-                std::process::id(),
-                NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
-            );
-            match openat(
-                &self.directory,
-                name.as_str(),
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::RUSR | Mode::WUSR,
-            ) {
-                Ok(fd) => {
-                    temporary = Some((name, File::from(fd)));
-                    break;
-                }
-                Err(rustix::io::Errno::EXIST) => continue,
-                Err(error) => return Err(error.into()),
-            }
-        }
-        let (temporary, mut file) =
-            temporary.context("could not reserve atomic report temporary file")?;
-        let result = (|| {
-            let mut writer = LimitedWriter::new(BufWriter::new(&mut file), limit);
-            serde_json::to_writer_pretty(&mut writer, value)?;
-            writer.flush()?;
-            drop(writer);
-            file.sync_all()?;
-            renameat(&self.directory, temporary.as_str(), &self.directory, name)?;
-            self.directory.sync_all()?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = unlinkat(&self.directory, temporary.as_str(), AtFlags::empty());
-        }
-        result
+        // Preserve the typed publication error: replaced/unknown states must
+        // never become an assertion that the previous report survived.
+        self.directory
+            .publish(std::ffi::OsStr::new(name), &mut |file| {
+                let mut writer = LimitedWriter::new(BufWriter::new(file), limit);
+                serde_json::to_writer_pretty(&mut writer, value).map_err(std::io::Error::other)?;
+                writer.flush()
+            })
+            .context("publish report metadata")?;
+        Ok(())
     }
-    /// Create one stream file exclusively. Runtime adapters can stream bounded
-    /// output to it while preserving 0600 permissions and safe parent traversal.
+    /// Create one stream exclusively through retained private directory authority.
     pub fn create_log(&self, relative: &str) -> Result<File> {
-        let parts = log_components(relative)?;
-        let parent = self.log_parent(&parts[..parts.len() - 1], true)?;
-        Ok(File::from(
-            openat(
-                &parent,
-                parts[parts.len() - 1],
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::RUSR | Mode::WUSR,
-            )
-            .context("create private command log")?,
-        ))
+        log_components(relative)?;
+        self.directory
+            .create_file(&RelativePath::parse(relative)?)
+            .context("create private command log")
     }
     pub fn write_log(&self, relative: &str, bytes: &[u8], limit: usize) -> Result<LogReference> {
         let mut file = self.create_log(relative)?;
@@ -198,22 +129,10 @@ impl ReportStore {
         Ok(LogRead { bytes, truncated })
     }
     fn open_log(&self, relative: &str) -> Result<File> {
-        let parts = log_components(relative)?;
-        let parent = self.log_parent(&parts[..parts.len() - 1], false)?;
-        let file = File::from(
-            openat(
-                &parent,
-                parts[parts.len() - 1],
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .context("open contained command log")?,
-        );
-        ensure!(
-            file.metadata()?.is_file(),
-            "log reference is not a regular file"
-        );
-        Ok(file)
+        log_components(relative)?;
+        self.directory
+            .open_file(&RelativePath::parse(relative)?)
+            .context("open contained command log")
     }
     /// Read a raw page without reading its prefix. EOF itself is a valid offset.
     pub fn read_log_page(
@@ -234,16 +153,16 @@ impl ReportStore {
             .checked_add(limit as u64)
             .context("log page offset overflow")?;
         let file = self.open_log(&reference.path)?;
-        let before = LogFingerprint::from(&file.metadata()?);
-        let total = reference.bytes.min(before.size).min(DEFAULT_LOG_LIMIT);
+        let before = fingerprint(&file)?;
+        let total = reference.bytes.min(before.len).min(DEFAULT_LOG_LIMIT);
         ensure!(offset <= total, "log page offset exceeds readable length");
         let length = (total - offset).min(limit as u64) as usize;
         let mut bytes = vec![0; length];
-        file.read_exact_at(&mut bytes, offset)
+        read_exact_at(&file, &mut bytes, offset)
             .context("read log page (file may have changed)")?;
-        let after = LogFingerprint::from(&file.metadata()?);
+        let after = fingerprint(&file)?;
         // Re-open via the pinned directory too: a renamed/replaced path is not a fresh page.
-        let current = LogFingerprint::from(&self.open_log(&reference.path)?.metadata()?);
+        let current = fingerprint(&self.open_log(&reference.path)?)?;
         ensure!(
             before == after && before == current,
             "log changed while reading page"
@@ -254,46 +173,16 @@ impl ReportStore {
             offset,
             readable_total: total,
             recorded_bytes: reference.bytes,
-            current_bytes: before.size,
+            current_bytes: before.len,
             next_offset: (end < total).then_some(end),
             fingerprint: before,
         })
     }
-    fn log_parent(&self, parts: &[&str], create: bool) -> Result<File> {
-        let mut directory = self.directory.try_clone()?;
-        for part in parts {
-            if create {
-                match mkdirat(&directory, *part, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
-                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            directory = File::from(
-                openat(
-                    &directory,
-                    *part,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .context("open safe log parent")?,
-            );
-        }
-        Ok(directory)
-    }
     pub(crate) fn read_bytes(&self, name: &str) -> Result<Vec<u8>> {
-        let file = File::from(
-            openat(
-                &self.directory,
-                name,
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .context("open report/journal")?,
-        );
-        ensure!(
-            file.metadata()?.is_file(),
-            "report/journal must be a regular file"
-        );
+        let file = self
+            .directory
+            .open_file(&RelativePath::parse(name)?)
+            .context("open report/journal")?;
         let mut bytes = Vec::new();
         file.take(MAX_REPORT_BYTES + 1).read_to_end(&mut bytes)?;
         ensure!(
@@ -313,66 +202,70 @@ impl ReportStore {
         } else {
             std::env::current_dir()?.join(root)
         };
-        let mut directory = File::from(open(
-            "/",
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?);
-        let mut resolved = PathBuf::from("/");
+        let mut resolved = PathBuf::new();
+        let mut parts = Vec::new();
         for component in root.components() {
-            let part = match component {
-                Component::RootDir | Component::CurDir => continue,
-                Component::Normal(part) => part,
+            match component {
+                Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+                Component::RootDir => resolved.push(component.as_os_str()),
+                Component::CurDir => (),
+                Component::Normal(part) => parts.push(part),
                 _ => bail!("unsafe directory path"),
-            };
-            if create {
-                durable_mkdir(&directory, part, true)?;
             }
-            directory = File::from(
-                openat(
-                    &directory,
-                    part,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .context("open no-follow directory")?,
-            );
+        }
+        let mut directory = HostDir::open(&resolved, RootPolicy::AllComponentsNoFollow)?;
+        for part in parts {
+            directory = if create {
+                match directory.create_child(part) {
+                    Ok(child) => child,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        directory.open_child_name(part)?
+                    }
+                    Err(error) => return Err(error).context("create durable recovery directory"),
+                }
+            } else {
+                directory
+                    .open_child_name(part)
+                    .context("open no-follow directory")?
+            };
             resolved.push(part);
         }
         Ok(Self {
             root: resolved,
             directory,
+            #[cfg(test)]
+            fail_child_creation: false,
         })
     }
     pub(crate) fn create_child(&self, name: &str) -> Result<Self> {
         let parts = log_components(name)?;
         ensure!(parts.len() == 1, "expected one directory component");
-        durable_mkdir(&self.directory, std::ffi::OsStr::new(name), false)?;
-        self.open_child(name)
+        #[cfg(test)]
+        if self.fail_child_creation {
+            bail!("injected child creation failure");
+        }
+        let directory = self.directory.create_child(std::ffi::OsStr::new(name))?;
+        Ok(Self {
+            root: self.root.join(name),
+            directory,
+            #[cfg(test)]
+            fail_child_creation: false,
+        })
     }
     pub(crate) fn open_child(&self, relative: &str) -> Result<Self> {
-        let parts = log_components(relative)?;
-        let directory = self.log_parent(&parts, false)?;
+        log_components(relative)?;
+        let directory = self.directory.open_child(&RelativePath::parse(relative)?)?;
         Ok(Self {
             root: self.root.join(relative),
             directory,
+            #[cfg(test)]
+            fail_child_creation: false,
         })
     }
     pub(crate) fn load_journal(&self) -> Result<RunJournal> {
         let journal = self.read_json("journal.json")?;
         validate_journal(&journal)?;
         Ok(journal)
-    }
-}
-/// A child's contents cannot make its name durable in the containing directory.
-/// Complete this barrier before opening/using a newly created recovery directory.
-fn durable_mkdir(parent: &File, name: &std::ffi::OsStr, allow_existing: bool) -> Result<()> {
-    match mkdirat(parent, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
-        Ok(()) => parent
-            .sync_all()
-            .context("sync new recovery directory in parent"),
-        Err(rustix::io::Errno::EXIST) if allow_existing => Ok(()),
-        Err(error) => Err(error.into()),
     }
 }
 fn log_components(relative: &str) -> Result<Vec<&str>> {
@@ -401,6 +294,7 @@ fn log_components(relative: &str) -> Result<Vec<&str>> {
             .all(|p| matches!(p, Component::Normal(_))),
         "unsafe log reference"
     );
+    RelativePath::parse(relative)?;
     Ok(parts)
 }
 fn validate_report(report: &RunReport) -> Result<()> {
@@ -659,6 +553,10 @@ fn validate_journal(journal: &RunJournal) -> Result<()> {
 pub fn read_log(root: &Path, relative: &str, limit: usize) -> Result<LogRead> {
     open_store(root)?.read_log(relative, limit)
 }
+/// Freshness from a safely reopened regular file, including native replacement identity.
+pub fn log_fingerprint(root: &Path, relative: &str) -> Result<LogFingerprint> {
+    fingerprint(&open_store(root)?.open_log(relative)?).context("fingerprint contained command log")
+}
 pub fn read_log_page(
     root: &Path,
     reference: &LogReference,
@@ -685,40 +583,89 @@ fn report_root(path: &Path, filename: &str) -> Result<PathBuf> {
 mod durability_tests {
     use super::*;
 
+    use crate::{
+        engine::CancellationToken,
+        model::*,
+        recipe::{Limits, ValidatedRecipe},
+        runner::*,
+        snapshot::Snapshot,
+    };
     #[test]
-    fn child_creation_propagates_parent_fsync_failure_after_mkdir_before_open() {
-        let temp = tempfile::tempdir().unwrap();
-        // O_PATH permits mkdirat/openat, but Linux rejects fsync with EBADF.
-        // This tests a real syscall boundary, not simulated power-loss recovery.
-        let store = ReportStore {
-            root: temp.path().into(),
-            directory: File::from(
-                open(temp.path(), OFlags::PATH | OFlags::DIRECTORY, Mode::empty()).unwrap(),
-            ),
+    fn strict_root_creation_and_reopen_preserve_native_non_utf8_ancestry() {
+        #[cfg(unix)]
+        let name = {
+            use std::os::unix::ffi::OsStringExt;
+            std::ffi::OsString::from_vec(b"native-\xff".to_vec())
         };
-        let result = store.create_child("source");
-        assert!(
-            temp.path().join("source").is_dir(),
-            "mkdir must precede fsync"
-        );
-        assert!(
-            result.is_err(),
-            "a failed parent sync must prevent returning a usable store"
-        );
-        let result = durable_mkdir(
-            &store.directory,
-            std::ffi::OsStr::new("output-parent"),
-            true,
-        );
-        assert!(temp.path().join("output-parent").is_dir());
-        assert!(
-            result.is_err(),
-            "output ancestry must use the same durability barrier"
+        #[cfg(windows)]
+        let name = {
+            use std::os::windows::ffi::OsStringExt;
+            std::ffi::OsString::from_wide(&[110, 97, 116, 105, 118, 101, 45, 0xd800])
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join(name).join("run");
+        let created = ReportStore::safe_root(&root, true).unwrap();
+        created.save(&RunReport::new("native-ancestry")).unwrap();
+        let reopened = ReportStore::safe_root(&root, false).unwrap();
+        assert_eq!(
+            reopened
+                .read_json::<RunReport>("report.json")
+                .unwrap()
+                .run_id,
+            "native-ancestry"
         );
     }
+    struct PreparationObserver {
+        called: bool,
+    }
+    impl Environment for PreparationObserver {
+        fn prepare(
+            &mut self,
+            _: &ValidatedRecipe,
+            _: bool,
+            _: &CancellationToken,
+        ) -> Result<PreparedEnvironment> {
+            self.called = true;
+            bail!("unexpected prepare")
+        }
+        fn create(&mut self, _: &str, _: &str, _: &ValidatedRecipe) -> Result<OwnedResource> {
+            unreachable!()
+        }
+        fn setup(
+            &mut self,
+            _: &OwnedResource,
+            _: &ValidatedRecipe,
+            _: &CancellationToken,
+        ) -> Result<()> {
+            unreachable!()
+        }
+        fn execute(
+            &mut self,
+            _: &OwnedResource,
+            _: CommandRequest,
+            _: &ReportStore,
+            _: &CancellationToken,
+        ) -> Result<ExecutedCommand> {
+            unreachable!()
+        }
+        fn observe(
+            &mut self,
+            _: &OwnedResource,
+            _: &[String],
+            _: Limits,
+            _: &CancellationToken,
+        ) -> Result<Vec<Snapshot>> {
+            unreachable!()
+        }
+        fn stop(&mut self, _: &OwnedResource) -> Result<()> {
+            unreachable!()
+        }
+        fn remove(&mut self, _: &OwnedResource) -> Result<()> {
+            unreachable!()
+        }
+    }
     #[test]
-    fn suite_run_parent_sync_failure_precedes_started_and_environment_preparation() {
-        use std::os::unix::fs::PermissionsExt;
+    fn injected_run_directory_creation_failure_precedes_started_and_environment_preparation() {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir(temp.path().join("target")).unwrap();
         let recipe_path = temp.path().join("recipe.toml");
@@ -728,34 +675,24 @@ mod durability_tests {
         )
         .unwrap();
         let recipe = crate::recipe::load(&recipe_path).unwrap();
-        let executable = temp.path().join("docker-boundary");
-        fs::write(
-            &executable,
-            "#!/bin/sh\nprintf invoked > \"$0.called\"\nexit 1\n",
-        )
-        .unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-        let parent = ReportStore {
-            root: temp.path().into(),
-            directory: File::from(
-                open(temp.path(), OFlags::PATH | OFlags::DIRECTORY, Mode::empty()).unwrap(),
-            ),
-        };
+        let mut parent = open_existing(temp.path()).unwrap();
+        parent.fail_child_creation = true;
+        let mut environment = PreparationObserver { called: false };
         let mut emitted = false;
         let result = crate::engine::run_with_parent(
             &recipe,
             crate::engine::RunOptions::all(&recipe),
-            crate::engine::CancellationToken::default(),
-            &mut crate::runner::Docker::new(executable.as_os_str()),
+            CancellationToken::default(),
+            &mut environment,
             Some(&parent),
             |_| emitted = true,
         );
-        assert!(result.is_err());
-        assert!(!emitted, "failed run-directory sync must precede Started");
+        assert!(format!("{:#}", result.err().unwrap()).contains("injected child creation failure"));
         assert!(
-            !temp.path().join("docker-boundary.called").exists(),
-            "environment preparation must not run"
+            !emitted,
+            "failed run directory creation must precede Started"
         );
+        assert!(!environment.called, "environment preparation must not run");
     }
 }
 
@@ -774,6 +711,34 @@ mod bounded_tests {
             }
             seq.end()
         }
+    }
+    #[test]
+    fn serializer_failure_preserves_exact_report_and_recomputed_outcome_with_typed_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = create(&temp.path().join("run")).unwrap();
+        let mut report = RunReport::new("cancelled");
+        report.cancelled = true;
+        store.save(&report).unwrap();
+        let previous = fs::read(store.report_path()).unwrap();
+        let error = store
+            .atomic_json_with_limit("report.json", &Many(&Cell::new(0)), 512)
+            .unwrap_err();
+        let io_error = error.downcast_ref::<std::io::Error>().unwrap();
+        let detail = io_error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<theseus_host::fs::PublicationError>()
+            .unwrap();
+        assert_eq!(
+            detail.state(),
+            theseus_host::fs::PublicationState::NotReplaced
+        );
+        assert_eq!(fs::read(store.report_path()).unwrap(), previous);
+        assert_eq!(
+            load(store.root()).unwrap().outcome,
+            crate::model::RunOutcome::Cancelled
+        );
+        assert_eq!(fs::read_dir(store.root()).unwrap().count(), 1);
     }
     #[test]
     fn atomic_serialization_stops_early_preserves_previous_and_removes_pending() {

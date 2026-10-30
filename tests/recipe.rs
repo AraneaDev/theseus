@@ -149,7 +149,10 @@ fn environment_forwarding_is_not_read_from_host_during_validation() {
 
 #[test]
 fn artifacts_resolve_in_project_and_cannot_escape_through_symlinks_or_special_files() {
+    #[cfg(unix)]
     use std::os::unix::{fs::symlink, net::UnixListener};
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_file as symlink;
     let dir = tempfile::tempdir().unwrap();
     let external = tempfile::tempdir().unwrap();
     fs::create_dir(dir.path().join("base")).unwrap();
@@ -163,8 +166,21 @@ fn artifacts_resolve_in_project_and_cannot_escape_through_symlinks_or_special_fi
     .unwrap();
     assert!(theseus::recipe::load(&dir.path().join("theseus.toml")).is_err());
     fs::remove_file(dir.path().join("target/leak")).unwrap();
-    let _socket = UnixListener::bind(dir.path().join("target/socket")).unwrap();
-    assert!(theseus::recipe::load(&dir.path().join("theseus.toml")).is_err());
+    #[cfg(unix)]
+    {
+        let _socket = UnixListener::bind(dir.path().join("target/socket")).unwrap();
+        assert!(theseus::recipe::load(&dir.path().join("theseus.toml")).is_err());
+    }
+    #[cfg(windows)]
+    {
+        fs::create_dir(dir.path().join("target/reparse-source")).unwrap();
+        std::os::windows::fs::symlink_dir(
+            external.path(),
+            dir.path().join("target/reparse-source/escape"),
+        )
+        .unwrap();
+        assert!(theseus::recipe::load(&dir.path().join("theseus.toml")).is_err());
+    }
 }
 
 #[test]

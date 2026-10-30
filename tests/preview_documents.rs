@@ -141,6 +141,7 @@ fn open_requires_unchanged_utf8_source_within_editor_limit() {
 
 #[test]
 fn recipe_save_copy_writes_exact_bytes_exclusively_and_preserves_original() {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     let dir = tree();
     let path = dir.path().join("recipe.toml");
@@ -153,6 +154,7 @@ fn recipe_save_copy_writes_exact_bytes_exclusively_and_preserves_original() {
     let copy = dir.path().join("new.edited.toml");
     assert_eq!(fs::read(&copy).unwrap(), draft.text.as_bytes());
     assert_eq!(fs::read(&path).unwrap(), before);
+    #[cfg(unix)]
     assert_eq!(
         fs::metadata(&copy).unwrap().permissions().mode() & 0o777,
         0o600
@@ -198,7 +200,10 @@ fn suite_save_copy_reloads_variants_from_original_root() {
 
 #[test]
 fn save_rejects_bad_names_collisions_and_invalid_drafts_without_creation() {
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_file as symlink;
     let dir = tree();
     let path = dir.path().join("recipe.toml");
     let accepted = recipe::load(&path).unwrap();

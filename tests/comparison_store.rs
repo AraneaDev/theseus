@@ -1,7 +1,19 @@
+#[cfg(unix)]
+use std::os::unix::fs::{PermissionsExt, symlink};
+#[cfg(windows)]
+fn symlink(
+    source: impl AsRef<std::path::Path>,
+    target: impl AsRef<std::path::Path>,
+) -> std::io::Result<()> {
+    if source.as_ref().is_dir() {
+        std::os::windows::fs::symlink_dir(source, target)
+    } else {
+        std::os::windows::fs::symlink_file(source, target)
+    }
+}
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
 };
 use theseus::{
@@ -16,7 +28,7 @@ fn digest(bytes: &[u8]) -> String {
 }
 fn fixture() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("suite");
+    let root = temp.path().canonicalize().unwrap().join("suite");
     fs::create_dir(&root).unwrap();
     let manifest = SuiteManifest {
         schema_version: 1,
@@ -284,6 +296,7 @@ fn unfinished_cancelled_and_source_error_evidence_survive_cached_verdicts() {
             }
         );
         comparison::cleanup(&root).unwrap();
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(root.join("sources/copy/run-copy/journal.json"))
                 .unwrap()

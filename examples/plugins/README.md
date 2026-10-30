@@ -78,3 +78,9 @@ client configuration is exercised. Typed saved observations prove ordinary repor
 consistency; they are not authenticated attestations or independent JSON query
 replay. The new reader supports report schemas 1 through 7; older released readers
 need not support 7. Journal/ownership/comparison schemas remain 1.
+
+Preparation preserves supplied ELF bytes and emits generated text as UTF-8/LF.
+Windows preparation requires Python 3.12+ and checks regular, nonreparse source
+identity before/after opening; Unix retains no-follow acquisition. The guest copies
+the client to `/home/theseus/.local/bin/theseus-client`, compares it with the staged
+input, and applies explicit execute permission in its user-owned destination.

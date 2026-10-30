@@ -80,6 +80,31 @@ impl HostDir {
     pub fn open_child(&self, path: &RelativePath) -> io::Result<Self> {
         self.walk(path.components(), false)
     }
+    /// Open one native directory component through retained authority.
+    pub fn open_child_name(&self, name: &OsStr) -> io::Result<Self> {
+        validate_name(name)?;
+        Ok(Self {
+            directory: platform::open_dir(&self.directory, name)?,
+            display: self.display.join(name),
+            #[cfg(windows)]
+            enumeration: std::sync::Mutex::new(()),
+        })
+    }
+    /// Sync this retained directory on Unix. Windows directory power-loss
+    /// persistence is unsupported; file flush and atomic replace are separate.
+    pub fn sync_directory(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.directory.sync_all()
+        }
+        #[cfg(windows)]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "directory persistence is unsupported on Windows",
+            ))
+        }
+    }
     pub fn create_child(&self, name: &OsStr) -> io::Result<Self> {
         validate_name(name)?;
         Ok(Self {

@@ -5,13 +5,15 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::BTreeSet,
     fs,
     io::{Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
+use theseus_host::fs::{HostDir, RelativePath, RootPolicy};
 
 pub(super) struct Inputs {
     pub directory: tempfile::TempDir,
@@ -74,106 +76,118 @@ fn copy(
         resolved.starts_with(project),
         "artifact escaped project during materialization"
     );
-    let metadata = fs::metadata(&resolved)?;
-    if metadata.is_dir() {
-        ensure!(
-            ancestors.insert(resolved.clone()),
-            "artifact directory cycle"
-        );
-        fs::create_dir(target)?;
-        fs::set_permissions(target, fs::Permissions::from_mode(0o755))?;
-        let directory = open_confined(project, &resolved)?;
-        use std::os::fd::AsRawFd;
-        let mut entries: Vec<_> = fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))?
-            .collect::<std::io::Result<_>>()?;
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
-            copy(
-                &resolved.join(entry.file_name()),
-                &target.join(entry.file_name()),
-                &relative.join(entry.file_name()),
-                project,
-                ancestors,
-                files,
-                cancel,
-            )?;
-        }
-        ancestors.remove(&resolved);
+    let root = HostDir::open(project, RootPolicy::LeafNoFollow)?;
+    let relative_source = posix_relative(resolved.strip_prefix(project)?)?;
+    let input = if relative_source.is_empty() {
+        None
     } else {
-        ensure!(metadata.is_file(), "artifact has unsupported special file");
-        let mut input = open_confined(project, &resolved)?;
-        ensure!(
-            input.metadata()?.is_file(),
-            "artifact is not a regular file"
-        );
-        let mut output = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(target)?;
-        let mut hash = Sha256::new();
-        let mut size = 0u64;
-        let mut buffer = [0; 32768];
-        loop {
-            ensure!(!cancel.is_cancelled(), "artifact copy cancelled");
-            let count = input.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            output.write_all(&buffer[..count])?;
-            hash.update(&buffer[..count]);
-            size = size
-                .checked_add(count as u64)
-                .context("artifact size overflow")?;
-        }
-        output.sync_all()?;
-        fs::set_permissions(
-            target,
-            fs::Permissions::from_mode((metadata.permissions().mode() & 0o111) | 0o444),
-        )?;
-        files.push(ArtifactFileDigest {
-            path: if relative.as_os_str().is_empty() {
-                ".".into()
+        root.open_file(&RelativePath::parse(&relative_source)?).ok()
+    };
+    match input {
+        None => {
+            ensure!(
+                ancestors.insert(resolved.clone()),
+                "artifact directory cycle"
+            );
+            fs::create_dir(target)?;
+            #[cfg(unix)]
+            fs::set_permissions(target, fs::Permissions::from_mode(0o755))?;
+            let directory = if relative_source.is_empty() {
+                root
             } else {
-                relative
-                    .to_str()
-                    .context("artifact path must be UTF-8")?
-                    .into()
-            },
-            sha256: format!("{:x}", hash.finalize()),
-            size,
-        });
+                root.open_child(&RelativePath::parse(&relative_source)?)?
+            };
+            for name in directory.entries()? {
+                copy(
+                    &resolved.join(name.clone()),
+                    &target.join(name.clone()),
+                    &relative.join(name.clone()),
+                    project,
+                    ancestors,
+                    files,
+                    cancel,
+                )?;
+            }
+            ancestors.remove(&resolved);
+        }
+        Some(mut input) => {
+            #[cfg(unix)]
+            let metadata = input.metadata()?;
+            let parent = HostDir::open(
+                target.parent().context("artifact target parent")?,
+                RootPolicy::LeafNoFollow,
+            )?;
+            let name = target
+                .file_name()
+                .and_then(|s| s.to_str())
+                .context("artifact target must be UTF-8")?;
+            let mut output = parent.create_file(&RelativePath::parse(name)?)?;
+            let mut hash = Sha256::new();
+            let mut size = 0u64;
+            let mut buffer = [0; 32768];
+            loop {
+                ensure!(!cancel.is_cancelled(), "artifact copy cancelled");
+                let count = input.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                output.write_all(&buffer[..count])?;
+                hash.update(&buffer[..count]);
+                size = size
+                    .checked_add(count as u64)
+                    .context("artifact size overflow")?;
+            }
+            output.sync_all()?;
+            #[cfg(unix)]
+            output.set_permissions(fs::Permissions::from_mode(
+                (metadata.permissions().mode() & 0o111) | 0o444,
+            ))?;
+            files.push(ArtifactFileDigest {
+                path: if relative.as_os_str().is_empty() {
+                    ".".into()
+                } else {
+                    posix_relative(relative)?
+                },
+                sha256: format!("{:x}", hash.finalize()),
+                size,
+            });
+        }
     }
     Ok(())
 }
 
-// Open each canonical component relative to the project directory, closing races
-// through replaced symlink ancestors. NONBLOCK also prevents a raced FIFO hang.
-fn open_confined(project: &Path, resolved: &Path) -> Result<fs::File> {
-    use rustix::fs::{Mode, OFlags, open, openat};
-    let mut descriptor = open(
-        project,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?;
-    let relative = resolved.strip_prefix(project)?;
-    let components: Vec<_> = relative.components().collect();
-    for (index, component) in components.iter().enumerate() {
-        let std::path::Component::Normal(name) = component else {
-            anyhow::bail!("invalid canonical artifact component");
-        };
-        let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-        if index + 1 < components.len() {
-            flags |= OFlags::DIRECTORY;
-        }
-        descriptor = openat(&descriptor, *name, flags, Mode::empty())?;
-    }
-    Ok(fs::File::from(descriptor))
+// Stored manifest paths are POSIX references, independent of host separators.
+fn posix_relative(path: &Path) -> Result<String> {
+    path.components()
+        .map(|part| {
+            let std::path::Component::Normal(name) = part else {
+                anyhow::bail!("invalid canonical artifact component")
+            };
+            name.to_str().context("artifact path must be UTF-8")
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|parts| parts.join("/"))
+}
+
+/// Windows-host inputs carry bytes, with guest modes declared only on owned roots.
+#[cfg(any(windows, test))]
+pub(super) fn windows_input_normalization() -> &'static str {
+    r#"set -eu
+command -v find >/dev/null || { echo 'required tool missing: find' >&2; exit 1; }
+for input in /inputs/base /inputs/target; do
+  if test -e "$input"; then
+    find "$input" -type d -exec chmod 0755 {} +
+    find "$input" -type f -exec chmod 0444 {} +
+  fi
+done
+"#
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
+    #[cfg(unix)]
     #[test]
     fn materializes_contained_links_and_hashes_actual_bytes() {
         let temp = tempfile::tempdir().unwrap();
@@ -205,6 +219,7 @@ mod tests {
         std::os::unix::fs::symlink("/etc/passwd", project.join("input/link")).unwrap();
         assert!(materialize(&recipe, &CancellationToken::default()).is_err());
     }
+    #[cfg(unix)]
     #[test]
     fn descriptor_open_refuses_a_symlink_ancestor_even_after_validation() {
         let temp = tempfile::tempdir().unwrap();
@@ -214,6 +229,132 @@ mod tests {
         fs::create_dir(&outside).unwrap();
         fs::write(outside.join("secret"), b"private").unwrap();
         std::os::unix::fs::symlink(&outside, project.join("replaced")).unwrap();
-        assert!(open_confined(&project, &project.join("replaced/secret")).is_err());
+        let root = HostDir::open(&project, RootPolicy::LeafNoFollow).unwrap();
+        assert!(
+            root.open_file(&RelativePath::parse("replaced/secret").unwrap())
+                .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+    #[test]
+    fn file_and_directory_inputs_keep_bytes_sorted_posix_names_and_archive_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir_all(project.join("input/nested")).unwrap();
+        let archive = b"\x7fELF\r\n\0opaque tar bytes\xff";
+        fs::write(project.join("bundle.tar"), archive).unwrap();
+        fs::write(project.join("input/z.exe"), b"data only").unwrap();
+        fs::write(project.join("input/nested/a.sh"), b"#!/bin/sh\n").unwrap();
+        let mut recipe =
+            crate::recipe::load(Path::new("tests/fixtures/lifecycle/recipe.toml")).unwrap();
+        recipe.project_root = project.canonicalize().unwrap();
+        recipe.base_artifact = Some(project.join("bundle.tar"));
+        recipe.target_artifact = project.join("input");
+        let inputs = materialize(&recipe, &CancellationToken::default()).unwrap();
+        assert_eq!(
+            fs::read(inputs.directory.path().join("base")).unwrap(),
+            archive
+        );
+        assert_eq!(inputs.manifests[0].files[0].path, ".");
+        assert_eq!(
+            inputs.manifests[1]
+                .files
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
+            ["nested/a.sh", "z.exe"]
+        );
+        assert_eq!(
+            fs::read(inputs.directory.path().join("target/z.exe")).unwrap(),
+            b"data only"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn unix_staging_preserves_only_source_execute_bits_and_windows_guest_script_sets_data_modes() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir_all(project.join("input/subdir")).unwrap();
+        fs::write(project.join("input/data.exe"), b"plain bytes").unwrap();
+        fs::write(project.join("input/executable.sh"), b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(
+            project.join("input/data.exe"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        fs::set_permissions(
+            project.join("input/executable.sh"),
+            fs::Permissions::from_mode(0o710),
+        )
+        .unwrap();
+        let mut recipe =
+            crate::recipe::load(Path::new("tests/fixtures/lifecycle/recipe.toml")).unwrap();
+        recipe.project_root = project.canonicalize().unwrap();
+        recipe.base_artifact = None;
+        recipe.target_artifact = project.join("input");
+        let inputs = materialize(&recipe, &CancellationToken::default()).unwrap();
+        let target = inputs.directory.path().join("target");
+        assert_eq!(
+            fs::metadata(target.join("data.exe"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o444
+        );
+        assert_eq!(
+            fs::metadata(target.join("executable.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o554
+        );
+        // Execute the Windows-controller guest policy only on this owned fixture.
+        // Supplied fixture bytes themselves are never executed.
+        let script = windows_input_normalization()
+            .replace("/inputs", inputs.directory.path().to_str().unwrap());
+        let result = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        for name in ["data.exe", "executable.sh"] {
+            assert_eq!(
+                fs::metadata(target.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o444
+            );
+        }
+        assert_eq!(
+            fs::metadata(target.join("subdir"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert_eq!(fs::read(target.join("data.exe")).unwrap(), b"plain bytes");
+    }
+    #[test]
+    fn windows_guest_policy_declares_data_modes_without_extension_inference() {
+        let script = windows_input_normalization();
+        assert!(script.contains("/inputs/base /inputs/target"));
+        assert!(script.contains("-type d -exec chmod 0755"));
+        assert!(script.contains("-type f -exec chmod 0444"));
+        for extension in [".exe", ".sh", ".bat", ".cmd"] {
+            assert!(!script.contains(extension));
+        }
     }
 }

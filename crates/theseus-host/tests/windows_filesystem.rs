@@ -269,6 +269,8 @@ fn junctions_and_substituted_ancestors_are_rejected() -> io::Result<()> {
     let root = HostDir::create_private(&path)?;
     root.create_child("child".as_ref())?;
     junction(&temp.path().join("alias"), &path)?;
+    let parent = HostDir::open(temp.path(), RootPolicy::LeafNoFollow)?;
+    assert!(parent.open_child_name("alias".as_ref()).is_err());
     for alias in [temp.path().join("alias"), temp.path().join("alias/")] {
         assert!(HostDir::open(&alias, RootPolicy::LeafNoFollow).is_err());
     }

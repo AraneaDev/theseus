@@ -371,6 +371,13 @@ chmod 755 /home/theseus /workspace /inputs
             process::utility(&mut command, cancel)
                 .context("copy materialized inputs into container")?;
         }
+        #[cfg(windows)]
+        self.root_exec(
+            resource,
+            artifacts::windows_input_normalization(),
+            &[],
+            cancel,
+        )?;
         self.root_exec(
             resource,
             "test \"$(id -u theseus)\" = 10001 && test \"$(id -g theseus)\" = 10001",

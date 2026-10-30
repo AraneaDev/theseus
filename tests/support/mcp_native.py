@@ -354,8 +354,8 @@ def fault_recipe(root, name):
     if name in ('duplicate','stale','settings-loss'):
         upgrade = profile['steps']['upgrade']['script']
         suffix = {
-            'duplicate': '/inputs/target/client/claude mcp add --scope project probe -- /bin/sh /inputs/target/server.sh',
-            'stale': '/inputs/target/client/claude mcp remove probe --scope user; /inputs/target/client/claude mcp add --scope user probe -- /bin/sh /inputs/base/server.sh',
+            'duplicate': '/home/theseus/.local/bin/theseus-client mcp add --scope project probe -- /bin/sh /inputs/target/server.sh',
+            'stale': '/home/theseus/.local/bin/theseus-client mcp remove probe --scope user; /home/theseus/.local/bin/theseus-client mcp add --scope user probe -- /bin/sh /inputs/base/server.sh',
             'settings-loss': "sed -i 's/\"hasCompletedOnboarding\": *true/\"hasCompletedOnboarding\":false/' /home/theseus/plugin-config/.claude.json",
         }[name]
         profile['steps']['upgrade']['script'] = 'set -eu; export CLAUDE_CONFIG_DIR=/home/theseus/plugin-config CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1; ' + upgrade + '; ' + suffix

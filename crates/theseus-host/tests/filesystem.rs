@@ -196,3 +196,41 @@ fn enumeration_handles_multiple_batches_and_concurrent_readers() -> io::Result<(
     })?;
     Ok(())
 }
+
+#[test]
+fn native_child_names_preserve_identity_and_directory_sync_profile() -> io::Result<()> {
+    use std::ffi::{OsStr, OsString};
+    #[cfg(unix)]
+    let native = {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec(b"native-\xff".to_vec())
+    };
+    #[cfg(windows)]
+    let native = {
+        use std::os::windows::ffi::OsStringExt;
+        OsString::from_wide(&[110, 97, 116, 105, 118, 101, 45, 0xd800])
+    };
+    let temp = tempfile::tempdir()?;
+    let root = HostDir::create_private(&temp.path().join("root"))?;
+    root.create_child(&native)?
+        .create_file(&RelativePath::parse("marker")?)?
+        .write_all(b"retained")?;
+    let child = root.open_child_name(&native)?;
+    assert_eq!(child.entries()?, [OsString::from("marker")]);
+    for invalid in ["..", "a/b", ""] {
+        assert!(root.open_child_name(OsStr::new(invalid)).is_err());
+    }
+    #[cfg(unix)]
+    root.sync_directory()?;
+    #[cfg(windows)]
+    assert_eq!(
+        root.sync_directory().unwrap_err().kind(),
+        io::ErrorKind::Unsupported
+    );
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&native, temp.path().join("root/alias"))?;
+        assert!(root.open_child_name(OsStr::new("alias")).is_err());
+    }
+    Ok(())
+}

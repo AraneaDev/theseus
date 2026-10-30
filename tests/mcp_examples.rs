@@ -12,3 +12,17 @@ fn independent_wire_and_cancel_oracles_reject_false_native_proof() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn portable_guest_script_bytes_and_preparation_boundaries() {
+    let output = std::process::Command::new("python3")
+        .arg("tests/support/portable_guest_bytes.py")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

@@ -780,6 +780,7 @@ dependencies = [
  "sha2",
  "signal-hook",
  "tempfile",
+ "theseus-host",
  "tokio",
  "toml",
 ]

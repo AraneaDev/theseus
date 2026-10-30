@@ -1,7 +1,17 @@
-use std::{
-    fs,
-    os::unix::fs::{PermissionsExt, symlink},
-};
+#[cfg(unix)]
+use std::os::unix::fs::{PermissionsExt, symlink};
+#[cfg(windows)]
+fn symlink(
+    source: impl AsRef<std::path::Path>,
+    target: impl AsRef<std::path::Path>,
+) -> std::io::Result<()> {
+    if source.as_ref().is_dir() {
+        std::os::windows::fs::symlink_dir(source, target)
+    } else {
+        std::os::windows::fs::symlink_file(source, target)
+    }
+}
+use std::fs;
 use theseus::{model::*, report};
 
 #[test]
@@ -89,10 +99,12 @@ fn stores_atomically_in_private_files_and_refuses_run_collisions() {
     store.save(&run).unwrap();
     let loaded = report::load(&root).unwrap();
     assert_eq!(loaded.errors, vec!["later event"]);
+    #[cfg(unix)]
     assert_eq!(
         fs::metadata(&root).unwrap().permissions().mode() & 0o777,
         0o700
     );
+    #[cfg(unix)]
     assert_eq!(
         fs::metadata(store.report_path())
             .unwrap()
@@ -121,6 +133,7 @@ fn stores_atomically_in_private_files_and_refuses_run_collisions() {
         report::load_journal(&root).unwrap().resources[0].container_id,
         "abc123"
     );
+    #[cfg(unix)]
     assert_eq!(
         fs::metadata(root.join("journal.json"))
             .unwrap()
@@ -172,6 +185,7 @@ fn log_reads_and_writes_are_bounded_and_symlinks_are_never_followed() {
     let read = store.read_log(&log.path, 3).unwrap();
     assert_eq!(read.bytes, b"123");
     assert!(read.truncated);
+    #[cfg(unix)]
     assert_eq!(
         fs::metadata(store.root().join("logs"))
             .unwrap()
@@ -180,6 +194,7 @@ fn log_reads_and_writes_are_bounded_and_symlinks_are_never_followed() {
             & 0o777,
         0o700
     );
+    #[cfg(unix)]
     assert_eq!(
         fs::metadata(store.root().join(&log.path))
             .unwrap()
@@ -315,8 +330,16 @@ fn reopening_a_store_for_cleanup_preserves_existing_evidence() {
         "recovery"
     );
     let alias = temp.path().join("alias");
-    std::os::unix::fs::symlink(original.root(), &alias).unwrap();
+    symlink(original.root(), &alias).unwrap();
     assert!(theseus::report::open_existing(&alias).is_err());
+    // Normal report roots permit aliases in ancestors, while rejecting the leaf.
+    let parent_alias = temp.path().join("parent-alias");
+    symlink(temp.path(), &parent_alias).unwrap();
+    let through_ancestor = theseus::report::open_existing(&parent_alias.join("run")).unwrap();
+    assert_eq!(
+        report::load(through_ancestor.root()).unwrap().run_id,
+        "recovery"
+    );
 }
 
 #[test]
@@ -1530,5 +1553,23 @@ fn old_report_schema_rejects_plugin_contract_and_stages() {
                 .to_string()
                 .contains("plugin lifecycle requires report schema version 7")
         );
+    }
+}
+
+#[test]
+fn native_temp_store_reads_all_eight_legacy_schemas_and_recomputes_current_outcomes() {
+    let temp = tempfile::tempdir().unwrap();
+    for schema in 1..=8 {
+        let store = report::create(&temp.path().join(format!("schema-{schema}"))).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(include_bytes!("fixtures/reports/schema1-report.json")).unwrap();
+        value["schema_version"] = schema.into();
+        // The frozen passing evidence remains valid in every readable schema.
+        fs::write(store.report_path(), serde_json::to_vec(&value).unwrap()).unwrap();
+        let loaded = report::load(store.root()).unwrap();
+        assert_eq!(loaded.schema_version, schema);
+        assert_eq!(loaded.outcome, RunOutcome::Passed);
+        store.save(&loaded).unwrap();
+        assert_eq!(report::load(store.root()).unwrap().outcome, loaded.outcome);
     }
 }

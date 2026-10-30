@@ -95,10 +95,13 @@ pub fn stage_plugin(
 /// Both manifest and report name explicitly identify synthetic behavior.
 pub fn replace_with_replay(root: &std::path::Path) {
     use sha2::{Digest, Sha256};
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     let bytes = fs::read("tests/fixtures/plugins/replay-client").unwrap();
     let client = root.join("target/client/claude");
     fs::write(&client, &bytes).unwrap();
+    #[cfg(unix)]
     fs::set_permissions(&client, fs::Permissions::from_mode(0o755)).unwrap();
     let path = root.join("input-manifest.json");
     let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();

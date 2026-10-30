@@ -5,6 +5,7 @@ export DISABLE_AUTOUPDATER=1
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 export CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1
 export LC_ALL=C
+cmp /inputs/target/client/claude /home/theseus/.local/bin/theseus-client
 cd /workspace/plugin-project
 version=$1
 case "$version" in 1.0.0) generation=v1 ;; 2.0.0) generation=v2 ;; *) exit 64 ;; esac
@@ -37,5 +38,5 @@ done
 # Retain native details as text only. Modern clients count one skill plus one
 # legacy command as Skills: 2; this fixture does not assert model dispatch.
 printf 'Details observation (Skills includes legacy hello; expected count 2):\n'
-/inputs/target/client/claude plugin details theseus-probe@theseus-probe-market
+/home/theseus/.local/bin/theseus-client plugin details theseus-probe@theseus-probe-market
 printf 'source/cache manifests skills legacy-command manual-hook verified %s\n' "$version"

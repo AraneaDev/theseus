@@ -4,6 +4,8 @@ import argparse
 import hashlib
 import json
 import os
+import stat
+import sys
 from pathlib import Path
 import shutil
 import tomllib
@@ -102,6 +104,38 @@ def recipe(args, plugin_recipe=None):
     return result
 
 
+def open_client(source):
+    # Unix retains atomic leaf no-follow/nonblocking acquisition. Windows uses
+    # checked lstat/open/lstat identities; this is not atomic no-follow or a
+    # sandbox against same-user ancestor replacement.
+    if os.name == 'nt' and sys.version_info < (3, 12):
+        raise ValueError('Windows preparation requires Python 3.12+ native file identity')
+    before = source.lstat()
+    flags = os.O_RDONLY
+    if os.name == 'nt':
+        flags |= os.O_BINARY | os.O_NOINHERIT
+    else:
+        flags |= os.O_NOFOLLOW | os.O_NONBLOCK
+    fd = os.open(source, flags)
+    try:
+        opened, after = os.fstat(fd), source.lstat()
+        for info in [before, opened, after]:
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError('client must be a regular nonsymlink file')
+            if os.name == 'nt':
+                if not hasattr(info, 'st_file_attributes') or info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                    raise ValueError('client reparse attributes are missing or unsafe')
+                if not info.st_ino or not info.st_dev:
+                    raise ValueError('client native identity is unavailable')
+        if not ((before.st_dev, before.st_ino) == (opened.st_dev, opened.st_ino) == (after.st_dev, after.st_ino)):
+            raise ValueError('client identity changed during acquisition')
+        stream = os.fdopen(fd, 'rb')
+    except BaseException:
+        os.close(fd)
+        raise
+    return stream
+
+
 def prepare(args):
     expected = {'claude-code-2.1.312': '2.1.312 (Claude Code)', 'codex-cli-0.166.0': 'codex-cli 0.166.0'}
     if args.client_version != expected[args.adapter]:
@@ -121,8 +155,7 @@ def prepare(args):
         raise ValueError('client must be an explicit regular nonsymlink ELF')
     if not args.image or any(ord(c) < 32 or ord(c) > 126 for c in args.image):
         raise ValueError('image must be printable ASCII')
-    fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(fd, 'rb') as stream:
+    with open_client(source) as stream:
         if os.fstat(stream.fileno()).st_mode & 0o170000 != 0o100000:
             raise ValueError('client must be a regular file')
         first = stream.read(4)
@@ -145,29 +178,29 @@ def prepare(args):
             (target / 'client/claude').chmod(0o755)
             for asset in ['action.sh', 'codex-settings-prefix.txt']:
                 shutil.copyfile(HERE / 'assets' / asset, target / asset)
-            (target / 'expected-version.txt').write_text(args.client_version + '\n')
+            (target / 'expected-version.txt').write_text(args.client_version + '\n', encoding='utf-8', newline='\n')
             for generation, version, tool in [('base', '1.0.0', 'hello_v1'), ('target', '2.0.0', 'hello_v2')]:
-                server = (HERE / 'assets/server.sh').read_text().replace('@@VERSION@@', version).replace('@@TOOL@@', tool).replace('@@PROTOCOL@@', args.protocol)
+                server = (HERE / 'assets/server.sh').read_text(encoding='utf-8').replace('@@VERSION@@', version).replace('@@TOOL@@', tool).replace('@@PROTOCOL@@', args.protocol)
                 if plugin:
                     folder = target / ('market-v1' if generation == 'base' else 'market-v2') / 'plugins/theseus-probe'
-                    (folder / 'server.sh').write_text(server)
-                    (folder / '.mcp.json').write_text(json.dumps({'probe': {'command': '/bin/sh', 'args': ['${CLAUDE_PLUGIN_ROOT}/server.sh']}}) + '\n')
+                    (folder / 'server.sh').write_text(server, encoding='utf-8', newline='\n')
+                    (folder / '.mcp.json').write_text(json.dumps({'probe': {'command': '/bin/sh', 'args': ['${CLAUDE_PLUGIN_ROOT}/server.sh']}}) + '\n', encoding='utf-8', newline='\n')
                 else:
                     folder = output / generation
                     folder.mkdir(exist_ok=True)
-                    (folder / 'server.sh').write_text(server)
+                    (folder / 'server.sh').write_text(server, encoding='utf-8', newline='\n')
             plugin_recipe = None
             if plugin:
-                text = (HERE.parent / 'plugins/user.toml.in').read_text().replace('@@IMAGE_JSON@@', json.dumps(args.image)).replace('@@CLIENT_VERSION_JSON@@', json.dumps(args.client_version)).replace('@@CLIENT_VERSION_SCALAR_JSON@@', json.dumps(json.dumps(args.client_version)))
+                text = (HERE.parent / 'plugins/user.toml.in').read_text(encoding='utf-8').replace('@@IMAGE_JSON@@', json.dumps(args.image)).replace('@@CLIENT_VERSION_JSON@@', json.dumps(args.client_version)).replace('@@CLIENT_VERSION_SCALAR_JSON@@', json.dumps(json.dumps(args.client_version)))
                 text = text.replace('/workspace/plugin-project', '/workspace')
                 plugin_recipe = tomllib.loads(text)
                 for name in ['lifecycle.sh', 'client-version.sh', 'components.sh']:
                     path = target / name
-                    path.write_text(path.read_text().replace('/workspace/plugin-project', '/workspace'))
+                    path.write_text(path.read_text(encoding='utf-8').replace('/workspace/plugin-project', '/workspace'), encoding='utf-8', newline='\n')
             result = recipe(args, plugin_recipe)
-            (output / 'theseus.toml').write_text('\n'.join(json.dumps(k) + ' = ' + toml_value(v) for k, v in result.items()) + '\n')
+            (output / 'theseus.toml').write_text('\n'.join(json.dumps(k) + ' = ' + toml_value(v) for k, v in result.items()) + '\n', encoding='utf-8', newline='\n')
             manifest = {'provenance': 'explicit supplied ELF; never executed on host; expected version until guest proof', 'adapter': args.adapter, 'scope': args.scope, 'delivery': args.delivery, 'scenario': args.scenario, 'protocol': args.protocol, 'image': args.image, 'client': {'path': 'target/client/claude', 'sha256': digest.hexdigest(), 'size': size, 'expected_version': args.client_version}}
-            (output / 'input-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+            (output / 'input-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8', newline='\n')
         except BaseException:
             shutil.rmtree(output)
             raise

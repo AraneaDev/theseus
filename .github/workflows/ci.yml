@@ -60,6 +60,36 @@ jobs:
           cargo test --locked -p theseus-host --all-targets --no-fail-fast 2>&1 |
             Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'tests.log')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Portable owned guest script bytes and preparation boundaries
+        shell: pwsh
+        run: |
+          $theseusTask6Python = if ($IsWindows) { 'python' } else { 'python3' }
+          & $theseusTask6Python --version 2>&1 | Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'python-version.txt')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $theseusTask6Python tests/support/portable_guest_bytes.py 2>&1 |
+            Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'portable-guest-bytes.log')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Native macOS application storage integration
+        if: ${{ runner.os == 'macOS' }}
+        shell: pwsh
+        run: |
+          $theseusTask6TempRoot = python3 -c "import pathlib, tempfile; print(pathlib.Path(tempfile.gettempdir()).resolve())"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:TMPDIR = $theseusTask6TempRoot
+          @{ source_sha = $env:GITHUB_SHA; canonical_temp_root = $theseusTask6TempRoot; fixture_policy = 'canonical native temp ancestry; production strict no-follow remains unchanged' } |
+            ConvertTo-Json | Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'app-storage-fixture-policy.json')
+          cargo test --locked --lib report::store 2>&1 |
+            Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'app-storage-unit.log')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --lib runner::artifacts 2>&1 |
+            Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'app-artifacts-unit.log')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --lib tui::view::changed_log_tests 2>&1 |
+            Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'app-cache-unit.log')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --test reports --test log_pages --test comparison_store --test preview_documents --test recipe --test tui_paging --test mcp_examples --test plugin_examples 2>&1 |
+            Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'app-storage-integration.log')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload native package evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

@@ -1,0 +1,11 @@
+# Repository-owned Linux guest text; never normalize arbitrary user artifacts.
+/examples/**/*.sh text eol=lf
+/examples/**/sample-cli text eol=lf
+/examples/**/comparison-cli text eol=lf
+/examples/mcp/assets/codex-settings-prefix.txt text eol=lf
+/examples/plugins/*.toml.in text eol=lf
+/examples/plugins/fixture/**/*.json text eol=lf
+/examples/plugins/fixture/**/*.md text eol=lf
+/tests/fixtures/**/*.sh text eol=lf
+/tests/fixtures/**/sample-cli text eol=lf
+/tests/fixtures/plugins/replay-client text eol=lf

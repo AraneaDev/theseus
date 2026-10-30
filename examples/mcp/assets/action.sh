@@ -4,12 +4,18 @@ set -eu
 export LC_ALL=C
 export DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1
 export CLAUDE_CONFIG_DIR=/home/theseus/plugin-config CODEX_HOME=/home/theseus/codex
-client=/inputs/target/client/claude
+client=/home/theseus/.local/bin/theseus-client
 action=$1 adapter=$2 delivery=$3 scope=$4 generation=$5
 alias=probe
 source="/bin/sh /inputs/$generation/server.sh"
 if test "$delivery" = plugin; then alias=plugin:theseus-probe:probe; source='/bin/sh /workspace/local-market/plugins/theseus-probe/server.sh'; fi
-mkdir -p "$CLAUDE_CONFIG_DIR" "$CODEX_HOME"
+mkdir -p "$CLAUDE_CONFIG_DIR" "$CODEX_HOME" /home/theseus/.local/bin
+case "$action" in
+ install_target|install_base)
+  cp /inputs/target/client/claude "$client"
+  chmod 0755 "$client" ;;
+esac
+cmp /inputs/target/client/claude "$client"
 cd /workspace
 seed() {
  printf '%s\n' '{"hasCompletedOnboarding":true,"mcpServers":{"companion":{"command":"/bin/true","args":[]}},"projects":{"/workspace":{"mcpServers":{}}}}' > "$CLAUDE_CONFIG_DIR/.claude.json"

@@ -89,6 +89,15 @@ Native health capture has its own file bound and timeout; a nonzero native statu
 never becomes absence proof. Guest production uses shell/core tools only, Linux
 UID:GID 10001:10001 and network none. The image must already provide the native
 client's runtime libraries and core tools; preparation does not install them.
+The supplied ELF is staged byte-for-byte in the input manifest, then copied inside
+the guest to `/home/theseus/.local/bin/theseus-client`, compared with the input,
+and explicitly made executable. Recipes do not chmod root-owned `/inputs` or infer
+executable modes from a host extension. Preparation emits owned guest text as UTF-8
+with LF; arbitrary ELF/archive bytes are never normalized. Windows preparation
+requires Python 3.12+ for native file identity. Unix acquisition uses no-follow
+opens; Windows rejects reparse points and checks native identity before and after
+opening the retained source, without claiming atomic no-follow acquisition.
+
 Native commands, config observations and fixture requests establish no credentials,
 model use, tools/call, host configuration fidelity or companion activation.
 
