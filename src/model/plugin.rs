@@ -259,26 +259,29 @@ pub(crate) fn artifact_outcome(r: &RunReport) -> RunOutcome {
         let Some(p) = &s.plugin else {
             return RunOutcome::Incomplete;
         };
-        let targets = r
-            .artifacts
-            .iter()
-            .filter(|a| a.name == "target")
-            .collect::<Vec<_>>();
-        if targets.len() != 1 {
-            return RunOutcome::Incomplete;
-        }
-        let files = targets[0]
-            .files
-            .iter()
-            .filter(|f| f.path == p.client_artifact)
-            .collect::<Vec<_>>();
-        if files.len() != 1
-            || files[0].size == 0
-            || files[0].sha256.len() != 64
-            || !files[0].sha256.bytes().all(|b| b.is_ascii_hexdigit())
-        {
+        if !client_artifact_present(r, &p.client_artifact) {
             return RunOutcome::Incomplete;
         }
     }
     RunOutcome::Passed
+}
+
+pub(crate) fn client_artifact_present(r: &RunReport, path: &str) -> bool {
+    let targets = r
+        .artifacts
+        .iter()
+        .filter(|a| a.name == "target")
+        .collect::<Vec<_>>();
+    if targets.len() != 1 {
+        return false;
+    }
+    let files = targets[0]
+        .files
+        .iter()
+        .filter(|f| f.path == path)
+        .collect::<Vec<_>>();
+    files.len() == 1
+        && files[0].size > 0
+        && files[0].sha256.len() == 64
+        && files[0].sha256.bytes().all(|b| b.is_ascii_hexdigit())
 }

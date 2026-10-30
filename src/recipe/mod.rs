@@ -1,4 +1,9 @@
 //! Typed recipes and offline validation. Environment forwarding is a run-preflight concern.
+pub(crate) mod mcp;
+pub use mcp::{
+    McpCheckpointContract, McpClientClaim, McpDelivery, McpLifecycleContract, McpRegistrationState,
+    validate_mcp_contract,
+};
 mod downgrade;
 pub(crate) mod plugin;
 pub use plugin::{PluginCheckpointContract, PluginContract, PluginScope, validate_plugin_contract};

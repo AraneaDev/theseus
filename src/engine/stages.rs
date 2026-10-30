@@ -569,11 +569,20 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                 .values()
                 .any(|c| c.components.contains(&check.id))
         });
-        if scenario.scenario != ScenarioKind::InterruptedRollback && !plugin_component {
+        let mcp_activation = scenario.mcp.as_ref().is_some_and(|p| {
+            p.checkpoints
+                .values()
+                .any(|c| c.activation.as_ref() == Some(&check.id))
+        });
+        if scenario.scenario != ScenarioKind::InterruptedRollback
+            && !plugin_component
+            && !mcp_activation
+        {
             return None;
         }
 
         let required = plugin_component
+            || mcp_activation
             || matches!(
                 (&check.checkpoint, &check.expectation),
                 (

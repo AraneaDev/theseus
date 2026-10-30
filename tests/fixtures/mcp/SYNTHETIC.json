@@ -1,0 +1,7 @@
+{
+  "provenance": "SYNTHETIC contract and transport test fixtures; not vendor-native acceptance",
+  "server": "server.sh is a bounded static-ID wire fixture for transport tests",
+  "client_documents": "tests/support/mcp.rs supplies native-shaped JSON documents and real McpSession-derived response evidence",
+  "preparation_input": "mcp_contracts.rs creates an inert ELF-header byte fixture which is never executed",
+  "native_acceptance": false
+}

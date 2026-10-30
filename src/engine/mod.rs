@@ -183,6 +183,7 @@ pub(crate) fn run_with_parent(
                     report
                         .scenarios
                         .push(ScenarioReport::new(&sid, *profile, *scenario));
+                    report.scenarios[index].mcp = recipe.recipe.profiles[profile].mcp.clone();
                     if *scenario == ScenarioKind::PluginLifecycle {
                         report.scenarios[index].plugin =
                             recipe.recipe.profiles[profile].plugin.clone();
@@ -276,6 +277,29 @@ pub(crate) fn run_with_parent(
 fn preflight_env(recipe: &ValidatedRecipe, options: &RunOptions) -> Result<()> {
     for name in &options.profiles {
         let profile = &recipe.recipe.profiles[name];
+        if let Some(p) = &profile.mcp {
+            ensure!(
+                recipe.recipe.schema_version == 8
+                    && recipe.recipe.network == crate::recipe::Network::None
+                    && *name == ProfileName::User
+                    && recipe.declared_scenarios().len() == 1,
+                "invalid MCP execution boundary"
+            );
+            for scenario in &options.scenarios {
+                crate::recipe::validate_mcp_contract(profile, *scenario)?;
+            }
+            let path = recipe
+                .target_artifact
+                .join(&p.client_artifact)
+                .canonicalize()
+                .context("resolve MCP client artifact")?;
+            ensure!(
+                path.starts_with(&recipe.target_artifact)
+                    && path.is_file()
+                    && path.metadata()?.len() > 0,
+                "MCP client artifact must be a nonempty confined target file"
+            );
+        }
         let mut names: Vec<&String> = profile.steps.values().flat_map(|c| &c.pass_env).collect();
         for check in &profile.checks {
             match &check.expectation {

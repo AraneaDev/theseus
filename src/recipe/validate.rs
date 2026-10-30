@@ -50,6 +50,7 @@ impl ValidatedRecipe {
                 .get(name)
                 .with_context(|| format!("profile {name} is not defined"))?;
             for scenario in scenarios {
+                super::validate_mcp_contract(profile, *scenario)?;
                 let required = match scenario {
                     ScenarioKind::PluginLifecycle => {
                         ensure!(
@@ -360,6 +361,20 @@ pub fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<ValidatedRecipe> {
         }
     }
     for (name, profile) in &mut recipe.profiles {
+        if profile.mcp.is_some() {
+            ensure!(
+                recipe.schema_version == 8
+                    && recipe.network == Network::None
+                    && *name == ProfileName::User,
+                "MCP contract requires schema 8, network none and user profile"
+            );
+            let scenarios = recipe.scenarios.as_ref().unwrap();
+            ensure!(
+                scenarios.len() == 1,
+                "MCP contract requires exactly one scenario"
+            );
+            super::validate_mcp_contract(profile, scenarios[0])?;
+        }
         let plugin_features = profile.plugin.is_some()
             || profile
                 .steps

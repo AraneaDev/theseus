@@ -409,6 +409,10 @@ fn validate_report(report: &RunReport) -> Result<()> {
         "unsupported report schema version {}",
         report.schema_version
     );
+    ensure!(
+        report.schema_version >= 8 || report.scenarios.iter().all(|s| s.mcp.is_none()),
+        "MCP lifecycle requires report schema version 8"
+    );
     if report.schema_version < 7 {
         ensure!(
             !report

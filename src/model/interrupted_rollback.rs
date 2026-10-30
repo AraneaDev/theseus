@@ -50,6 +50,11 @@ impl ScenarioReport {
             return self.interrupted_rollback.is_some()
                 || self.stages.iter().flat_map(|s| &s.checks).any(|c| {
                     c.command_expectation.is_some()
+                        && !self.mcp.as_ref().is_some_and(|p| {
+                            p.checkpoints.iter().any(|(cp, proof)| {
+                                *cp == c.checkpoint && proof.activation.as_ref() == Some(&c.id)
+                            })
+                        })
                         && !(self.scenario == ScenarioKind::PluginLifecycle
                             && self.plugin.as_ref().is_some_and(|p| {
                                 p.checkpoints

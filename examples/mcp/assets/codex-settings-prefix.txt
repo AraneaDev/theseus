@@ -1,0 +1,3 @@
+hide_agent_reasoning = true
+[tui]
+disable_paste_burst = true

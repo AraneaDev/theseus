@@ -65,14 +65,7 @@ pub(crate) fn validate_contract(p: &PluginContract) -> Result<()> {
         p.base_version != p.target_version,
         "plugin versions must be distinct"
     );
-    ensure!(
-        !p.client_artifact.is_empty()
-            && p.client_artifact
-                .split('/')
-                .all(|x| !x.is_empty() && x != "." && x != ".." && !x.contains('\0'))
-            && !p.client_artifact.contains('\\'),
-        "unsafe client_artifact path"
-    );
+    validate_client_artifact(&p.client_artifact)?;
     ensure!(
         p.checkpoints.len() == 5 && CHECKPOINTS.iter().all(|cp| p.checkpoints.contains_key(cp)),
         "plugin requires exactly five checkpoint entries"
@@ -239,5 +232,17 @@ pub fn validate_plugin_contract(profile: &Profile) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+pub(crate) fn validate_client_artifact(path: &str) -> Result<()> {
+    ensure!(
+        !path.is_empty()
+            && path
+                .split('/')
+                .all(|x| !x.is_empty() && x != "." && x != ".." && !x.contains('\0'))
+            && !path.contains('\\'),
+        "unsafe client_artifact path"
+    );
     Ok(())
 }

@@ -1,6 +1,7 @@
 //! Stable, serializable identifiers and evidence shared by every interface.
 mod interrupted_rollback;
 mod json;
+pub mod mcp;
 pub(crate) mod plugin;
 pub use json::{
     JsonAssertionObservation, JsonCommandEvidence, JsonParseStatus, JsonValueObservation,
@@ -465,6 +466,8 @@ impl StageReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScenarioReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<crate::recipe::McpLifecycleContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin: Option<crate::recipe::PluginContract>,
     pub id: String,
     pub profile: ProfileName,
@@ -495,6 +498,7 @@ impl ScenarioReport {
             profile,
             scenario,
             plugin: None,
+            mcp: None,
             downgrade: None,
             rollback: None,
             interrupted_rollback: None,
@@ -516,6 +520,7 @@ impl ScenarioReport {
             .map(StageReport::aggregate_outcome)
             .collect::<Vec<_>>();
         outcomes.push(plugin::scenario_outcome(self));
+        outcomes.push(mcp::scenario_outcome(self));
         if self.unmatched_rollback_policy() || self.unmatched_interrupted_rollback_policy() {
             outcomes.push(RunOutcome::Incomplete);
         }
@@ -740,6 +745,7 @@ impl RunReport {
             .map(ScenarioReport::aggregate_outcome)
             .collect::<Vec<_>>();
         outcomes.push(plugin::artifact_outcome(self));
+        outcomes.push(mcp::artifact_outcome(self));
         if self.cancelled {
             outcomes.push(RunOutcome::Cancelled);
         }
