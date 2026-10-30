@@ -2,6 +2,8 @@
 mod animation;
 mod app;
 mod comparison;
+#[cfg(test)]
+mod editor;
 pub mod evidence;
 mod input;
 pub mod paging;
