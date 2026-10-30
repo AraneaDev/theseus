@@ -189,6 +189,37 @@ def session(root, args, live=False, cancel=False, saved=None):
         os.close(slave)
 
 
+def run_headless(binary, root, environment):
+    evidence_path = os.environ.get('THESEUS_INTERRUPTION_EVIDENCE')
+    evidence = pathlib.Path(evidence_path or tempfile.mkdtemp(prefix='theseus-interruption-evidence-')) / 'headless'
+    evidence.mkdir(parents=True, exist_ok=True)
+
+    def retain(stdout, stderr, returncode, complete):
+        metadata = {'capture_complete': complete, 'returncode': returncode, 'streams': {}}
+        for stream, captured in [('stdout', stdout), ('stderr', stderr)]:
+            available = captured or b''
+            window = available[:4 * 1024 * 1024]
+            (evidence/stream).write_bytes(window)
+            # Available partial capture is not the process's total source output.
+            metadata['streams'][stream] = {
+                'available_captured_bytes': len(available), 'stored_window_bytes': len(window),
+                'window_truncated': len(window) < len(available)}
+        (evidence/'status').write_text('unknown' if returncode is None else str(returncode))
+        (evidence/'capture.json').write_text(json.dumps(metadata, indent=2))
+        for artifact in root.glob('.theseus-runs/*/*.json'):
+            if artifact.name in ['report.json', 'journal.json']:
+                shutil.copyfile(artifact, evidence/artifact.name)
+
+    try:
+        result = subprocess.run([binary, 'run', '--headless'], cwd=root, capture_output=True,
+                                env=environment, timeout=150)
+    except subprocess.TimeoutExpired as error:
+        retain(error.stdout, error.stderr, None, False)
+        raise
+    retain(result.stdout, result.stderr, result.returncode, True)
+    return result
+
+
 def main():
     global binary
     binary = str(pathlib.Path(sys.argv[1]).resolve())
@@ -201,17 +232,7 @@ def main():
         source = recipe.read_text().replace('timeout_seconds = 15', 'timeout_seconds = 15\npass_env = ["THESEUS_ACCEPTANCE_SECRET"]')
         recipe.write_text(source)
         secret = 'private-acceptance-value-456391'
-        result = subprocess.run([binary, 'run', '--headless'], cwd=root, capture_output=True,
-                                env={**os.environ, 'THESEUS_ACCEPTANCE_SECRET': secret}, timeout=150)
-        evidence_path = os.environ.get('THESEUS_INTERRUPTION_EVIDENCE')
-        evidence = pathlib.Path(evidence_path or tempfile.mkdtemp(prefix='theseus-interruption-evidence-')) / 'headless'
-        evidence.mkdir(parents=True, exist_ok=True)
-        for stream in ['stdout', 'stderr']:
-            (evidence/stream).write_bytes(getattr(result, stream)[:4 * 1024 * 1024])
-        (evidence/'status').write_text(str(result.returncode))
-        for artifact in root.glob('.theseus-runs/*/*.json'):
-            if artifact.name in ['report.json', 'journal.json']:
-                shutil.copyfile(artifact, evidence/artifact.name)
+        result = run_headless(binary, root, {**os.environ, 'THESEUS_ACCEPTANCE_SECRET': secret})
         assert result.returncode == 0, (result.stdout, result.stderr)
         saved = next(root.glob('.theseus-runs/*/report.json'))
         value = check_cleanup(saved)
