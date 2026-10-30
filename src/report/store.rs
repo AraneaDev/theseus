@@ -241,10 +241,7 @@ impl ReportStore {
                 _ => bail!("unsafe directory path"),
             };
             if create {
-                match mkdirat(&directory, part, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
-                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-                    Err(e) => return Err(e.into()),
-                }
+                durable_mkdir(&directory, part, true)?;
             }
             directory = File::from(
                 openat(
@@ -265,7 +262,7 @@ impl ReportStore {
     pub(crate) fn create_child(&self, name: &str) -> Result<Self> {
         let parts = log_components(name)?;
         ensure!(parts.len() == 1, "expected one directory component");
-        mkdirat(&self.directory, name, Mode::RUSR | Mode::WUSR | Mode::XUSR)?;
+        durable_mkdir(&self.directory, std::ffi::OsStr::new(name), false)?;
         self.open_child(name)
     }
     pub(crate) fn open_child(&self, relative: &str) -> Result<Self> {
@@ -280,6 +277,17 @@ impl ReportStore {
         let journal = self.read_json("journal.json")?;
         validate_journal(&journal)?;
         Ok(journal)
+    }
+}
+/// A child's contents cannot make its name durable in the containing directory.
+/// Complete this barrier before opening/using a newly created recovery directory.
+fn durable_mkdir(parent: &File, name: &std::ffi::OsStr, allow_existing: bool) -> Result<()> {
+    match mkdirat(parent, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
+        Ok(()) => parent
+            .sync_all()
+            .context("sync new recovery directory in parent"),
+        Err(rustix::io::Errno::EXIST) if allow_existing => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 fn log_components(relative: &str) -> Result<Vec<&str>> {
@@ -527,4 +535,82 @@ fn report_root(path: &Path, filename: &str) -> Result<PathBuf> {
             .into());
     }
     bail!("expected run directory or {filename}")
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+
+    #[test]
+    fn child_creation_propagates_parent_fsync_failure_after_mkdir_before_open() {
+        let temp = tempfile::tempdir().unwrap();
+        // O_PATH permits mkdirat/openat, but Linux rejects fsync with EBADF.
+        // This tests a real syscall boundary, not simulated power-loss recovery.
+        let store = ReportStore {
+            root: temp.path().into(),
+            directory: File::from(
+                open(temp.path(), OFlags::PATH | OFlags::DIRECTORY, Mode::empty()).unwrap(),
+            ),
+        };
+        let result = store.create_child("source");
+        assert!(
+            temp.path().join("source").is_dir(),
+            "mkdir must precede fsync"
+        );
+        assert!(
+            result.is_err(),
+            "a failed parent sync must prevent returning a usable store"
+        );
+        let result = durable_mkdir(
+            &store.directory,
+            std::ffi::OsStr::new("output-parent"),
+            true,
+        );
+        assert!(temp.path().join("output-parent").is_dir());
+        assert!(
+            result.is_err(),
+            "output ancestry must use the same durability barrier"
+        );
+    }
+    #[test]
+    fn suite_run_parent_sync_failure_precedes_started_and_environment_preparation() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("target")).unwrap();
+        let recipe_path = temp.path().join("recipe.toml");
+        fs::write(
+            &recipe_path,
+            include_str!("../../tests/fixtures/recipes/v2_clean.toml"),
+        )
+        .unwrap();
+        let recipe = crate::recipe::load(&recipe_path).unwrap();
+        let executable = temp.path().join("docker-boundary");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nprintf invoked > \"$0.called\"\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let parent = ReportStore {
+            root: temp.path().into(),
+            directory: File::from(
+                open(temp.path(), OFlags::PATH | OFlags::DIRECTORY, Mode::empty()).unwrap(),
+            ),
+        };
+        let mut emitted = false;
+        let result = crate::engine::run_with_parent(
+            &recipe,
+            crate::engine::RunOptions::all(&recipe),
+            crate::engine::CancellationToken::default(),
+            &mut crate::runner::Docker::new(executable.as_os_str()),
+            Some(&parent),
+            |_| emitted = true,
+        );
+        assert!(result.is_err());
+        assert!(!emitted, "failed run-directory sync must precede Started");
+        assert!(
+            !temp.path().join("docker-boundary.called").exists(),
+            "environment preparation must not run"
+        );
+    }
 }

@@ -547,3 +547,151 @@ fn unfinished_cleanup_uses_pinned_journals_and_validates_all_ownership_before_re
             .removed
     );
 }
+
+// This executable replaces only the Docker CLI transport. Preparation, artifact
+// materialization, observation parsing, lifecycle execution and ownership checks
+// all use the production Docker adapter and engine.
+fn docker_transport(directory: &std::path::Path, mode: &str) -> Docker {
+    let script = r#"#!/usr/bin/python3
+import json, pathlib, sys, tarfile
+directory = pathlib.Path(__file__).parent
+state_path = directory / 'docker-state.json'
+state = json.loads(state_path.read_text()) if state_path.exists() else {'observations':0, 'creates':0}
+args = sys.argv[1:]
+with (directory / 'docker-calls.jsonl').open('a') as log: log.write(json.dumps(args) + '\n')
+mode = @MODE@
+def save(): state_path.write_text(json.dumps(state))
+if args[0] == 'version': print('29.0'); sys.exit(0)
+if args[:2] == ['image', 'inspect']:
+    print('sha256:' + 'a'*64 if args[3] == '{{.Id}}' else 'null'); sys.exit(0)
+if args[0] == 'create':
+    state['creates'] += 1
+    state['id'] = format(state['creates'], '064x')
+    state['labels'] = dict(args[i+1].split('=',1) for i, a in enumerate(args) if a == '--label')
+    save(); print(state['id']); sys.exit(0)
+if args[:2] == ['container', 'inspect']:
+    print(json.dumps({'Id':state['id'], 'Config':{'Labels':state['labels']}, 'State':{'Running':True}})); sys.exit(0)
+if args[0] in ['start', 'rm']: sys.exit(0)
+if args[0] == 'cp':
+    if args[-1] != '-': sys.exit(0)
+    if mode == 'archive-transport': print('daemon disconnected', file=sys.stderr); sys.exit(1)
+    if mode == 'archive-io': sys.stdout.buffer.write(b'partial'); sys.exit(0)
+    with tarfile.open(fileobj=sys.stdout.buffer, mode='w|', format=tarfile.USTAR_FORMAT) as archive:
+        root = tarfile.TarInfo('theseus'); root.type = tarfile.DIRTYPE; archive.addfile(root)
+        child = tarfile.TarInfo('theseus/child'); archive.addfile(child)
+    sys.exit(0)
+if args[0] == 'exec':
+    script = args[args.index('-c')+1]
+    if script.startswith('p=$1;'):
+        state['observations'] += 1; save()
+        if mode == 'probe-transport' and state['observations'] == 1:
+            print('daemon disconnected', file=sys.stderr); sys.exit(1)
+        print('nofollow' if mode == 'nofollow' else 'present' if mode in ['limit', 'archive-transport', 'archive-io'] else 'missing', end=''); sys.exit(0)
+    if script.startswith('receipt=') and mode == 'command-transport':
+        print('daemon disconnected', file=sys.stderr); sys.exit(1)
+    if script.startswith('test -f'): print(args[-1].split('/')[1].removeprefix('.theseus-') + ':0')
+    sys.exit(0)
+print('unexpected Docker operation: ' + repr(args), file=sys.stderr); sys.exit(99)
+"#.replace("@MODE@", &serde_json::to_string(mode).unwrap());
+    let executable = directory.join("docker-transport");
+    fs::write(&executable, script).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    Docker::new(executable.as_os_str())
+}
+fn docker_calls(directory: &std::path::Path, operation: &str) -> usize {
+    fs::read_to_string(directory.join("docker-calls.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Vec<String>>(line).unwrap())
+        .filter(|args| args[0] == operation)
+        .count()
+}
+#[test]
+fn production_docker_transport_failures_stop_next_variant_after_successful_teardown() {
+    for mode in [
+        "probe-transport",
+        "archive-transport",
+        "archive-io",
+        "command-transport",
+    ] {
+        let (t, suite, options) = fixture();
+        let r = comparison::run_with(
+            &suite,
+            options,
+            CancellationToken::default(),
+            &mut docker_transport(t.path(), mode),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            docker_calls(t.path(), "version"),
+            1,
+            "next variant prepared after {mode}"
+        );
+        assert_eq!(
+            docker_calls(t.path(), "rm"),
+            1,
+            "owned teardown must succeed after {mode}"
+        );
+        assert_eq!(r.report.outcome, RunOutcome::Incomplete);
+        assert!(r.report.sources[0].error.is_some(), "{mode}");
+        let source = r
+            .report_path
+            .parent()
+            .unwrap()
+            .join(r.report.sources[0].report_path.as_ref().unwrap());
+        let report = theseus::report::load(&source).unwrap();
+        assert!(matches!(
+            report.scenarios[0].teardown,
+            TeardownStatus::Complete
+        ));
+        let journal = theseus::report::load_journal(source.parent().unwrap()).unwrap();
+        assert!(journal.resources[0].removed);
+    }
+}
+#[test]
+fn production_docker_bounded_and_nofollow_observations_continue_variants() {
+    for mode in ["limit", "nofollow"] {
+        let (t, mut suite, options) = fixture();
+        for variant in &mut suite.variants {
+            variant.recipe.recipe.limits.max_entries = 1;
+        }
+        let r = comparison::run_with(
+            &suite,
+            options,
+            CancellationToken::default(),
+            &mut docker_transport(t.path(), mode),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(docker_calls(t.path(), "version"), 2, "{mode}");
+        assert_eq!(docker_calls(t.path(), "rm"), 2, "{mode}");
+        assert_eq!(r.report.outcome, RunOutcome::Incomplete);
+        assert!(
+            r.report.sources.iter().all(|source| source.error.is_none()),
+            "{mode}"
+        );
+    }
+}
+#[test]
+fn ordinary_docker_observe_preserves_incomplete_snapshots_for_transport_errors() {
+    let t = tempfile::tempdir().unwrap();
+    let mut docker = docker_transport(t.path(), "probe-transport");
+    let resource = OwnedResource {
+        container_id: "a".repeat(64),
+        labels: BTreeMap::new(),
+        removed: false,
+    };
+    let snapshots = docker
+        .observe(
+            &resource,
+            &["/home/theseus".into()],
+            Limits::default(),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+    assert!(matches!(
+        snapshots[0].completeness,
+        ObservationStatus::Incomplete { .. }
+    ));
+}

@@ -2,7 +2,7 @@
 //! Every call/result is forwarded unchanged; the engine alone controls execution.
 use crate::{
     engine::CancellationToken,
-    model::{OwnedResource, RestartEvidence},
+    model::{CommandOutcome, OwnedResource, RestartEvidence},
     recipe::{Limits, ValidatedRecipe},
     report::ReportStore,
     runner::{CommandRequest, Environment, ExecutedCommand, PreparedEnvironment},
@@ -15,6 +15,26 @@ pub(super) struct TrackedEnvironment<'a, E> {
     pub error: Option<String>,
 }
 impl<E> TrackedEnvironment<'_, E> {
+    fn command(
+        &mut self,
+        operation: &str,
+        result: Result<ExecutedCommand>,
+    ) -> Result<ExecutedCommand> {
+        if self.error.is_none()
+            && let Ok(executed) = &result
+            && executed.record.outcome == CommandOutcome::Error
+        {
+            self.error = Some(format!(
+                "infrastructure {operation}: {}",
+                executed
+                    .record
+                    .error
+                    .as_deref()
+                    .unwrap_or("command control failed")
+            ));
+        }
+        self.record(operation, result)
+    }
     fn record<T>(&mut self, operation: &str, result: Result<T>) -> Result<T> {
         if self.error.is_none()
             && let Err(error) = &result
@@ -60,7 +80,7 @@ impl<E: Environment> Environment for TrackedEnvironment<'_, E> {
         cancel: &CancellationToken,
     ) -> Result<ExecutedCommand> {
         let result = self.inner.execute(resource, request, store, cancel);
-        self.record("execute", result)
+        self.command("execute", result)
     }
     fn execute_interrupted(
         &mut self,
@@ -72,7 +92,7 @@ impl<E: Environment> Environment for TrackedEnvironment<'_, E> {
         let result = self
             .inner
             .execute_interrupted(resource, request, store, cancel);
-        self.record("execute interrupted", result)
+        self.command("execute interrupted", result)
     }
     fn restart(
         &mut self,
@@ -89,7 +109,17 @@ impl<E: Environment> Environment for TrackedEnvironment<'_, E> {
         limits: Limits,
         cancel: &CancellationToken,
     ) -> Result<Vec<Snapshot>> {
-        let result = self.inner.observe(resource, roots, limits, cancel);
+        let result = self
+            .inner
+            .observe_with_status(resource, roots, limits, cancel)
+            .map(|batch| {
+                if self.error.is_none()
+                    && let Some(error) = batch.infrastructure_error
+                {
+                    self.error = Some(format!("infrastructure observe: {error}"));
+                }
+                batch.snapshots
+            });
         self.record("observe", result)
     }
     fn stop(&mut self, resource: &OwnedResource) -> Result<()> {

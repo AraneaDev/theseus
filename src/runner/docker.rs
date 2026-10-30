@@ -170,8 +170,11 @@ impl Docker {
     ) -> Result<Snapshot> {
         // Check ancestors without following links; a root symlink itself is
         // legitimate evidence and docker cp (without -L) preserves it.
-        let probe = r#"p=$1; while test "$p" != /; do p=${p%/*}; test -n "$p" || p=/; if test -L "$p"; then echo 'symlink ancestor' >&2; exit 4; fi; done; if test -e "$1" || test -L "$1"; then printf present; else printf missing; fi"#;
+        let probe = r#"p=$1; while test "$p" != /; do p=${p%/*}; test -n "$p" || p=/; if test -L "$p"; then printf nofollow; exit 0; fi; done; if test -e "$1" || test -L "$1"; then printf present; else printf missing; fi"#;
         let present = self.root_exec(resource, probe, &[root], cancel)?;
+        if present == "nofollow" {
+            return Ok(Snapshot::incomplete(root, "symlink ancestor"));
+        }
         if present == "missing" {
             return Ok(Snapshot::missing(root));
         }
@@ -389,13 +392,35 @@ chmod 755 /home/theseus /workspace /inputs
         limits: Limits,
         cancel: &CancellationToken,
     ) -> Result<Vec<Snapshot>> {
-        Ok(roots
-            .iter()
-            .map(|root| {
-                self.snapshot(resource, root, limits, cancel)
-                    .unwrap_or_else(|error| Snapshot::incomplete(root, format!("{error:#}")))
-            })
-            .collect())
+        Ok(self
+            .observe_with_status(resource, roots, limits, cancel)?
+            .snapshots)
+    }
+    fn observe_with_status(
+        &mut self,
+        resource: &OwnedResource,
+        roots: &[String],
+        limits: Limits,
+        cancel: &CancellationToken,
+    ) -> Result<ObservationBatch> {
+        let mut batch = ObservationBatch {
+            snapshots: vec![],
+            infrastructure_error: None,
+        };
+        for root in roots {
+            let snapshot = self
+                .snapshot(resource, root, limits, cancel)
+                .unwrap_or_else(|error| {
+                    if error.downcast_ref::<process::ArchiveRejected>().is_none()
+                        && batch.infrastructure_error.is_none()
+                    {
+                        batch.infrastructure_error = Some(format!("observe {root}: {error:#}"));
+                    }
+                    Snapshot::incomplete(root, format!("{error:#}"))
+                });
+            batch.snapshots.push(snapshot);
+        }
+        Ok(batch)
     }
     fn stop(&mut self, resource: &OwnedResource) -> Result<()> {
         self.remove(resource)

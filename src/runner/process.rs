@@ -358,6 +358,16 @@ pub(super) fn run_supervised(
     })
 }
 
+/// Typed evidence rejection, distinct from process/pipe acquisition failure.
+#[derive(Debug)]
+pub(super) struct ArchiveRejected;
+impl std::fmt::Display for ArchiveRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("archive observation rejected")
+    }
+}
+impl std::error::Error for ArchiveRejected {}
+
 /// Streaming archive acquisition uses the same child-and-pipes deadline as logs.
 pub(super) fn archive(
     command: &mut Command,
@@ -378,10 +388,20 @@ pub(super) fn archive(
     let failed = rejected.clone();
     let root = root.to_string();
     let parser = thread::spawn(move || {
-        let result = snapshot::read_archive(&mut out, &root, limits).and_then(|snapshot| {
-            std::io::copy(&mut out, &mut std::io::sink())?;
-            Ok(snapshot)
-        });
+        let result = snapshot::read_archive(&mut out, &root, limits)
+            .map_err(|error| {
+                // A bounded/unsafe archive rejection is expected incomplete evidence.
+                // Actual pipe/file I/O errors remain infrastructure failures.
+                if error.downcast_ref::<std::io::Error>().is_some() {
+                    error
+                } else {
+                    error.context(ArchiveRejected)
+                }
+            })
+            .and_then(|snapshot| {
+                std::io::copy(&mut out, &mut std::io::sink())?;
+                Ok(snapshot)
+            });
         if result.is_err() {
             rejected.store(true, Ordering::SeqCst);
         }

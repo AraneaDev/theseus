@@ -36,6 +36,13 @@ pub struct ExecutedCommand {
     pub stdout: String,
     pub stdout_complete: bool,
 }
+/// Observation evidence and a separate infrastructure failure channel. Expected
+/// bounded/no-follow gaps stay in snapshots; transport errors must not disappear
+/// when an adapter preserves partial observations for the ordinary run viewer.
+pub struct ObservationBatch {
+    pub snapshots: Vec<Snapshot>,
+    pub infrastructure_error: Option<String>,
+}
 pub trait Environment {
     fn prepare(
         &mut self,
@@ -87,6 +94,19 @@ pub trait Environment {
         limits: Limits,
         cancel: &CancellationToken,
     ) -> Result<Vec<Snapshot>>;
+    fn observe_with_status(
+        &mut self,
+        resource: &OwnedResource,
+        roots: &[String],
+        limits: Limits,
+        cancel: &CancellationToken,
+    ) -> Result<ObservationBatch> {
+        self.observe(resource, roots, limits, cancel)
+            .map(|snapshots| ObservationBatch {
+                snapshots,
+                infrastructure_error: None,
+            })
+    }
     /// Stops container descendants after timeout/cancellation. Must verify ownership.
     fn stop(&mut self, resource: &OwnedResource) -> Result<()>;
     /// Idempotent removal, with ownership verified before any destructive action.
