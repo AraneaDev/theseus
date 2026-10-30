@@ -1,4 +1,4 @@
-use super::{App, Focus, Tab, safe_text};
+use super::{App, Focus, safe_text};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -46,7 +46,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             }
             format!(
                 "{} | {} | passed {} failed {} review {} incomplete {} skipped {}",
-                r.run_id,
+                projection(&r.run_id, 256),
                 app.outcome(),
                 c.passed_checks,
                 c.failed_checks,
@@ -78,7 +78,7 @@ pub fn render(frame: &mut Frame, app: &App) {
                 Direction::Horizontal
             })
             .constraints(if narrow {
-                vec![Constraint::Length(7), Constraint::Min(1)]
+                vec![Constraint::Length(4), Constraint::Min(1)]
             } else {
                 vec![Constraint::Length(30), Constraint::Min(1)]
             })
@@ -87,11 +87,14 @@ pub fn render(frame: &mut Frame, app: &App) {
         evidence(frame, app, parts[1]);
     }
     let hint = if app.editing_filter {
-        format!("Filter: {}_ | Enter apply / Esc finish", app.filter)
+        format!(
+            "Filter (Enter/Esc apply): {}_",
+            projection(&app.filter_draft, 512)
+        )
     } else {
         format!(
-            "{} | Tab/Enter focus Esc back ↑↓/j/k select ←→ tabs / filter PgUp/Dn scroll | r run c cancel q quit",
-            app.status
+            "{} | Tab/Enter focus Esc back ↑↓/j/k select ←→ tabs / filter Home/End select [ ] chunks PgUp/Dn scroll CtrlHome/End log m metadata | r run c cancel q quit",
+            projection(&app.status, 512)
         )
     };
     frame.render_widget(
@@ -108,12 +111,25 @@ fn selectors(frame: &mut Frame, app: &App, area: Rect, narrow: bool) {
         })
         .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
         .split(area);
+    let scenario_start = app.scenario_index.saturating_sub(32).min(
+        app.report
+            .as_ref()
+            .map_or(0, |r| r.scenarios.len())
+            .saturating_sub(64),
+    );
+    let stage_start = app.stage_index.saturating_sub(32).min(
+        app.scenario()
+            .map_or(0, |s| s.stages.len())
+            .saturating_sub(64),
+    );
     let scenarios = app
         .report
         .as_ref()
         .map(|r| {
             r.scenarios
                 .iter()
+                .skip(scenario_start)
+                .take(64)
                 .map(|s| {
                     ListItem::new(safe_text(&format!(
                         "{}/{} {}",
@@ -123,7 +139,8 @@ fn selectors(frame: &mut Frame, app: &App, area: Rect, narrow: bool) {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let mut state = ListState::default().with_selected(Some(app.scenario_index));
+    let mut state =
+        ListState::default().with_selected(Some(app.scenario_index.saturating_sub(scenario_start)));
     frame.render_stateful_widget(
         List::new(scenarios)
             .block(block("Scenarios", app.focus == Focus::Scenario))
@@ -137,11 +154,20 @@ fn selectors(frame: &mut Frame, app: &App, area: Rect, narrow: bool) {
         .map(|s| {
             s.stages
                 .iter()
-                .map(|s| ListItem::new(safe_text(&format!("{} {}", s.name, s.outcome))))
+                .skip(stage_start)
+                .take(64)
+                .map(|s| {
+                    ListItem::new(safe_text(&format!(
+                        "{} {}",
+                        projection(&s.name, 256),
+                        s.outcome
+                    )))
+                })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let mut state = ListState::default().with_selected(Some(app.stage_index));
+    let mut state =
+        ListState::default().with_selected(Some(app.stage_index.saturating_sub(stage_start)));
     frame.render_stateful_widget(
         List::new(stages)
             .block(block("Stages", app.focus == Focus::Stage))
@@ -152,7 +178,7 @@ fn selectors(frame: &mut Frame, app: &App, area: Rect, narrow: bool) {
     );
 }
 fn evidence(frame: &mut Frame, app: &App, area: Rect) {
-    let parts = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(area);
+    let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
     frame.render_widget(
         Tabs::new(["Stages", "Findings", "Files", "Commands", "Logs"])
             .select(app.tab.index())
@@ -163,53 +189,55 @@ fn evidence(frame: &mut Frame, app: &App, area: Rect) {
             ),
         parts[0],
     );
-    let items = app.items();
-    let mut text = String::new();
-    let mut selected_start = 0;
-    for (i, item) in items.iter().enumerate() {
-        if i == app.evidence_index {
-            selected_start = text.len();
-        }
-        text += &format!(
-            "{} {}\n",
-            if i == app.evidence_index { ">" } else { " " },
-            item
-        );
-    }
-    if text.is_empty() {
-        text = "No evidence for this stage/filter.\n".into();
-    }
-    if app.tab == Tab::Logs {
-        text = format!(
-            "{}\n{}",
-            items
-                .get(app.evidence_index)
-                .map_or("No stored log", String::as_str),
-            app.log_text
-        );
-    }
-    let evidence_block = block("Evidence", app.focus == Focus::Evidence);
-    // Measure the exact displayed prefix with Ratatui's own word/grapheme wrapping
-    // and the same inner width, prefix markers and Wrap used for rendering.
-    let before = if app.focus == Focus::Evidence && app.tab != Tab::Logs && selected_start > 0 {
-        Paragraph::new(&text[..selected_start])
-            .wrap(Wrap { trim: false })
-            .line_count(evidence_block.inner(parts[1]).width)
-    } else {
-        0
-    };
-    // Paragraph scroll is u16; for longer prefixes start directly at the selected
-    // record instead of silently clamping its position outside the viewport.
-    let (text, offset) = if before > u16::MAX as usize {
-        (&text[selected_start..], 0)
-    } else {
-        (text.as_str(), before as u16)
-    };
+    record_panes(frame, app, parts[1], app.focus == Focus::Evidence);
+}
+/// All strings in outer chrome are bounded before interpolation/sanitization.
+pub(super) fn projection(text: &str, bytes: usize) -> String {
+    super::evidence::Record::Text(text).summary(bytes)
+}
+pub(super) fn record_panes(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
+    let mut view = app.viewport.borrow_mut();
+    view.update(app, Some(area.width));
+    let count = view.len(app);
+    let selected = app.evidence_index.min(count.saturating_sub(1));
+    let regions = Layout::vertical([
+        Constraint::Length((area.height / 4).clamp(3, 10)),
+        Constraint::Min(1),
+        Constraint::Length(2),
+    ])
+    .split(area);
+    // Flattening is restricted to <=64 already bounded projections. The selected
+    // detail retains every newline and is separately chunked without elision.
+    let rows = view
+        .rows
+        .iter()
+        .map(|row| ListItem::new(row.text.replace('\n', " | ")))
+        .collect::<Vec<_>>();
+    let mut state = ListState::default().with_selected(Some(selected.saturating_sub(view.start)));
+    frame.render_stateful_widget(
+        List::new(rows)
+            .block(block("Records — Home/End select", focused))
+            .highlight_symbol("> ")
+            .highlight_style(Style::default().add_modifier(Modifier::BOLD)),
+        regions[0],
+        &mut state,
+    );
+    let title = format!(
+        "Detail — record {} / {}",
+        if count == 0 { 0 } else { selected + 1 },
+        count
+    );
+    let detail = Paragraph::new(view.body.as_str())
+        .block(block(&title, focused))
+        .wrap(Wrap { trim: false });
+    let inner = block(&title, focused).inner(regions[1]);
+    let maximum = detail
+        .line_count(inner.width)
+        .saturating_sub(inner.height as usize)
+        .min(u16::MAX as usize) as u16;
+    frame.render_widget(detail.scroll((view.scroll.min(maximum), 0)), regions[1]);
     frame.render_widget(
-        Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .scroll((offset.saturating_add(app.scroll), 0))
-            .block(evidence_block),
-        parts[1],
+        Paragraph::new(view.label.as_str()).wrap(Wrap { trim: false }),
+        regions[2],
     );
 }

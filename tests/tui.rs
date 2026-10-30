@@ -68,6 +68,8 @@ fn stage_selection_changes_real_evidence_and_narrow_layout_retains_it() {
     let wide = screen(&app, 120, 36);
     assert!(wide.contains("old executable wins on PATH"));
     assert!(!wide.contains("base-only evidence"));
+    app.focus = Focus::Evidence;
+    key(&mut app, KeyCode::Down);
     assert!(screen(&app, 52, 24).contains("old executable wins on PATH"));
     assert_eq!(app.stage_index, 1);
 }
@@ -463,6 +465,8 @@ fn reinstall_failed_directory_scope_and_comparison_references_are_browsable() {
         }
     }
     app.tab = Tab::Stages;
+    app.focus = Focus::Evidence;
+    key(&mut app, KeyCode::Down);
     assert!(screen(&app, 52, 24).contains("declared directory changed"));
 }
 
@@ -751,7 +755,7 @@ fn rollback_offline_narrow_evidence_shows_failed_mutation_and_mapped_restore() {
     stage.commands.push(command);
     scenario.stages.push(stage);
     report.scenarios.push(scenario);
-    let app = App::offline(report, temp.path().into());
+    let mut app = App::offline(report, temp.path().into());
     let text = app.items().join("\n");
     for needle in [
         "Expected failure: exit=9",
@@ -763,7 +767,9 @@ fn rollback_offline_narrow_evidence_shows_failed_mutation_and_mapped_restore() {
     }
     let narrow = screen(&app, 52, 30);
     assert!(narrow.contains("Expected failure"));
-    assert!(narrow.contains("restore scope differs"));
+    app.focus = Focus::Evidence;
+    key(&mut app, KeyCode::End);
+    assert!(screen(&app, 52, 30).contains("restore scope differs"));
     assert!(!narrow.contains("Rollback verified"));
 }
 

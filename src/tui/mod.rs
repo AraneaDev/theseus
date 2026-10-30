@@ -7,6 +7,7 @@ mod input;
 pub mod paging;
 mod render;
 pub mod terminal;
+mod view;
 use crate::{
     engine::{self, CancellationToken, RunResult},
     report,

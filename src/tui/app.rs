@@ -2,7 +2,6 @@ use crate::{
     engine::RunOptions,
     model::*,
     recipe::{Expectation, ValidatedRecipe},
-    report,
 };
 use std::path::PathBuf;
 
@@ -34,6 +33,9 @@ impl Tab {
 }
 /// UI state contains evidence and selections only; execution belongs to engine::run.
 pub struct App {
+    pub(super) viewport: std::cell::RefCell<super::view::View>,
+    pub(super) view_revision: u64,
+    pub(super) filter_draft: String,
     pub comparison: Option<super::comparison::ComparisonView>,
     pub recipe: Option<ValidatedRecipe>,
     pub options: Option<RunOptions>,
@@ -59,6 +61,9 @@ pub struct App {
 impl App {
     pub fn offline(report: RunReport, root: PathBuf) -> Self {
         Self {
+            viewport: Default::default(),
+            view_revision: 0,
+            filter_draft: String::new(),
             comparison: None,
             recipe: None,
             options: None,
@@ -112,6 +117,7 @@ impl App {
         self.scenario()?.stages.get(self.stage_index)
     }
     pub fn set_report(&mut self, report: RunReport, root: PathBuf) {
+        self.view_revision = self.view_revision.wrapping_add(1);
         self.report = Some(report);
         self.root = root;
         self.scenario_index = self.scenario_index.min(
@@ -361,34 +367,21 @@ impl App {
             .collect()
     }
     pub fn refresh_logs(&mut self) {
-        self.log_text.clear();
-        if self.tab != Tab::Logs {
-            return;
-        }
-        let Some(item) = self.items().get(self.evidence_index).cloned() else {
-            return;
+        // Explicit refresh also checks same-path replacement and retries errors.
+        self.viewport.borrow_mut().force_refresh();
+        self.sync_view();
+    }
+    pub(super) fn sync_view(&mut self) {
+        let mut view = self.viewport.borrow_mut();
+        view.update(self, None);
+        self.log_text = if self.tab == Tab::Logs && view.raw_log() {
+            format!("{}\n{}", view.label, view.body)
+        } else {
+            String::new()
         };
-        let log = self
-            .stage()
-            .into_iter()
-            .flat_map(|s| &s.commands)
-            .flat_map(|c| c.stdout.iter().chain(&c.stderr))
-            .find(|l| item.contains(&format!(": {} (", safe_text(&l.path))))
-            .cloned();
-        if let Some(log) = log {
-            self.log_text = match report::read_log(&self.root, &log.path, 64 * 1024) {
-                Ok(read) => format!(
-                    "{}\n{}",
-                    if read.truncated || log.truncated {
-                        "[truncated: showing at most 64 KiB]"
-                    } else {
-                        "[complete stored stream]"
-                    },
-                    safe_text(&String::from_utf8_lossy(&read.bytes))
-                ),
-                Err(error) => format!("Cannot read log: {error:#}"),
-            };
-        }
+    }
+    pub(super) fn evidence_len(&self) -> usize {
+        self.viewport.borrow_mut().len(self)
     }
 }
 /// Prevent saved command output and recipe text from injecting terminal controls.

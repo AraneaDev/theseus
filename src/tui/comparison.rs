@@ -17,6 +17,7 @@ pub struct ComparisonView {
     pub options: Option<SuiteRunOptions>,
     pub report: Option<ComparisonReport>,
     pub row: usize,
+    pub evidence_focus: bool,
 }
 impl App {
     /// Preview is read-only until an explicit r reaches the shared workbench.
@@ -29,6 +30,7 @@ impl App {
             options: Some(options),
             report: None,
             row: 0,
+            evidence_focus: false,
         });
         app.status = "Comparison preview — r starts the declared suite".into();
         app
@@ -43,12 +45,14 @@ impl App {
             options: None,
             report: None,
             row: 0,
+            evidence_focus: false,
         });
         app.set_comparison_report(document.report, root);
         app.status = "Offline comparison".into();
         app
     }
     pub fn set_comparison_report(&mut self, report: ComparisonReport, root: PathBuf) {
+        self.view_revision = self.view_revision.wrapping_add(1);
         if let Some(view) = &mut self.comparison {
             view.row = view.row.min(report.cells.len().saturating_sub(1));
             view.report = Some(report);
@@ -63,7 +67,7 @@ impl App {
     }
 }
 pub(super) fn input(app: &mut App, key: KeyEvent) {
-    let view = app.comparison.as_mut().unwrap();
+    let evidence_focus = app.comparison.as_ref().unwrap().evidence_focus;
     match key.code {
         KeyCode::Char('q') => {
             app.quit_requested = true;
@@ -75,52 +79,66 @@ pub(super) fn input(app: &mut App, key: KeyEvent) {
         KeyCode::Char('r')
             if !app.active
                 && !app.quit_requested
-                && view.suite.is_some()
-                && view.report.is_none() =>
+                && app
+                    .comparison
+                    .as_ref()
+                    .is_some_and(|v| v.suite.is_some() && v.report.is_none()) =>
         {
             app.start_requested = true
         }
+        KeyCode::Tab => {
+            app.comparison.as_mut().unwrap().evidence_focus = !evidence_focus;
+            app.scroll = 0;
+        }
         KeyCode::PageDown => app.scroll = app.scroll.saturating_add(10),
         KeyCode::PageUp => app.scroll = app.scroll.saturating_sub(10),
-        KeyCode::Down | KeyCode::Char('j') | KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Home
+        | KeyCode::End
+        | KeyCode::Down
+        | KeyCode::Char('j')
+        | KeyCode::Up
+        | KeyCode::Char('k') => {
             let down = matches!(key.code, KeyCode::Down | KeyCode::Char('j'));
-            if let Some(report) = &view.report {
-                view.row = if down {
-                    view.row
-                        .saturating_add(1)
-                        .min(report.cells.len().saturating_sub(1))
-                } else {
-                    view.row.saturating_sub(1)
-                };
-                app.scroll = 0;
-            } else {
+            if app.comparison.as_ref().unwrap().report.is_none() {
                 app.scroll = if down {
                     app.scroll.saturating_add(1)
                 } else {
                     app.scroll.saturating_sub(1)
                 };
+                return;
             }
+            let len = if evidence_focus {
+                app.evidence_len()
+            } else {
+                app.comparison
+                    .as_ref()
+                    .unwrap()
+                    .report
+                    .as_ref()
+                    .map_or(0, |r| r.cells.len())
+            };
+            let index = if evidence_focus {
+                &mut app.evidence_index
+            } else {
+                &mut app.comparison.as_mut().unwrap().row
+            };
+            *index = match key.code {
+                KeyCode::Home => 0,
+                KeyCode::End => len.saturating_sub(1),
+                _ if down => index.saturating_add(1).min(len.saturating_sub(1)),
+                _ => index.saturating_sub(1),
+            };
+            if !evidence_focus {
+                app.evidence_index = 0;
+            }
+            app.scroll = 0;
         }
         _ => {}
     }
+    app.sync_view();
 }
-// UI projections only. Full strings and every difference remain in offline JSON.
-const DISPLAY_DIFFERENCES: usize = 100;
 fn bounded(text: &str) -> String {
-    let flat = safe_text(text).replace('\n', "\\n").replace('\t', "\\t");
-    let mut chars = flat.chars();
-    let prefix = chars.by_ref().take(512).collect::<String>();
-    if chars.next().is_some() {
-        format!("{prefix}… [elided; full text in JSON]")
-    } else {
-        prefix
-    }
-}
-fn metadata(entry: &Option<crate::snapshot::FileEntry>) -> String {
-    entry.as_ref().map_or_else(|| "None".into(), |e| format!(
-        "kind: {:?}, mode: {:o}, uid: {}, gid: {}, size: {}, sha256: {:?}, link_target: {:?}",
-        e.kind, e.mode, e.uid, e.gid, e.size, e.sha256.as_deref().map(bounded), e.link_target.as_deref().map(bounded)
-    ))
+    super::render::projection(text, 512)
 }
 fn panel(title: &str) -> Block<'_> {
     Block::default().title(title).borders(Borders::ALL)
@@ -137,7 +155,7 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
     let title = format!(
         "{} | Baseline: {} | {}{}",
         bounded(&m.name),
-        m.baseline,
+        bounded(&m.baseline),
         app.outcome(),
         if view.report.is_none() {
             " | Preview — no commands executed"
@@ -151,18 +169,6 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
             .wrap(Wrap { trim: false }),
         layout[0],
     );
-    let mut context = format!(
-        "Profiles: {:?} | Scenarios: {:?}\nStages: {:?}\n",
-        m.profiles, m.scenarios, m.stages
-    );
-    for scope in &m.scopes {
-        context += &format!(
-            "Scope {}: {} {}\n",
-            scope.id,
-            scope.profile,
-            bounded(&scope.path)
-        );
-    }
     if let Some(report) = &view.report {
         let narrow = frame.area().width < 100;
         let parts = if narrow {
@@ -171,121 +177,79 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
             Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
                 .split(layout[1])
         };
+        let row_start = view
+            .row
+            .saturating_sub(32)
+            .min(report.cells.len().saturating_sub(64));
         let rows = report
             .cells
             .iter()
+            .skip(row_start)
+            .take(64)
             .map(|c| {
-                ListItem::new(safe_text(&format!(
+                ListItem::new(format!(
                     "{} {}/{}/{} {} {:?}",
-                    c.variant_id,
+                    bounded(&c.variant_id),
                     c.profile,
                     c.scenario,
                     bounded(&c.stage),
-                    c.scope_id,
+                    bounded(&c.scope_id),
                     c.comparison.status
-                )))
+                ))
             })
             .collect::<Vec<_>>();
-        let mut state = ListState::default().with_selected(Some(view.row));
+        let mut state =
+            ListState::default().with_selected(Some(view.row.saturating_sub(row_start)));
         frame.render_stateful_widget(
             List::new(rows)
-                .block(panel("Comparison rows — ↑↓/j/k"))
+                .block(panel("Comparison rows — Tab evidence"))
                 .highlight_symbol("> "),
             parts[0],
             &mut state,
         );
-        let mut text = String::new();
-        if let Some(error) = &app.terminal_error {
-            text += &format!("{}\n\n", bounded(error));
-        }
-        if let Some(cell) = report.cells.get(view.row) {
-            let path = m
-                .scopes
-                .iter()
-                .find(|s| s.id == cell.scope_id)
-                .map_or("<unknown scope>", |s| s.path.as_str());
-            text += &format!(
-                "{} vs {} | {} | {} | {}\nScope {}: {} | {:?}\n",
-                cell.variant_id,
-                m.baseline,
-                cell.profile,
-                cell.scenario,
-                bounded(&cell.stage),
-                cell.scope_id,
-                bounded(path),
-                cell.comparison.status
-            );
-            for reason in &cell.comparison.diagnostics {
-                text += &format!("Unknown / diagnostic: {}\n", bounded(reason));
-            }
-        }
-        text += &format!("\n{context}\nSources (exact recorded identities):\n");
-        for source in &report.sources {
-            text += &format!(
-                "{}: {} | run {}\nImage: {}\nImage ID: {}\nRecipe digest: {}\n",
-                source.variant_id,
-                source.outcome,
-                bounded(source.run_id.as_deref().unwrap_or("<pending>")),
-                bounded(source.image.as_deref().unwrap_or("<pending>")),
-                bounded(source.image_id.as_deref().unwrap_or("<pending>")),
-                bounded(source.recipe_digest.as_deref().unwrap_or("<pending>"))
-            );
-            for artifact in &source.artifacts {
-                text += &format!(
-                    "Artifact {}: {} ({} files; file digests in JSON)\n",
-                    bounded(&artifact.name),
-                    bounded(&artifact.sha256),
-                    artifact.files.len()
-                );
-            }
-            if let Some(path) = &source.report_path {
-                text += &format!(
-                    "Source logs/commands: theseus report {}\n",
-                    crate::shell::path_argument(&app.root.join(path))
-                );
-            }
-            if let Some(error) = &source.error {
-                text += &format!("Source error: {}\n", bounded(error));
-            }
-        }
-        for diagnostic in &report.diagnostics {
-            text += &format!("{}\n", bounded(diagnostic));
-        }
-        text += &format!(
-            "Recovery: theseus cleanup {}\n",
-            crate::shell::path_argument(&app.root)
-        );
-        if let Some(cell) = report.cells.get(view.row) {
-            let total = cell.comparison.differences.len();
-            text += &format!(
-                "\nDifferences: showing {} of {}{}\nComplete evidence: theseus comparison {} --json\n",
-                total.min(DISPLAY_DIFFERENCES),
-                total,
-                if total > DISPLAY_DIFFERENCES {
-                    " (UI prefix limit)"
-                } else {
-                    ""
-                },
-                crate::shell::path_argument(&app.root)
-            );
-            for change in cell.comparison.differences.iter().take(DISPLAY_DIFFERENCES) {
-                text += &format!(
-                    "{} {:?}\nBefore: {}\nAfter: {}\n",
-                    bounded(&change.path),
-                    change.kind,
-                    metadata(&change.before),
-                    metadata(&change.after)
-                );
-            }
-        }
+        let detail = Layout::vertical([Constraint::Length(4), Constraint::Min(1)]).split(parts[1]);
+        let heading = report
+            .cells
+            .get(view.row)
+            .map(|c| {
+                let path = m
+                    .scopes
+                    .iter()
+                    .find(|s| s.id == c.scope_id)
+                    .map_or("<unknown scope>", |s| s.path.as_str());
+                let project = super::render::projection;
+                format!(
+                    "Variant: {} | {}/{} | Stage: {}\nScope {}: {} | {:?}",
+                    project(&c.variant_id, 32),
+                    c.profile,
+                    c.scenario,
+                    project(&c.stage, 32),
+                    project(&c.scope_id, 24),
+                    project(path, 48),
+                    c.comparison.status
+                )
+            })
+            .unwrap_or_default();
         frame.render_widget(
-            Paragraph::new(safe_text(&text))
-                .block(panel("Evidence / source reports — PgUp/Dn scroll"))
+            Paragraph::new(heading)
                 .wrap(Wrap { trim: false })
-                .scroll((app.scroll, 0)),
-            parts[1],
+                .block(panel("Selected cell")),
+            detail[0],
         );
+        super::render::record_panes(frame, app, detail[1], view.evidence_focus);
     } else {
+        let mut context = format!(
+            "Profiles: {:?} | Scenarios: {:?}\nStages: {:?}\n",
+            m.profiles, m.scenarios, m.stages
+        );
+        for scope in &m.scopes {
+            context += &format!(
+                "Scope {}: {} {}\n",
+                scope.id,
+                scope.profile,
+                bounded(&scope.path)
+            );
+        }
         context += &format!(
             "pull: {}\n\nVariants:\n",
             view.options.as_ref().is_some_and(|o| o.pull)
@@ -310,8 +274,8 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
     }
     frame.render_widget(
         Paragraph::new(safe_text(&format!(
-            "{} | ↑↓/j/k rows | PgUp/Dn evidence scroll | r run c cancel q quit",
-            bounded(&app.status)
+            "{} | Tab cells/evidence | ↑↓/j/k Home/End select | [ ] chunks PgUp/Dn scroll / filter | r run c cancel q quit",
+            if app.editing_filter { format!("Filter (Enter/Esc apply): {}_", bounded(&app.filter_draft)) } else { bounded(&app.status) }
         )))
         .wrap(Wrap { trim: false }),
         layout[2],

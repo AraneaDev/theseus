@@ -1,28 +1,22 @@
 use super::{App, Focus, Tab};
 use crate::model::ProfileName;
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 pub fn input(app: &mut App, key: KeyEvent) {
     if key.kind == KeyEventKind::Release {
+        return;
+    }
+    app.viewport.borrow_mut().update(app, None);
+    if filter_input(app, key) {
+        return;
+    }
+    if page_input(app, key) {
         return;
     }
     if app.comparison.is_some() {
         super::comparison::input(app, key);
         return;
     }
-    if app.editing_filter {
-        match key.code {
-            KeyCode::Esc | KeyCode::Enter => app.editing_filter = false,
-            KeyCode::Backspace => {
-                app.filter.pop();
-            }
-            KeyCode::Char(c) => app.filter.push(c),
-            _ => {}
-        }
-        app.evidence_index = 0;
-        app.scroll = 0;
-        app.refresh_logs();
-        return;
-    }
+
     match key.code {
         KeyCode::Char('q') => {
             app.quit_requested = true;
@@ -86,15 +80,14 @@ pub fn input(app: &mut App, key: KeyEvent) {
             app.evidence_index = 0;
             app.scroll = 0;
         }
-        KeyCode::Char('/') => {
-            app.editing_filter = true;
-            app.filter.clear();
-            app.evidence_index = 0;
-            app.scroll = 0;
-        }
         KeyCode::PageDown => app.scroll = app.scroll.saturating_add(10),
         KeyCode::PageUp => app.scroll = app.scroll.saturating_sub(10),
-        KeyCode::Down | KeyCode::Char('j') | KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Home
+        | KeyCode::End
+        | KeyCode::Down
+        | KeyCode::Char('j')
+        | KeyCode::Up
+        | KeyCode::Char('k') => {
             if app.report.is_none() {
                 app.scroll = if matches!(key.code, KeyCode::Down | KeyCode::Char('j')) {
                     app.scroll.saturating_add(1)
@@ -107,14 +100,18 @@ pub fn input(app: &mut App, key: KeyEvent) {
             let len = match app.focus {
                 Focus::Scenario => app.report.as_ref().map_or(0, |r| r.scenarios.len()),
                 Focus::Stage => app.scenario().map_or(0, |s| s.stages.len()),
-                Focus::Evidence => app.items().len(),
+                Focus::Evidence => app.evidence_len(),
             };
             let index = match app.focus {
                 Focus::Scenario => &mut app.scenario_index,
                 Focus::Stage => &mut app.stage_index,
                 Focus::Evidence => &mut app.evidence_index,
             };
-            *index = if down {
+            *index = if key.code == KeyCode::Home {
+                0
+            } else if key.code == KeyCode::End {
+                len.saturating_sub(1)
+            } else if down {
                 index.saturating_add(1).min(len.saturating_sub(1))
             } else {
                 index.saturating_sub(1)
@@ -129,5 +126,53 @@ pub fn input(app: &mut App, key: KeyEvent) {
         }
         _ => {}
     }
-    app.refresh_logs();
+    app.sync_view();
+}
+
+/// Filter edits are cheap drafts. Enter and Esc both apply the complete query.
+pub(super) fn filter_input(app: &mut App, key: KeyEvent) -> bool {
+    if app.editing_filter {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                app.filter = std::mem::take(&mut app.filter_draft);
+                app.editing_filter = false;
+                app.viewport.borrow_mut().restart_detail();
+                app.evidence_index = 0;
+                app.scroll = 0;
+                app.sync_view();
+            }
+            KeyCode::Backspace => {
+                app.filter_draft.pop();
+            }
+            KeyCode::Char(c) => app.filter_draft.push(c),
+            _ => {}
+        }
+        return true;
+    }
+    if key.code == KeyCode::Char('/') {
+        app.editing_filter = true;
+        app.filter_draft.clear();
+        return true;
+    }
+    false
+}
+pub(super) fn page_input(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('m') => {
+            if !app.viewport.borrow_mut().toggle_log_metadata(app) {
+                return false;
+            }
+        }
+        KeyCode::Char(']') => app.viewport.borrow_mut().next(app),
+        KeyCode::Char('[') => app.viewport.borrow_mut().previous(app),
+        KeyCode::Home | KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.viewport
+                .borrow_mut()
+                .log_edge(app, key.code == KeyCode::End);
+        }
+        _ => return false,
+    }
+    app.scroll = 0;
+    app.sync_view();
+    true
 }

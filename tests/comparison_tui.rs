@@ -45,6 +45,10 @@ fn preview_shows_explicit_manifest_and_quit_does_not_run_or_edit_it() {
     ] {
         assert!(text.contains(s), "missing {s}: {text}");
     }
+    key(&mut app, KeyCode::Char('j'));
+    assert_eq!(app.scroll, 1);
+    key(&mut app, KeyCode::Char('k'));
+    assert_eq!(app.scroll, 0);
     key(&mut app, KeyCode::Char('p'));
     key(&mut app, KeyCode::Char('s'));
     key(&mut app, KeyCode::Char('q'));
@@ -132,6 +136,8 @@ fn selected_difference_displays_relative_key_and_both_recorded_metadata_sides() 
             after: Some(after),
         });
     let mut app = App::comparison_offline(document, root);
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::End);
     let text = screen(&app, 180, 48);
     for expected in [
         "bin/tool",
@@ -139,8 +145,8 @@ fn selected_difference_displays_relative_key_and_both_recorded_metadata_sides() 
         "baseline-sha",
         "candidate-sha",
         "uid: 10001",
-        "Before:",
-        "After:",
+        "before:",
+        "after:",
     ] {
         assert!(text.contains(expected), "missing {expected}: {text}");
     }
@@ -150,7 +156,7 @@ fn selected_difference_displays_relative_key_and_both_recorded_metadata_sides() 
     assert_eq!(app.scroll, 0);
 }
 #[test]
-fn large_difference_display_keeps_source_paths_reachable_and_labels_ui_elision() {
+fn large_difference_display_keeps_all_differences_and_full_source_fields_reachable() {
     use theseus::snapshot::{ChangeKind, FileChange};
     let t = tempfile::tempdir().unwrap();
     let root = support::saved(t.path());
@@ -172,17 +178,20 @@ fn large_difference_display_keeps_source_paths_reachable_and_labels_ui_elision()
     for expected in [
         "sources/copy/run-copy/report.json",
         "theseus cleanup",
-        "showing 100 of 101",
-        "UI prefix limit",
-        "elided;",
         &format!("theseus comparison {} --json", root.display()),
     ] {
         assert!(text.contains(expected), "missing {expected}");
     }
     assert!(!text.contains("tail-that-must-be-elided"));
-    key(&mut app, KeyCode::PageDown);
-    let text = screen(&app, 180, 400);
-    assert!(!text.contains("item-100"));
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::End);
+    assert!(screen(&app, 180, 70).contains("item-100"));
+    key(&mut app, KeyCode::Char('/'));
+    for c in "tail-that-must-be-elided".chars() {
+        key(&mut app, KeyCode::Char(c));
+    }
+    key(&mut app, KeyCode::Enter);
+    assert!(screen(&app, 180, 70).contains("tail-that-must-be-elided"));
     assert_eq!(
         app.comparison
             .as_ref()
