@@ -64,7 +64,7 @@ impl Drop for OperationOwner {
     }
 }
 impl Operation {
-    fn new(handle: OwnedHandle) -> io::Result<OperationOwner> {
+    fn allocate_owned(handle: OwnedHandle) -> io::Result<OperationOwner> {
         let event = unsafe { CreateEventW(null(), 1, 0, null()) };
         if event.is_null() {
             return Err(io::Error::last_os_error());
@@ -214,10 +214,11 @@ impl Endpoint {
             if op.pending.get() {
                 return result.map(|_| ());
             }
-            if let Err(error) = result {
-                if !code(&error, ERROR_OPERATION_ABORTED) && !code(&error, ERROR_BROKEN_PIPE) {
-                    cancellation_error.get_or_insert(error);
-                }
+            if let Err(error) = result
+                && !code(&error, ERROR_OPERATION_ABORTED)
+                && !code(&error, ERROR_BROKEN_PIPE)
+            {
+                cancellation_error.get_or_insert(error);
             }
         }
         self.operation.take(); // closes server, peer (setup only), event, then storage
@@ -282,7 +283,7 @@ fn server(reading: bool) -> io::Result<(OperationOwner, Vec<u16>)> {
         return Err(io::Error::last_os_error());
     }
     let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
-    Ok((Operation::new(handle)?, name))
+    Ok((Operation::allocate_owned(handle)?, name))
 }
 fn pair(reading: bool) -> Result<(Endpoint, File), SpawnFailure> {
     let (owner, name) = server(reading).map_err(SpawnFailure::never)?;
