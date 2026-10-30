@@ -600,18 +600,90 @@ fn real_missing_truncated_transport_control_one_and_unavailable_reference_are_in
             prerequisites(scenario);
         }
         let attempt = stage(scenario, "downgrade");
-        let command = &attempt.commands[0];
         if fault == "unavailable-reference" {
-            assert!(attempt.verified_rejection());
-            let check = stage(scenario, "downgrade_rejected")
-                .checks
-                .iter()
-                .find(|c| c.id == "data-stable")
-                .unwrap();
-            assert_eq!(check.outcome, CheckOutcome::Incomplete);
-            assert_eq!(check.path.as_deref(), Some(DATA));
-            assert!(check.message.contains("before:"));
+            for name in [
+                "install_target",
+                "target_installed",
+                "configure",
+                "configured",
+                "exercise_before_downgrade",
+            ] {
+                assert_eq!(
+                    stage(scenario, name).outcome,
+                    StageOutcome::Passed,
+                    "{fault}/{name}: {scenario:#?}"
+                );
+            }
+            let reference = stage(scenario, "before_downgrade");
+            assert_eq!(reference.outcome, StageOutcome::Incomplete, "{fault}");
+            assert_eq!(
+                reference
+                    .snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.root.as_str())
+                    .collect::<Vec<_>>(),
+                ["/home/theseus", "/usr/local/bin", "/workspace"],
+                "{fault}: {reference:#?}"
+            );
+            assert!(matches!(
+                &reference.snapshots[0].completeness,
+                theseus::snapshot::ObservationStatus::Incomplete { reason } if !reason.is_empty()
+            ));
+            assert!(reference.snapshots[1..].iter().all(|snapshot| matches!(
+                snapshot.completeness,
+                theseus::snapshot::ObservationStatus::Complete
+            )));
+            assert_eq!(attempt.outcome, StageOutcome::Skipped, "{fault}");
+            assert_eq!(attempt.skip_reason.as_deref(), Some("failed prerequisite"));
+            assert!(attempt.commands.is_empty(), "{fault}: {attempt:#?}");
+            assert!(!attempt.verified_rejection());
+
+            // A later complete capture cannot rehabilitate the lost reference.
+            for name in ["downgrade_rejected", "downgrade_rejected:after_checks"] {
+                let checkpoint = stage(scenario, name);
+                assert_eq!(checkpoint.snapshots.len(), 3, "{fault}/{name}");
+                assert!(checkpoint.snapshots.iter().all(|snapshot| matches!(
+                    snapshot.completeness,
+                    theseus::snapshot::ObservationStatus::Complete
+                )));
+                assert!(checkpoint.commands.is_empty(), "{fault}: {checkpoint:#?}");
+            }
+            let checkpoint = stage(scenario, "downgrade_rejected");
+            assert_eq!(checkpoint.checks.len(), 4, "{fault}: {checkpoint:#?}");
+            for (id, path) in [
+                ("retained-version", None),
+                ("binary-stable", Some("/home/theseus/.local/bin/sample-cli")),
+                ("data-stable", Some(DATA)),
+                ("settings-stable", Some(SETTINGS)),
+            ] {
+                let check = checkpoint
+                    .checks
+                    .iter()
+                    .find(|check| check.id == id)
+                    .unwrap_or_else(|| panic!("{fault}: missing {id}: {checkpoint:#?}"));
+                assert_eq!(check.outcome, CheckOutcome::Skipped, "{fault}/{id}");
+                assert_eq!(check.path.as_deref(), path, "{fault}/{id}");
+                assert!(check.command_ids.is_empty(), "{fault}/{id}");
+                if path.is_some() {
+                    assert_eq!(
+                        check.comparison,
+                        Some(ComparisonReference {
+                            before_stage: "before_downgrade".into(),
+                            after_stage: "downgrade_rejected".into()
+                        }),
+                        "{fault}/{id}"
+                    );
+                }
+            }
+            let after = stage(scenario, "exercise_after_rejection");
+            assert_eq!(after.outcome, StageOutcome::Skipped, "{fault}");
+            assert_eq!(after.skip_reason.as_deref(), Some("failed prerequisite"));
+            let uninstall = stage(scenario, "uninstall");
+            assert_eq!(uninstall.outcome, StageOutcome::Passed, "{fault}");
+            assert_eq!(uninstall.commands.len(), 1, "{fault}");
         } else {
+            assert_eq!(attempt.commands.len(), 1, "{fault}: {attempt:#?}");
+            let command = &attempt.commands[0];
             assert!(!attempt.verified_rejection());
             assert_eq!(command.outcome, CommandOutcome::Error);
             assert!(command.rejection.is_none());
