@@ -447,12 +447,21 @@ fn numeric_temporary_keeps_original_prefix_and_case_alias_destinations_absent() 
 fn numeric_temporary_has_no_distinct_native_short_name() -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::{
-        Foundation::INVALID_HANDLE_VALUE,
+        Foundation::{HANDLE, INVALID_HANDLE_VALUE},
         Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW},
     };
+    struct Search(HANDLE);
+    impl Drop for Search {
+        fn drop(&mut self) {
+            if self.0 != INVALID_HANDLE_VALUE {
+                unsafe { FindClose(self.0) };
+            }
+        }
+    }
     let parent = tempfile::tempdir()?;
     let path = parent.path().join("run");
     let root = HostDir::create_private(&path)?;
+    let mut observed = false;
     let error = root
         .publish(OsStr::new("report.json"), &mut |file| {
             file.write_all(b"partial")?;
@@ -468,10 +477,11 @@ fn numeric_temporary_has_no_distinct_native_short_name() -> io::Result<()> {
             if handle == INVALID_HANDLE_VALUE {
                 return Err(io::Error::last_os_error());
             }
-            let closed = unsafe { FindClose(handle) };
-            if closed == 0 {
+            let mut search = Search(handle);
+            if unsafe { FindClose(search.0) } == 0 {
                 return Err(io::Error::last_os_error());
             }
+            search.0 = INVALID_HANDLE_VALUE;
             let actual: Vec<u16> = found
                 .cFileName
                 .into_iter()
@@ -482,13 +492,63 @@ fn numeric_temporary_has_no_distinct_native_short_name() -> io::Result<()> {
                 found.cAlternateFileName[0], 0,
                 "numeric 8.3 temporary acquired a distinct alias"
             );
-            Err(io::Error::other(
-                "injected writer failure after native short-name query",
-            ))
+            observed = true;
+            Err(io::Error::other(NATIVE_OBSERVATION_SENTINEL))
         })
         .unwrap_err();
-    assert_eq!(detail(&error).stage(), PublishStage::Write);
+    require_completed_observation(&error, observed)?;
     assert!(detail(&error).cleanup_error().is_none());
+    assert!(root.entries()?.is_empty());
+    Ok(())
+}
+
+const NATIVE_OBSERVATION_SENTINEL: &str = "native observation completed; deliberate writer failure";
+fn require_completed_observation(error: &io::Error, completed: bool) -> io::Result<()> {
+    let failure = detail(error);
+    let deliberate = std::error::Error::source(failure)
+        .is_some_and(|source| source.to_string() == NATIVE_OBSERVATION_SENTINEL);
+    if completed && failure.stage() == PublishStage::Write && deliberate {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "native observation did not complete: {error}"
+        )))
+    }
+}
+
+#[test]
+fn observation_harness_rejects_query_failure_and_requires_deliberate_sentinel() -> io::Result<()> {
+    let parent = tempfile::tempdir()?;
+    let root = HostDir::create_private(&parent.path().join("run"))?;
+    for source in [
+        io::Error::from_raw_os_error(87),
+        io::Error::other("FindClose failed"),
+    ] {
+        let mut source = Some(source);
+        let error = root
+            .publish(OsStr::new("report.json"), &mut |_| {
+                Err(source.take().unwrap())
+            })
+            .unwrap_err();
+        assert!(
+            require_completed_observation(&error, false).is_err(),
+            "early native error was accepted as observation proof"
+        );
+        assert!(
+            require_completed_observation(&error, true).is_err(),
+            "non-sentinel error was accepted as observation proof"
+        );
+    }
+    let error = root
+        .publish(OsStr::new("report.json"), &mut |_| {
+            Err(io::Error::other(NATIVE_OBSERVATION_SENTINEL))
+        })
+        .unwrap_err();
+    assert!(
+        require_completed_observation(&error, false).is_err(),
+        "missing completed checks were accepted"
+    );
+    require_completed_observation(&error, true)?;
     assert!(root.entries()?.is_empty());
     Ok(())
 }
