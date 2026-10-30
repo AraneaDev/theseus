@@ -25,6 +25,7 @@ if test "${MODE:-clean}" != silent; then
   printf '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"%s","inputSchema":{"type":"object"}}]}}\n' "$tool"
  fi
 fi
+if test "${MODE:-clean}" = truncated-ignore; then printf x; fi
 # Wait for real stdin EOF before normal completion/receipt.
 while IFS= read -r request; do :; done
 case "${MODE:-clean}" in *ignore*|silent) while :; do sleep 1; done;; esac

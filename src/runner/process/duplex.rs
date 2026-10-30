@@ -11,6 +11,8 @@ pub(in crate::runner) trait DuplexDriver: Send + 'static {
     fn wants_close(&self) -> bool;
 }
 pub(in crate::runner) struct DuplexOutput<D> {
+    /// The interactive CLI child was successfully spawned.
+    pub acquisition_started: bool,
     pub process: Output,
     pub driver: D,
     pub stdin_closed: bool,
@@ -203,8 +205,46 @@ fn configure_pipes(
     }
 }
 
+// No interactive child exists; preparation may still require owned cleanup.
+fn unstarted<D: DuplexDriver>(
+    mut driver: D,
+    mut error: Option<String>,
+    cancel: &CancellationToken,
+    started: Instant,
+    abort: &mut impl FnMut() -> Result<()>,
+) -> DuplexOutput<D> {
+    if let Err(failure) = abort() {
+        append_error(&mut error, format!("abort owned environment: {failure:#}"));
+    }
+    let cancelled = cancel.is_cancelled();
+    if cancelled {
+        driver.cancel();
+    }
+    DuplexOutput {
+        acquisition_started: false,
+        process: Output {
+            supervised_stop: false,
+            status: None,
+            timed_out: false,
+            cancelled,
+            stdout: Drain::empty(),
+            stderr: Drain::empty(),
+            duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            error,
+        },
+        driver,
+        stdin_closed: true,
+        stdout_eof: false,
+        io_error: None,
+        forced_abort: true,
+        stdout_bytes: 0,
+    }
+}
+
 /// `timeout` excludes the caller's receipt reserve. The last second is for EOF
 /// and draining. The owned abort callback must enforce its own cleanup deadline.
+/// Errors are post-spawn setup/worker failures; pre-spawn failures retain the
+/// driver in a structured output with acquisition_started=false.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::runner) fn run_duplex<D: DuplexDriver>(
     command: &mut Command,
@@ -213,34 +253,25 @@ pub(in crate::runner) fn run_duplex<D: DuplexDriver>(
     files: Option<(File, File)>,
     stdout_limit: usize,
     stderr_limit: usize,
-    mut driver: D,
+    driver: D,
     mut abort: impl FnMut() -> Result<()>,
 ) -> Result<DuplexOutput<D>> {
+    let started = Instant::now();
     if cancel.is_cancelled() {
-        driver.cancel();
-        let error = abort()
-            .err()
-            .map(|failure| format!("abort owned environment: {failure:#}"));
-        return Ok(DuplexOutput {
-            process: Output {
-                supervised_stop: false,
-                status: None,
-                timed_out: false,
-                cancelled: true,
-                stdout: Drain::empty(),
-                stderr: Drain::empty(),
-                duration_ms: 0,
-                error,
-            },
-            driver,
-            stdin_closed: true,
-            stdout_eof: false,
-            io_error: None,
-            forced_abort: true,
-            stdout_bytes: 0,
-        });
+        return Ok(unstarted(driver, None, cancel, started, &mut abort));
     }
-    let mut process = HostProcess::spawn_with_stdin(command, StdinMode::Piped)?;
+    let mut process = match HostProcess::spawn_with_stdin(command, StdinMode::Piped) {
+        Ok(process) => process,
+        Err(error) => {
+            return Ok(unstarted(
+                driver,
+                Some(format!("{error:#}")),
+                cancel,
+                started,
+                &mut abort,
+            ));
+        }
+    };
     let (input, output, stderr) = configure_pipes(&mut process, &mut abort)?;
     let signals = Arc::new(Signals::default());
     let (out_file, err_file) = files.map_or((None, None), |(a, b)| (Some(a), Some(b)));
@@ -353,6 +384,7 @@ pub(in crate::runner) fn run_duplex<D: DuplexDriver>(
         }
         let stdout = stdout.ok_or_else(|| anyhow!(process_error.clone().unwrap()))?;
         Ok(DuplexOutput {
+            acquisition_started: true,
             process: Output {
                 supervised_stop: false,
                 status: if forced_abort {
@@ -1006,5 +1038,100 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         panic!("owned descriptor holder survived group cleanup");
+    }
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::*;
+    #[derive(Default)]
+    struct Reply {
+        received: bool,
+    }
+    impl DuplexDriver for Reply {
+        fn pending_write(&self) -> &[u8] {
+            &[]
+        }
+        fn written(&mut self, _: usize) -> Result<()> {
+            Ok(())
+        }
+        fn receive(&mut self, _: &[u8]) {
+            self.received = true;
+        }
+        fn eof(&mut self) {}
+        fn cancel(&mut self) {}
+        fn wants_close(&self) -> bool {
+            self.received
+        }
+    }
+    #[test]
+    fn early_interactive_shutdown_keeps_timeout_decision_before_emergency_cleanup() {
+        for cancel_during_cleanup in [false, true] {
+            let cancel = CancellationToken::default();
+            let began = Instant::now();
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "printf reply; while :; do sleep 30; done"]);
+            let mut aborted = false;
+            let out = run_duplex(
+                &mut command,
+                Duration::from_secs(2),
+                &cancel,
+                None,
+                128,
+                128,
+                Reply::default(),
+                || {
+                    assert!(
+                        began.elapsed() < Duration::from_secs(2),
+                        "shutdown decision precedes execution deadline"
+                    );
+                    aborted = true;
+                    thread::sleep(Duration::from_millis(1200));
+                    if cancel_during_cleanup {
+                        cancel.cancel();
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(aborted && out.forced_abort);
+            assert!(began.elapsed() > Duration::from_secs(2));
+            assert!(
+                !out.process.timed_out,
+                "separate cleanup elapsed must not fabricate execution timeout"
+            );
+            assert_eq!(out.process.cancelled, cancel_during_cleanup);
+            assert_eq!(out.process.status, None);
+        }
+    }
+    #[test]
+    fn pre_spawn_cancellation_and_spawn_error_retain_explicit_not_started_driver() {
+        for cancelled in [true, false] {
+            let cancel = CancellationToken::default();
+            if cancelled {
+                cancel.cancel();
+            }
+            let mut aborted = false;
+            let out = run_duplex(
+                &mut Command::new("/missing-duplex-executable"),
+                Duration::from_secs(3),
+                &cancel,
+                None,
+                32,
+                32,
+                Reply::default(),
+                || {
+                    aborted = true;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(!out.acquisition_started);
+            assert!(aborted && out.forced_abort);
+            assert!(!out.driver.received);
+            assert_eq!(out.process.cancelled, cancelled);
+            assert_eq!(out.process.status, None);
+            assert_eq!(out.process.error.is_some(), !cancelled);
+        }
     }
 }

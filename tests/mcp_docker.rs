@@ -95,7 +95,11 @@ impl Guest {
             pass_env: vec![],
             timeout_seconds: 3,
             expected_exit: 0,
-            log_limit: 262144,
+            log_limit: if mode == "truncated-ignore" {
+                408
+            } else {
+                262144
+            },
         };
         let observed = self
             .docker
@@ -266,4 +270,58 @@ fn ownership_mismatch_refuses_removal_and_unrelated_guest_survives() {
         assert_eq!(output.stdout, b"true\n");
         eprintln!("verified surviving {id}");
     }
+}
+
+#[test]
+#[ignore = "requires explicit cached image and reachable Docker"]
+fn truncated_successful_prefix_with_cancellation_remains_saveable_incomplete_evidence() {
+    let mut guest = Guest::new();
+    let cancel = CancellationToken::default();
+    let signal = cancel.clone();
+    let stdout = guest
+        .store
+        .root()
+        .join("logs/probe-truncated-ignore-0-2026-07-28-stdout.log");
+    let cancellation = std::thread::spawn(move || {
+        let until = Instant::now() + Duration::from_secs(2);
+        // The retained complete response prefix is exactly 408 bytes; let the
+        // worker also acquire the extra discarded byte before cancelling.
+        while Instant::now() < until && !std::fs::metadata(&stdout).is_ok_and(|m| m.len() == 408) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        signal.cancel();
+    });
+    let o = guest.probe(McpProtocol::Modern20260728, "truncated-ignore", 0, &cancel);
+    cancellation.join().unwrap();
+    assert!(o.command.record.cancelled && o.command.record.stdout.as_ref().unwrap().truncated);
+    assert_eq!(o.evidence.stdout_bytes, 409);
+    assert_eq!(outcome(&o), CheckOutcome::Incomplete);
+    let check = recipe::Check {
+        id: "discovery".into(),
+        checkpoint: Checkpoint::Configured,
+        expectation: recipe::Expectation::McpStdio {
+            probe: o.evidence.probe.clone(),
+        },
+    };
+    let mut result = theseus::checks::evaluate_mcp(&check, &o);
+    result.command_ids = vec![o.command.record.id.clone()];
+    let mut stage = StageReport::new("configured");
+    stage.outcome = StageOutcome::Cancelled;
+    stage.commands.push(o.command.record);
+    stage.checks.push(result);
+    let mut scenario = ScenarioReport::new("user-clean", ProfileName::User, ScenarioKind::Clean);
+    scenario.stages.push(stage);
+    let mut run = RunReport::new("truncated");
+    run.cancelled = true;
+    run.scenarios.push(scenario);
+    guest.store.save(&run).unwrap();
+    let loaded = report::load(guest.store.root()).unwrap();
+    let evidence = loaded.scenarios[0].stages[0].checks[0]
+        .mcp
+        .as_ref()
+        .unwrap();
+    assert!(evidence.valid() && !evidence.protocol_complete);
+    assert_eq!(evidence.issue.as_ref().unwrap().kind, McpIssueKind::Limit);
+    assert_eq!(loaded.outcome, RunOutcome::Cancelled);
 }

@@ -284,7 +284,11 @@ impl HostProcess {
                     }));
                 }
                 cancelled |= cancel.is_cancelled();
-                timed_out |= self.started.elapsed() >= timeout;
+                // Duplex abort owns a separate emergency cleanup budget. Its
+                // elapsed time cannot change the execution/shutdown decision.
+                if matches!(policy, MonitorPolicy::Immediate) {
+                    timed_out |= self.started.elapsed() >= timeout;
+                }
                 break;
             }
             thread::sleep(Duration::from_millis(5));

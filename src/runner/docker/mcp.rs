@@ -1,6 +1,6 @@
 //! Interactive MCP acquisition using the ordinary launch and completion boundary.
 use super::*;
-use crate::mcp::{McpIssue, McpIssueKind, McpProbe, McpSession, McpShutdown};
+use crate::mcp::{McpEvidence, McpIssue, McpIssueKind, McpProbe, McpSession, McpShutdown};
 use process::{DuplexDriver, DuplexOutput, run_duplex};
 
 impl DuplexDriver for McpSession {
@@ -154,10 +154,14 @@ impl Docker {
                     } else {
                         McpShutdown::Unverified
                     };
-                    evidence = output.driver.finish(shutdown);
-                    evidence.stdout_bytes = output.stdout_bytes;
-                    evidence.stdout_complete &=
-                        !output.process.stdout.truncated && output.stdout_eof;
+                    evidence = finish_evidence(
+                        output.driver,
+                        output.acquisition_started,
+                        shutdown,
+                        output.stdout_bytes,
+                        output.stdout_eof,
+                        output.process.stdout.truncated,
+                    );
                     stdout_utf8 = std::str::from_utf8(&output.process.stdout.bytes).is_ok();
                     stdout = String::from_utf8_lossy(&output.process.stdout.bytes).into_owned();
                     record.stdout = Some(LogReference {
@@ -249,5 +253,158 @@ fn append(target: &mut Option<String>, message: String) {
         previous.push_str(&message);
     } else {
         *target = Some(message);
+    }
+}
+
+fn finish_evidence(
+    driver: McpSession,
+    acquisition_started: bool,
+    shutdown: McpShutdown,
+    stdout_bytes: u64,
+    stdout_eof: bool,
+    stdout_truncated: bool,
+) -> McpEvidence {
+    let mut evidence = driver.finish(if acquisition_started {
+        shutdown
+    } else {
+        McpShutdown::NotStarted
+    });
+    evidence.stdout_bytes = stdout_bytes;
+    evidence.stdout_complete &= stdout_eof && !stdout_truncated;
+    if stdout_truncated {
+        evidence.protocol_complete = false;
+        if evidence.issue.is_none() {
+            evidence.issue = Some(McpIssue {
+                kind: McpIssueKind::Limit,
+                message: "MCP stdout capture limit exceeded".into(),
+            });
+        }
+    }
+    evidence
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn cancellation_after_preparation_uses_real_duplex_not_started_disposition() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("control");
+        let calls = root.path().join("calls");
+        std::fs::write(
+            &executable,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$1 $2" in
+ 'exec --user') exit 0;;
+ 'container inspect') printf 'Error: No such object: %s\n' "$5" >&2; exit 1;;
+ *) exit 98;;
+esac
+"#,
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut docker = Docker::new(executable);
+        let resource = OwnedResource {
+            container_id: "a".repeat(64),
+            labels: BTreeMap::from([
+                (OWNER_LABEL.into(), "v1".into()),
+                (RUN_LABEL.into(), "review".into()),
+                (SCENARIO_LABEL.into(), "user-clean".into()),
+            ]),
+            removed: false,
+        };
+        let probe:McpProbe=toml::from_str("argv=['/bin/server']\nprotocol='2026-07-28'\nserver_name='fixture'\nserver_version='2'\ntools=[]\ntimeout_seconds=3").unwrap();
+        let request = CommandRequest {
+            id: "seam".into(),
+            phase: "check:discovery".into(),
+            identity: ExecutionIdentity::runtime(),
+            argv: probe.argv.clone(),
+            env: probe.env.clone(),
+            pass_env: vec![],
+            timeout_seconds: 3,
+            expected_exit: 0,
+            log_limit: 1024,
+        };
+        let store = crate::report::create(&root.path().join("run")).unwrap();
+        let cancel = CancellationToken::default();
+        let (_, mut launch) = docker
+            .prepare_mcp_execution(
+                &resource,
+                &request,
+                &store,
+                &cancel,
+                Instant::now() + Duration::from_secs(3),
+            )
+            .unwrap();
+        assert!(launch.prepared.is_ok());
+        let mut command =
+            docker.execution_command_mode(&resource, &request, &launch, &BTreeMap::new(), true);
+        // Reproduce the adapter guard/duplex-entry seam without a scheduler race
+        // or production fault hook: preparation has really completed first.
+        cancel.cancel();
+        let mut removed = false;
+        let out = run_duplex(
+            &mut command,
+            Duration::from_secs(2),
+            &cancel,
+            launch.files.take(),
+            1024,
+            1024,
+            McpSession::new(probe).unwrap(),
+            || {
+                docker.remove_owned_until(&resource, Instant::now() + Duration::from_secs(3))?;
+                removed = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(removed && out.process.cancelled && !out.acquisition_started);
+        assert_eq!(out.process.status, None);
+        let evidence = finish_evidence(
+            out.driver,
+            out.acquisition_started,
+            McpShutdown::ForcedOwnedRemoval,
+            out.stdout_bytes,
+            out.stdout_eof,
+            out.process.stdout.truncated,
+        );
+        assert_eq!(evidence.shutdown, McpShutdown::NotStarted);
+        assert!(
+            evidence.valid() && evidence.sent_ids.is_empty() && evidence.response_lines.is_empty()
+        );
+        assert!(!std::fs::read_to_string(calls).unwrap().contains("exec -i"));
+    }
+    #[test]
+    fn truncation_preserves_prior_response_derived_protocol_and_inventory_findings() {
+        for (id, expected) in [(1, McpIssueKind::Inventory), (2, McpIssueKind::Protocol)] {
+            let probe:McpProbe=toml::from_str("argv=['/bin/server']\nprotocol='2026-07-28'\nserver_name='fixture'\nserver_version='2'\ntools=['expected']").unwrap();
+            let mut driver = McpSession::new(probe).unwrap();
+            let mut bytes = 0;
+            let replies = [
+                serde_json::json!({"jsonrpc":"2.0","id":"theseus-discover-1","result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"public","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"fixture","version":"2"}}}}),
+                serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"resultType":"complete","tools":[{"name":"wrong","inputSchema":{"type":"object"}}],"ttlMs":0,"cacheScope":"public"}}),
+            ];
+            for response in replies {
+                driver.written(driver.pending_write().len()).unwrap();
+                let line = format!("{response}\n");
+                bytes += line.len() as u64;
+                driver.receive(line.as_bytes());
+            }
+            let evidence = finish_evidence(
+                driver,
+                true,
+                McpShutdown::ForcedOwnedRemoval,
+                bytes + 1,
+                false,
+                true,
+            );
+            assert_eq!(evidence.issue.as_ref().unwrap().kind, expected);
+            assert!(evidence.valid() && !evidence.protocol_complete && !evidence.stdout_complete);
+        }
     }
 }

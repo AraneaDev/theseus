@@ -707,3 +707,74 @@ esac
         observed.command.record.error
     );
 }
+
+#[test]
+fn interactive_cli_spawn_failure_after_successful_preparation_is_not_started() {
+    use std::os::unix::fs::PermissionsExt;
+    use theseus::runner::Environment;
+    let root = tempfile::tempdir().unwrap();
+    let executable = root.path().join("control");
+    let calls = root.path().join("calls");
+    std::fs::write(
+        &executable,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$1 $2" in
+ 'exec --user') rm -- "$0"; exit 0;;
+ *) exit 98;;
+esac
+"#,
+            calls.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (_, observed) = observation("hello_v2");
+    let probe = observed.evidence.probe;
+    let request = theseus::runner::CommandRequest {
+        id: "spawn-failure".into(),
+        phase: "check:discovery".into(),
+        identity: ExecutionIdentity::runtime(),
+        argv: probe.argv.clone(),
+        env: probe.env.clone(),
+        pass_env: vec![],
+        timeout_seconds: 3,
+        expected_exit: 0,
+        log_limit: 1024,
+    };
+    let resource = OwnedResource {
+        container_id: "a".repeat(64),
+        labels: BTreeMap::from([
+            ("io.theseus.owner".into(), "v1".into()),
+            ("io.theseus.run".into(), "review".into()),
+            ("io.theseus.scenario".into(), "user-clean".into()),
+        ]),
+        removed: false,
+    };
+    let store = theseus::report::create(&root.path().join("run")).unwrap();
+    let observed = theseus::runner::Docker::new(executable)
+        .probe_mcp(
+            &resource,
+            request,
+            probe,
+            &store,
+            &theseus::engine::CancellationToken::default(),
+        )
+        .unwrap();
+    assert_eq!(observed.evidence.shutdown, McpShutdown::NotStarted);
+    assert!(observed.evidence.valid() && observed.evidence.sent_ids.is_empty());
+    assert_eq!(observed.command.record.exit_status, None);
+    assert_eq!(observed.command.record.outcome, CommandOutcome::Error);
+    assert!(
+        observed
+            .command
+            .record
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("spawn Docker CLI")
+    );
+    assert!(!observed.container_available && !observed.command.record.timed_out);
+    assert!(!std::fs::read_to_string(calls).unwrap().contains("exec -i"));
+}
