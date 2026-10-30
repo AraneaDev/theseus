@@ -240,3 +240,25 @@ fn save_rejects_bad_names_collisions_and_invalid_drafts_without_creation() {
     assert!(draft.save_copy("oversize.toml").is_err());
     assert!(!dir.path().join("oversize.toml").exists());
 }
+#[path = "support/plugin.rs"]
+mod plugin_fixture;
+#[test]
+fn schema7_plugin_draft_edit_and_save_copy_preserve_contract() {
+    let dir = plugin_fixture::project();
+    let path = dir.path().join("plugin.toml");
+    let bytes = plugin_fixture::bytes(&plugin_fixture::declaration("local"));
+    fs::write(&path, &bytes).unwrap();
+    let accepted = recipe::load(&path).unwrap();
+    let mut draft =
+        DraftDocument::open(source(&path, DocumentKind::Recipe, &accepted.digest)).unwrap();
+    draft.text.push_str("\n# edited plugin declaration\n");
+    let ValidatedDocument::Recipe(saved) = draft.save_copy("plugin.edited.toml").unwrap() else {
+        panic!("recipe expected")
+    };
+    assert_eq!(
+        saved.recipe.profiles[&theseus::model::ProfileName::User].plugin,
+        accepted.recipe.profiles[&theseus::model::ProfileName::User].plugin
+    );
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(fs::read(saved.path).unwrap(), draft.text.as_bytes());
+}

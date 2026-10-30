@@ -409,6 +409,29 @@ fn validate_report(report: &RunReport) -> Result<()> {
         "unsupported report schema version {}",
         report.schema_version
     );
+    if report.schema_version < 7 {
+        ensure!(
+            !report
+                .selected_scenarios
+                .contains(&ScenarioKind::PluginLifecycle)
+                && report
+                    .scenarios
+                    .iter()
+                    .all(|s| s.scenario != ScenarioKind::PluginLifecycle
+                        && s.plugin.is_none()
+                        && s.stages.iter().all(|st| !matches!(
+                            st.step,
+                            Some(StepName::DisablePlugin | StepName::EnablePlugin)
+                        ) && !matches!(
+                            st.checkpoint,
+                            Some(Checkpoint::PluginDisabled | Checkpoint::PluginEnabled)
+                        ) && st.checks.iter().all(|c| !matches!(
+                            c.checkpoint,
+                            Checkpoint::PluginDisabled | Checkpoint::PluginEnabled
+                        )))),
+            "plugin lifecycle requires report schema version 7"
+        );
+    }
     if report.schema_version == 1 {
         ensure!(
             !report.selected_scenarios.contains(&ScenarioKind::Reinstall)

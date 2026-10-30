@@ -31,6 +31,7 @@ pub enum Record<'a> {
     Diagnostic(&'a str),
     Source(&'a ComparisonSource),
     Artifact(&'a ArtifactDigest),
+    Plugin(&'a crate::recipe::PluginContract),
     SourcePath(&'a Path, &'a str),
     Cleanup(&'a Path),
     Json(&'a Path),

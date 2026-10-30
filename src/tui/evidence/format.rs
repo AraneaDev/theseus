@@ -106,6 +106,17 @@ pub(super) fn record(r: Record<'_>, out: &mut dyn Write) -> fmt::Result {
             s.image_id.as_deref().unwrap_or("<pending>"),
             s.recipe_digest.as_deref().unwrap_or("<pending>")
         ),
+        Record::Plugin(p) => write!(
+            out,
+            "Plugin {} | scope: {} | {} -> {}\nClient version: {} | client artifact: {}\nProof boundary: declared container observations; manual hook rehearsal, no authentication/model invocation or real client hook dispatch.\nCheckpoint contracts: {:?}",
+            p.id,
+            p.scope.as_str(),
+            p.base_version,
+            p.target_version,
+            p.client_version,
+            p.client_artifact,
+            p.checkpoints
+        ),
         Record::Artifact(a) => write!(
             out,
             "Artifact {}: {} ({} files)\nFile digests: {:?}",

@@ -48,11 +48,15 @@ impl ScenarioReport {
     pub(super) fn unmatched_interrupted_rollback_policy(&self) -> bool {
         if self.scenario != ScenarioKind::InterruptedRollback {
             return self.interrupted_rollback.is_some()
-                || self
-                    .stages
-                    .iter()
-                    .flat_map(|s| &s.checks)
-                    .any(|c| c.command_expectation.is_some());
+                || self.stages.iter().flat_map(|s| &s.checks).any(|c| {
+                    c.command_expectation.is_some()
+                        && !(self.scenario == ScenarioKind::PluginLifecycle
+                            && self.plugin.as_ref().is_some_and(|p| {
+                                p.checkpoints
+                                    .values()
+                                    .any(|proof| proof.components.contains(&c.id))
+                            }))
+                });
         }
         let Some(policy) = &self.interrupted_rollback else {
             return true;

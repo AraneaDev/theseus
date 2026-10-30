@@ -1,5 +1,7 @@
 //! Typed recipes and offline validation. Environment forwarding is a run-preflight concern.
 mod downgrade;
+pub(crate) mod plugin;
+pub use plugin::{PluginCheckpointContract, PluginContract, PluginScope, validate_plugin_contract};
 mod interrupted_rollback;
 pub(crate) mod json;
 mod rollback;

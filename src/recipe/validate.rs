@@ -51,6 +51,14 @@ impl ValidatedRecipe {
                 .with_context(|| format!("profile {name} is not defined"))?;
             for scenario in scenarios {
                 let required = match scenario {
+                    ScenarioKind::PluginLifecycle => {
+                        ensure!(
+                            *name == ProfileName::User,
+                            "plugin_lifecycle requires user profile"
+                        );
+                        super::validate_plugin_contract(profile)?;
+                        &super::plugin::STEPS[..]
+                    }
                     ScenarioKind::InterruptedRollback => {
                         ensure!(
                             self.base_artifact.is_some(),
@@ -272,6 +280,18 @@ pub fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<ValidatedRecipe> {
         }
         version => bail!("unsupported recipe schema version {version}"),
     }
+    let plugin_declared = recipe
+        .scenarios
+        .as_ref()
+        .is_some_and(|s| s.contains(&ScenarioKind::PluginLifecycle));
+    ensure!(
+        !plugin_declared || recipe.schema_version == 7,
+        "plugin_lifecycle requires recipe schema version 7"
+    );
+    ensure!(
+        !plugin_declared || recipe.network == Network::None,
+        "plugin_lifecycle requires network none"
+    );
     let interrupted_rollback_declared = recipe
         .scenarios
         .as_ref()
@@ -341,6 +361,28 @@ pub fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<ValidatedRecipe> {
         }
     }
     for (name, profile) in &mut recipe.profiles {
+        let plugin_features = profile.plugin.is_some()
+            || profile
+                .steps
+                .keys()
+                .any(|s| matches!(s, StepName::DisablePlugin | StepName::EnablePlugin))
+            || profile.checks.iter().any(|c| {
+                matches!(
+                    c.checkpoint,
+                    Checkpoint::PluginDisabled | Checkpoint::PluginEnabled
+                )
+            });
+        ensure!(
+            !plugin_features || plugin_declared,
+            "plugin features require declared plugin_lifecycle scenario"
+        );
+        if plugin_declared {
+            ensure!(
+                *name == ProfileName::User,
+                "plugin_lifecycle requires user profile"
+            );
+            super::validate_plugin_contract(profile)?;
+        }
         super::rollback::validate_features(
             profile,
             recipe.schema_version,

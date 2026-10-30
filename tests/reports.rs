@@ -1498,3 +1498,31 @@ fn json_proof_objects_reject_unknown_fields_during_decode() {
         );
     }
 }
+#[test]
+fn old_report_schema_rejects_plugin_contract_and_stages() {
+    for version in 1..7 {
+        let dir = tempfile::tempdir().unwrap();
+        let mut report = theseus::model::RunReport::new("old-plugin");
+        report.schema_version = version;
+        let mut scenario = theseus::model::ScenarioReport::new(
+            "plugin",
+            theseus::model::ProfileName::User,
+            theseus::model::ScenarioKind::PluginLifecycle,
+        );
+        let mut stage = theseus::model::StageReport::new("plugin_disabled");
+        stage.checkpoint = Some(theseus::model::Checkpoint::PluginDisabled);
+        scenario.stages.push(stage);
+        report.scenarios.push(scenario);
+        std::fs::write(
+            dir.path().join("report.json"),
+            serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            theseus::report::load(dir.path())
+                .unwrap_err()
+                .to_string()
+                .contains("plugin lifecycle requires report schema version 7")
+        );
+    }
+}

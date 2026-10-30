@@ -536,3 +536,24 @@ fn noninteractive_commands_do_not_draw_or_dwell_with_animation_default() {
         "noninteractive path dwelled on animation"
     );
 }
+#[test]
+fn plugin_lifecycle_is_a_public_cli_selection() {
+    use clap::Parser;
+    let cli = theseus::cli::Cli::try_parse_from([
+        "theseus",
+        "run",
+        "--headless",
+        "--profile",
+        "user",
+        "--scenario",
+        "plugin-lifecycle",
+    ])
+    .unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(theseus::cli::Action::Run {
+            scenario: theseus::cli::ScenarioSelection::PluginLifecycle,
+            ..
+        })
+    ));
+}

@@ -599,7 +599,7 @@ pub(super) fn generated_context_at(
     })
 }
 
-fn command_role_evidence(stage: &StageReport, check: &CheckResult) -> bool {
+pub(super) fn command_role_evidence(stage: &StageReport, check: &CheckResult) -> bool {
     let Some(proof) = &check.command_expectation else {
         return false;
     };

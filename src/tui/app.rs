@@ -191,6 +191,19 @@ impl App {
         for name in &options.profiles {
             if let Some(profile) = recipe.recipe.profiles.get(name) {
                 text += &format!("\n[{name}]\n");
+                if options.scenarios.contains(&ScenarioKind::PluginLifecycle) {
+                    if let Some(plugin) = &profile.plugin {
+                        text += &format!(
+                            "Plugin lifecycle: {} | scope: {} | {} -> {}\nClient expected version: {} | artifact: {} (file SHA256/size retained in run evidence)\nProof boundary: declared container observations, no authentication/model invocation or real hook dispatch; manual hook rehearsal only. Disposable HOME/config/project; no forwarded environment, network none.\nPlugin contract: {plugin:#?}\n",
+                            plugin.id,
+                            plugin.scope.as_str(),
+                            plugin.base_version,
+                            plugin.target_version,
+                            plugin.client_version,
+                            plugin.client_artifact
+                        );
+                    }
+                }
                 if options.scenarios.iter().any(|kind| {
                     matches!(
                         kind,

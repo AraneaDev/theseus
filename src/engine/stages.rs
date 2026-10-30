@@ -82,6 +82,7 @@ pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
     c.finish(stage)?;
     let kind = c.report.scenarios[c.index].scenario;
     match kind {
+        ScenarioKind::PluginLifecycle => super::plugin::run(c, &mut state)?,
         ScenarioKind::Downgrade => super::downgrade::run(c, &mut state)?,
         ScenarioKind::Rollback => super::rollback::run(c, &mut state)?,
         ScenarioKind::InterruptedRollback => super::interrupted_rollback::run(c, &mut state)?,
@@ -98,6 +99,7 @@ pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
                 | ScenarioKind::InterruptedUpgrade
                 | ScenarioKind::Downgrade
                 | ScenarioKind::Rollback
+                | ScenarioKind::PluginLifecycle
                 | ScenarioKind::InterruptedRollback => {
                     unreachable!("handled explicitly above")
                 }
@@ -117,6 +119,7 @@ pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
                 | ScenarioKind::InterruptedUpgrade
                 | ScenarioKind::Downgrade
                 | ScenarioKind::Rollback
+                | ScenarioKind::PluginLifecycle
                 | ScenarioKind::InterruptedRollback => {
                     unreachable!("handled explicitly above")
                 }
@@ -556,29 +559,38 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
         check: &Check,
         executed: &ExecutedCommand,
     ) -> Option<CommandExpectationEvidence> {
-        if self.report.scenarios[self.index].scenario != ScenarioKind::InterruptedRollback {
+        let scenario = &self.report.scenarios[self.index];
+        let plugin_component = scenario.plugin.as_ref().is_some_and(|p| {
+            p.checkpoints
+                .values()
+                .any(|c| c.components.contains(&check.id))
+        });
+        if scenario.scenario != ScenarioKind::InterruptedRollback && !plugin_component {
             return None;
         }
-        let required = matches!(
-            (&check.checkpoint, &check.expectation),
-            (
-                Checkpoint::BaseInstalled,
-                Expectation::Executable {
-                    expected_exit: 0,
-                    ..
-                }
-            ) | (
-                Checkpoint::KnownGood,
-                Expectation::Command {
-                    expected_exit: 0,
-                    ..
-                }
+
+        let required = plugin_component
+            || matches!(
+                (&check.checkpoint, &check.expectation),
+                (
+                    Checkpoint::BaseInstalled,
+                    Expectation::Executable {
+                        expected_exit: 0,
+                        ..
+                    }
+                ) | (
+                    Checkpoint::KnownGood,
+                    Expectation::Command {
+                        expected_exit: 0,
+                        ..
+                    }
+                )
             )
-        ) || self.report.scenarios[self.index]
-            .rollback_recovery()
-            .is_some_and(|p| {
-                p.runtime_checks.contains(&check.id) || p.data_checks.contains(&check.id)
-            });
+            || self.report.scenarios[self.index]
+                .rollback_recovery()
+                .is_some_and(|p| {
+                    p.runtime_checks.contains(&check.id) || p.data_checks.contains(&check.id)
+                });
         if !required {
             return None;
         }

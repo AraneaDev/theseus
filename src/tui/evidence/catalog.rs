@@ -134,7 +134,23 @@ fn lifecycle(app: &App) -> Records<'_> {
             .flatten()
         })),
     };
-    Box::new(proofs.chain(rest))
+    let plugin = app.scenario().and_then(|s| s.plugin.as_ref());
+    Box::new(
+        plugin
+            .into_iter()
+            .filter(|_| matches!(app.tab, Tab::Stages | Tab::Findings))
+            .map(Record::Plugin)
+            .chain(
+                app.report
+                    .iter()
+                    .filter(move |_| {
+                        plugin.is_some() && matches!(app.tab, Tab::Stages | Tab::Findings)
+                    })
+                    .flat_map(|r| r.artifacts.iter().map(Record::Artifact)),
+            )
+            .chain(proofs)
+            .chain(rest),
+    )
 }
 fn verified_label(s: &ScenarioReport) -> Option<&'static str> {
     use crate::recipe::{DowngradeContract, RestorationPolicy};

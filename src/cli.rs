@@ -67,6 +67,7 @@ pub enum ProfileSelection {
 }
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum ScenarioSelection {
+    PluginLifecycle,
     Rollback,
     InterruptedRollback,
     Downgrade,
@@ -224,6 +225,7 @@ pub fn execute(cli: Cli) -> Result<i32> {
                 ProfileSelection::All => options.profiles,
             };
             options.scenarios = match scenario {
+                ScenarioSelection::PluginLifecycle => vec![ScenarioKind::PluginLifecycle],
                 ScenarioSelection::Downgrade => vec![ScenarioKind::Downgrade],
                 ScenarioSelection::Rollback => vec![ScenarioKind::Rollback],
                 ScenarioSelection::InterruptedRollback => vec![ScenarioKind::InterruptedRollback],

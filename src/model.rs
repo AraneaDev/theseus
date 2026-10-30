@@ -1,6 +1,7 @@
 //! Stable, serializable identifiers and evidence shared by every interface.
 mod interrupted_rollback;
 mod json;
+pub(crate) mod plugin;
 pub use json::{
     JsonAssertionObservation, JsonCommandEvidence, JsonParseStatus, JsonValueObservation,
 };
@@ -25,15 +26,16 @@ macro_rules! named_enum {
     };
 }
 named_enum!(ProfileName { User => "user", System => "system" });
-named_enum!(ScenarioKind { Clean => "clean", Upgrade => "upgrade", Reinstall => "reinstall", InterruptedInstall => "interrupted_install", InterruptedUpgrade => "interrupted_upgrade", Downgrade => "downgrade", Rollback => "rollback", InterruptedRollback => "interrupted_rollback" });
-named_enum!(StepName { InstallBase => "install_base", InstallTarget => "install_target", Configure => "configure", Upgrade => "upgrade", Exercise => "exercise", Reinstall => "reinstall", Uninstall => "uninstall", InterruptInstall => "interrupt_install", RecoverInstall => "recover_install", InterruptUpgrade => "interrupt_upgrade", RecoverUpgrade => "recover_upgrade", Downgrade => "downgrade", ExerciseDowngraded => "exercise_downgraded", Backup => "backup", AttemptUpgrade => "attempt_upgrade", Rollback => "rollback", ExerciseRolledBack => "exercise_rolled_back", CleanupBackup => "cleanup_backup" });
-named_enum!(Checkpoint { BaseInstalled => "base_installed", Configured => "configured", TargetInstalled => "target_installed", Uninstalled => "uninstalled", Reinstalled => "reinstalled", Interrupted => "interrupted", Recovered => "recovered", Downgraded => "downgraded", DowngradeRejected => "downgrade_rejected", KnownGood => "known_good", BackupCreated => "backup_created", UpgradeFailed => "upgrade_failed", RolledBack => "rolled_back", BackupRemoved => "backup_removed" });
+named_enum!(ScenarioKind { Clean => "clean", Upgrade => "upgrade", Reinstall => "reinstall", InterruptedInstall => "interrupted_install", InterruptedUpgrade => "interrupted_upgrade", Downgrade => "downgrade", Rollback => "rollback", InterruptedRollback => "interrupted_rollback", PluginLifecycle => "plugin_lifecycle" });
+named_enum!(StepName { InstallBase => "install_base", InstallTarget => "install_target", Configure => "configure", Upgrade => "upgrade", Exercise => "exercise", Reinstall => "reinstall", Uninstall => "uninstall", InterruptInstall => "interrupt_install", RecoverInstall => "recover_install", InterruptUpgrade => "interrupt_upgrade", RecoverUpgrade => "recover_upgrade", Downgrade => "downgrade", ExerciseDowngraded => "exercise_downgraded", Backup => "backup", AttemptUpgrade => "attempt_upgrade", Rollback => "rollback", ExerciseRolledBack => "exercise_rolled_back", CleanupBackup => "cleanup_backup", DisablePlugin => "disable_plugin", EnablePlugin => "enable_plugin" });
+named_enum!(Checkpoint { BaseInstalled => "base_installed", Configured => "configured", TargetInstalled => "target_installed", Uninstalled => "uninstalled", Reinstalled => "reinstalled", Interrupted => "interrupted", Recovered => "recovered", Downgraded => "downgraded", DowngradeRejected => "downgrade_rejected", KnownGood => "known_good", BackupCreated => "backup_created", UpgradeFailed => "upgrade_failed", RolledBack => "rolled_back", BackupRemoved => "backup_removed", PluginDisabled => "plugin_disabled", PluginEnabled => "plugin_enabled" });
 /// One applicability map for selection, orchestration and unperformed evidence.
 pub fn checkpoint_applies(scenario: ScenarioKind, checkpoint: Checkpoint) -> bool {
     match checkpoint {
         Checkpoint::BaseInstalled => matches!(
             scenario,
             ScenarioKind::Upgrade
+                | ScenarioKind::PluginLifecycle
                 | ScenarioKind::InterruptedUpgrade
                 | ScenarioKind::Rollback
                 | ScenarioKind::InterruptedRollback
@@ -44,6 +46,7 @@ pub fn checkpoint_applies(scenario: ScenarioKind, checkpoint: Checkpoint) -> boo
                 | ScenarioKind::Upgrade
                 | ScenarioKind::Reinstall
                 | ScenarioKind::Downgrade
+                | ScenarioKind::PluginLifecycle
         ),
         Checkpoint::Reinstalled => scenario == ScenarioKind::Reinstall,
         Checkpoint::KnownGood
@@ -62,7 +65,11 @@ pub fn checkpoint_applies(scenario: ScenarioKind, checkpoint: Checkpoint) -> boo
             scenario,
             ScenarioKind::InterruptedInstall | ScenarioKind::InterruptedUpgrade
         ),
-        Checkpoint::Configured | Checkpoint::Uninstalled => true,
+        Checkpoint::PluginDisabled | Checkpoint::PluginEnabled => {
+            scenario == ScenarioKind::PluginLifecycle
+        }
+        Checkpoint::Configured => scenario != ScenarioKind::PluginLifecycle,
+        Checkpoint::Uninstalled => true,
     }
 }
 /// Backup checkpoints belong only to the active restoration policy.
@@ -450,6 +457,8 @@ impl StageReport {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScenarioReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<crate::recipe::PluginContract>,
     pub id: String,
     pub profile: ProfileName,
     pub scenario: ScenarioKind,
@@ -478,6 +487,7 @@ impl ScenarioReport {
             id: id.into(),
             profile,
             scenario,
+            plugin: None,
             downgrade: None,
             rollback: None,
             interrupted_rollback: None,
@@ -498,6 +508,7 @@ impl ScenarioReport {
             .iter()
             .map(StageReport::aggregate_outcome)
             .collect::<Vec<_>>();
+        outcomes.push(plugin::scenario_outcome(self));
         if self.unmatched_rollback_policy() || self.unmatched_interrupted_rollback_policy() {
             outcomes.push(RunOutcome::Incomplete);
         }
@@ -721,6 +732,7 @@ impl RunReport {
             .iter()
             .map(ScenarioReport::aggregate_outcome)
             .collect::<Vec<_>>();
+        outcomes.push(plugin::artifact_outcome(self));
         if self.cancelled {
             outcomes.push(RunOutcome::Cancelled);
         }

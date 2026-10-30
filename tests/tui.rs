@@ -864,3 +864,62 @@ fn json_check_evidence_renders_typed_proof_and_unexecuted_marker() {
     result.outcome = CheckOutcome::Skipped;
     assert!(app.items().join("\n").contains("JSON proof: unavailable"));
 }
+#[path = "support/plugin.rs"]
+mod plugin_fixture;
+#[test]
+fn plugin_preview_and_offline_evidence_show_scope_client_and_proof_boundary() {
+    let dir = plugin_fixture::project();
+    let recipe = theseus::recipe::parse_bytes(
+        &dir.path().join("plugin.toml"),
+        &plugin_fixture::bytes(&plugin_fixture::declaration("project")),
+    )
+    .unwrap();
+    let options = theseus::engine::RunOptions::all(&recipe);
+    let app = App::preview(recipe.clone(), options);
+    let text = app.preview_text();
+    for marker in [
+        "scope: project",
+        "probe@market",
+        "2.1.312 (Claude Code)",
+        "client/claude",
+        "manual hook",
+        "network none",
+        "disable_plugin",
+        "base-inventory",
+    ] {
+        assert!(text.contains(marker), "{marker}: {text}");
+    }
+    let mut report = RunReport::new("plugin");
+    let mut scenario = ScenarioReport::new(
+        "user-plugin_lifecycle",
+        ProfileName::User,
+        ScenarioKind::PluginLifecycle,
+    );
+    scenario.plugin = recipe.recipe.profiles[&ProfileName::User].plugin.clone();
+    scenario.stages.push(StageReport::new("base_installed"));
+    report.scenarios.push(scenario);
+    report.artifacts.push(ArtifactDigest {
+        name: "target".into(),
+        sha256: "a".repeat(64),
+        files: vec![ArtifactFileDigest {
+            path: "client/claude".into(),
+            sha256: "b".repeat(64),
+            size: 123,
+        }],
+    });
+    let app = App::offline(report, dir.path().to_path_buf());
+    let evidence = theseus::tui::evidence::Catalog::for_app(&app)
+        .records()
+        .map(|r| r.record.text())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for marker in [
+        "scope: project",
+        "client/claude",
+        "manual hook",
+        "2.1.312 (Claude Code)",
+        &"b".repeat(64),
+    ] {
+        assert!(evidence.contains(marker), "{marker}: {evidence}");
+    }
+}

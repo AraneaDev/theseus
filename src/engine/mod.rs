@@ -2,6 +2,7 @@
 mod downgrade;
 mod interrupted_rollback;
 mod interruption;
+mod plugin;
 mod rollback;
 mod rollback_checks;
 mod stages;
@@ -182,6 +183,10 @@ pub(crate) fn run_with_parent(
                     report
                         .scenarios
                         .push(ScenarioReport::new(&sid, *profile, *scenario));
+                    if *scenario == ScenarioKind::PluginLifecycle {
+                        report.scenarios[index].plugin =
+                            recipe.recipe.profiles[profile].plugin.clone();
+                    }
                     if *scenario == ScenarioKind::Downgrade {
                         report.scenarios[index].downgrade =
                             recipe.recipe.profiles[profile].downgrade.clone();
