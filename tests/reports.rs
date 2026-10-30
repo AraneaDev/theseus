@@ -17,6 +17,8 @@ fn failed_contract_evidence_survives_cleanup_error_and_cancellation_wins() {
     let mut scenario = ScenarioReport::new("user-clean", ProfileName::User, ScenarioKind::Clean);
     let mut stage = StageReport::new("uninstalled");
     stage.checks.push(CheckResult {
+        mcp_required: false,
+        mcp: None,
         json_expectation: None,
         json_required: false,
         command_expectation: None,
@@ -352,14 +354,14 @@ fn frozen_schema_one_report_and_journal_remain_readable_and_writable() {
 }
 
 #[test]
-fn new_reports_write_schema_seven_while_journals_stay_schema_one() {
+fn new_reports_write_schema_eight_while_journals_stay_schema_one() {
     let temp = tempfile::tempdir().unwrap();
     let store = report::create(&temp.path().join("run")).unwrap();
     store.save(&RunReport::new("new-run")).unwrap();
     let serialized: serde_json::Value =
         serde_json::from_slice(&fs::read(store.report_path()).unwrap()).unwrap();
-    assert_eq!(serialized["schema_version"], 7);
-    assert_eq!(report::load(store.root()).unwrap().schema_version, 7);
+    assert_eq!(serialized["schema_version"], 8);
+    assert_eq!(report::load(store.root()).unwrap().schema_version, 8);
     let journal = RunJournal {
         schema_version: 1,
         run_id: "new-run".into(),
@@ -380,13 +382,13 @@ fn new_reports_write_schema_seven_while_journals_stay_schema_one() {
 fn report_versions_and_journal_versions_are_validated_independently() {
     let temp = tempfile::tempdir().unwrap();
     let store = report::create(&temp.path().join("run")).unwrap();
-    for version in [1, 2, 3, 4, 5, 6, 7] {
+    for version in [1, 2, 3, 4, 5, 6, 7, 8] {
         let mut run = RunReport::new("run");
         run.schema_version = version;
         store.save(&run).unwrap();
         assert_eq!(report::load(store.root()).unwrap().schema_version, version);
     }
-    for version in [0, 8, 999] {
+    for version in [0, 9, 999] {
         let mut run = RunReport::new("run");
         run.schema_version = version;
         assert!(store.save(&run).is_err());
@@ -700,6 +702,8 @@ fn rejected_downgrade_report() -> RunReport {
     checkpoint.outcome = StageOutcome::Passed;
     for id in ["binary", "data"] {
         checkpoint.checks.push(CheckResult {
+            mcp_required: false,
+            mcp: None,
             json_expectation: None,
             json_required: false,
             command_expectation: None,
@@ -878,6 +882,8 @@ fn downgrade_each_feature_has_schema_four_floor_and_optional_fields_omit_none() 
                 "exercise" => stage.step = Some(StepName::ExerciseDowngraded),
                 "checkpoint" => stage.checkpoint = Some(Checkpoint::Downgraded),
                 "check" | "comparison" => stage.checks.push(CheckResult {
+                    mcp_required: false,
+                    mcp: None,
                     json_expectation: None,
                     json_required: false,
                     command_expectation: None,

@@ -5,7 +5,7 @@ use crate::{
     model::{CommandOutcome, OwnedResource, RestartEvidence},
     recipe::{Limits, ValidatedRecipe},
     report::ReportStore,
-    runner::{CommandRequest, Environment, ExecutedCommand, PreparedEnvironment},
+    runner::{CommandRequest, Environment, ExecutedCommand, ExecutedMcp, PreparedEnvironment},
     snapshot::Snapshot,
 };
 use anyhow::Result;
@@ -82,6 +82,33 @@ impl<E: Environment> Environment for TrackedEnvironment<'_, E> {
         let result = self.inner.execute(resource, request, store, cancel);
         self.command("execute", result)
     }
+    fn probe_mcp(
+        &mut self,
+        resource: &OwnedResource,
+        request: CommandRequest,
+        probe: crate::mcp::McpProbe,
+        store: &ReportStore,
+        cancel: &CancellationToken,
+    ) -> Result<ExecutedMcp> {
+        let result = self
+            .inner
+            .probe_mcp(resource, request, probe, store, cancel);
+        if self.error.is_none()
+            && let Ok(observed) = &result
+            && observed.command.record.outcome == CommandOutcome::Error
+        {
+            self.error = Some(format!(
+                "infrastructure probe MCP: {}",
+                observed
+                    .command
+                    .record
+                    .error
+                    .as_deref()
+                    .unwrap_or("command control failed")
+            ));
+        }
+        self.record("probe MCP", result)
+    }
     fn execute_interrupted(
         &mut self,
         resource: &OwnedResource,
@@ -129,5 +156,143 @@ impl<E: Environment> Environment for TrackedEnvironment<'_, E> {
     fn remove(&mut self, resource: &OwnedResource) -> Result<()> {
         let result = self.inner.remove(resource);
         self.record("remove", result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        mcp::{McpProbe, McpSession, McpShutdown},
+        model::CommandRecord,
+    };
+    struct ProbeFailure {
+        outer: bool,
+        calls: usize,
+    }
+    impl Environment for ProbeFailure {
+        fn prepare(
+            &mut self,
+            _: &ValidatedRecipe,
+            _: bool,
+            _: &CancellationToken,
+        ) -> Result<PreparedEnvironment> {
+            unreachable!()
+        }
+        fn create(&mut self, _: &str, _: &str, _: &ValidatedRecipe) -> Result<OwnedResource> {
+            unreachable!()
+        }
+        fn setup(
+            &mut self,
+            _: &OwnedResource,
+            _: &ValidatedRecipe,
+            _: &CancellationToken,
+        ) -> Result<()> {
+            unreachable!()
+        }
+        fn execute(
+            &mut self,
+            _: &OwnedResource,
+            _: CommandRequest,
+            _: &ReportStore,
+            _: &CancellationToken,
+        ) -> Result<ExecutedCommand> {
+            unreachable!()
+        }
+        fn observe(
+            &mut self,
+            _: &OwnedResource,
+            _: &[String],
+            _: Limits,
+            _: &CancellationToken,
+        ) -> Result<Vec<Snapshot>> {
+            unreachable!()
+        }
+        fn stop(&mut self, _: &OwnedResource) -> Result<()> {
+            unreachable!()
+        }
+        fn remove(&mut self, _: &OwnedResource) -> Result<()> {
+            unreachable!()
+        }
+        fn probe_mcp(
+            &mut self,
+            _: &OwnedResource,
+            r: CommandRequest,
+            p: McpProbe,
+            _: &ReportStore,
+            _: &CancellationToken,
+        ) -> Result<ExecutedMcp> {
+            self.calls += 1;
+            assert_eq!(r.argv, p.argv);
+            assert_eq!(r.env, p.env);
+            assert!(r.pass_env.is_empty());
+            if self.outer {
+                anyhow::bail!("fixture transport failure");
+            }
+            let mut record = CommandRecord::new(r.id, r.phase);
+            record.outcome = CommandOutcome::Error;
+            record.error = Some("fixture command control failure".into());
+            Ok(ExecutedMcp {
+                command: ExecutedCommand {
+                    record,
+                    stdout: String::new(),
+                    stdout_complete: false,
+                    stdout_utf8: true,
+                },
+                evidence: McpSession::new(p)?.finish(McpShutdown::Unverified),
+                container_available: false,
+            })
+        }
+    }
+    #[test]
+    fn mcp_forwarding_retains_both_infrastructure_error_channels() {
+        for outer in [true, false] {
+            let mut inner = ProbeFailure { outer, calls: 0 };
+            let mut tracked = TrackedEnvironment {
+                inner: &mut inner,
+                error: None,
+            };
+            let probe:McpProbe=toml::from_str("argv=['/bin/server']\nprotocol='2026-07-28'\nserver_name='fixture'\nserver_version='2'\ntools=[]").unwrap();
+            let request = CommandRequest {
+                id: "probe".into(),
+                phase: "check:discovery".into(),
+                identity: crate::model::ExecutionIdentity::runtime(),
+                argv: probe.argv.clone(),
+                env: probe.env.clone(),
+                pass_env: vec![],
+                timeout_seconds: 15,
+                expected_exit: 0,
+                log_limit: 1024,
+            };
+            let root = tempfile::tempdir().unwrap();
+            let store = crate::report::create(&root.path().join("run")).unwrap();
+            let resource = OwnedResource {
+                container_id: "owned".into(),
+                labels: Default::default(),
+                removed: false,
+            };
+            let result = tracked.probe_mcp(
+                &resource,
+                request,
+                probe,
+                &store,
+                &CancellationToken::default(),
+            );
+            assert_eq!(result.is_err(), outer);
+            let error = tracked.error.as_ref().unwrap();
+            assert!(error.contains(if outer {
+                "fixture transport failure"
+            } else {
+                "fixture command control failure"
+            }));
+            if let Ok(observed) = result {
+                assert!(!observed.container_available);
+                assert_eq!(
+                    observed.command.record.error.as_deref(),
+                    Some("fixture command control failure")
+                );
+            }
+            assert_eq!(inner.calls, 1);
+        }
     }
 }

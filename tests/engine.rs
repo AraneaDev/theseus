@@ -1831,7 +1831,7 @@ fn downgrade_actual_flow_uses_declared_policy_same_container_and_persists_refusa
             );
         }
         let loaded = theseus::report::load(&result.report_path).unwrap();
-        assert_eq!(loaded.schema_version, 7);
+        assert_eq!(loaded.schema_version, 8);
         assert_eq!(loaded.outcome, RunOutcome::Passed);
         if rejection {
             assert_eq!(

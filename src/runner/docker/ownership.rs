@@ -98,6 +98,26 @@ impl Docker {
         Ok(Some(state))
     }
 
+    pub(super) fn remove_owned_until(
+        &mut self,
+        resource: &OwnedResource,
+        deadline: Instant,
+    ) -> Result<()> {
+        let cancel = CancellationToken::default();
+        if self
+            .inspect_owned_until(resource, deadline, &cancel)?
+            .is_some()
+        {
+            self.owned_transition(&["rm", "-f", &resource.container_id], deadline, &cancel)?;
+        }
+        ensure!(
+            self.inspect_owned_until(resource, deadline, &cancel)?
+                .is_none(),
+            "owned container remains after removal"
+        );
+        Ok(())
+    }
+
     pub(super) fn verified_exists(&self, resource: &OwnedResource) -> Result<bool> {
         Ok(self
             .inspect_owned_until(

@@ -11,6 +11,7 @@ pub(super) struct Launch {
     pub(super) directory: String,
     pub(super) nonce: String,
     actual: BTreeMap<OsString, OsString>,
+    bounded_mcp: bool,
     pub(super) prepared: Result<()>,
 }
 
@@ -28,7 +29,7 @@ impl Docker {
         store: &ReportStore,
         cancel: &CancellationToken,
     ) -> Result<(CommandRecord, Launch)> {
-        self.prepare_execution_inner(resource, request, store, cancel, false)
+        self.prepare_execution_inner(resource, request, store, cancel, false, None)
     }
 
     pub(super) fn prepare_interrupted_execution(
@@ -38,9 +39,21 @@ impl Docker {
         store: &ReportStore,
         cancel: &CancellationToken,
     ) -> Result<(CommandRecord, Launch)> {
-        self.prepare_execution_inner(resource, request, store, cancel, true)
+        self.prepare_execution_inner(resource, request, store, cancel, true, None)
     }
 
+    pub(super) fn prepare_mcp_execution(
+        &mut self,
+        resource: &OwnedResource,
+        request: &CommandRequest,
+        store: &ReportStore,
+        cancel: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<(CommandRecord, Launch)> {
+        self.prepare_execution_inner(resource, request, store, cancel, false, Some(deadline))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn prepare_execution_inner(
         &mut self,
         resource: &OwnedResource,
@@ -48,44 +61,9 @@ impl Docker {
         store: &ReportStore,
         cancel: &CancellationToken,
         interrupted: bool,
+        outer_deadline: Option<Instant>,
     ) -> Result<(CommandRecord, Launch)> {
-        let mut public = BTreeMap::from([
-            ("HOME".into(), request.identity.home.clone()),
-            (
-                "XDG_CONFIG_HOME".into(),
-                format!("{}/.config", request.identity.home),
-            ),
-            (
-                "XDG_DATA_HOME".into(),
-                format!("{}/.local/share", request.identity.home),
-            ),
-            (
-                "XDG_CACHE_HOME".into(),
-                format!("{}/.cache", request.identity.home),
-            ),
-            (
-                "PATH".into(),
-                "/home/theseus/.local/bin:/usr/local/bin:/usr/bin:/bin".into(),
-            ),
-            (
-                "USER".into(),
-                if request.identity.uid == 0 {
-                    "root"
-                } else {
-                    "theseus"
-                }
-                .into(),
-            ),
-            (
-                "LOGNAME".into(),
-                if request.identity.uid == 0 {
-                    "root"
-                } else {
-                    "theseus"
-                }
-                .into(),
-            ),
-        ]);
+        let mut public = request.identity.public_environment();
         public.extend(request.env.clone());
         let mut actual: BTreeMap<std::ffi::OsString, std::ffi::OsString> =
             public.iter().map(|(k, v)| (k.into(), v.into())).collect();
@@ -110,7 +88,8 @@ impl Docker {
         record.argv = request.argv.clone();
         record.started_at = now();
         let started = Instant::now();
-        let deadline = started + Duration::from_secs(request.timeout_seconds);
+        let deadline =
+            outer_deadline.unwrap_or(started + Duration::from_secs(request.timeout_seconds));
         // Fresh, exclusive control storage outside every observed root. A receipt
         // is separate from application streams and is never inferred from CLI text.
         let nonce = fresh_nonce()?;
@@ -131,7 +110,7 @@ impl Docker {
                     .context("owned container missing before interruption")?;
                 ensure!(state.running, "owned container is not running");
             }
-            self.control(
+            self.control_inner(
                 resource,
                 r#"umask 077; mkdir "$1" && chmod 755 "$1" && mkdir "$1/command" && chown "$2" "$1/command""#,
                 &[
@@ -140,6 +119,7 @@ impl Docker {
                 ],
                 if interrupted { deadline.min(Instant::now() + Duration::from_secs(1)) } else { deadline },
                 cancel,
+                outer_deadline.is_none(),
             )
         })();
         Ok((
@@ -153,6 +133,7 @@ impl Docker {
                 directory,
                 nonce,
                 actual,
+                bounded_mcp: outer_deadline.is_some(),
                 prepared: prepared.map(|_| ()),
             },
         ))
@@ -165,10 +146,25 @@ impl Docker {
         launch: &Launch,
         private_environment: &BTreeMap<String, String>,
     ) -> Command {
+        self.execution_command_mode(resource, request, launch, private_environment, false)
+    }
+
+    pub(super) fn execution_command_mode(
+        &self,
+        resource: &OwnedResource,
+        request: &CommandRequest,
+        launch: &Launch,
+        private_environment: &BTreeMap<String, String>,
+        interactive: bool,
+    ) -> Command {
         let receipt = launch.receipt();
         let mut command = self.command();
+        command.arg("exec");
+        if interactive {
+            command.arg("-i");
+        }
         command.args([
-            "exec", "--user", &format!("{}:{}", request.identity.uid, request.identity.gid),
+            "--user", &format!("{}:{}", request.identity.uid, request.identity.gid),
             "--workdir", "/workspace", &resource.container_id,
             "/bin/sh", "-c",
             // The wrapper's environment stays independent of forwarded PATH/HOME.
@@ -217,12 +213,13 @@ impl Docker {
             "Docker command control failed (status {:?}); application completion unknown",
             status
         );
-        let text = self.control(
+        let text = self.control_inner(
             resource,
             "test -f \"$1\" && test ! -L \"$1\" && cat \"$1\" && rm -f \"$1\"",
             &[&launch.receipt()],
             deadline,
             cancel,
+            !launch.bounded_mcp,
         )?;
         let status = text
             .strip_prefix(&format!("{}:", launch.nonce))

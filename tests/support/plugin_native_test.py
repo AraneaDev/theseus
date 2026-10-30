@@ -38,7 +38,7 @@ class InspectionDeadlines(unittest.TestCase):
 
     def test_cleanup_stall_cannot_be_accepted_as_owned_container_absence(self):
         report = {
-            'schema_version': 7, 'outcome': 'passed', 'errors': [],
+            'schema_version': 8, 'outcome': 'passed', 'errors': [],
             'image_id': native.IMAGE, 'network': 'none',
             'artifacts': [{'name': 'target', 'files': [
                 {'path': 'client/claude', 'sha256': 'synthetic-sha', 'size': 4}]}],

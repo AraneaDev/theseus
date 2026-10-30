@@ -5,7 +5,9 @@ mod completion;
 mod failure;
 mod files;
 mod json;
+mod mcp;
 pub use json::{JsonCommandObservation, evaluate_json_command};
+pub use mcp::evaluate_mcp;
 pub(crate) mod lookup;
 mod rejection;
 mod stability;
@@ -21,6 +23,11 @@ pub use rejection::{RejectionAssessment, assess_rejection};
 pub use stability::{StabilityResult, compare_unchanged};
 fn result(check: &Check, outcome: CheckOutcome, message: impl Into<String>) -> CheckResult {
     CheckResult {
+        mcp_required: matches!(
+            check.expectation,
+            crate::recipe::Expectation::McpStdio { .. }
+        ),
+        mcp: None,
         json_expectation: None,
         json_required: matches!(
             check.expectation,

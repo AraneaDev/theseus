@@ -110,6 +110,10 @@ named_enum!(CheckOutcome { Passed => "passed", Failed => "failed", Incomplete =>
 named_enum!(FindingKind { Leftover => "leftover", BaselineDeletion => "baseline_deletion", ChangedBaseline => "changed_baseline", ObservationIncomplete => "observation_incomplete" });
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckResult {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mcp_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<crate::mcp::McpEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub json_expectation: Option<JsonCommandEvidence>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -169,7 +173,7 @@ pub struct Finding {
     pub message: String,
 }
 
-pub const REPORT_SCHEMA_VERSION: u32 = 7;
+pub const REPORT_SCHEMA_VERSION: u32 = 8;
 pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
 named_enum!(RunOutcome { Passed => "passed", Failed => "failed", Incomplete => "incomplete", Cancelled => "cancelled" });
 impl RunOutcome {
@@ -391,7 +395,10 @@ impl StageReport {
             _ => RunOutcome::Incomplete,
         };
         let mut outcomes = vec![initial];
-        if self.unmatched_rollback_evidence() || !self.valid_json_checks() {
+        if self.unmatched_rollback_evidence()
+            || !self.valid_json_checks()
+            || !self.valid_mcp_checks()
+        {
             outcomes.push(RunOutcome::Incomplete);
         }
         if self.restart.as_ref().is_some_and(|proof| {
@@ -790,4 +797,80 @@ pub struct RunJournal {
     pub run_id: String,
     pub resources: Vec<OwnedResource>,
     pub cleanup_errors: Vec<String>,
+}
+
+impl StageReport {
+    pub(crate) fn valid_mcp_checks(&self) -> bool {
+        self.checks.iter().all(|check| {
+            if check.mcp.is_some() && !check.mcp_required {
+                return false;
+            }
+            if check.mcp.as_ref().is_some_and(|p| !p.valid()) {
+                return false;
+            }
+            if !check.mcp_required || check.outcome != CheckOutcome::Passed {
+                return true;
+            }
+            let Some(proof) = &check.mcp else {
+                return false;
+            };
+            let matching: Vec<_> = self
+                .commands
+                .iter()
+                .filter(|c| check.command_ids.first() == Some(&c.id))
+                .collect();
+            if check.command_ids.len() != 1 || matching.len() != 1 || !proof.verified_pass() {
+                return false;
+            }
+            let command = matching[0];
+            let mut environment = ExecutionIdentity::runtime().public_environment();
+            environment.extend(proof.probe.env.clone());
+            command.phase == format!("check:{}", check.id)
+                && command.identity.uid == 10001
+                && command.identity.gid == 10001
+                && command.identity.home == "/home/theseus"
+                && command.argv == proof.probe.argv
+                && command.environment == environment
+                && command.forwarded_environment.is_empty()
+                && command.outcome == CommandOutcome::Succeeded
+                && command.exit_status == Some(0)
+                && !command.timed_out
+                && !command.cancelled
+                && command.error.is_none()
+                && command.interruption.is_none()
+                && command.expected_failure.is_none()
+                && command.rejection.is_none()
+                && command
+                    .stdout
+                    .as_ref()
+                    .is_some_and(|log| !log.truncated && log.bytes == proof.stdout_bytes)
+                && command.stderr.is_some()
+        })
+    }
+}
+
+impl ExecutionIdentity {
+    pub(crate) fn public_environment(&self) -> std::collections::BTreeMap<String, String> {
+        std::collections::BTreeMap::from([
+            ("HOME".into(), self.home.clone()),
+            ("XDG_CONFIG_HOME".into(), format!("{}/.config", self.home)),
+            (
+                "XDG_DATA_HOME".into(),
+                format!("{}/.local/share", self.home),
+            ),
+            ("XDG_CACHE_HOME".into(), format!("{}/.cache", self.home)),
+            (
+                "PATH".into(),
+                "/home/theseus/.local/bin:/usr/local/bin:/usr/bin:/bin".into(),
+            ),
+            (
+                "USER".into(),
+                if self.uid == 0 { "root" } else { "theseus" }.into(),
+            ),
+            (
+                "LOGNAME".into(),
+                if self.uid == 0 { "root" } else { "theseus" }.into(),
+            ),
+        ])
+    }
 }

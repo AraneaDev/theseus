@@ -1,5 +1,6 @@
 mod execution;
 mod interruption;
+mod mcp;
 mod ownership;
 
 use super::{
@@ -82,6 +83,18 @@ impl Docker {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<String> {
+        self.control_inner(resource, script, args, deadline, cancel, true)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn control_inner(
+        &mut self,
+        resource: &OwnedResource,
+        script: &str,
+        args: &[&str],
+        deadline: Instant,
+        cancel: &CancellationToken,
+        abort_guest: bool,
+    ) -> Result<String> {
         let mut command = self.command();
         command
             .args([
@@ -101,7 +114,13 @@ impl Docker {
             cancel,
             None,
             512,
-            || self.stop(resource),
+            || {
+                if abort_guest {
+                    self.stop(resource)
+                } else {
+                    Ok(())
+                }
+            },
         )?;
         ensure!(
             !output.cancelled && !output.timed_out && output.error.is_none(),
@@ -368,6 +387,16 @@ chmod 755 /home/theseus /workspace /inputs
         cancel: &CancellationToken,
     ) -> Result<ExecutedCommand> {
         self.execute_ordinary(resource, request, store, cancel)
+    }
+    fn probe_mcp(
+        &mut self,
+        resource: &OwnedResource,
+        request: CommandRequest,
+        probe: crate::mcp::McpProbe,
+        store: &ReportStore,
+        cancel: &CancellationToken,
+    ) -> Result<ExecutedMcp> {
+        self.execute_mcp(resource, request, probe, store, cancel)
     }
     fn execute_interrupted(
         &mut self,

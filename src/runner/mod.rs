@@ -37,6 +37,11 @@ pub struct ExecutedCommand {
     pub stdout_complete: bool,
     pub stdout_utf8: bool,
 }
+pub struct ExecutedMcp {
+    pub command: ExecutedCommand,
+    pub evidence: crate::mcp::McpEvidence,
+    pub container_available: bool,
+}
 /// Observation evidence and a separate infrastructure failure channel. Expected
 /// bounded/no-follow gaps stay in snapshots; transport errors must not disappear
 /// when an adapter preserves partial observations for the ordinary run viewer.
@@ -71,6 +76,16 @@ pub trait Environment {
         store: &ReportStore,
         cancel: &CancellationToken,
     ) -> Result<ExecutedCommand>;
+    fn probe_mcp(
+        &mut self,
+        _resource: &OwnedResource,
+        _request: CommandRequest,
+        _probe: crate::mcp::McpProbe,
+        _store: &ReportStore,
+        _cancel: &CancellationToken,
+    ) -> Result<ExecutedMcp> {
+        anyhow::bail!("environment does not support bounded MCP probing")
+    }
     /// Deliberate interruption is opt-in; unsupported environments fail closed.
     fn execute_interrupted(
         &mut self,

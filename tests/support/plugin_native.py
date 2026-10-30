@@ -134,7 +134,7 @@ def verify_common(binary, evidence, name, path, expected, scope, version, sha, s
     # report --json reports read/validation success; outcome remains in the document.
     assert result.returncode == 0, (result.returncode, result.stderr)
     report = json.loads(result.stdout)
-    assert report['schema_version'] == 7 and report['outcome'] == expected, report['outcome']
+    assert report['schema_version'] == 8 and report['outcome'] == expected, report['outcome']
     assert not report['errors'], report['errors']
     assert report['image_id'] == IMAGE
     assert report['network'] == 'none'

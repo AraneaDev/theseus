@@ -133,7 +133,7 @@ def session(root, policy=None, saved=None, legacy=False, unverified=False, negat
             assert b'Expected failure:' not in rendered()
         else:
             value = json.loads(saved.read_text())
-            assert value['schema_version'] == 7 and value['outcome'] == 'passed', value
+            assert value['schema_version'] == 8 and value['outcome'] == 'passed', value
             assert value['selected_profiles'] == ['user']
             assert value['selected_scenarios'] == ['rollback']
             scenario = value['scenarios'][0]

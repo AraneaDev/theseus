@@ -267,11 +267,10 @@ pub fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<ValidatedRecipe> {
             recipe.scenarios.is_none(),
             "scenarios requires recipe schema version 2"
         ),
-        2..=7 => {
-            let scenarios = recipe
-                .scenarios
-                .as_ref()
-                .context("recipe schema version 2/3/4/5/6/7 requires an explicit scenarios list")?;
+        2..=8 => {
+            let scenarios = recipe.scenarios.as_ref().context(
+                "recipe schema version 2/3/4/5/6/7/8 requires an explicit scenarios list",
+            )?;
             ensure!(!scenarios.is_empty(), "declare at least one scenario");
             let mut seen = BTreeSet::new();
             for scenario in scenarios {
@@ -285,7 +284,7 @@ pub fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<ValidatedRecipe> {
         .as_ref()
         .is_some_and(|s| s.contains(&ScenarioKind::PluginLifecycle));
     ensure!(
-        !plugin_declared || recipe.schema_version == 7,
+        !plugin_declared || recipe.schema_version >= 7,
         "plugin_lifecycle requires recipe schema version 7"
     );
     ensure!(
@@ -513,6 +512,13 @@ pub fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<ValidatedRecipe> {
                 );
             }
             match &mut check.expectation {
+                Expectation::McpStdio { probe } => {
+                    ensure!(
+                        recipe.schema_version >= 8,
+                        "mcp_stdio requires recipe schema version 8"
+                    );
+                    probe.validate()?;
+                }
                 Expectation::JsonCommand {
                     script,
                     timeout_seconds,

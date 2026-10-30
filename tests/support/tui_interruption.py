@@ -69,7 +69,7 @@ def session(root, args, live=False, cancel=False, saved=None):
             until(lambda: (value := report()) and value['finished_at'], 90)
             saved = next(root.glob('.theseus-runs/*/report.json'))
         value = json.loads(saved.read_text())
-        assert value['schema_version'] == 7
+        assert value['schema_version'] == 8
         assert value['outcome'] == ('cancelled' if cancel else 'passed'), value
         assert value['selected_profiles'] == ['user']
         assert value['selected_scenarios'] == ['interrupted_install']
@@ -130,7 +130,7 @@ with tempfile.TemporaryDirectory(prefix='theseus-interruption-public-') as tmp:
     saved = next(root.glob('.theseus-runs/*/report.json'))
     value = check_cleanup(saved)
     assert len(value['scenarios']) == 4 and value['outcome'] == 'passed'
-    assert value['schema_version'] == 7
+    assert value['schema_version'] == 8
     metadata = saved.read_text()
     assert secret not in metadata and '/.theseus-' not in metadata
     assert 'THESEUS_ACCEPTANCE_SECRET' in metadata

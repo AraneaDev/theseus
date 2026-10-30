@@ -15,6 +15,8 @@ fn result(
     after: &str,
 ) -> CheckResult {
     CheckResult {
+        mcp_required: false,
+        mcp: None,
         json_expectation: None,
         json_required: false,
         command_expectation: None,

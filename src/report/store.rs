@@ -405,7 +405,7 @@ fn log_components(relative: &str) -> Result<Vec<&str>> {
 }
 fn validate_report(report: &RunReport) -> Result<()> {
     ensure!(
-        matches!(report.schema_version, 1..=7),
+        matches!(report.schema_version, 1..=8),
         "unsupported report schema version {}",
         report.schema_version
     );
@@ -600,6 +600,18 @@ fn validate_report(report: &RunReport) -> Result<()> {
                         .iter()
                         .all(|check| !check.json_required && check.json_expectation.is_none()),
                 "JSON evidence requires report schema version 7"
+            );
+            ensure!(
+                report.schema_version >= 8
+                    || stage
+                        .checks
+                        .iter()
+                        .all(|c| !c.mcp_required && c.mcp.is_none()),
+                "MCP evidence requires report schema version 8"
+            );
+            ensure!(
+                stage.valid_mcp_checks(),
+                "invalid MCP check evidence or command binding"
             );
             ensure!(
                 stage.valid_json_checks(),

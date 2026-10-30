@@ -502,6 +502,8 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                 && (blocked || prerequisite_skipped || retention_without_configuration)
             {
                 CheckResult {
+                    mcp_required: matches!(check.expectation, Expectation::McpStdio { .. }),
+                    mcp: None,
                     json_expectation: None,
                     json_required: matches!(check.expectation, Expectation::JsonCommand { .. }),
                     command_expectation: None,
@@ -516,6 +518,8 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                 }
             } else if state.availability != Availability::Running {
                 CheckResult {
+                    mcp_required: matches!(check.expectation, Expectation::McpStdio { .. }),
+                    mcp: None,
                     json_expectation: None,
                     json_required: matches!(check.expectation, Expectation::JsonCommand { .. }),
                     command_expectation: None,
@@ -640,6 +644,72 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
         let command_start = stage.commands.len();
         let mut command_expectation = None;
         let mut result = match &check.expectation {
+            Expectation::McpStdio { probe } => {
+                let spec = CommandSpec {
+                    script: String::new(),
+                    timeout_seconds: probe.timeout_seconds,
+                    env: probe.env.clone(),
+                    pass_env: vec![],
+                };
+                let request = self.request(
+                    state,
+                    format!("check:{}", check.id),
+                    &spec,
+                    ExecutionIdentity::runtime(),
+                    probe.argv.clone(),
+                    0,
+                );
+                let observed = match self.environment.probe_mcp(
+                    &state.resource,
+                    request.clone(),
+                    probe.clone(),
+                    self.store,
+                    self.cancel,
+                ) {
+                    Ok(observed) => observed,
+                    Err(error) => {
+                        state.availability = Availability::Unavailable;
+                        let mut record = CommandRecord::new(request.id, request.phase);
+                        record.identity = request.identity;
+                        record.argv = request.argv;
+                        record.environment = record.identity.public_environment();
+                        record.environment.extend(request.env);
+                        record.error = Some(format!("{error:#}"));
+                        record.cancelled = self.cancel.is_cancelled();
+                        record.outcome = if record.cancelled {
+                            CommandOutcome::Cancelled
+                        } else {
+                            CommandOutcome::Error
+                        };
+                        if let Err(error) = self.environment.stop(&state.resource) {
+                            stage
+                                .errors
+                                .push(format!("stop after MCP infrastructure error: {error:#}"));
+                        }
+                        crate::runner::ExecutedMcp {
+                            command: ExecutedCommand {
+                                record,
+                                stdout: String::new(),
+                                stdout_complete: false,
+                                stdout_utf8: false,
+                            },
+                            evidence: crate::mcp::McpSession::new(probe.clone())
+                                .expect("validated probe")
+                                .finish(crate::mcp::McpShutdown::Unverified),
+                            container_available: false,
+                        }
+                    }
+                };
+                if !observed.container_available {
+                    state.availability = Availability::Unavailable;
+                }
+                if observed.command.record.cancelled {
+                    self.cancel.cancel();
+                    self.report.cancelled = true;
+                }
+                stage.commands.push(observed.command.record.clone());
+                checks::evaluate_mcp(check, &observed)
+            }
             Expectation::JsonCommand {
                 script,
                 timeout_seconds,
@@ -810,6 +880,8 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                         "binary scope must be a file or symlink before upgrade".into();
                 }
                 CheckResult {
+                    mcp_required: matches!(check.expectation, Expectation::McpStdio { .. }),
+                    mcp: None,
                     json_expectation: None,
                     json_required: matches!(check.expectation, Expectation::JsonCommand { .. }),
                     command_expectation: None,
@@ -835,6 +907,8 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                     &stage.snapshots,
                 );
                 CheckResult {
+                    mcp_required: matches!(check.expectation, Expectation::McpStdio { .. }),
+                    mcp: None,
                     json_expectation: None,
                     json_required: matches!(check.expectation, Expectation::JsonCommand { .. }),
                     command_expectation: None,

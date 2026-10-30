@@ -18,6 +18,8 @@ fn fixture(root: &Path) -> App {
     let mut second = StageReport::new("target_installed");
     second.outcome = StageOutcome::Incomplete;
     second.checks.push(CheckResult {
+        mcp_required: false,
+        mcp: None,
         json_expectation: None,
         json_required: false,
         command_expectation: None,
@@ -443,6 +445,8 @@ fn reinstall_failed_directory_scope_and_comparison_references_are_browsable() {
     let mut stage = StageReport::new("reinstalled");
     stage.outcome = StageOutcome::Failed;
     stage.checks.push(CheckResult {
+        mcp_required: false,
+        mcp: None,
         json_expectation: None,
         json_required: false,
         command_expectation: None,
@@ -732,6 +736,8 @@ fn rollback_offline_narrow_evidence_shows_failed_mutation_and_mapped_restore() {
     let mut stage = StageReport::new("rolled_back");
     stage.outcome = StageOutcome::Failed;
     stage.checks.push(CheckResult {
+        mcp_required: false,
+        mcp: None,
         json_expectation: None,
         json_required: false,
         command_expectation: None,

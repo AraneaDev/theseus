@@ -1,6 +1,4 @@
 //! Deadlines cover child processes and pipe lifetime, including inherited handles.
-// Task 3 adds the production caller for this independently tested transport.
-#[allow(dead_code)]
 mod duplex;
 use crate::{
     engine::CancellationToken,
@@ -8,7 +6,6 @@ use crate::{
     snapshot::{self, Snapshot},
 };
 use anyhow::{Context, Result, anyhow};
-#[allow(unused_imports)]
 pub(super) use duplex::{DuplexDriver, DuplexOutput, run_duplex};
 use rustix::{
     fs::{OFlags, fcntl_getfl, fcntl_setfl},
