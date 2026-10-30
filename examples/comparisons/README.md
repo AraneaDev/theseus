@@ -39,8 +39,16 @@ theseus report 'examples/comparisons/.theseus-comparisons/ID/sources/copy/RUN_ID
 ```
 
 The suite view gives exact source report paths. In interactive preview, r starts,
-q exits, and the manifest fixes profiles/scenarios; p/s do not edit it. Live and
-offline Up/Down or j/k select cells initially. Tab switches to evidence-record
+q exits, and the manifest fixes profiles/scenarios; p/s do not edit it.
+Before the first run, `e` edits the suite
+manifest as raw TOML; Ctrl-T validates and Ctrl-S saves a new adjacent `.toml`
+copy without overwriting the original. Esc keeps an unsaved draft, while `d`
+and `q` require confirmation before discarding it. The editor has a 1 MiB raw
+UTF-8 limit. Relative variant recipe paths still resolve from the source
+directory. A saved copy needs a fresh `r` to execute; there is no autosave or
+automatic run. See the main README for filename rules and other controls.
+Live and offline evidence remains read-only: Up/Down or j/k select cells initially.
+Tab switches to evidence-record
 selection and back; Home/End selects the first/last item in either list. `/` edits
 a filter applied by Enter/Esc; `[`/`]` loads detail chunks, and PgUp/PgDn scrolls
 inside the current chunk. Active q cancels

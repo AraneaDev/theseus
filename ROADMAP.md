@@ -1,6 +1,6 @@
 # Theseus roadmap
 
-Theseus 0.8 ships a shared Docker lifecycle engine, Ratatui workbench, headless
+Theseus 0.9 ships a shared Docker lifecycle engine, Ratatui workbench, headless
 CLI, versioned recipes/reports, private bounded logs, user/system profiles,
 clean/upgrade/reinstall, interrupted-install/upgrade, downgrade and failed-upgrade
 rollback scenarios, interrupted-upgrade rollback, decorative startup/exit animations,
@@ -83,12 +83,13 @@ priority. Synthetic public CLI PTYs establish large-report browsing; real compar
 PTYs cover lifecycle integration. Report/comparison schemas, lifecycle outcomes and
 capture/derivation budgets stay unchanged.
 
+## Complete: preview editing (0.9)
+
+- Standalone recipe and comparison suite previews now support bounded raw TOML
+  editing, explicit validation and Save Copy to a new adjacent source. A saved
+  source runs only after a fresh `r`; there is no autosave or source overwrite.
+
 The following capabilities are planned, not available features.
-
-## Next: preview editing
-
-- Editable command and selection previews before explicit execution. Preview in
-  0.8 remains read-only.
 
 ## Claude Code plugins
 

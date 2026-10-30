@@ -1,0 +1,369 @@
+"""Public preview editing acceptance. All fixture and terminal evidence is retained."""
+import fcntl
+import hashlib
+import json
+import os
+import pathlib
+import pty
+import select
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+import tomllib
+
+sys.dont_write_bytecode = True
+from terminal_screen import Screen
+from docker_absence import require_container_absent
+
+binary = str(pathlib.Path(sys.argv[1]).resolve())
+case = sys.argv[2]
+repo = pathlib.Path(__file__).resolve().parents[2]
+evidence = pathlib.Path(tempfile.mkdtemp(prefix='theseus-preview-editing-task4-'))
+print('Evidence:', evidence, flush=True)
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def manifest(root):
+    return {str(p.relative_to(root)): digest(p) for p in root.rglob('*') if p.is_file()}
+
+
+def fixture(kind, name):
+    root = evidence / name
+    source = repo / ('tests/fixtures/lifecycle' if kind == 'recipe' else 'examples/comparisons')
+    shutil.copytree(source, root)
+    return root, root / ('recipe.toml' if kind == 'recipe' else 'methods.toml')
+
+
+class Session:
+    def __init__(self, root, name, args, sentinel=True, animation=False):
+        self.root, self.name = root, name
+        self.master, self.slave = pty.openpty()
+        self.before = termios.tcgetattr(self.slave)
+        fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack('HHHH', 42, 140, 0, 0))
+        self.screen = Screen(42, 140)
+        self.raw = bytearray()
+        self.sentinel = root / (name + '.docker-called')
+        env = {**os.environ, 'TERM': 'xterm-256color'}
+        if sentinel:
+            bindir = root / (name + '-bin')
+            bindir.mkdir()
+            docker = bindir / 'docker'
+            docker.write_text('#!/bin/sh\nprintf called > "$THESEUS_DOCKER_SENTINEL"\nexit 111\n')
+            docker.chmod(0o755)
+            env.update(PATH=str(bindir) + os.pathsep + os.environ['PATH'],
+                       THESEUS_DOCKER_SENTINEL=str(self.sentinel))
+        self.proc = subprocess.Popen([binary, '--no-animation', *args] if not animation else [binary, *args],
+                                     cwd=root, stdin=self.slave, stdout=self.slave, stderr=self.slave, env=env)
+
+    def pump(self):
+        if select.select([self.master], [], [], .05)[0]:
+            try:
+                chunk = os.read(self.master, 65536)
+            except OSError:
+                return
+            self.raw.extend(chunk)
+            self.screen.feed(chunk)
+
+    def text(self):
+        return self.screen.text().decode('utf8', 'replace')
+
+    def until(self, token, seconds=8):
+        deadline = time.monotonic() + seconds
+        while token not in self.text() and self.proc.poll() is None and time.monotonic() < deadline:
+            self.pump()
+        assert token in self.text(), (self.name, token, self.proc.poll(), self.text())
+
+    def key(self, data):
+        os.write(self.master, data)
+
+    def snap(self, label):
+        (evidence / f'{self.name}-{label}.screen').write_bytes(self.screen.text())
+
+    def finish(self, code=0):
+        deadline = time.monotonic() + 15
+        while self.proc.poll() is None and time.monotonic() < deadline:
+            self.pump()
+        assert self.proc.poll() is not None, (self.name, 'did not exit', self.text())
+        while select.select([self.master], [], [], .02)[0]:
+            self.pump()
+        assert self.proc.returncode == code, (self.name, self.proc.returncode, self.text())
+        assert termios.tcgetattr(self.slave) == self.before, 'termios not restored'
+        assert b'\x1b[?1049h' in self.raw and b'\x1b[?1049l' in self.raw, 'alternate screen not restored'
+        assert b'\x1b[?2004h' in self.raw and b'\x1b[?2004l' in self.raw, 'bracketed paste not restored'
+        assert not self.sentinel.exists(), 'preview invoked Docker'
+
+    def close(self):
+        if self.proc.poll() is None:
+            self.proc.send_signal(signal.SIGTERM)
+            try:
+                self.proc.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+        (evidence / (self.name + '.raw')).write_bytes(self.raw)
+        (evidence / (self.name + '.terminal.json')).write_text(json.dumps({
+            'exit': self.proc.returncode, 'before': self.before,
+            'after': termios.tcgetattr(self.slave)}, default=list))
+        os.close(self.master)
+        os.close(self.slave)
+
+
+def args(kind, source):
+    if kind == 'recipe':
+        return ['run', '--recipe', str(source), '--profile', 'user', '--scenario', 'clean']
+    return ['compare', '--suite', str(source)]
+
+
+def name_in_prompt(s, old, new):
+    s.key(b'\x1b[H' + b'\x1b[3~' * len(old))
+    s.key(new.encode() + b'\r')
+
+
+def choose_name(s, source, new):
+    s.key(b'\x13')
+    s.until('SAVE COPY')
+    name_in_prompt(s, source.stem + '.edited.toml', new)
+
+
+def preview(kind):
+    root, source = fixture(kind, kind + '-preview')
+    collision = root / 'occupied.toml'
+    collision.write_bytes(b'original collision\n')
+    link = root / 'linked.toml'
+    link.symlink_to(collision)
+    before = manifest(root)
+    (evidence / (kind + '-before.json')).write_text(json.dumps(before, indent=2))
+    s = Session(root, kind + '-preview', args(kind, source))
+    try:
+        s.until('Preview')
+        s.key(b'\x1b[200~r\nq\x1b[201~')
+        s.pump()
+        assert not (root / ('.theseus-runs' if kind == 'recipe' else '.theseus-comparisons')).exists()
+        s.key(b'e')
+        s.until('EDIT unchanged')
+        s.key(b'\x1b[1;5H')  # Ctrl-Home
+        s.key(b'qrsd')  # ordinary controls are literal editor text
+        s.until('EDIT UNSAVED')
+        s.key(b'\x14')  # Ctrl-T: invalid TOML, no adoption
+        s.until('Invalid draft')
+        s.snap('invalid')
+        choose_name(s, source, 'bad-copy.toml')
+        s.until('Save Copy failed')
+        assert not (root / 'bad-copy.toml').exists(), 'invalid draft persisted'
+        s.key(b'\x1b')  # return to editor from the failed name prompt
+        s.until('EDIT UNSAVED')
+        s.key(b'\x1b')
+        s.until('UNSAVED draft')
+        s.key(b'rps')
+        s.pump()
+        assert not (root / ('.theseus-runs' if kind == 'recipe' else '.theseus-comparisons')).exists()
+        s.key(b'd')
+        s.until('Discard unsaved draft?')
+        s.key(b'\x1b')
+        s.until('UNSAVED draft')
+        s.key(b'd')
+        s.until('Discard unsaved draft?')
+        s.key(b'\r')
+        s.until('Preview')
+        s.key(b'e')
+        s.until('EDIT unchanged')
+        s.key(b'\x1b[1;5H')
+        comment = '# q r ñ\n'.encode()
+        s.key(b'\x1b[200~' + comment + b'\x1b[201~')
+        s.until('EDIT UNSAVED')
+        s.snap('valid-draft')
+        s.key(b'\x14')
+        s.until('Draft valid')
+        choose_name(s, source, 'occupied.toml')
+        s.until('Save Copy failed')
+        assert collision.read_bytes() == b'original collision\n'
+        s.snap('collision')
+        name_in_prompt(s, 'occupied.toml', 'linked.toml')
+        s.until('Save Copy failed')
+        assert link.is_symlink() and collision.read_bytes() == b'original collision\n'
+        s.snap('symlink')
+        s.key(b'\x1b')
+        s.until('EDIT UNSAVED')
+        chosen = 'verified-copy.toml'
+        choose_name(s, source, chosen)
+        s.until('Preview')
+        saved = root / chosen
+        assert saved.read_bytes() == comment + source.read_bytes()
+        assert saved.stat().st_mode & 0o777 == 0o600
+        assert saved.resolve().parent == source.resolve().parent
+        assert not (root / ('.theseus-runs' if kind == 'recipe' else '.theseus-comparisons')).exists()
+        s.snap('saved-preview')
+        s.key(b'q')
+        s.finish()
+    finally:
+        s.close()
+    after = manifest(root)
+    (evidence / (kind + '-after.json')).write_text(json.dumps(after, indent=2))
+    assert all(after.get(k) == v for k, v in before.items()), 'original fixture changed'
+    assert after['verified-copy.toml'] == digest(root / 'verified-copy.toml')
+
+
+def dirty_quit():
+    root, source = fixture('recipe', 'dirty-quit')
+    before = digest(source)
+    s = Session(root, 'dirty-quit', args('recipe', source))
+    try:
+        s.until('Preview')
+        s.key(b'e')
+        s.until('EDIT unchanged')
+        s.key(b'x\x1b')
+        s.until('UNSAVED draft')
+        s.key(b'q')
+        s.until('Discard unsaved draft and quit?')
+        s.key(b'\x1b')
+        s.until('UNSAVED draft')
+        s.key(b'q')
+        s.until('Discard unsaved draft and quit?')
+        s.key(b'\r')
+        s.finish()
+        assert digest(source) == before
+        assert not (root / '.theseus-runs').exists()
+    finally:
+        s.close()
+
+
+def offline_inert():
+    root = evidence / 'offline'
+    root.mkdir()
+    source = root / 'report.json'
+    shutil.copyfile(repo / 'tests/fixtures/reports/schema1-report.json', source)
+    before = digest(source)
+    s = Session(root, 'offline', ['report', str(source)])
+    try:
+        s.until('Offline report')
+        s.key(b'e')
+        s.pump()
+        assert 'EDIT unchanged' not in s.text(), 'offline report opened editor'
+        s.key(b'\x1b[200~r\nq\x1b[201~')
+        s.pump()
+        assert s.proc.poll() is None, 'paste outside editor ran commands'
+        s.snap('inert')
+        s.key(b'q')
+        s.finish()
+        assert digest(source) == before
+    finally:
+        s.close()
+
+
+def signals():
+    for name, action in (('CtrlC', b'\x03'), ('SIGINT', signal.SIGINT), ('SIGTERM', signal.SIGTERM)):
+        root, source = fixture('recipe', 'signal-' + name)
+        initial = digest(source)
+        s = Session(root, name, args('recipe', source))
+        try:
+            s.until('Preview')
+            s.key(b'e')
+            s.until('EDIT unchanged')
+            s.key(b'x')
+            s.until('EDIT UNSAVED')
+            if isinstance(action, bytes):
+                s.key(action)
+            else:
+                s.proc.send_signal(action)
+            s.finish()
+            assert digest(source) == initial
+        finally:
+            s.close()
+
+
+def docker():
+    out = subprocess.run(['docker', 'info'], capture_output=True)
+    assert out.returncode == 0, out.stderr
+    out = subprocess.run(['docker', 'image', 'inspect', 'ubuntu:24.04'], capture_output=True)
+    assert out.returncode == 0, out.stderr
+    for kind in ('recipe', 'suite'):
+        root, source = fixture(kind, kind + '-docker')
+        s = Session(root, kind + '-docker', args(kind, source), sentinel=False)
+        try:
+            s.until('Preview')
+            s.key(b'e')
+            s.until('EDIT unchanged')
+            s.key(b'\x1b[1;5H')
+            s.key(b'\x1b[200~' + '# saved source ñ\n'.encode() + b'\x1b[201~')
+            s.until('EDIT UNSAVED')
+            s.key(b'\x13')
+            s.until('SAVE COPY')
+            name_in_prompt(s, source.stem + '.edited.toml', 'saved.toml')
+            s.until('Preview')
+            saved = root / 'saved.toml'
+            assert saved.exists()
+            assert not list(root.glob('.theseus-runs/*/report.json'))
+            assert not list(root.glob('.theseus-comparisons/*/comparison.json'))
+            s.key(b'r')
+            pattern = '.theseus-runs/*/report.json' if kind == 'recipe' else '.theseus-comparisons/*/comparison.json'
+            deadline = time.monotonic() + 120
+            while not list(root.glob(pattern)) and time.monotonic() < deadline:
+                s.pump()
+            reports = list(root.glob(pattern))
+            assert len(reports) == 1, (kind, s.text())
+            report = reports[0]
+            def complete():
+                state = json.loads(report.read_text())
+                return state.get('finished_at') is not None if kind == 'recipe' else state.get('finished', False)
+            while not complete() and time.monotonic() < deadline:
+                s.pump()
+            assert complete(), (kind, s.text())
+            value = json.loads(report.read_text())
+            (evidence / (kind + '-actual-report.json')).write_text(json.dumps(value, indent=2))
+            if kind == 'recipe':
+                assert value['outcome'] == 'passed', value
+                assert pathlib.Path(value['recipe_path']) == saved.resolve()
+                assert value['recipe_digest'] == digest(saved)
+            else:
+                assert value['finished'] and value['report']['outcome'] == 'passed', value
+                assert value['manifest']['name'] == tomllib.loads(saved.read_text())['name']
+                assert set(value['recipe_digests']) == {'copy', 'archive'}
+                (evidence / 'suite-saved-source.json').write_text(json.dumps({
+                    'path': str(saved.resolve()), 'raw_sha256': digest(saved)}, indent=2))
+            s.key(b'q')
+            s.finish()
+        finally:
+            prior_error = sys.exc_info()[1]
+            s.close()
+            # Even a failed assertion leaves only owned evidence for cleanup.
+            for index, candidate in enumerate(list(root.glob('.theseus-runs/*/report.json')) +
+                                              list(root.glob('.theseus-comparisons/*/comparison.json'))):
+                clean = subprocess.run([binary, 'cleanup', str(candidate.parent)], capture_output=True)
+                (evidence / f'{kind}-cleanup-{index}.stdout').write_bytes(clean.stdout)
+                (evidence / f'{kind}-cleanup-{index}.stderr').write_bytes(clean.stderr)
+                (evidence / f'{kind}-cleanup-{index}.status').write_text(str(clean.returncode))
+                if prior_error is None:
+                    assert clean.returncode == 0, clean.stderr
+        for journal in root.glob('.theseus-runs/*/journal.json'):
+            resources = json.loads(journal.read_text())['resources']
+            assert all(resource['removed'] for resource in resources), resources
+            for resource in resources:
+                require_container_absent(resource['container_id'], subprocess.run(
+                    ['docker', 'inspect', resource['container_id']], capture_output=True, text=True))
+        for journal in root.glob('.theseus-comparisons/*/sources/*/*/journal.json'):
+            resources = json.loads(journal.read_text())['resources']
+            assert all(resource['removed'] for resource in resources), resources
+            for resource in resources:
+                require_container_absent(resource['container_id'], subprocess.run(
+                    ['docker', 'inspect', resource['container_id']], capture_output=True, text=True))
+
+
+if case == 'preview':
+    preview('recipe')
+    preview('suite')
+    dirty_quit()
+    offline_inert()
+    signals()
+elif case == 'docker':
+    docker()
+else:
+    raise AssertionError(case)
+print('PASS', case, flush=True)

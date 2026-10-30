@@ -144,6 +144,30 @@ cycles the recipe’s declared scenarios and all; `r` starts the displayed selec
 Arrows or `j/k` and Page Up/Down scroll the preview. Preview never executes
 automatically.
 
+In a pristine recipe or comparison suite preview, `e` opens a raw TOML editor
+before the first run. It preserves comments, Unicode and exact source bytes.
+Ordinary `q`, `r`, `p`, `s` and `d` typed in the editor are text. Use arrows,
+Home/End, Ctrl-Home/End, Enter, Tab and Backspace/Delete to edit; bracketed
+paste inserts once. Ctrl-T validates the draft without saving or running it.
+Ctrl-S opens Save Copy; enter a new basename and press Enter to save, or Esc
+to return. Esc in the editor closes it while retaining an unsaved draft.
+The preview then labels the displayed details as the accepted source and blocks
+`r`, `p` and `s`. Press `d` to discard or `q` to quit: Enter confirms, Esc
+keeps the draft. Ctrl-C and SIGINT/SIGTERM exit immediately without saving.
+
+The editor accepts at most 1 MiB of UTF-8 source and rejects an oversized
+insertion or paste as one operation. This limit applies to editing, not existing
+recipe loading. A pathological sequence of combining marks may be abbreviated
+on screen; the raw draft and saved bytes remain exact. Save Copy validates the
+whole draft and creates only a new file adjacent to the accepted source in its
+canonical directory, so relative artifact and variant paths keep their meaning.
+The basename must be 1–128 ASCII bytes using letters, digits, `.`, `_` or `-`
+and end in `.toml`. Existing files and symlinks are never overwritten. A failed
+save retains the draft; if a failure occurs after creating a new file, the
+diagnostic identifies that attempted adjacent path for inspection. A successful
+save adopts the copy as the accepted source. Nothing is autosaved or run: press
+fresh `r` to execute the saved source.
+
 Interactive startup and ordinary idle exit show Theseus entering and retracing a
 labyrinth with Ariadne's thread: six 900ms frames per scene (5.4 seconds each).
 These scenes are decorative, with no observed lifecycle progress or success claim.
