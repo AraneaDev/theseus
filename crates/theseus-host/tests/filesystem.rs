@@ -59,6 +59,11 @@ fn retained_root_and_file_survive_replacement() -> io::Result<()> {
         .map_err(|e| io::Error::new(e.kind(), format!("set replacement time: {e}")))?;
     assert_ne!(fingerprint(&old)?, fingerprint(&replacement)?);
     assert_eq!(fingerprint(&old)?.len, original.len);
+    // Windows refuses directory renames while descendant files have open handles.
+    // The file-identity assertions are complete; retain the directory authority
+    // itself through the separate root-replacement proof below.
+    drop(old);
+    drop(replacement);
     std::fs::rename(&path, parent.path().join("moved"))
         .map_err(|e| io::Error::new(e.kind(), format!("rename retained root: {e}")))?;
     let new_root = HostDir::create_private(&path)?;
