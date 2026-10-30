@@ -2,6 +2,7 @@
 use super::model::*;
 use crate::recipe::{self, ValidatedRecipe, normalize_container_path, validate::contained};
 use anyhow::{Context, Result, ensure};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs::File,
@@ -15,6 +16,8 @@ pub struct ValidatedSuite {
     pub variants: Vec<ValidatedVariant>,
     pub project_root: PathBuf,
     pub path: PathBuf,
+    /// SHA-256 of the manifest's original bytes.
+    pub digest: String,
 }
 #[derive(Debug, Clone)]
 pub struct ValidatedVariant {
@@ -117,10 +120,6 @@ pub fn validate_manifest(suite: &SuiteManifest) -> Result<()> {
 /// Load every recipe and validate all selected combinations before any execution.
 pub fn load(path: &Path) -> Result<ValidatedSuite> {
     let path = path.canonicalize().context("resolve suite manifest path")?;
-    let project_root = path
-        .parent()
-        .context("manifest must have a parent directory")?
-        .to_path_buf();
     let mut bytes = Vec::new();
     File::open(&path)
         .context("open suite manifest")?
@@ -131,8 +130,29 @@ pub fn load(path: &Path) -> Result<ValidatedSuite> {
         bytes.len() as u64 <= MAX_MANIFEST_BYTES,
         "suite manifest exceeds 1 MiB"
     );
+    parse_bytes(&path, &bytes)
+}
+
+/// Validate exact manifest bytes relative to a source path in a canonical parent.
+pub fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<ValidatedSuite> {
+    ensure!(path.is_absolute(), "suite source path must be absolute");
+    let project_root = path
+        .parent()
+        .context("manifest must have a parent directory")?
+        .to_path_buf();
+    ensure!(
+        project_root
+            .canonicalize()
+            .context("resolve suite source directory")?
+            == project_root,
+        "suite source directory must be canonical"
+    );
+    ensure!(
+        bytes.len() as u64 <= MAX_MANIFEST_BYTES,
+        "suite manifest exceeds 1 MiB"
+    );
     let mut manifest: SuiteManifest =
-        toml::from_str(std::str::from_utf8(&bytes)?).context("parse comparison suite")?;
+        toml::from_str(std::str::from_utf8(bytes)?).context("parse comparison suite")?;
     for scope in &mut manifest.scopes {
         scope.path = normalize_container_path(&scope.path)?;
     }
@@ -167,6 +187,7 @@ pub fn load(path: &Path) -> Result<ValidatedSuite> {
         manifest,
         variants,
         project_root,
-        path,
+        path: path.to_path_buf(),
+        digest: format!("{:x}", Sha256::digest(bytes)),
     })
 }

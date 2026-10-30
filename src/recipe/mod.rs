@@ -9,7 +9,7 @@ pub use interrupted_rollback::{
     InterruptedRollbackContract, validate_interrupted_rollback_contract,
 };
 pub use types::*;
-pub use validate::{ValidatedRecipe, load, normalize_container_path};
+pub use validate::{ValidatedRecipe, load, normalize_container_path, parse_bytes};
 
 pub use rollback::{
     BackupScope, ExpectedFailureContract, RestorationPolicy, RollbackContract,

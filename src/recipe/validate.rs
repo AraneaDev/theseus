@@ -233,13 +233,27 @@ impl ValidatedRecipe {
 }
 pub fn load(path: &Path) -> Result<ValidatedRecipe> {
     let path = path.canonicalize().context("resolve recipe path")?;
+    let bytes = fs::read(&path).context("read recipe")?;
+    parse_bytes(&path, &bytes)
+}
+
+/// Validate exact recipe bytes against a source path in a canonical parent directory.
+/// The source file itself need not exist, so adjacent drafts keep their original root.
+pub fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<ValidatedRecipe> {
+    ensure!(path.is_absolute(), "recipe source path must be absolute");
     let project_root = path
         .parent()
         .context("recipe must have a parent directory")?
         .to_path_buf();
-    let bytes = fs::read(&path).context("read recipe")?;
+    ensure!(
+        project_root
+            .canonicalize()
+            .context("resolve recipe source directory")?
+            == project_root,
+        "recipe source directory must be canonical"
+    );
     let mut recipe: Recipe =
-        toml::from_str(std::str::from_utf8(&bytes)?).context("parse theseus.toml")?;
+        toml::from_str(std::str::from_utf8(bytes)?).context("parse theseus.toml")?;
     match recipe.schema_version {
         1 => ensure!(
             recipe.scenarios.is_none(),
@@ -551,7 +565,7 @@ pub fn load(path: &Path) -> Result<ValidatedRecipe> {
         .transpose()?;
     Ok(ValidatedRecipe {
         recipe,
-        path,
+        path: path.to_path_buf(),
         project_root,
         base_artifact,
         target_artifact,

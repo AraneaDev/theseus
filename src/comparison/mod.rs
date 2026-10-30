@@ -7,7 +7,7 @@ mod run;
 mod scope;
 mod store;
 pub use budget::MAX_DERIVED_BYTES;
-pub use manifest::{ValidatedSuite, ValidatedVariant, load, validate_manifest};
+pub use manifest::{ValidatedSuite, ValidatedVariant, load, parse_bytes, validate_manifest};
 pub use model::*;
 pub use run::{ComparisonEvent, ComparisonResult, SuiteRunOptions, run, run_with};
 pub use scope::compare_scope;
