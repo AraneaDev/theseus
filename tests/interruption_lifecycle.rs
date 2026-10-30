@@ -416,6 +416,20 @@ fn real_interruption_cancellation_before_ready_stopped_and_restart_is_130() {
 }
 
 #[test]
+fn python_interruption_visibility_requires_current_terminal_cells() {
+    let output = Command::new("python3")
+        .arg("tests/support/tui_interruption_test.py")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 #[ignore = "requires Docker and Unix PTY"]
 fn real_public_example_headless_and_live_offline_pty() {
     let output = Command::new("python3")
