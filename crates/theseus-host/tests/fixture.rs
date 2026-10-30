@@ -212,3 +212,38 @@ fn malformed_commands_fail_without_output() {
         assert!(!output.stderr.is_empty(), "{args:?}");
     }
 }
+
+#[test]
+fn delayed_launch_marker_has_positive_immediate_and_late_controls() {
+    let root = tempfile::tempdir().unwrap();
+    let ready = root.path().join("ready");
+    let late = root.path().join("late");
+    let start = Instant::now();
+    let output = fixture()
+        .arg("delayed-marker")
+        .arg(&ready)
+        .arg(&late)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(start.elapsed() >= Duration::from_millis(500));
+    assert_eq!(std::fs::read(ready).unwrap(), b"native fixture ran");
+    assert_eq!(std::fs::read(late).unwrap(), b"native fixture ran");
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn cwd_record_is_a_successful_native_directory_value() {
+    let root = tempfile::tempdir().unwrap();
+    let output = fixture()
+        .arg("echo-cwd")
+        .current_dir(root.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let values = records(&output.stdout);
+    assert_eq!(values.len(), 1);
+    assert!(!values[0].is_empty());
+    assert!(output.stderr.is_empty());
+}

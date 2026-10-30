@@ -21,6 +21,16 @@
 //!   Each gate prints/flushed readiness, then reads exactly one byte from stdin.
 //!   Only byte `!` releases it; EOF/errors abort. The owning test kills/reaps it.
 //!
+//! - `echo-cwd`: current directory as one native record.
+//! - `launch-marker PATH`: write fixed bytes `native fixture ran` to PATH.
+//! - `nested-launch PATH`: launch this fixture's marker through OwnedChild.
+//! - `delayed-marker READY LATE`: write READY, wait 500ms, then write LATE.
+//! - `descendant-marker READY LATE`: spawn delayed-marker then exit immediately.
+//! - Windows `close-job-owner READY LATE`: create nested owned delayed-marker,
+//!   wait for READY, exit without Rust Drop to close the native job handle.
+//! - Windows `probe-handle NUMBER FORBIDDEN_BASENAME`: succeed only if the handle
+//!   is absent or names a different file; detects unrelated inherited objects.
+//!
 //! Counts are decimal, at most 64 MiB; durations are at most 60,000 ms.
 //! Hex output is at most 64 MiB. No mode reads unrelated environment variables.
 
@@ -113,12 +123,118 @@ fn publication_interruption(root: &OsStr, gate: &OsStr) -> io::Result<()> {
     Ok(())
 }
 
+fn marker(path: &OsStr) -> io::Result<()> {
+    std::fs::write(path, b"native fixture ran")
+}
+
+fn delayed_marker(ready: &OsStr, late: &OsStr) -> io::Result<()> {
+    marker(ready)?;
+    std::thread::sleep(Duration::from_millis(500));
+    marker(late)
+}
+
+#[allow(clippy::zombie_processes)]
+fn descendant_marker(ready: &OsStr, late: &OsStr) -> io::Result<()> {
+    Command::new(env::current_exe()?)
+        .arg("delayed-marker")
+        .arg(ready)
+        .arg(late)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    Ok(())
+}
+
+fn nested_launch(path: &OsStr) -> io::Result<()> {
+    use theseus_host::process::{ChildEnvironment, NativeCommand, OwnedChild};
+    let command = NativeCommand {
+        program: env::current_exe()?.into(),
+        args: vec!["launch-marker".into(), path.into()],
+        cwd: None,
+        environment: ChildEnvironment::Inherit,
+    };
+    let mut child =
+        OwnedChild::spawn_files(&command, None, None, None).map_err(io::Error::other)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !child.exited_reserved()? {
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "nested fixture"));
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    if child.reap_and_release()?.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("nested launch failed"))
+    }
+}
+
+// Exiting the owning process bypasses Rust Drop. Its non-inherited job handle is
+// closed by the kernel, independently proving KILL_ON_JOB_CLOSE for the child.
+#[cfg(windows)]
+fn close_job_owner(ready: &OsStr, late: &OsStr) -> io::Result<()> {
+    use theseus_host::process::{ChildEnvironment, NativeCommand, OwnedChild};
+    let command = NativeCommand {
+        program: env::current_exe()?.into(),
+        args: vec!["delayed-marker".into(), ready.into(), late.into()],
+        cwd: None,
+        environment: ChildEnvironment::Inherit,
+    };
+    let _child = OwnedChild::spawn_files(&command, None, None, None).map_err(io::Error::other)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !std::path::Path::new(ready).exists() {
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "nested ready marker",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    std::process::exit(0)
+}
+
+#[cfg(windows)]
+fn probe_handle(value: &OsStr, forbidden: &OsStr) -> io::Result<()> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+    let handle = number(value, usize::MAX as u64)? as usize as *mut std::ffi::c_void;
+    let mut name = vec![0u16; 32768];
+    // An absent handle can be reused for another object in the child. Compare the
+    // observed object name, rather than assuming matching numeric values identify it.
+    let count =
+        unsafe { GetFinalPathNameByHandleW(handle, name.as_mut_ptr(), name.len() as u32, 0) };
+    if count == 0 {
+        return Ok(());
+    }
+    if count as usize >= name.len() {
+        return Err(io::Error::other("unexpected handle path length"));
+    }
+    let path = OsString::from_wide(&name[..count as usize]);
+    if std::path::Path::new(&path).file_name() == Some(forbidden) {
+        return Err(io::Error::other(
+            "unrelated inheritable file leaked to child",
+        ));
+    }
+    Ok(())
+}
+
 fn run(args: &[OsString]) -> io::Result<()> {
     let (mode, args) = args
         .split_first()
         .ok_or_else(|| invalid("missing command"))?;
     match (mode.to_str(), args) {
+        (Some("launch-marker"), [path]) => marker(path),
+        (Some("nested-launch"), [path]) => nested_launch(path),
+        (Some("delayed-marker"), [ready, late]) => delayed_marker(ready, late),
+        (Some("descendant-marker"), [ready, late]) => descendant_marker(ready, late),
+        #[cfg(windows)]
+        (Some("close-job-owner"), [ready, late]) => close_job_owner(ready, late),
+        #[cfg(windows)]
+        (Some("probe-handle"), [value, forbidden]) => probe_handle(value, forbidden),
         (Some("publication-interruption"), [root, gate]) => publication_interruption(root, gate),
+        (Some("echo-cwd"), []) => record(&mut io::stdout().lock(), env::current_dir()?.as_os_str()),
         (Some("echo-argv"), args) => {
             let mut output = io::stdout().lock();
             for arg in args {
