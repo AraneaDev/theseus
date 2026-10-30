@@ -2,7 +2,20 @@ use crate::preview::MAX_DRAFT_BYTES;
 use anyhow::{Result, ensure};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{Frame, layout::Rect, style::Style, text::Line};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+
+#[cfg(test)]
+thread_local! {
+    static SOURCE_VISITS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn source_visit(bytes: usize) {
+    SOURCE_VISITS.with(|visits| visits.set(visits.get() + bytes));
+}
+
+#[cfg(not(test))]
+fn source_visit(_bytes: usize) {}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum EditorAction {
@@ -19,7 +32,20 @@ pub(super) struct Editor {
     preferred_column: Option<usize>,
     top_line: Cell<usize>,
     left_cell: Cell<usize>,
+    viewport: RefCell<Option<Viewport>>,
     diagnostic: String,
+}
+
+/// A screen-sized projection. A stable draw reuses these rows instead of
+/// revisiting the raw source.
+struct Viewport {
+    width: usize,
+    frame_height: u16,
+    line_index: usize,
+    column: usize,
+    elided_marks: bool,
+    rows: Vec<String>,
+    cursor: Option<(usize, usize)>,
 }
 
 impl Editor {
@@ -32,6 +58,7 @@ impl Editor {
             preferred_column: None,
             top_line: Cell::new(0),
             left_cell: Cell::new(0),
+            viewport: RefCell::new(None),
             diagnostic: String::new(),
         })
     }
@@ -45,6 +72,7 @@ impl Editor {
         &self.diagnostic
     }
     pub(super) fn set_diagnostic(&mut self, message: &str) {
+        self.viewport.get_mut().take();
         self.diagnostic.clear();
         for c in message.chars() {
             if self.diagnostic.len() + c.len_utf8() > 256 {
@@ -107,6 +135,7 @@ impl Editor {
     }
 
     pub(super) fn paste(&mut self, text: &str) {
+        self.viewport.get_mut().take();
         self.insert(text);
     }
 
@@ -121,6 +150,7 @@ impl Editor {
                 _ => return EditorAction::None,
             }
             self.preferred_column = None;
+            self.viewport.get_mut().take();
             return EditorAction::None;
         }
         if key.modifiers.contains(KeyModifiers::ALT) {
@@ -145,10 +175,12 @@ impl Editor {
             KeyCode::End => self.cursor = self.line_end(),
             KeyCode::Up => {
                 self.vertical(false);
+                self.viewport.get_mut().take();
                 return EditorAction::None;
             }
             KeyCode::Down => {
                 self.vertical(true);
+                self.viewport.get_mut().take();
                 return EditorAction::None;
             }
             KeyCode::Backspace => {
@@ -177,6 +209,7 @@ impl Editor {
             _ => return EditorAction::None,
         }
         self.preferred_column = None;
+        self.viewport.get_mut().take();
         EditorAction::None
     }
 
@@ -187,24 +220,41 @@ impl Editor {
             return;
         }
         let width = area.width as usize;
-        let show_diagnostic = !self.diagnostic.is_empty() && area.height >= 4;
-        let chrome_height = if show_diagnostic { 4 } else { 3 };
-        let body_y = area.y.saturating_add(if show_diagnostic { 3 } else { 2 });
-        let body_height = area.height.saturating_sub(chrome_height) as usize;
-        let line_index = self.text[..self.cursor]
-            .bytes()
-            .filter(|b| *b == b'\n')
-            .count();
-        let col = self.column();
+        // Reserve one status row for a diagnostic or projection elision. Its
+        // fixed position keeps viewport sizing independent of source contents.
+        let body_y = area.y.saturating_add(3);
+        let body_height = area.height.saturating_sub(4) as usize;
+        let rebuild = self
+            .viewport
+            .borrow()
+            .as_ref()
+            .is_none_or(|view| view.width != width || view.frame_height != area.height);
+        if rebuild {
+            self.viewport
+                .replace(Some(self.project(width, body_height, area.height)));
+        }
+        let view = self.viewport.borrow();
+        let view = view.as_ref().expect("viewport was projected");
         let status = if dirty { "UNSAVED" } else { "unchanged" };
-        let heading = format!("EDIT {status} | Ln {} Col {}", line_index + 1, col + 1);
+        let heading = format!(
+            "EDIT {status} | Ln {} Col {}",
+            view.line_index + 1,
+            view.column + 1
+        );
         draw_row(frame, area.x, area.y, width, &heading);
         if area.height > 1 {
             let source_row = format!("Source: {}", bounded_safe(source, width.saturating_mul(4)));
             draw_row(frame, area.x, area.y + 1, width, &source_row);
         }
-        if show_diagnostic {
-            draw_row(frame, area.x, area.y + 2, width, &self.diagnostic);
+        if area.height > 3 {
+            if view.elided_marks && self.diagnostic.is_empty() {
+                draw_row(frame, area.x, area.y + 2, width, "Marks elided");
+            } else if view.elided_marks {
+                let message = format!("Marks elided | {}", self.diagnostic);
+                draw_row(frame, area.x, area.y + 2, width, &message);
+            } else {
+                draw_row(frame, area.x, area.y + 2, width, &self.diagnostic);
+            }
         }
         if area.height > 2 {
             draw_row(
@@ -215,8 +265,38 @@ impl Editor {
                 "CtrlT test | CtrlS save | Esc close",
             );
         }
+        for (row, projected) in view.rows.iter().enumerate() {
+            frame.buffer_mut().set_stringn(
+                area.x,
+                body_y + row as u16,
+                projected,
+                width,
+                Style::default(),
+            );
+        }
+        if let Some((x, y)) = view.cursor {
+            frame.set_cursor_position((area.x + x as u16, body_y + y as u16));
+        }
+    }
+
+    fn project(&self, width: usize, body_height: usize, frame_height: u16) -> Viewport {
+        source_visit(self.cursor);
+        let line_index = self.text[..self.cursor]
+            .bytes()
+            .filter(|b| *b == b'\n')
+            .count();
+        let column = self.column();
+        let mut view = Viewport {
+            width,
+            frame_height,
+            line_index,
+            column,
+            elided_marks: false,
+            rows: Vec::new(),
+            cursor: None,
+        };
         if body_height == 0 {
-            return;
+            return view;
         }
         let top = self.top_line.get();
         let top = if line_index < top {
@@ -238,28 +318,15 @@ impl Editor {
             left
         };
         self.left_cell.set(left);
-        for (row, line) in self
-            .text
-            .split('\n')
-            .skip(top)
-            .take(body_height)
-            .enumerate()
-        {
-            let projected = visible_line(line, left, width);
-            frame.buffer_mut().set_stringn(
-                area.x,
-                body_y + row as u16,
-                projected,
-                width,
-                Style::default(),
-            );
+        for line in self.text.split('\n').skip(top).take(body_height) {
+            let (row, elided) = visible_line(line, left, width);
+            view.elided_marks |= elided;
+            view.rows.push(row);
         }
         if cursor_cell >= left && cursor_cell - left < width {
-            frame.set_cursor_position((
-                area.x + (cursor_cell - left) as u16,
-                body_y + (line_index - top) as u16,
-            ));
+            view.cursor = Some((cursor_cell - left, line_index - top));
         }
+        view
     }
 }
 
@@ -293,6 +360,7 @@ fn scalar_width(s: &str) -> usize {
 fn cell_width(line: &str) -> usize {
     let mut cells = 0;
     for (at, c) in line.char_indices() {
+        source_visit(c.len_utf8());
         cells += if c == '\t' {
             4
         } else if c.is_control() {
@@ -304,13 +372,19 @@ fn cell_width(line: &str) -> usize {
     cells
 }
 
-fn visible_line(line: &str, left: usize, width: usize) -> String {
+fn visible_line(line: &str, left: usize, width: usize) -> (String, bool) {
     let mut projected = String::with_capacity(width.saturating_mul(4));
     let mut cell = 0;
     let mut written = 0;
+    let mut decoration_bytes = 0;
+    let mut elided_marks = false;
+    // Keep at most two display bytes of zero-cell marks per terminal cell.
+    // Positive-width scalars retain a separate budget and their true positions.
+    let decoration_budget = width.saturating_mul(2);
     let max_bytes = width.saturating_mul(8).max(8);
     let right = left.saturating_add(width);
     for (at, c) in line.char_indices() {
+        source_visit(c.len_utf8());
         let cells = if c == '\t' {
             4
         } else if c.is_control() {
@@ -318,6 +392,17 @@ fn visible_line(line: &str, left: usize, width: usize) -> String {
         } else {
             scalar_width(&line[at..at + c.len_utf8()])
         };
+        if cells == 0 {
+            if cell >= left && cell <= right {
+                if written == 0 || decoration_bytes + c.len_utf8() > decoration_budget {
+                    elided_marks = true;
+                } else {
+                    projected.push(c);
+                    decoration_bytes += c.len_utf8();
+                }
+            }
+            continue;
+        }
         if cell >= right && cells > 0 {
             break;
         }
@@ -353,12 +438,12 @@ fn visible_line(line: &str, left: usize, width: usize) -> String {
         }
         cell += cells;
     }
-    projected
+    (projected, elided_marks)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Editor, EditorAction};
+    use super::{Editor, EditorAction, SOURCE_VISITS};
     use crate::preview::MAX_DRAFT_BYTES;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
@@ -507,7 +592,7 @@ mod tests {
         assert!(text.contains("界"));
         assert!(text.contains("�"));
         assert!(!text.contains('\u{1b}'));
-        backend.assert_cursor_position((8, 2));
+        backend.assert_cursor_position((8, 3));
         assert_eq!(editor.text(), "a\t界e\u{301}\u{1b}Z");
     }
 
@@ -529,9 +614,9 @@ mod tests {
         editor.key(ctrl(KeyCode::Home));
         editor.key(key(KeyCode::Right));
         let (_, mut backend) = screen(&editor, 2, 6);
-        assert_eq!(backend.buffer()[(0, 2)].symbol(), " ");
-        assert_eq!(backend.buffer()[(1, 2)].symbol(), "a");
-        backend.assert_cursor_position((1, 2));
+        assert_eq!(backend.buffer()[(0, 3)].symbol(), " ");
+        assert_eq!(backend.buffer()[(1, 3)].symbol(), "a");
+        backend.assert_cursor_position((1, 3));
     }
 
     #[test]
@@ -559,5 +644,121 @@ mod tests {
         assert!(text.contains("bad�"));
         assert!(text.contains("CtrlT"));
         assert!(!text.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn repeated_draws_at_long_line_tail_visit_only_bounded_source() {
+        let editor = Editor::new(format!("HEAD{}TAIL", "x".repeat(MAX_DRAFT_BYTES - 8))).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        terminal
+            .draw(|frame| editor.draw(frame, Rect::new(0, 0, 40, 8), "source.toml", true))
+            .unwrap();
+        SOURCE_VISITS.with(|visits| visits.set(0));
+        for _ in 0..3 {
+            terminal
+                .draw(|frame| editor.draw(frame, Rect::new(0, 0, 40, 8), "source.toml", true))
+                .unwrap();
+        }
+        let visits = SOURCE_VISITS.with(Cell::get);
+        assert!(
+            visits < 10_000,
+            "unchanged long-line viewport visited {visits} source bytes"
+        );
+    }
+
+    #[test]
+    fn repeated_draws_at_many_line_tail_visit_only_bounded_source() {
+        let editor = Editor::new("x\n".repeat(MAX_DRAFT_BYTES / 2)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        terminal
+            .draw(|frame| editor.draw(frame, Rect::new(0, 0, 40, 8), "source.toml", true))
+            .unwrap();
+        SOURCE_VISITS.with(|visits| visits.set(0));
+        for _ in 0..3 {
+            terminal
+                .draw(|frame| editor.draw(frame, Rect::new(0, 0, 40, 8), "source.toml", true))
+                .unwrap();
+        }
+        let visits = SOURCE_VISITS.with(Cell::get);
+        assert!(
+            visits < 10_000,
+            "unchanged many-line viewport visited {visits} source bytes"
+        );
+    }
+
+    #[test]
+    fn viewport_reprojects_after_navigation_edit_and_diagnostic() {
+        let mut editor = Editor::new(format!("HEAD{}TAIL", "x".repeat(100))).unwrap();
+        assert!(screen(&editor, 20, 6).0.contains("TAIL"));
+        editor.key(ctrl(KeyCode::Home));
+        let (text, mut backend) = screen(&editor, 20, 6);
+        assert!(text.contains("HEAD"));
+        assert!(!text.contains("TAIL"));
+        backend.assert_cursor_position((0, 3));
+        editor.key(key(KeyCode::Char('Z')));
+        assert!(screen(&editor, 20, 6).0.contains("ZHEAD"));
+        editor.set_diagnostic("invalid draft");
+        let (text, mut backend) = screen(&editor, 20, 6);
+        assert!(text.contains("invalid draft"));
+        backend.assert_cursor_position((1, 3));
+    }
+
+    #[test]
+    fn huge_combining_run_elides_marks_but_keeps_printable_tail_and_cursor() {
+        let raw = format!("e{}Z", "\u{301}".repeat((MAX_DRAFT_BYTES - 2) / 2));
+        let editor = Editor::new(raw.clone()).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        terminal
+            .draw(|frame| editor.draw(frame, Rect::new(0, 0, 40, 8), "source.toml", true))
+            .unwrap();
+        let first = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(first.contains("Marks elided"));
+        assert!(first.contains('Z'));
+        terminal.backend_mut().assert_cursor_position((2, 3));
+        assert_eq!(editor.text(), raw);
+        SOURCE_VISITS.with(|visits| visits.set(0));
+        LARGEST_ALLOCATION.with(|largest| largest.set(0));
+        TRACK_ALLOCATIONS.with(|active| active.set(true));
+        for _ in 0..3 {
+            terminal
+                .draw(|frame| editor.draw(frame, Rect::new(0, 0, 40, 8), "source.toml", true))
+                .unwrap();
+        }
+        TRACK_ALLOCATIONS.with(|active| active.set(false));
+        assert!(SOURCE_VISITS.with(Cell::get) < 10_000);
+        assert!(LARGEST_ALLOCATION.with(Cell::get) < 64 * 1024);
+    }
+
+    #[test]
+    fn leading_combining_run_elides_marks_before_printable_text() {
+        let raw = format!("{}Z", "\u{301}".repeat((MAX_DRAFT_BYTES - 1) / 2));
+        let editor = Editor::new(raw.clone()).unwrap();
+        let (text, mut backend) = screen(&editor, 40, 8);
+        assert!(text.contains("Marks elided"));
+        assert!(text.contains('Z'));
+        backend.assert_cursor_position((1, 3));
+        assert_eq!(editor.text(), raw);
+    }
+
+    #[test]
+    fn action_keys_leave_unchanged_viewport_cached() {
+        let mut editor = Editor::new("x".repeat(MAX_DRAFT_BYTES)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        terminal
+            .draw(|frame| editor.draw(frame, Rect::new(0, 0, 40, 8), "source.toml", true))
+            .unwrap();
+        assert_eq!(editor.key(ctrl(KeyCode::Char('t'))), EditorAction::Validate);
+        assert_eq!(editor.key(ctrl(KeyCode::Char('s'))), EditorAction::SaveCopy);
+        SOURCE_VISITS.with(|visits| visits.set(0));
+        terminal
+            .draw(|frame| editor.draw(frame, Rect::new(0, 0, 40, 8), "source.toml", true))
+            .unwrap();
+        assert!(SOURCE_VISITS.with(Cell::get) < 10_000);
     }
 }
