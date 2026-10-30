@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import pathlib
+import posixpath
 import pty
 import select
 import shutil
@@ -33,6 +34,48 @@ def digest(path):
 
 def manifest(root):
     return {str(p.relative_to(root)): digest(p) for p in root.rglob('*') if p.is_file()}
+
+
+def expected_suite_manifest(saved):
+    """Build schema-1 field order from saved TOML, independent of the artifact."""
+    source = tomllib.loads(saved.read_text())
+    return {
+        'schema_version': source['schema_version'],
+        'name': source['name'],
+        'baseline': source['baseline'],
+        'profiles': source['profiles'],
+        'scenarios': source['scenarios'],
+        'variants': [{'id': v['id'], 'recipe': v['recipe']} for v in source['variants']],
+        'scopes': [{'id': scope['id'], 'profile': scope['profile'],
+                    'path': posixpath.normpath(scope['path'])} for scope in source['scopes']],
+        'stages': source['stages'],
+    }
+
+
+def assert_suite_provenance(value, saved, artifact_path):
+    expected = expected_suite_manifest(saved)
+    assert value['manifest'] == expected, 'saved suite manifest differs from artifact'
+    canonical = json.dumps(expected, ensure_ascii=False, separators=(',', ':')).encode()
+    assert value['manifest_digest'] == hashlib.sha256(canonical).hexdigest(), 'manifest digest differs'
+    declared = {v['id']: digest(saved.parent / v['recipe']) for v in expected['variants']}
+    assert value['recipe_digests'] == declared, 'variant recipe digests differ'
+    ids = [v['id'] for v in expected['variants']]
+    assert [s['variant_id'] for s in value['report']['sources']] == ids
+    assert [s['variant_id'] for s in value['sources']] == ids
+    for source, reference in zip(value['report']['sources'], value['sources']):
+        variant = source['variant_id']
+        assert source['outcome'] == 'passed' and source['error'] is None, source
+        assert source['recipe_digest'] == declared[variant], source
+        assert reference['error'] is None and reference['report_digest'] is not None, reference
+        assert source['report_path'] == reference['path'] + '/report.json', source
+        source_path = artifact_path.parent / source['report_path']
+        assert source_path.is_file(), source_path
+        assert reference['report_digest'] == digest(source_path), reference
+        actual = json.loads(source_path.read_text())
+        assert actual['outcome'] == 'passed', actual
+        assert actual['recipe_digest'] == declared[variant], actual
+        assert pathlib.Path(actual['recipe_path']) == (saved.parent / next(
+            v['recipe'] for v in expected['variants'] if v['id'] == variant)).resolve(), actual
 
 
 def fixture(kind, name):
@@ -208,6 +251,9 @@ def preview(kind):
     after = manifest(root)
     (evidence / (kind + '-after.json')).write_text(json.dumps(after, indent=2))
     assert all(after.get(k) == v for k, v in before.items()), 'original fixture changed'
+    assert set(after) - set(before) == {
+        'verified-copy.toml', f'{s.name}-bin/docker'
+    }, 'unexpected file created during preview editing'
     assert after['verified-copy.toml'] == digest(root / 'verified-copy.toml')
 
 
@@ -324,8 +370,7 @@ def docker():
                 assert value['recipe_digest'] == digest(saved)
             else:
                 assert value['finished'] and value['report']['outcome'] == 'passed', value
-                assert value['manifest']['name'] == tomllib.loads(saved.read_text())['name']
-                assert set(value['recipe_digests']) == {'copy', 'archive'}
+                assert_suite_provenance(value, saved, report)
                 (evidence / 'suite-saved-source.json').write_text(json.dumps({
                     'path': str(saved.resolve()), 'raw_sha256': digest(saved)}, indent=2))
             s.key(b'q')
