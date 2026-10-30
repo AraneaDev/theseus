@@ -9,6 +9,10 @@ pub struct RelativePath {
 }
 
 impl RelativePath {
+    pub(super) fn components(&self) -> &[String] {
+        &self.components
+    }
+
     pub fn parse(text: &str) -> io::Result<Self> {
         let mut components = Vec::new();
         for component in text.split('/') {
