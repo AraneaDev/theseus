@@ -1,6 +1,6 @@
 # Theseus roadmap
 
-Theseus 0.9 ships a shared Docker lifecycle engine, Ratatui workbench, headless
+Theseus 0.10 ships a shared Docker lifecycle engine, Ratatui workbench, headless
 CLI, versioned recipes/reports, private bounded logs, user/system profiles,
 clean/upgrade/reinstall, interrupted-install/upgrade, downgrade and failed-upgrade
 rollback scenarios, interrupted-upgrade rollback, decorative startup/exit animations,
@@ -72,7 +72,7 @@ Ubuntu 24.04 plus a content-marker derivative, not two distro releases. Real PTY
 cover preview with explicit start, live/offline selection, active cancellation and
 terminal restoration. Equivalent/Different/Unknown retain source lifecycle outcome
 precedence and exact image/recipe/artifact identity. Comparison artifacts use schema
-1, source report writers remain 6 and journal/ownership remain 1. These scoped
+1, current source report writers use 7 and journal/ownership remain 1. These scoped
 observations do not establish arbitrary method equivalence or package compatibility.
 
 Scalable browsing in 0.8 adds typed evidence selection, bounded metadata/detail
@@ -89,15 +89,28 @@ capture/derivation budgets stay unchanged.
   editing, explicit validation and Save Copy to a new adjacent source. A saved
   source runs only after a fresh `r`; there is no autosave or source overwrite.
 
+## Complete: local Claude Code plugins (0.10)
+
+Schema 7 adds native plugin install/update/disable/enable/uninstall through the
+shared Docker engine, with bounded typed JSON proofs, exact identity counts,
+companion/settings preservation and source/cache component checks. Public CLI
+acceptance passed `user`, `project` and `local` client scopes under Linux UID10001
+with native `2.1.312 (Claude Code)`, SHA-256
+`4f4178ce41d83e23341ebfbaecdbcf8ea6bf7baea0690025abe49eeec3a5d01d`
+and image ID
+`sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55`.
+Deliberate duplicate-list/settings/component faults, timeout/cancel and owned
+cleanup are checked; real narrow live/offline PTYs exercise retained proof,
+file digest, logs and terminal restoration. Tests use a local inert marketplace,
+empty private guest HOME/config/project, network none and no forwarded environment.
+Legacy commands appear as Skills; hooks are rehearsed manually. No credentials,
+models, automatic client event dispatch or public marketplace are claimed.
+Reports write schema 7; the new reader accepts 1 through 7, while older released
+readers need not read 7. Journals/ownership/comparison stay version 1. Typed JSON
+observations establish report consistency, not authenticated reports or independent
+query replay. See [plugin fixtures](examples/plugins/README.md).
+
 The following capabilities are planned, not available features.
-
-## Claude Code plugins
-
-- Install, update, disable and remove plugins in a disposable host configuration.
-- Verify plugin inventory, hooks, skills, commands and configuration changes.
-- Detect duplicate/stale registrations while preserving unrelated settings.
-- Record tested client versions and distinguish local checks from authenticated
-  model-backed checks that need explicitly supplied credentials.
 
 ## MCP lifecycle and client registration
 

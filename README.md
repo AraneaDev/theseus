@@ -5,7 +5,7 @@ Know what your tool leaves behind.
 Theseus rehearses CLI installation, configuration, upgrade, reinstall,
 interrupted installation/upgrade, forward recovery, declared downgrade compatibility
 or rejection, rollback after a declared failed or deliberately interrupted upgrade,
-runtime checks and uninstall in disposable Linux containers.
+runtime checks, local Claude Code plugin lifecycles and uninstall in disposable Linux containers.
 A Ratatui workbench and headless CLI use one scenario engine. Evidence includes commands, private logs, file fingerprints,
 declared check outcomes, and remaining files that need review.
 
@@ -135,6 +135,63 @@ immediate references, typed runtime/reader evidence, authorization and limits.
 Create your own starter with `theseus init`. It refuses to overwrite an existing
 recipe. Replace the failing placeholder commands **and** the `.` artifact paths
 before running it. `theseus validate --recipe PATH` validates without Docker.
+
+## Local Claude Code plugins (0.10)
+
+Schema 7 adds `plugin_lifecycle`: install v1, update to v2, disable, enable and
+uninstall, with exact inventory and preservation checks at all five checkpoints.
+Linux profile `user` (UID:GID 10001:10001) runs each client scope `user`, `project`
+or `local`; client scope is separate from the operating-system profile.
+
+Prepare a new workspace from an explicitly supplied native Linux ELF client:
+
+```sh
+python3 examples/plugins/prepare.py --client /explicit/path/to/claude \
+  --client-version '2.1.312 (Claude Code)' --scope project \
+  --output /tmp/new-plugin-project --image ubuntu:24.04
+cargo run --offline -- --no-animation validate --recipe /tmp/new-plugin-project/theseus.toml
+cargo run --offline -- --no-animation run --headless \
+  --recipe /tmp/new-plugin-project/theseus.toml --profile user --scenario plugin-lifecycle
+```
+
+The image must already be available locally. The helper streams only the supplied
+ELF into a new private directory outside the checkout's `examples/` and `tests/`
+trees, retaining its SHA-256 and size. It never discovers or executes a host client.
+The supplied version remains expected until the guest `--version` check passes.
+See [the plugin example](examples/plugins/README.md) for staging and acceptance.
+
+Each run has network `none`, no forwarded environment and disposable guest
+HOME/config/project directories. The inert local marketplace installs a target
+and an independent companion, preserving two unrelated settings through removal.
+Checks bind target identity cardinality, scope, version, enabled state and
+source/cache paths. Removal checks inventory, installed records and settings;
+old cache directories may remain. Component proofs inspect source and cache
+manifests, skill/legacy-command files and hook declarations. The cache hook is
+invoked **manually**; native details list the skill and legacy command together as
+`Skills (2)`. These observations establish neither model invocation nor automatic
+client hook dispatch, authenticated behavior, host fidelity or arbitrary marketplace
+compatibility. No credentials, model/session calls or public marketplace are used.
+
+Actual public CLI acceptance passed all three scopes with guest client
+`2.1.312 (Claude Code)`, native file size `293592432`, SHA-256
+`4f4178ce41d83e23341ebfbaecdbcf8ea6bf7baea0690025abe49eeec3a5d01d`,
+and Ubuntu image ID
+`sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55`.
+Deliberately corrupted native list output, lost settings and a removed component
+produced Failed reports after successful native updates; timeout/cancel stopped
+later client commands and retained owned cleanup. List corruption is a test fault,
+not a Claude defect. Real 80-column live/offline PTYs cover explicit start,
+scope/version/file digest, JSON identity counts, component/manual-hook labels,
+bounded logs, active cancellation and terminal restoration. Binary inputs and
+reports remain ignored local evidence.
+
+Schema-7 `json_command` checks parse one bounded complete JSON document and reject
+duplicate keys, invalid UTF-8 and excessive nesting. Finite RFC-6901 pointer
+assertions support scalar equality, absence with an existing parent, and exact
+identity counts with selected scalar values. Incomplete capture cannot pass.
+Saved typed proofs are consistency-checked against retained command observations;
+they are ordinary report data, not authenticated attestations or independent
+query replay over the original JSON. Raw output remains in bounded logs.
 
 ## Workbench controls
 
@@ -433,8 +490,8 @@ their precedence even when scoped observations match. Inspect exact image IDs,
 recipe/artifact digests and source reports; mutable tag names imply no ordering or
 compatibility. These are declared observations, not universal installer equivalence.
 
-Comparison manifests and saved artifacts use schema 1; source reports still write
-schema 6. Offline viewing/JSON recomputes results and checks contained source digests
+Comparison manifests and saved artifacts use schema 1; source reports write
+schema 7. Offline viewing/JSON recomputes results and checks contained source digests
 without Docker. JSON returns 0 for valid evidence regardless of suite outcome.
 Derivation uses a shared conservative 32 MiB budget, including JSON escaping,
 source summaries and diagnostics, before copying variable evidence. Limits also
@@ -545,13 +602,16 @@ Acquisition errors, unsupported archives, symlinked observed-root ancestors and
 observation overflow remain incomplete rather than silently passing.
 
 Runs are saved under the recipe project's `.theseus-runs/<id>/`, using private
-0700 directories and 0600 files: atomic `report.json` (schema 6), `journal.json`
-(schema 1), and separate bounded logs. Readers accept report schemas 1 through 6; schema 1
+0700 directories and 0600 files: atomic `report.json` (schema 7), `journal.json`
+(schema 1), and separate bounded logs. The new reader accepts report schemas 1 through 7;
+older released readers need not read schema 7. Schema 1
 continues to represent clean/upgrade evidence, while reinstall/comparison evidence
 requires schema 2 or later. Interruption/proof/restart evidence requires schema 3.
 Downgrade policy, checkpoints and rejection proof require schema 4. Rollback
 policy, failure proof, Changed checks and backup metadata require schema 5.
-Interrupted rollback and its typed command expectations require schema 6. Recovery
+Interrupted rollback and its typed command expectations require schema 6. Plugin
+lifecycle and bounded JSON proofs require schema 7. Recipe schemas 1 through 7
+remain supported. Recovery
 journals and ownership labels remain version 1. No observed file contents are retained except explicit command output; metadata/hashes and diffs are stored.
 Reports can be large (load limit 64 MiB). Live progress schedules read-only
 refreshes with at most one read in flight and one coalesced latest request; stale

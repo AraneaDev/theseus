@@ -7,6 +7,23 @@ use theseus::{
 };
 
 #[test]
+fn guest_version_adapter_bounds_and_exit_status_are_checked_before_json() {
+    let output = std::process::Command::new("python3")
+        .args([
+            "tests/support/plugin_prepare_test.py",
+            "GuestVersionAdapter",
+        ])
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn prepared_examples_load_all_scopes_without_host_paths_or_forwarded_environment() {
     let input = tempfile::tempdir().unwrap();
     let client = input.path().join("unexecutable-elf");

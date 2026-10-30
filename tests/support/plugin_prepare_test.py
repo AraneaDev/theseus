@@ -6,9 +6,41 @@ import subprocess
 import shutil
 import tempfile
 import unittest
+import shlex
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 PREPARE = ROOT / 'examples/plugins/prepare.py'
+
+class GuestVersionAdapter(unittest.TestCase):
+    def test_length_ascii_and_process_exit_boundaries_with_explicit_synthetic_producer(self):
+        # Only this tiny shell producer runs on the host, never a native client.
+        # Exercise the actual adapter with disposable literal paths substituted.
+        source = (ROOT / 'examples/plugins/fixture/client-version.sh').read_text()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            producer = root / 'synthetic-version-producer'
+            adapter = root / 'adapter.sh'
+            adapter.write_text(source.replace('/home/theseus/plugin-config', str(root))
+                               .replace('/workspace/plugin-project', str(root))
+                               .replace('/inputs/target/client/claude', shlex.quote(str(producer))))
+            for output, status, accepted in [
+                (b'a' * 128, 0, True),
+                (b'a' * 128 + b'\n', 0, True),
+                (b'a' * 129, 0, False),
+                ('v\u00e9rsion'.encode(), 0, False),
+                (b'2.1.312 (Claude Code)\n', 23, False),
+            ]:
+                with self.subTest(bytes=len(output), status=status, accepted=accepted):
+                    (root / 'literal-output').write_bytes(output)
+                    producer.write_text('#!/bin/sh\ncat ' + shlex.quote(str(root / 'literal-output')) + '\nexit ' + str(status) + '\n')
+                    producer.chmod(0o755)
+                    result = subprocess.run(['sh', str(adapter)], capture_output=True)
+                    if accepted:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(json.loads(result.stdout), {'version': 'a' * 128})
+                    else:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertEqual(result.stdout, b'')
 
 class Preparation(unittest.TestCase):
     def setUp(self):
