@@ -2,7 +2,9 @@ use std::{
     ffi::OsStr,
     io::{self, Read, Write},
 };
-use theseus_host::fs::{CommitScope, HostDir, PublicationError, PublishStage, RelativePath};
+use theseus_host::fs::{
+    CommitScope, HostDir, PublicationError, PublicationState, PublishStage, RelativePath,
+};
 
 fn bytes(root: &HostDir) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -32,7 +34,7 @@ fn failed_writer_preserves_published_bytes() -> io::Result<()> {
         })
         .unwrap_err();
     assert_eq!(detail(&error).stage(), PublishStage::Write);
-    assert!(!detail(&error).replaced());
+    assert_eq!(detail(&error).state(), PublicationState::NotReplaced);
     assert_eq!(bytes(&root)?, b"old");
     assert_eq!(root.entries()?, vec!["report.json"]);
     Ok(())
@@ -111,7 +113,7 @@ fn invalid_basename_never_calls_writer_or_creates_temporary() -> io::Result<()> 
             .unwrap_err();
         assert!(!called);
         assert_eq!(detail(&error).stage(), PublishStage::Reserve);
-        assert!(!detail(&error).replaced());
+        assert_eq!(detail(&error).state(), PublicationState::NotReplaced);
     }
     assert!(root.entries()?.is_empty());
     Ok(())
@@ -126,7 +128,7 @@ fn failed_replace_keeps_destination_directory_and_unrelated_files() -> io::Resul
         .write_all(b"keep")?;
     let error = publish(&root, b"new").unwrap_err();
     assert_eq!(detail(&error).stage(), PublishStage::Replace);
-    assert!(!detail(&error).replaced());
+    assert_eq!(detail(&error).state(), PublicationState::NotReplaced);
     root.open_child(&RelativePath::parse("report.json")?)?;
     assert_eq!(root.entries()?, vec!["report.json", "unrelated"]);
     assert_eq!(std::fs::read(parent.path().join("run/unrelated"))?, b"keep");
@@ -177,7 +179,7 @@ fn sharing_violation_preserves_old_file_and_cleans_temporary() -> io::Result<()>
         .open(path.join("report.json"))?;
     let error = publish(&root, b"new").unwrap_err();
     assert_eq!(detail(&error).stage(), PublishStage::Replace);
-    assert!(!detail(&error).replaced());
+    assert_eq!(detail(&error).state(), PublicationState::NotReplaced);
     assert_eq!(bytes(&root)?, b"old");
     assert_eq!(root.entries()?, vec!["report.json"]);
     drop(retained);
@@ -388,7 +390,7 @@ fn readonly_destination_is_preserved_without_delete_fallback() -> io::Result<()>
     std::fs::set_permissions(&destination, permissions)?;
     let error = publish(&root, b"new").unwrap_err();
     assert_eq!(detail(&error).stage(), PublishStage::Replace);
-    assert!(!detail(&error).replaced());
+    assert_eq!(detail(&error).state(), PublicationState::NotReplaced);
     assert!(detail(&error).cleanup_error().is_none());
     assert_eq!(bytes(&root)?, b"old");
     assert_eq!(root.entries()?, vec!["report.json"]);

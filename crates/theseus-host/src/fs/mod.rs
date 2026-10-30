@@ -184,11 +184,22 @@ pub enum PublishStage {
     ParentSync,
 }
 
+/// Observed namespace outcome, independent of the operation's error stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublicationState {
+    NotReplaced,
+    Replaced,
+    /// Completion is unobserved. Replacement may still occur; rollback and
+    /// completed temporary cleanup must not be inferred.
+    Unknown,
+}
+
 /// Payload of publication's `io::Error`, available through `get_ref().downcast_ref()`.
 /// A ParentSync failure means the new entry is already published; retry is not rollback.
 #[derive(Debug)]
 pub struct PublicationError {
     stage: PublishStage,
+    state: PublicationState,
     source: io::Error,
     cleanup: Option<io::Error>,
 }
@@ -196,8 +207,8 @@ impl PublicationError {
     pub fn stage(&self) -> PublishStage {
         self.stage
     }
-    pub fn replaced(&self) -> bool {
-        self.stage == PublishStage::ParentSync
+    pub fn state(&self) -> PublicationState {
+        self.state
     }
     /// Failure to remove the owned temporary, in addition to the primary failure.
     pub fn cleanup_error(&self) -> Option<&io::Error> {
@@ -206,18 +217,22 @@ impl PublicationError {
 }
 impl std::fmt::Display for PublicationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.replaced() {
-            write!(
+        match self.state {
+            PublicationState::Replaced => write!(
                 f,
                 "publication occurred but directory durability failed: {}",
                 self.source
-            )?;
-        } else {
-            write!(
+            )?,
+            PublicationState::NotReplaced => write!(
                 f,
                 "publication failed before replacement at {:?}: {}",
                 self.stage, self.source
-            )?;
+            )?,
+            PublicationState::Unknown => write!(
+                f,
+                "publication state UNKNOWN; replacement and cleanup are unconfirmed: {}",
+                self.source
+            )?,
         }
         if let Some(error) = &self.cleanup {
             write!(f, "; owned temporary cleanup failed: {error}")?;
@@ -230,6 +245,30 @@ impl std::error::Error for PublicationError {
         Some(&self.source)
     }
 }
+// Only a platform operation that retains its complete unresolved owner may
+// return this marker. It must never be treated as an ordinary rollback error.
+#[derive(Debug)]
+struct UnresolvedReplacement;
+impl std::fmt::Display for UnresolvedReplacement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("native rename operation retained until process exit")
+    }
+}
+impl std::error::Error for UnresolvedReplacement {}
+fn publication_state(stage: PublishStage, source: &io::Error) -> PublicationState {
+    if stage == PublishStage::Replace
+        && source
+            .get_ref()
+            .is_some_and(|e| e.is::<UnresolvedReplacement>())
+    {
+        PublicationState::Unknown
+    } else if stage == PublishStage::ParentSync {
+        PublicationState::Replaced
+    } else {
+        PublicationState::NotReplaced
+    }
+}
+
 fn publication_error(
     stage: PublishStage,
     source: io::Error,
@@ -239,6 +278,7 @@ fn publication_error(
         source.kind(),
         PublicationError {
             stage,
+            state: publication_state(stage, &source),
             source,
             cleanup,
         },
@@ -337,6 +377,11 @@ impl HostDir {
             }
         })();
         result.map_err(|(stage, source)| {
+            if publication_state(stage, &source) == PublicationState::Unknown {
+                // The native owner holds the source and directory. That source
+                // may already have its final name: never dispose/unlink it here.
+                pending.temporary = false;
+            }
             let cleanup = pending.cleanup().err();
             publication_error(stage, source, cleanup)
         })
@@ -387,8 +432,14 @@ mod publication_tests {
         cell::Cell,
         io::{Read, Write},
     };
-    thread_local! { static FAIL: Cell<Option<PublishStage>> = const { Cell::new(None) }; }
+    thread_local! {
+        static FAIL: Cell<Option<PublishStage>> = const { Cell::new(None) };
+        static UNRESOLVED: Cell<bool> = const { Cell::new(false) };
+    }
     pub(super) fn checkpoint(stage: PublishStage) -> io::Result<()> {
+        if stage == PublishStage::Replace && UNRESOLVED.get() {
+            return Err(io::Error::other(UnresolvedReplacement));
+        }
         if FAIL.get() == Some(stage) {
             Err(io::Error::other("injected publication stage failure"))
         } else {
@@ -408,6 +459,39 @@ mod publication_tests {
         });
         FAIL.set(None);
         Ok(result.unwrap_err())
+    }
+    #[test]
+    fn unresolved_replacement_is_unknown_and_never_cleans_possible_renamed_source() -> io::Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("run");
+        let root = HostDir::create_private(&path)?;
+        root.publish(OsStr::new("report"), &mut |f| f.write_all(b"old"))?;
+        UNRESOLVED.set(true);
+        let result = root.publish_with_names(
+            OsStr::new("report"),
+            &mut |f| f.write_all(b"complete new bytes"),
+            [OsString::from("91234567.890")].into_iter(),
+        );
+        UNRESOLVED.set(false);
+        let error = result.unwrap_err();
+        let detail = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<PublicationError>()
+            .unwrap();
+        assert_eq!(detail.stage(), PublishStage::Replace);
+        assert_eq!(detail.state(), PublicationState::Unknown);
+        assert!(detail.cleanup_error().is_none());
+        assert!(error.to_string().contains("UNKNOWN"));
+        assert_eq!(root.entries()?, vec!["91234567.890", "report"]);
+        assert_eq!(
+            std::fs::read(path.join("91234567.890"))?,
+            b"complete new bytes"
+        );
+        // This seam starts no kernel operation. It proves the wrapper does not
+        // delete/dispose possible renamed authority; actual pending is unexercised.
+        Ok(())
     }
     #[test]
     fn absent_destination_is_never_reserved_as_its_own_temporary() -> io::Result<()> {
@@ -463,7 +547,7 @@ mod publication_tests {
                 .downcast_ref::<PublicationError>()
                 .unwrap();
             assert_eq!(detail.stage(), PublishStage::Write);
-            assert!(!detail.replaced());
+            assert_eq!(detail.state(), PublicationState::NotReplaced);
             assert!(detail.cleanup_error().is_none());
             assert_eq!(
                 std::fs::metadata(path.join(&destination))
@@ -545,7 +629,7 @@ mod publication_tests {
                 .downcast_ref::<PublicationError>()
                 .unwrap();
             assert_eq!(detail.stage(), stage);
-            assert!(!detail.replaced());
+            assert_eq!(detail.state(), PublicationState::NotReplaced);
             assert!(detail.cleanup_error().is_none());
             assert_eq!(content(&root)?, b"old");
             assert_eq!(root.entries()?, vec!["report", "unrelated"]);
@@ -569,7 +653,7 @@ mod publication_tests {
             .downcast_ref::<PublicationError>()
             .unwrap();
         assert_eq!(detail.stage(), PublishStage::ParentSync);
-        assert!(detail.replaced());
+        assert_eq!(detail.state(), PublicationState::Replaced);
         assert!(error.to_string().contains("publication occurred"));
         assert_eq!(content(&root)?, b"complete new bytes");
         assert_eq!(root.entries()?, vec!["report"]);
