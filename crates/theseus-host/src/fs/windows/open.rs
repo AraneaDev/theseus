@@ -1,5 +1,6 @@
-use super::{identity::query, security::PrivateSecurity};
+use super::identity::query;
 use crate::fs::{RootPolicy, invalid};
+use crate::windows_security::PrivateSecurity;
 use std::{
     ffi::{OsStr, OsString},
     fs::File,

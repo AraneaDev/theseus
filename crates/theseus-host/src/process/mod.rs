@@ -6,9 +6,9 @@ mod unix;
 mod windows;
 pub use command::{ChildEnvironment, NativeCommand};
 #[cfg(unix)]
-pub use unix::OwnedChild;
+pub use unix::{OwnedChild, PipeReader, PipeWriter};
 #[cfg(windows)]
-pub use windows::OwnedChild;
+pub use windows::{OwnedChild, PipeReader, PipeWriter};
 
 use std::io;
 
@@ -26,15 +26,47 @@ pub enum HostCleanup {
     Pending(OwnedSpawnCleanup),
 }
 
-/// Retains process, primary thread and group/job authority after incomplete cleanup.
+/// Retains unresolved process, primary thread, group/job and endpoint ownership.
+/// Endpoint setup can require this guard even before a child exists.
 #[derive(Debug)]
 pub struct OwnedSpawnCleanup {
-    pub(crate) child: OwnedChild,
+    pub(crate) child: Option<Box<OwnedChild>>,
+    pub(crate) readers: Vec<PipeReader>,
+    pub(crate) writers: Vec<PipeWriter>,
 }
 impl OwnedSpawnCleanup {
     /// Retry cleanup using retained authority. On error this guard remains owned.
     pub fn try_complete(&mut self) -> io::Result<bool> {
-        self.child.cleanup()
+        let mut error = None;
+        for reader in &mut self.readers {
+            if let Err(e) = reader.cancel_and_complete() {
+                error.get_or_insert(e);
+            }
+        }
+        for writer in &mut self.writers {
+            if let Err(e) = writer.close() {
+                error.get_or_insert(e);
+            }
+        }
+        let child_complete = match &mut self.child {
+            Some(child) => match child.cleanup() {
+                Ok(complete) => complete,
+                Err(e) => {
+                    error.get_or_insert(e);
+                    false
+                }
+            },
+            None => true,
+        };
+        if let Some(error) = error {
+            return Err(error);
+        }
+        if child_complete {
+            self.child = None;
+            self.readers.clear();
+            self.writers.clear();
+        }
+        Ok(child_complete)
     }
 }
 
@@ -63,5 +95,77 @@ impl std::fmt::Display for SpawnFailure {
 impl std::error::Error for SpawnFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.error)
+    }
+}
+
+/// The child receives either the null device or an owned synchronous stdin pipe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputMode {
+    Null,
+    Pipe,
+}
+
+#[derive(Debug)]
+pub struct AcquiredChild {
+    pub child: OwnedChild,
+    pub stdin: Option<PipeWriter>,
+    pub stdout: PipeReader,
+    pub stderr: PipeReader,
+}
+
+impl OwnedChild {
+    /// Acquire an owned process/group or job and bounded, interruptible endpoints.
+    pub fn spawn(command: &NativeCommand, input: InputMode) -> Result<AcquiredChild, SpawnFailure> {
+        #[cfg(unix)]
+        use unix as platform;
+        #[cfg(windows)]
+        use windows::pipe as platform;
+        command.validate().map_err(SpawnFailure::never)?;
+        let mut readers = Vec::new();
+        let mut writers = Vec::new();
+        let result = (|| {
+            let (stdout, output) = platform::reader()?;
+            readers.push(stdout);
+            let (stderr, errors) = platform::reader()?;
+            readers.push(stderr);
+            let input = match input {
+                InputMode::Null => None,
+                InputMode::Pipe => {
+                    let (stdin, input) = platform::writer()?;
+                    writers.push(stdin);
+                    Some(input)
+                }
+            };
+            Self::spawn_files(command, input, Some(output), Some(errors))
+        })();
+        match result {
+            Ok(child) => Ok(AcquiredChild {
+                child,
+                stdin: writers.pop(),
+                stderr: readers.pop().unwrap(),
+                stdout: readers.pop().unwrap(),
+            }),
+            Err(mut failure) => {
+                let mut guard = match failure.cleanup {
+                    HostCleanup::Complete => OwnedSpawnCleanup {
+                        child: None,
+                        readers: Vec::new(),
+                        writers: Vec::new(),
+                    },
+                    HostCleanup::Pending(guard) => guard,
+                };
+                guard.readers.extend(readers);
+                guard.writers.extend(writers);
+                failure.cleanup = match guard.try_complete() {
+                    Ok(true) => HostCleanup::Complete,
+                    Ok(false) => HostCleanup::Pending(guard),
+                    Err(error) => {
+                        failure.cleanup_errors.push(error);
+                        HostCleanup::Pending(guard)
+                    }
+                };
+                Err(failure)
+            }
+        }
     }
 }

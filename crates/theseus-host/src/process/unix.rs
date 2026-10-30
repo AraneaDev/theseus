@@ -1,7 +1,7 @@
 use super::{ChildEnvironment, NativeCommand, SpawnFailure};
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
 use std::fs::File;
-use std::io;
+use std::io::{self, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
 
@@ -13,7 +13,7 @@ pub struct OwnedChild {
     termination_requested: bool,
 }
 impl OwnedChild {
-    /// Temporary Task 4 acceptance bridge; Task 5 reuses it for real endpoints.
+    /// Shared null/file launch primitive for owned endpoints and mechanism tests.
     #[doc(hidden)]
     pub fn spawn_files(
         command: &NativeCommand,
@@ -215,4 +215,60 @@ mod tests {
         owned.terminate_owned().unwrap();
         assert!(owned.cleanup().unwrap());
     }
+}
+
+/// Controller end only is nonblocking; child stdin/stdout retain blocking semantics.
+fn pair(reading: bool) -> io::Result<(File, File)> {
+    let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+    let (controller, child) = if reading {
+        (read, write)
+    } else {
+        (write, read)
+    };
+    let flags = rustix::fs::fcntl_getfl(&controller)?;
+    rustix::fs::fcntl_setfl(&controller, flags | rustix::fs::OFlags::NONBLOCK)?;
+    Ok((controller.into(), child.into()))
+}
+pub(super) fn reader() -> Result<(PipeReader, File), SpawnFailure> {
+    let (file, child) = pair(true).map_err(SpawnFailure::never)?;
+    Ok((PipeReader { file: Some(file) }, child))
+}
+pub(super) fn writer() -> Result<(PipeWriter, File), SpawnFailure> {
+    let (file, child) = pair(false).map_err(SpawnFailure::never)?;
+    Ok((PipeWriter { file: Some(file) }, child))
+}
+#[derive(Debug)]
+pub struct PipeReader {
+    file: Option<File>,
+}
+impl PipeReader {
+    /// A nonempty destination returns zero only after real peer EOF.
+    pub fn try_read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let file = self.file.as_mut().ok_or_else(stopped)?;
+        let count = out.len().min(16384);
+        file.read(&mut out[..count])
+    }
+    /// Stop new I/O. No asynchronous operation exists on a Unix nonblocking fd.
+    pub fn cancel_and_complete(&mut self) -> io::Result<()> {
+        self.file.take();
+        Ok(())
+    }
+}
+#[derive(Debug)]
+pub struct PipeWriter {
+    file: Option<File>,
+}
+impl PipeWriter {
+    pub fn try_write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let file = self.file.as_mut().ok_or_else(stopped)?;
+        file.write(&bytes[..bytes.len().min(16384)])
+    }
+    /// Closing the last owned write descriptor delivers real stdin EOF to the child.
+    pub fn close(&mut self) -> io::Result<()> {
+        self.file.take();
+        Ok(())
+    }
+}
+fn stopped() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "pipe endpoint stopped")
 }

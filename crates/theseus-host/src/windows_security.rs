@@ -13,12 +13,12 @@ use windows_sys::Win32::{
 
 /// The descriptor points into `acl`'s stable allocation, never into this moving struct.
 /// ACEs copy the SIDs, so token query storage need not outlive construction.
-pub(super) struct PrivateSecurity {
+pub(crate) struct PrivateSecurity {
     descriptor: SECURITY_DESCRIPTOR,
     _acl: Vec<usize>,
 }
 impl PrivateSecurity {
-    pub(super) fn new() -> io::Result<Self> {
+    pub(crate) fn new() -> io::Result<Self> {
         // SAFETY: All outputs use aligned owned storage; successful real token handles
         // are immediately owned. Pseudo current-thread/process handles are borrowed.
         unsafe {
@@ -59,8 +59,8 @@ impl PrivateSecurity {
                 + 2 * sid_offset
                 + GetLengthSid(user_sid) as usize
                 + GetLengthSid(system_sid) as usize;
-            let acl_bytes =
-                u16::try_from(acl_bytes).map_err(|_| super::super::invalid("ACL too large"))?;
+            let acl_bytes = u16::try_from(acl_bytes)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "ACL too large"))?;
             let mut acl = vec![0usize; (acl_bytes as usize).div_ceil(size_of::<usize>())];
             let acl_ptr = acl.as_mut_ptr().cast::<ACL>();
             checked(InitializeAcl(acl_ptr, acl_bytes as u32, ACL_REVISION))?;
@@ -96,7 +96,7 @@ impl PrivateSecurity {
             })
         }
     }
-    pub(super) fn as_ptr(&mut self) -> *const SECURITY_DESCRIPTOR {
+    pub(crate) fn as_ptr(&mut self) -> *const SECURITY_DESCRIPTOR {
         &self.descriptor
     }
 }

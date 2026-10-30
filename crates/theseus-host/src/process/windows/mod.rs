@@ -2,8 +2,10 @@
 mod encoding;
 mod job;
 mod launch;
+pub(super) mod pipe;
 use super::{NativeCommand, SpawnFailure};
 use job::Job;
+pub use pipe::{PipeReader, PipeWriter};
 use std::fs::File;
 use std::io;
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
@@ -24,7 +26,7 @@ pub struct OwnedChild {
     process_termination_requested: bool,
 }
 impl OwnedChild {
-    /// Temporary Task 4 acceptance bridge; Task 5 reuses it for real endpoints.
+    /// Shared null/file launch primitive for owned endpoints and mechanism tests.
     #[doc(hidden)]
     pub fn spawn_files(
         command: &NativeCommand,
@@ -96,7 +98,7 @@ impl OwnedChild {
     }
     pub fn reap_and_release(mut self) -> io::Result<ExitStatus> {
         self.terminate_owned()?;
-        // No pipe operation or worker is involved in this Task 4 consuming wait.
+        // The caller retains separate endpoint ownership through this process wait.
         while !self.cleanup()? {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }

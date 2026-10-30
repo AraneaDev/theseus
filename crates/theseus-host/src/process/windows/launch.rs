@@ -145,7 +145,11 @@ fn fail(
     if pending {
         return SpawnFailure {
             launch,
-            cleanup: HostCleanup::Pending(OwnedSpawnCleanup { child }),
+            cleanup: HostCleanup::Pending(OwnedSpawnCleanup {
+                child: Some(Box::new(child)),
+                readers: Vec::new(),
+                writers: Vec::new(),
+            }),
             error,
             cleanup_errors: vec![io::Error::other("injected cleanup failure")],
         };
@@ -161,7 +165,11 @@ fn fail(
     let cleanup = if complete {
         HostCleanup::Complete
     } else {
-        HostCleanup::Pending(OwnedSpawnCleanup { child })
+        HostCleanup::Pending(OwnedSpawnCleanup {
+            child: Some(Box::new(child)),
+            readers: Vec::new(),
+            writers: Vec::new(),
+        })
     };
     SpawnFailure {
         launch,
@@ -440,22 +448,38 @@ mod tests {
         let HostCleanup::Pending(guard) = &mut failure.cleanup else {
             panic!("lost cleanup authority")
         };
-        assert!(!guard.child.process.as_raw_handle().is_null());
-        assert!(!guard.child.thread.as_raw_handle().is_null());
-        assert!(!guard.child.exited_reserved().unwrap());
+        assert!(
+            !guard
+                .child
+                .as_mut()
+                .unwrap()
+                .process
+                .as_raw_handle()
+                .is_null()
+        );
+        assert!(
+            !guard
+                .child
+                .as_mut()
+                .unwrap()
+                .thread
+                .as_raw_handle()
+                .is_null()
+        );
+        assert!(!guard.child.as_mut().unwrap().exited_reserved().unwrap());
         // Inspect the retained exact thread: previous suspend count one proves
         // CREATE_SUSPENDED was applied before any fixture instruction could run.
         assert_eq!(
-            unsafe { SuspendThread(guard.child.thread.as_raw_handle()) },
+            unsafe { SuspendThread(guard.child.as_mut().unwrap().thread.as_raw_handle()) },
             1
         );
         assert_eq!(
-            unsafe { ResumeThread(guard.child.thread.as_raw_handle()) },
+            unsafe { ResumeThread(guard.child.as_mut().unwrap().thread.as_raw_handle()) },
             2
         );
         assert!(std::fs::read(out.path()).unwrap().is_empty());
-        guard.child.terminate_owned().unwrap();
-        guard.child.terminate_owned().unwrap();
+        guard.child.as_mut().unwrap().terminate_owned().unwrap();
+        guard.child.as_mut().unwrap().terminate_owned().unwrap();
         complete(&mut failure);
         assert!(std::fs::read(out.path()).unwrap().is_empty());
     }
@@ -518,30 +542,27 @@ mod tests {
             let HostCleanup::Pending(guard) = &mut failure.cleanup else {
                 panic!("requires suspended process")
             };
-            assert!(
-                guard
-                    .child
-                    .job
-                    .contains(guard.child.process.as_raw_handle())
-                    .unwrap()
-            );
-            let job = guard.child.job.terminate();
+            let child = guard.child.as_mut().unwrap();
+            assert!(child.job.contains(child.process.as_raw_handle()).unwrap());
+            let job = guard.child.as_mut().unwrap().job.terminate();
             assert!(job.is_ok());
             // Reproduce the original native sequence independently of the fix.
-            let process = unsafe { TerminateProcess(guard.child.process.as_raw_handle(), 1) };
+            let process = unsafe {
+                TerminateProcess(guard.child.as_mut().unwrap().process.as_raw_handle(), 1)
+            };
             let error = if process == 0 {
                 Some(io::Error::last_os_error().raw_os_error())
             } else {
                 None
             };
-            let signaled = guard.child.exited_reserved().unwrap();
+            let signaled = guard.child.as_mut().unwrap().exited_reserved().unwrap();
             writeln!(std::io::stdout().lock(), "termination-control attempt={attempt} TerminateJobObject=success TerminateProcess={process} error={error:?} process_signaled={signaled}").unwrap();
             if let Some(Some(code)) = error {
                 failures.push(code);
             }
             // The real successful job request covers this confirmed member.
-            guard.child.job_termination_requested = true;
-            guard.child.process_termination_requested = true;
+            guard.child.as_mut().unwrap().job_termination_requested = true;
+            guard.child.as_mut().unwrap().process_termination_requested = true;
             complete(&mut failure);
         }
         assert!(

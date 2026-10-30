@@ -2,7 +2,6 @@
 mod identity;
 mod open;
 mod publish;
-mod security;
 pub use identity::{FileFingerprint, fingerprint};
 pub use open::read_exact_at;
 pub(super) use open::{

@@ -8,6 +8,9 @@
 //! - `echo-bytes HEX`: decode an even-length ASCII hexadecimal string to stdout.
 //! - `flood COUNT [STDERR_COUNT]`: write COUNT `O` bytes to stdout, then
 //!   STDERR_COUNT `E` bytes to stderr (defaults to COUNT).
+//! - `flood-duplex COUNT`: concurrently write COUNT `O` / `E` bytes on stdout/stderr.
+//! - `delayed-read-until-eof MAX_BYTES MILLIS`: delay reading, then echo input at
+//!   EOF and report `stdin EOF received` on stderr.
 //! - `descendant MILLIS`: spawn this fixture's `hold-pipes MILLIS` with inherited
 //!   stdout/stderr, print its decimal PID and newline, then exit without waiting.
 //! - `hold-pipes MILLIS` / `ignore-stdin MILLIS`: retain streams without reading
@@ -220,6 +223,18 @@ fn probe_handle(value: &OsStr, forbidden: &OsStr) -> io::Result<()> {
     Ok(())
 }
 
+fn read_until_eof(maximum: u64) -> io::Result<()> {
+    let mut bytes = Vec::new();
+    io::stdin()
+        .lock()
+        .take(maximum + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > maximum {
+        return Err(invalid("input exceeds fixture bound"));
+    }
+    io::stdout().lock().write_all(&bytes)
+}
+
 fn run(args: &[OsString]) -> io::Result<()> {
     let (mode, args) = args
         .split_first()
@@ -277,6 +292,17 @@ fn run(args: &[OsString]) -> io::Result<()> {
                 .collect::<io::Result<Vec<_>>>()?;
             io::stdout().lock().write_all(&bytes)
         }
+        (Some("flood-duplex"), [count]) => {
+            let count = number(count, MAX_BYTES)?;
+            std::thread::scope(|scope| {
+                let errors = scope.spawn(|| flood(&mut io::stderr().lock(), b'E', count));
+                let output = flood(&mut io::stdout().lock(), b'O', count);
+                let errors = errors
+                    .join()
+                    .map_err(|_| io::Error::other("flood worker panicked"))?;
+                output.and(errors)
+            })
+        }
         (Some("flood"), [count]) => {
             let count = number(count, MAX_BYTES)?;
             flood(&mut io::stdout().lock(), b'O', count)?;
@@ -293,17 +319,12 @@ fn run(args: &[OsString]) -> io::Result<()> {
             std::thread::sleep(Duration::from_millis(number(millis, 60_000)?));
             Ok(())
         }
-        (Some("read-until-eof"), [maximum]) => {
+        (Some("read-until-eof"), [maximum]) => read_until_eof(number(maximum, MAX_BYTES)?),
+        (Some("delayed-read-until-eof"), [maximum, millis]) => {
             let maximum = number(maximum, MAX_BYTES)?;
-            let mut bytes = Vec::new();
-            io::stdin()
-                .lock()
-                .take(maximum + 1)
-                .read_to_end(&mut bytes)?;
-            if bytes.len() as u64 > maximum {
-                return Err(invalid("input exceeds fixture bound"));
-            }
-            io::stdout().lock().write_all(&bytes)
+            std::thread::sleep(Duration::from_millis(number(millis, 60_000)?));
+            read_until_eof(maximum)?;
+            writeln!(io::stderr().lock(), "stdin EOF received")
         }
         _ => Err(invalid("unknown command or wrong argument count")),
     }
