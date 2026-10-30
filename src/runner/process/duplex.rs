@@ -157,6 +157,9 @@ fn setup_failure(
     abort: &mut impl FnMut() -> Result<()>,
     message: String,
 ) -> anyhow::Error {
+    // Scoped workers must be able to join even if owned abort unwinds.
+    // Stop I/O first, but keep host signals/reaping after the owned abort.
+    process.stop.store(true, Ordering::SeqCst);
     let mut error = Some(message);
     if let Err(failure) = abort() {
         append_error(&mut error, format!("abort owned environment: {failure:#}"));
@@ -945,6 +948,117 @@ mod tests {
         assert_eq!(out.driver.offset, 5);
         assert!(out.process.cancelled && out.stdout_eof && !out.forced_abort);
     }
+    struct SetupReady(std::sync::mpsc::Sender<()>);
+    impl DuplexDriver for SetupReady {
+        fn pending_write(&self) -> &[u8] {
+            &[]
+        }
+        fn written(&mut self, _: usize) -> Result<()> {
+            Ok(())
+        }
+        fn receive(&mut self, _: &[u8]) {
+            let _ = self.0.send(());
+        }
+        fn eof(&mut self) {}
+        fn cancel(&mut self) {}
+        fn wants_close(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn second_worker_setup_failure_releases_stdout_before_abort_panic() {
+        second_worker_setup_failure(true);
+    }
+
+    #[test]
+    fn second_worker_setup_failure_preserves_abort_error_and_reaps_host() {
+        second_worker_setup_failure(false);
+    }
+
+    fn second_worker_setup_failure(panic_in_abort: bool) {
+        let mut leader = 0;
+        let mut released_before_abort = false;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // This owned inert child holds stdout independently of stdin EOF.
+            // Its lifetime is ended only by HostProcess cleanup, never a timer.
+            let mut process = HostProcess::spawn_with_stdin(
+                &mut shell("printf ready; exec /bin/sleep 30"),
+                StdinMode::Piped,
+            )
+            .unwrap();
+            leader = process.child.id();
+            let (input, output, _stderr) = configure_pipes(&mut process, &mut || Ok(())).unwrap();
+            let stop = process.stop.clone();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            thread::scope(|scope| {
+                let worker_stop = stop.clone();
+                scope.spawn(move || {
+                    let acquired = exchange(
+                        input,
+                        output,
+                        SetupReady(ready_tx),
+                        None,
+                        32,
+                        worker_stop,
+                        Arc::new(Signals::default()),
+                    );
+                    done_tx.send((acquired.stdout_eof, acquired.error)).unwrap();
+                });
+                // Prove the real exchange worker has read from the live child
+                // before injecting the second spawn's setup_failure seam.
+                let ready = ready_rx.recv_timeout(Duration::from_secs(2));
+                if ready.is_err() {
+                    stop.store(true, Ordering::SeqCst);
+                }
+                ready.unwrap();
+                setup_failure(
+                    &mut process,
+                    &mut || {
+                        let done = done_rx.recv_timeout(Duration::from_secs(2));
+                        released_before_abort = done.is_ok();
+                        // A bounded test-only rescue permits a failing RED run
+                        // to join safely without global limits or PID signals.
+                        if !released_before_abort {
+                            stop.store(true, Ordering::SeqCst);
+                        }
+                        if let Ok((eof, error)) = done {
+                            assert!(!eof && error.is_none(), "stop must release quiet stdout");
+                        }
+                        let stat = std::fs::read_to_string(format!("/proc/{leader}/stat"))?;
+                        let state = stat.rsplit_once(')').unwrap().1.trim_start();
+                        assert!(
+                            !state.starts_with('Z'),
+                            "host must remain alive during abort"
+                        );
+                        if panic_in_abort {
+                            panic!("setup abort panic");
+                        }
+                        anyhow::bail!("setup owned cleanup refused")
+                    },
+                    "start stderr worker: injected spawn failure".into(),
+                )
+            })
+        }));
+        assert!(!std::path::Path::new(&format!("/proc/{leader}")).exists());
+        eprintln!(
+            "setup seam panic={panic_in_abort} owned_leader={leader} reaped=true worker_released_before_abort={released_before_abort}"
+        );
+        if panic_in_abort {
+            let panic = result.expect_err("abort panic must propagate");
+            assert_eq!(panic.downcast_ref::<&str>(), Some(&"setup abort panic"));
+        } else {
+            let error = result.unwrap().to_string();
+            assert!(error.contains("start stderr worker: injected spawn failure"));
+            assert!(error.contains("abort owned environment: setup owned cleanup refused"));
+        }
+        assert!(
+            released_before_abort,
+            "setup abort waited for the stdout worker rescue"
+        );
+    }
+
     #[test]
     fn pipe_setup_failure_aborts_while_leader_is_reserved() {
         let mut process = HostProcess::spawn(&mut shell("sleep 30")).unwrap();
