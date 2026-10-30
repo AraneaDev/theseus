@@ -1,0 +1,189 @@
+#!/bin/sh
+# SYNTHETIC deterministic stateful replay. Never a native-client compatibility claim.
+set -eu
+export LC_ALL=C
+printf 'SYNTHETIC stateful replay client (no model/client compatibility claim)\n' >&2
+if test "$#" -eq 1 && test "$1" = --version; then
+    if test "${THESEUS_REPLAY_VERSION:-}" = __synthetic_version_with_nul__; then printf '2.1.312 (Claude Code)\000'; exit 0; fi
+    if test "${THESEUS_REPLAY_VERSION+x}" = x; then printf '%s' "$THESEUS_REPLAY_VERSION"; else printf '2.1.312 (Claude Code)\n'; fi
+    exit 0
+fi
+test "$1" = plugin || exit 64
+shift
+verb=$1
+shift
+config=${CLAUDE_CONFIG_DIR:?private guest config required}
+state=$config/synthetic-replay
+market=/workspace/local-market
+cache=$config/plugins/cache/theseus-probe-market
+mkdir -p "$state" "$config/plugins"
+fault=${THESEUS_REPLAY_FAULT:-}
+companion=theseus-companion@theseus-probe-market
+target=theseus-probe@theseus-probe-market
+user_settings=$config/settings.json
+
+settings_path() {
+    case "$1" in
+        user) printf '%s' "$user_settings" ;;
+        project) printf '%s' /workspace/plugin-project/.claude/settings.json ;;
+        local) printf '%s' /workspace/plugin-project/.claude/settings.local.json ;;
+        *) exit 64 ;;
+    esac
+}
+# Only alter the enabledPlugins object in the actual existing JSON fixture file.
+# The rest of the file, including unrelated sentinels, survives these mutations.
+write_settings() {
+    for s in user project local; do
+        file=$(settings_path "$s")
+        test -f "$file" || continue
+        entries=''
+        if test "$s" = user && test -f "$state/companion"; then
+            entries='"theseus-companion@theseus-probe-market":true'
+        fi
+        if test -f "$state/target" && test "$(cat "$state/scope")" = "$s"; then
+            if test -n "$entries"; then entries=$entries,; fi
+            entries=$entries'"theseus-probe@theseus-probe-market":'$(cat "$state/enabled")
+        fi
+        sed 's/"enabledPlugins":{[^}]*}/"enabledPlugins":{'"$entries"'}/' "$file" > "$file.new"
+        mv "$file.new" "$file"
+    done
+}
+record() {
+    name=$1
+    version=$2
+    scope=$3
+    enabled=$4
+    printf '{"id":"%s@theseus-probe-market","version":"%s","scope":"%s","enabled":%s,"installPath":"%s/%s/%s","readFromFolder":"%s/plugins/%s","folderVersion":"%s"' "$name" "$version" "$scope" "$enabled" "$cache" "$name" "$version" "$market" "$name" "$version"
+    if test "$scope" != user; then printf ',"projectPath":"/workspace/plugin-project"'; fi
+    printf '}'
+}
+installed_record() {
+    name=$1
+    version=$2
+    scope=$3
+    printf '"%s@theseus-probe-market":[{"scope":"%s","installPath":"%s/%s/%s","version":"%s"' "$name" "$scope" "$cache" "$name" "$version" "$version"
+    if test "$scope" != user; then printf ',"projectPath":"/workspace/plugin-project"'; fi
+    printf '}]'
+}
+write_inventory() {
+    {
+        printf '['
+        comma=''
+        if test -f "$state/companion"; then
+            record theseus-companion 1.0.0 user true
+            comma=,
+        fi
+        if test -f "$state/target"; then
+            printf '%s' "$comma"
+            v=$(cat "$state/version"); s=$(cat "$state/scope"); e=$(cat "$state/enabled")
+            if test -f "$state/wrong-scope"; then s=other; fi
+            record theseus-probe "$v" "$s" "$e"
+            if test -f "$state/duplicate"; then
+                printf ','
+                # A wrong-scope/stale duplicate must not disappear behind filters.
+                record theseus-probe 1.0.0 other true
+            fi
+        fi
+        printf ']\n'
+    } > "$state/inventory.json"
+    {
+        printf '{"version":2,"plugins":{'
+        comma=''
+        if test -f "$state/companion"; then installed_record theseus-companion 1.0.0 user; comma=,; fi
+        if test -f "$state/target"; then
+            printf '%s' "$comma"
+            installed_record theseus-probe "$(cat "$state/version")" "$(cat "$state/scope")"
+        fi
+        printf '}}\n'
+    } > "$config/plugins/installed_plugins.json"
+}
+
+case "$verb" in
+    marketplace)
+        test "$#" -eq 3 && test "$3" = --json || exit 64
+        case "$1:$2" in
+            add:/workspace/local-market) test -f "$market/.claude-plugin/marketplace.json"; printf '%s\n' "$market" > "$state/market" ;;
+            update:theseus-probe-market) test -f "$state/market"; printf updated > "$state/market-updated" ;;
+            *) exit 64 ;;
+        esac
+        printf 'Synthetic marketplace operation complete\n'
+        ;;
+    list)
+        test "$#" -eq 1 && test "$1" = --json || exit 64
+        test -f "$state/inventory.json"
+        if test -f "$state/updated"; then
+            case "$fault" in
+                malformed-list) printf '[broken'; exit 0 ;;
+                duplicate-key-list) printf '[{"id":"x","id":"y"}]'; exit 0 ;;
+                invalid-utf8-list) printf '\377'; exit 0 ;;
+                truncate-list) cat "$state/inventory.json"; head -c 40000 /dev/zero | tr '\000' ' '; exit 0 ;;
+            esac
+        fi
+        cat "$state/inventory.json"
+        ;;
+    details)
+        test "$#" -eq 1 && test "$1" = "$target" || exit 64
+        test -f "$state/target"
+        printf 'SYNTHETIC details observation\nSkills: 2 (one skill plus legacy hello command)\nHooks: 1\n'
+        ;;
+    install|update|disable|enable|uninstall)
+        test "$#" -eq 4 && test "$2" = --scope && test "$4" = --json || exit 64
+        id=$1; scope=$3
+        case "$scope" in user|project|local) ;; *) exit 64 ;; esac
+        case "$id" in "$target") name=theseus-probe ;; "$companion") name=theseus-companion ;; *) exit 64 ;; esac
+        test -f "$state/market" || exit 66
+        if test "$name" = theseus-probe; then
+            if test "$fault" = "fail-$verb"; then printf 'Synthetic mutation failed: %s\n' "$verb" >&2; exit 42; fi
+            if test "$verb" = update && test "$fault" = hang-update; then sleep 600; fi
+        fi
+        case "$verb" in
+            install)
+                if test "$name" = theseus-companion; then
+                    test "$scope" = user
+                    printf installed > "$state/companion"
+                else
+                    printf installed > "$state/target"
+                    printf '%s' "$scope" > "$state/scope"
+                    printf 1.0.0 > "$state/version"
+                    printf true > "$state/enabled"
+                fi
+                mkdir -p "$cache/$name/1.0.0"
+                cp -R "$market/plugins/$name/." "$cache/$name/1.0.0/"
+                ;;
+            update|disable|enable|uninstall)
+                test "$name" = theseus-probe && test -f "$state/target"
+                test "$(cat "$state/scope")" = "$scope"
+                case "$verb" in
+                    update)
+                        test -f "$state/market-updated"
+                        printf updated > "$state/updated"
+                        printf 2.0.0 > "$state/version"
+                        mkdir -p "$cache/$name/2.0.0"
+                        cp -R "$market/plugins/$name/." "$cache/$name/2.0.0/"
+                        chmod -R u+w "$cache/$name/2.0.0"
+                        case "$fault" in
+                            duplicate-target) touch "$state/duplicate" ;;
+                            wrong-scope) touch "$state/wrong-scope" ;;
+                            stale-version) printf 1.0.0 > "$state/version" ;;
+                            remove-companion) rm "$state/companion" ;;
+                            delete-setting)
+                                file=$(settings_path "$scope")
+                                sed 's/"THESEUS_SECOND":"still-here"/"OTHER":"changed"/' "$file" > "$file.new"
+                                mv "$file.new" "$file"
+                                ;;
+                            missing-component) rm "$cache/$name/2.0.0/commands/hello.md" ;;
+                            wrong-hook) printf '#!/bin/sh\nprintf wrong-hook\\n\n' > "$cache/$name/2.0.0/hooks/echo.sh" ;;
+                        esac
+                        ;;
+                    disable) printf false > "$state/enabled" ;;
+                    enable) printf true > "$state/enabled" ;;
+                    uninstall) rm "$state/target" ;;
+                esac
+                ;;
+        esac
+        write_settings
+        write_inventory
+        printf 'Synthetic %s mutated disposable state\n' "$verb"
+        ;;
+    *) exit 64 ;;
+esac

@@ -1,0 +1,8 @@
+{
+  "name": "theseus-probe",
+  "version": "2.0.0",
+  "description": "Inert local Theseus fixture",
+  "author": {
+    "name": "Theseus"
+  }
+}

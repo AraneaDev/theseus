@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use serde_json::{Value, json};
 pub fn declaration(scope: &str) -> Value {
     let mut checks = vec![
@@ -60,4 +61,50 @@ pub fn project() -> tempfile::TempDir {
     )
     .unwrap();
     t
+}
+
+/// Explicit artifact staging only: the supplied file is never executed here.
+pub fn stage_plugin(
+    client: &std::path::Path,
+    expected_version: &str,
+    scope: &str,
+) -> tempfile::TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new("python3")
+        .args(["examples/plugins/prepare.py", "--client"])
+        .arg(client)
+        .args([
+            "--client-version",
+            expected_version,
+            "--scope",
+            scope,
+            "--output",
+        ])
+        .arg(temp.path().join("prepared"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "preparation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    temp
+}
+
+/// The only shell-client staging path. Production prepare.py remains ELF-only.
+/// Both manifest and report name explicitly identify synthetic behavior.
+pub fn replace_with_replay(root: &std::path::Path) {
+    use sha2::{Digest, Sha256};
+    use std::{fs, os::unix::fs::PermissionsExt};
+    let bytes = fs::read("tests/fixtures/plugins/replay-client").unwrap();
+    let client = root.join("target/client/claude");
+    fs::write(&client, &bytes).unwrap();
+    fs::set_permissions(&client, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = root.join("input-manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest["prepared_dummy_elf"] = manifest["client"].clone();
+    manifest["provenance"] = "SYNTHETIC stateful shell replay; not native Claude acceptance".into();
+    manifest["client"]["sha256"] = format!("{:x}", Sha256::digest(&bytes)).into();
+    manifest["client"]["size"] = bytes.len().into();
+    fs::write(path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
 }

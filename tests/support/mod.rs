@@ -68,3 +68,5 @@ impl Tar {
         self.bytes
     }
 }
+
+pub mod plugin;
