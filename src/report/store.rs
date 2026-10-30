@@ -84,7 +84,7 @@ impl ReportStore {
         validate_journal(journal)?;
         self.atomic_json("journal.json", journal)
     }
-    fn atomic_json(&self, name: &str, value: &impl Serialize) -> Result<()> {
+    pub(crate) fn atomic_json(&self, name: &str, value: &impl Serialize) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(value)?;
         ensure!(
             bytes.len() as u64 <= MAX_REPORT_BYTES,
@@ -195,7 +195,7 @@ impl ReportStore {
         }
         Ok(directory)
     }
-    fn read_json<T: DeserializeOwned>(&self, name: &str) -> Result<T> {
+    pub(crate) fn read_bytes(&self, name: &str) -> Result<Vec<u8>> {
         let file = File::from(
             openat(
                 &self.directory,
@@ -215,7 +215,71 @@ impl ReportStore {
             bytes.len() as u64 <= MAX_REPORT_BYTES,
             "report/journal exceeds size limit"
         );
-        serde_json::from_slice(&bytes).context("decode report/journal JSON")
+        Ok(bytes)
+    }
+    pub(crate) fn read_json<T: DeserializeOwned>(&self, name: &str) -> Result<T> {
+        serde_json::from_slice(&self.read_bytes(name)?).context("decode report/journal JSON")
+    }
+    /// Walk every directory component without following links. The resulting fd,
+    /// not the display path, is the authority for all subsequent operations.
+    pub(crate) fn safe_root(root: &Path, create: bool) -> Result<Self> {
+        let root = if root.is_absolute() {
+            root.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(root)
+        };
+        let mut directory = File::from(open(
+            "/",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        let mut resolved = PathBuf::from("/");
+        for component in root.components() {
+            let part = match component {
+                Component::RootDir | Component::CurDir => continue,
+                Component::Normal(part) => part,
+                _ => bail!("unsafe directory path"),
+            };
+            if create {
+                match mkdirat(&directory, part, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            directory = File::from(
+                openat(
+                    &directory,
+                    part,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .context("open no-follow directory")?,
+            );
+            resolved.push(part);
+        }
+        Ok(Self {
+            root: resolved,
+            directory,
+        })
+    }
+    pub(crate) fn create_child(&self, name: &str) -> Result<Self> {
+        let parts = log_components(name)?;
+        ensure!(parts.len() == 1, "expected one directory component");
+        mkdirat(&self.directory, name, Mode::RUSR | Mode::WUSR | Mode::XUSR)?;
+        self.open_child(name)
+    }
+    pub(crate) fn open_child(&self, relative: &str) -> Result<Self> {
+        let parts = log_components(relative)?;
+        let directory = self.log_parent(&parts, false)?;
+        Ok(Self {
+            root: self.root.join(relative),
+            directory,
+        })
+    }
+    pub(crate) fn load_journal(&self) -> Result<RunJournal> {
+        let journal = self.read_json("journal.json")?;
+        validate_journal(&journal)?;
+        Ok(journal)
     }
 }
 fn log_components(relative: &str) -> Result<Vec<&str>> {
@@ -424,7 +488,10 @@ fn validate_report(report: &RunReport) -> Result<()> {
 }
 pub fn load(path: &Path) -> Result<RunReport> {
     let root = report_root(path, "report.json")?;
-    let mut report: RunReport = open_store(&root)?.read_json("report.json")?;
+    decode_report(&open_store(&root)?.read_bytes("report.json")?)
+}
+pub(crate) fn decode_report(bytes: &[u8]) -> Result<RunReport> {
+    let mut report: RunReport = serde_json::from_slice(bytes).context("decode report JSON")?;
     validate_report(&report)?;
     if report.schema_version >= 4 {
         report.recompute_outcome();

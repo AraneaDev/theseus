@@ -88,6 +88,17 @@ pub fn run_with(
     options: RunOptions,
     cancel: CancellationToken,
     environment: &mut impl Environment,
+    emit: impl FnMut(EngineEvent),
+) -> Result<RunResult> {
+    run_with_parent(recipe, options, cancel, environment, None, emit)
+}
+/// A pinned parent keeps suite-owned run creation inside the opened directory.
+pub(crate) fn run_with_parent(
+    recipe: &ValidatedRecipe,
+    options: RunOptions,
+    cancel: CancellationToken,
+    environment: &mut impl Environment,
+    parent: Option<&report::ReportStore>,
     mut emit: impl FnMut(EngineEvent),
 ) -> Result<RunResult> {
     recipe.validate_selection(&options.profiles, &options.scenarios)?;
@@ -116,8 +127,11 @@ pub fn run_with(
         std::process::id()
     );
     let directory = options.output_root.join(&id);
-    let store = report::create(&directory)
-        .with_context(|| format!("create run evidence directory {}", directory.display()))?;
+    let store = match parent {
+        Some(parent) => parent.create_child(&id),
+        None => report::create(&directory),
+    }
+    .with_context(|| format!("create run evidence directory {}", directory.display()))?;
     let mut report = RunReport::new(&id);
     report.recipe_path = recipe.path.display().to_string();
     report.recipe_digest = recipe.digest.clone();
@@ -143,8 +157,17 @@ pub fn run_with(
         None,
         None,
     )?;
-    let prepared = preflight_env(recipe, &options)
-        .and_then(|()| environment.prepare(recipe, options.pull, &cancel));
+    // Suite Started observers may cancel after failing to persist recovery refs.
+    // Do not call prepare (which can pull images) after that boundary fails.
+    // Standalone runs retain their existing pre-cancelled scenario evidence.
+    let prepared = (|| {
+        ensure!(
+            parent.is_none() || !cancel.is_cancelled(),
+            "cancelled before environment preparation"
+        );
+        preflight_env(recipe, &options)
+    })()
+    .and_then(|()| environment.prepare(recipe, options.pull, &cancel));
     match prepared {
         Err(error) => {
             report.errors.push(format!("preflight: {error:#}"));

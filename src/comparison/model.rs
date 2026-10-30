@@ -4,6 +4,7 @@ use crate::{
     snapshot::FileChange,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub const COMPARISON_SCHEMA_VERSION: u32 = 1;
@@ -81,9 +82,25 @@ pub struct ComparisonCell {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComparisonReport {
+    #[serde(default)]
+    pub sources: Vec<ComparisonSource>,
     pub cells: Vec<ComparisonCell>,
     pub outcome: RunOutcome,
     pub diagnostics: Vec<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComparisonSource {
+    pub variant_id: String,
+    pub run_id: Option<String>,
+    /// Validated relative path from the suite directory, including report.json.
+    pub report_path: Option<String>,
+    pub recipe_digest: Option<String>,
+    pub image: Option<String>,
+    pub image_id: Option<String>,
+    pub artifacts: Vec<crate::model::ArtifactDigest>,
+    pub outcome: RunOutcome,
+    pub error: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -92,6 +109,7 @@ pub struct SourceReference {
     /// Fixed relative form `sources/<variant>/<run-id>`; validated by the store.
     pub path: String,
     pub report_digest: Option<String>,
+    pub error: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -99,7 +117,11 @@ pub struct ComparisonArtifact {
     pub schema_version: u32,
     pub suite_id: String,
     pub manifest: SuiteManifest,
+    /// SHA-256 of canonical serde JSON of the manifest; does not depend on recipe files.
+    pub manifest_digest: String,
+    pub recipe_digests: BTreeMap<String, String>,
     pub sources: Vec<SourceReference>,
     pub report: ComparisonReport,
     pub cancelled: bool,
+    pub finished: bool,
 }

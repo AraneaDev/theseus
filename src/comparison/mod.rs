@@ -1,10 +1,15 @@
 //! Explicit comparison suites and pure evidence derivation.
+mod environment;
 mod manifest;
 mod model;
+mod run;
 mod scope;
+mod store;
 pub use manifest::{ValidatedSuite, ValidatedVariant, load, validate_manifest};
 pub use model::*;
+pub use run::{ComparisonEvent, ComparisonResult, SuiteRunOptions, run, run_with};
 pub use scope::compare_scope;
+pub use store::{cleanup, cleanup_with, load_report};
 
 use crate::{
     model::{ProfileName, RunOutcome, RunReport, ScenarioKind},
@@ -91,6 +96,7 @@ fn source_outcome(source: &SourceReport) -> RunOutcome {
 /// Invalid dimensions return Incomplete and no cells before matrix allocation.
 pub fn derive(suite: &SuiteManifest, sources: &[SourceReport]) -> ComparisonReport {
     let mut result = ComparisonReport {
+        sources: vec![],
         cells: vec![],
         outcome: RunOutcome::Incomplete,
         diagnostics: vec![],
@@ -113,7 +119,24 @@ pub fn derive(suite: &SuiteManifest, sources: &[SourceReport]) -> ComparisonRepo
         }
     }
     for variant in &suite.variants {
-        if let Err(reason) = source(sources, &variant.id) {
+        let source = source(sources, &variant.id).ok();
+        let report = source.and_then(|s| s.report.as_ref());
+        result.sources.push(ComparisonSource {
+            variant_id: variant.id.clone(),
+            run_id: report.map(|r| r.run_id.clone()),
+            report_path: None,
+            recipe_digest: report.map(|r| r.recipe_digest.clone()),
+            image: report.map(|r| r.image.clone()),
+            image_id: report.and_then(|r| r.image_id.clone()),
+            artifacts: report.map(|r| r.artifacts.clone()).unwrap_or_default(),
+            outcome: source.map(source_outcome).unwrap_or(RunOutcome::Incomplete),
+            error: source.and_then(|s| s.error.clone()).or_else(|| {
+                report
+                    .is_none()
+                    .then(|| "source report is unavailable".into())
+            }),
+        });
+        if let Err(reason) = self::source(sources, &variant.id) {
             result.diagnostics.push(reason);
             outcomes.push(RunOutcome::Incomplete);
         }
