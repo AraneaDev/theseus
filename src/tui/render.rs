@@ -55,7 +55,13 @@ pub fn render(frame: &mut Frame, app: &App) {
                 c.skipped_checks
             )
         })
-        .unwrap_or_else(|| "Theseus | Preview — no commands executed".into());
+        .unwrap_or_else(|| {
+            if app.has_started() {
+                "Theseus | Live evidence pending or unavailable".into()
+            } else {
+                "Theseus | Preview — no commands executed".into()
+            }
+        });
     frame.render_widget(
         Paragraph::new(safe_text(&summary))
             .block(block("Theseus", false))
@@ -64,10 +70,21 @@ pub fn render(frame: &mut Frame, app: &App) {
     );
     if app.report.is_none() {
         frame.render_widget(
-            Paragraph::new(app.preview_text())
-                .block(block("Recipe / command and environment preview", true))
-                .wrap(Wrap { trim: false })
-                .scroll((app.scroll, 0)),
+            Paragraph::new(if app.has_started() {
+                app.pending_text()
+            } else {
+                app.preview_text()
+            })
+            .block(block(
+                if app.has_started() {
+                    "Live evidence"
+                } else {
+                    "Recipe / command and environment preview"
+                },
+                true,
+            ))
+            .wrap(Wrap { trim: false })
+            .scroll((app.scroll, 0)),
             main[1],
         );
     } else {

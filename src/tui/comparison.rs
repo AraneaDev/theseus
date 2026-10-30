@@ -78,6 +78,7 @@ pub(super) fn input(app: &mut App, key: KeyEvent) {
         KeyCode::Char('c') if app.active => app.cancel_requested = true,
         KeyCode::Char('r')
             if !app.active
+                && !app.work_consumed
                 && !app.quit_requested
                 && app
                     .comparison
@@ -157,7 +158,9 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
         bounded(&m.name),
         bounded(&m.baseline),
         app.outcome(),
-        if view.report.is_none() {
+        if view.report.is_none() && app.has_started() {
+            " | Live evidence pending or unavailable"
+        } else if view.report.is_none() {
             " | Preview — no commands executed"
         } else {
             ""
@@ -237,6 +240,14 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
             detail[0],
         );
         super::render::record_panes(frame, app, detail[1], view.evidence_focus);
+    } else if app.has_started() {
+        frame.render_widget(
+            Paragraph::new(app.pending_text())
+                .block(panel("Live evidence"))
+                .wrap(Wrap { trim: false })
+                .scroll((app.scroll, 0)),
+            layout[1],
+        );
     } else {
         let mut context = format!(
             "Profiles: {:?} | Scenarios: {:?}\nStages: {:?}\n",

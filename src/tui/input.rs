@@ -25,7 +25,12 @@ pub fn input(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char('c') if app.active => app.cancel_requested = true,
-        KeyCode::Char('r') if !app.active && app.recipe.is_some() && app.report.is_none() => {
+        KeyCode::Char('r')
+            if !app.active
+                && !app.work_consumed
+                && app.recipe.is_some()
+                && app.report.is_none() =>
+        {
             app.start_requested = true
         }
         KeyCode::Char('p') if app.report.is_none() && !app.active => {

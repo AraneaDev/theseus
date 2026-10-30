@@ -35,6 +35,7 @@ impl Tab {
 pub struct App {
     pub(super) viewport: std::cell::RefCell<super::view::View>,
     pub(super) view_revision: u64,
+    pub(super) work_consumed: bool,
     pub(super) filter_draft: String,
     pub comparison: Option<super::comparison::ComparisonView>,
     pub recipe: Option<ValidatedRecipe>,
@@ -63,6 +64,7 @@ impl App {
         Self {
             viewport: Default::default(),
             view_revision: 0,
+            work_consumed: false,
             filter_draft: String::new(),
             comparison: None,
             recipe: None,
@@ -94,17 +96,39 @@ impl App {
         app.status = "Preview — press r to start".into();
         app
     }
+    pub(super) fn has_started(&self) -> bool {
+        self.work_consumed || self.active || self.terminal_error.is_some()
+    }
+    fn missing_outcome(&self) -> RunOutcome {
+        if self.has_started() {
+            RunOutcome::Incomplete
+        } else {
+            RunOutcome::Passed
+        }
+    }
+    pub(super) fn pending_text(&self) -> String {
+        let project = super::render::projection;
+        let mut text = format!(
+            "Live evidence pending or unavailable.\nSaved evidence root: {}\n{}",
+            project(&self.root.display().to_string(), 4096),
+            project(&self.status, 4096)
+        );
+        if let Some(error) = &self.terminal_error {
+            text.push_str(&format!("\n{}", project(error, 4096)));
+        }
+        safe_text(&text)
+    }
     pub fn outcome(&self) -> RunOutcome {
         if self.terminal_error.is_some() {
             RunOutcome::Incomplete
         } else if let Some(view) = &self.comparison {
             view.report
                 .as_ref()
-                .map_or(RunOutcome::Passed, |r| r.outcome)
+                .map_or(self.missing_outcome(), |r| r.outcome)
         } else {
             self.report
                 .as_ref()
-                .map_or(RunOutcome::Passed, |r| r.outcome)
+                .map_or(self.missing_outcome(), |r| r.outcome)
         }
     }
     pub fn exit_code(&self) -> i32 {
@@ -115,6 +139,19 @@ impl App {
     }
     pub fn stage(&self) -> Option<&StageReport> {
         self.scenario()?.stages.get(self.stage_index)
+    }
+    pub(super) fn pending_root(&mut self, root: PathBuf) {
+        if self.root != root {
+            self.report = None;
+            if let Some(view) = &mut self.comparison {
+                view.report = None;
+            }
+            self.root = root;
+            self.view_revision = self.view_revision.wrapping_add(1);
+            *self.viewport.borrow_mut() = Default::default();
+            self.log_text.clear();
+            self.scroll = 0;
+        }
     }
     pub fn set_report(&mut self, report: RunReport, root: PathBuf) {
         self.view_revision = self.view_revision.wrapping_add(1);

@@ -5,13 +5,11 @@ mod comparison;
 pub mod evidence;
 mod input;
 pub mod paging;
+mod refresh;
 mod render;
 pub mod terminal;
 mod view;
-use crate::{
-    engine::{self, CancellationToken, RunResult},
-    report,
-};
+use crate::engine::{self, CancellationToken, RunResult};
 use animation::{KeyAction, Presentation};
 use anyhow::{Result, anyhow};
 pub use app::{App, Focus, Tab, safe_text};
@@ -48,6 +46,7 @@ pub fn run_with_options(mut app: App, options: AnimationOptions) -> Result<i32> 
     let (guard, mut terminal) = terminal::Guard::enter()?;
     let (events_tx, mut events_rx) = mpsc::channel(32);
     let mut result_rx: Option<oneshot::Receiver<Result<WorkResult>>> = None;
+    let mut refresh = refresh::Coordinator::live(runtime.handle().clone());
     let mut quit_deadline = None;
     let mut last_path: Option<PathBuf> = None;
     let started = Instant::now();
@@ -62,14 +61,21 @@ pub fn run_with_options(mut app: App, options: AnimationOptions) -> Result<i32> 
                 latest = Some(event);
             }
             if let Some(event) = latest {
-                apply_event(&mut app, event, &mut last_path);
+                refresh.event(&mut app, event, &mut last_path);
             }
+            service_control(
+                &mut app,
+                &mut presentation,
+                &cancel,
+                &terminate,
+                &mut quit_deadline,
+                Instant::now(),
+            );
             if let Some(receiver) = &mut result_rx {
                 match receiver.try_recv() {
                     Ok(result) => {
-                        complete_work(&mut app, result)?;
+                        refresh.complete(&mut app, result)?;
                         result_rx = None;
-                        app.refresh_logs();
                     }
                     Err(oneshot::error::TryRecvError::Closed) => {
                         return Err(anyhow!("engine worker ended without delivering its result"));
@@ -77,36 +83,15 @@ pub fn run_with_options(mut app: App, options: AnimationOptions) -> Result<i32> 
                     Err(oneshot::error::TryRecvError::Empty) => {}
                 }
             }
-            if terminate.is_cancelled() {
-                presentation.bypass();
-                app.quit_requested = true;
-                if app.active {
-                    app.cancel_requested = true;
-                }
-            }
-            if app.cancel_requested && app.active {
-                cancel.cancel();
-                app.status = "Cancellation requested; waiting for owned-resource teardown".into();
-            }
             if let Some(result) = quit_result(&app, &mut presentation, started.elapsed()) {
                 return result;
             }
-            if app.quit_requested && app.active {
-                presentation.bypass();
-                cancel.cancel();
-                let deadline =
-                    quit_deadline.get_or_insert_with(|| Instant::now() + Duration::from_secs(5));
-                if Instant::now() >= *deadline {
-                    return Err(anyhow!(
-                        "cleanup window expired; worker may still be cleaning. Inspect saved report/journal and run theseus cleanup {}. Unresolved resources: {}",
-                        last_path
-                            .as_ref()
-                            .and_then(|p| p.parent())
-                            .map_or("<pending report>".into(), crate::shell::path_argument),
-                        unresolved(&app)
-                    ));
-                }
+            if let Some(error) =
+                cleanup_timeout(&app, quit_deadline, last_path.as_ref(), Instant::now())
+            {
+                return Err(error);
             }
+            refresh.poll(&mut app);
             if app.start_requested && !app.quit_requested {
                 match take_work(&mut app) {
                     Err(error) => app.status = format!("Cannot start: {error:#}"),
@@ -236,6 +221,46 @@ fn handle_key(
     }
 }
 
+// Service signals before completion can clear active, just like the key boundary.
+fn service_control(
+    app: &mut App,
+    presentation: &mut Presentation,
+    cancel: &CancellationToken,
+    terminate: &CancellationToken,
+    quit_deadline: &mut Option<Instant>,
+    now: Instant,
+) {
+    if terminate.is_cancelled() {
+        presentation.bypass();
+        app.quit_requested = true;
+        if app.active {
+            app.cancel_requested = true;
+        }
+    }
+    if app.cancel_requested && app.active {
+        cancel.cancel();
+        app.status = "Cancellation requested; waiting for owned-resource teardown".into();
+    }
+    if app.quit_requested && app.active {
+        presentation.bypass();
+        cancel.cancel();
+        quit_deadline.get_or_insert(now + Duration::from_secs(5));
+    }
+}
+
+fn cleanup_timeout(
+    app: &App,
+    deadline: Option<Instant>,
+    last_path: Option<&PathBuf>,
+    now: Instant,
+) -> Option<anyhow::Error> {
+    (app.quit_requested && app.active && deadline.is_some_and(|deadline| now >= deadline)).then(|| anyhow!(
+        "cleanup window expired; worker may still be cleaning. Inspect saved report/journal and run theseus cleanup {}. Unresolved resources: {}",
+        last_path.and_then(|p| p.parent()).map_or("<pending report>".into(), crate::shell::path_argument),
+        unresolved(app)
+    ))
+}
+
 fn unresolved(app: &App) -> String {
     if app.comparison.is_some() {
         return format!(
@@ -311,18 +336,24 @@ impl Work {
     }
 }
 fn take_work(app: &mut App) -> Result<Option<Work>> {
-    if !std::mem::take(&mut app.start_requested) || app.active || app.quit_requested {
+    if !std::mem::take(&mut app.start_requested)
+        || app.active
+        || app.quit_requested
+        || app.work_consumed
+    {
         return Ok(None);
     }
     if let Some(view) = &app.comparison {
         if view.report.is_some() {
             return Ok(None);
         }
-        return Ok(view
+        let work = view
             .suite
             .clone()
             .zip(view.options.clone())
-            .map(|(s, o)| Work::Suite(s, o)));
+            .map(|(s, o)| Work::Suite(s, o));
+        app.work_consumed = work.is_some();
+        return Ok(work);
     }
     if app.report.is_some() {
         return Ok(None);
@@ -331,30 +362,30 @@ fn take_work(app: &mut App) -> Result<Option<Work>> {
         return Ok(None);
     };
     recipe.validate_selection(&options.profiles, &options.scenarios)?;
+    app.work_consumed = true;
     Ok(Some(Work::Run(recipe, options)))
 }
-fn apply_event(app: &mut App, event: WorkEvent, last_path: &mut Option<PathBuf>) {
-    match event {
-        WorkEvent::Run(event) => {
-            *last_path = Some(event.report_path.clone());
-            app.root = event.report_path.parent().unwrap().to_path_buf();
-            if let Ok(report) = report::load(&event.report_path) {
-                app.set_report(report, app.root.clone());
-                app.status = format!(
-                    "Running {:?} {} {}",
-                    event.kind,
-                    event.scenario_id.unwrap_or_default(),
-                    event.stage.unwrap_or_default()
-                );
-            }
-        }
-        WorkEvent::Suite(event) => {
-            *last_path = Some(event.report_path.clone());
-            app.root = event.report_path.parent().unwrap().to_path_buf();
-            if let Ok(document) = crate::comparison::load_document(&event.report_path) {
-                app.set_comparison_report(document.report, app.root.clone());
-            }
-            app.status = format!(
+// Latch recovery context before scheduling any disk work.
+fn apply_event(
+    app: &mut App,
+    event: WorkEvent,
+    last_path: &mut Option<PathBuf>,
+) -> (refresh::Kind, PathBuf) {
+    let (kind, path, status) = match event {
+        WorkEvent::Run(event) => (
+            refresh::Kind::Run,
+            event.report_path,
+            format!(
+                "Running {:?} {} {}",
+                event.kind,
+                event.scenario_id.unwrap_or_default(),
+                event.stage.unwrap_or_default()
+            ),
+        ),
+        WorkEvent::Suite(event) => (
+            refresh::Kind::Suite,
+            event.report_path,
+            format!(
                 "Running suite | {} {}",
                 event.variant_id.unwrap_or_default(),
                 event.source.map_or(String::new(), |e| format!(
@@ -362,9 +393,17 @@ fn apply_event(app: &mut App, event: WorkEvent, last_path: &mut Option<PathBuf>)
                     e.kind,
                     e.stage.unwrap_or_default()
                 ))
-            );
-        }
-    }
+            ),
+        ),
+    };
+    *last_path = Some(path.clone());
+    app.pending_root(
+        path.parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf(),
+    );
+    app.status = status;
+    (kind, path)
 }
 // Shared completion boundary, also exercised without a terminal in regressions.
 fn complete_work(app: &mut App, result: Result<WorkResult>) -> Result<()> {
@@ -424,6 +463,40 @@ mod tests {
         StageReport, TeardownStatus,
     };
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn event_latches_recovery_and_status_even_when_report_cannot_be_loaded() {
+        let mut app = App::offline(RunReport::new("old-root-evidence"), PathBuf::from("/old"));
+        app.active = true;
+        let mut last = None;
+        apply_event(
+            &mut app,
+            WorkEvent::Run(engine::EngineEvent {
+                kind: engine::EventKind::StageStarted,
+                report_path: PathBuf::from("/missing-new-root/report.json"),
+                scenario_id: Some("user-clean".into()),
+                stage: Some("install".into()),
+            }),
+            &mut last,
+        );
+        assert!(
+            app.status.contains("StageStarted"),
+            "event status must not wait for a successful read"
+        );
+        assert_eq!(last, Some(PathBuf::from("/missing-new-root/report.json")));
+        assert_eq!(app.root, PathBuf::from("/missing-new-root"));
+        assert!(
+            app.report.is_none(),
+            "old document must not acquire a different root"
+        );
+        assert!(complete_run(&mut app, Err(anyhow!("final persistence failed"))).is_err());
+        assert!(
+            app.terminal_error
+                .as_ref()
+                .unwrap()
+                .contains("/missing-new-root/report.json")
+        );
+    }
 
     #[test]
     fn cached_worker_error_quit_keeps_diagnostic_when_animation_is_disabled_dumb_or_small() {
@@ -633,6 +706,43 @@ mod comparison_tests {
         assert!(!t.path().join("output").exists());
     }
     #[test]
+    fn invalid_run_selection_does_not_consume_the_single_start() {
+        let t = tempfile::tempdir().unwrap();
+        fixtures::recipe_suite(t.path());
+        let recipe = crate::recipe::load(&t.path().join("copy.toml")).unwrap();
+        let mut options = engine::RunOptions::all(&recipe);
+        options.profiles = vec![crate::model::ProfileName::System];
+        let mut app = App::preview(recipe, options);
+        app.start_requested = true;
+        assert!(take_work(&mut app).is_err());
+        app.options.as_mut().unwrap().profiles = vec![crate::model::ProfileName::User];
+        app.start_requested = true;
+        assert!(take_work(&mut app).unwrap().is_some());
+        app.start_requested = true;
+        assert!(take_work(&mut app).unwrap().is_none());
+    }
+    #[test]
+    fn suite_without_first_saved_report_cannot_launch_a_second_engine() {
+        let t = tempfile::tempdir().unwrap();
+        let path = fixtures::recipe_suite(t.path());
+        let mut app = App::comparison_preview(
+            suites::load(&path).unwrap(),
+            SuiteRunOptions {
+                output_root: t.path().join("output"),
+                pull: false,
+            },
+        );
+        app.start_requested = true;
+        assert!(take_work(&mut app).unwrap().is_some());
+        app.active = true;
+        assert!(complete_work(&mut app, Err(anyhow!("first save failed"))).is_err());
+        app.start_requested = true;
+        assert!(
+            take_work(&mut app).unwrap().is_none(),
+            "an App must consume its engine start once even without a saved report"
+        );
+    }
+    #[test]
     fn suite_ready_completion_retains_cancel_deadline_and_persisted_failed_outcome() {
         let t = tempfile::tempdir().unwrap();
         let root = fixtures::saved(t.path());
@@ -751,6 +861,9 @@ mod comparison_tests {
         assert!(!app.start_requested);
         assert!(take_work(&mut app).unwrap().is_none());
         assert!(!t.path().join("output").exists());
+        app.start_requested = true;
+        assert!(take_work(&mut app).unwrap().is_some());
+        app.active = true;
         let root = fixtures::saved(t.path());
         let mut last = None;
         apply_event(
@@ -764,7 +877,8 @@ mod comparison_tests {
         );
         assert_eq!(last, Some(root.join("comparison.json")));
         assert_eq!(app.root, root);
-        assert_eq!(app.outcome(), crate::model::RunOutcome::Failed);
+        assert!(app.comparison.as_ref().unwrap().report.is_none());
+        assert_eq!(app.outcome(), crate::model::RunOutcome::Incomplete);
         assert_eq!(app.comparison.as_ref().unwrap().manifest.baseline, "copy");
         input(&mut app, KeyCode::Char('r').into());
         assert!(take_work(&mut app).unwrap().is_none());
