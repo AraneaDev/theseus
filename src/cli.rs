@@ -173,7 +173,7 @@ pub fn execute(cli: Cli) -> Result<i32> {
                                 || "<not started>".into(),
                                 |p| root.join(p).display().to_string()
                             ),
-                            root.display()
+                            crate::shell::path_argument(root)
                         ))
                     );
                 }

@@ -1,0 +1,2 @@
+FROM ubuntu:24.04
+RUN printf "controlled marker, same Ubuntu base\n" > /theseus-comparison-image-marker

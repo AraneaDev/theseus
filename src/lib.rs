@@ -9,3 +9,5 @@ pub mod report;
 pub mod runner;
 pub mod snapshot;
 pub mod tui;
+
+pub(crate) mod shell;

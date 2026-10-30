@@ -1,0 +1,32 @@
+schema_version = 1
+name = "Same comparison-cli: images"
+baseline = "copy"
+profiles = ["user", "system"]
+scenarios = ["clean"]
+stages = ["target_installed", "configured", "uninstalled"]
+[[variants]]
+id = "copy"
+recipe = "copy.toml"
+[[variants]]
+id = "image-marker"
+recipe = "image-marker.toml"
+
+[[scopes]]
+id = "user-binary"
+profile = "user"
+path = "/home/theseus/.local/bin/comparison-cli"
+
+[[scopes]]
+id = "user-settings"
+profile = "user"
+path = "/home/theseus/.config/comparison-cli"
+
+[[scopes]]
+id = "system-binary"
+profile = "system"
+path = "/usr/local/bin/comparison-cli"
+
+[[scopes]]
+id = "system-settings"
+profile = "system"
+path = "/home/theseus/.config/comparison-cli"

@@ -1,0 +1,76 @@
+schema_version = 2
+name = "comparison-cli image-marker"
+image = "theseus-comparison:marker"
+network = "none"
+scenarios = ["clean"]
+observe = ["/home/theseus", "/usr/local/bin"]
+[artifacts]
+target = "artifact"
+
+[profiles.user.steps.install_target]
+script = "mkdir -p /home/theseus/.local/bin; cp /inputs/target/comparison-cli /home/theseus/.local/bin/comparison-cli; chmod 755 /home/theseus/.local/bin/comparison-cli; chown 10001:10001 /home/theseus/.local/bin/comparison-cli"
+
+[profiles.user.steps.configure]
+script = "comparison-cli configure"
+
+[profiles.user.steps.exercise]
+script = "comparison-cli smoke"
+
+[profiles.user.steps.uninstall]
+script = "rm -f /home/theseus/.local/bin/comparison-cli"
+
+[[profiles.user.checks]]
+id = "version"
+checkpoint = "target_installed"
+kind = "executable"
+name = "comparison-cli"
+resolved_path = "/home/theseus/.local/bin/comparison-cli"
+args = ["--version"]
+expected_exit = 0
+stdout_contains = "comparison-cli 1.0.0"
+
+[[profiles.user.checks]]
+id = "removed"
+checkpoint = "uninstalled"
+kind = "absent"
+path = "/home/theseus/.local/bin/comparison-cli"
+
+[[profiles.user.checks]]
+id = "settings-retained"
+checkpoint = "uninstalled"
+kind = "preserved"
+path = "/home/theseus/.config/comparison-cli/settings"
+
+[profiles.system.steps.install_target]
+script = "mkdir -p /usr/local/bin; cp /inputs/target/comparison-cli /usr/local/bin/comparison-cli; chmod 755 /usr/local/bin/comparison-cli; chown 10001:10001 /usr/local/bin/comparison-cli"
+
+[profiles.system.steps.configure]
+script = "comparison-cli configure"
+
+[profiles.system.steps.exercise]
+script = "comparison-cli smoke"
+
+[profiles.system.steps.uninstall]
+script = "rm -f /usr/local/bin/comparison-cli"
+
+[[profiles.system.checks]]
+id = "version"
+checkpoint = "target_installed"
+kind = "executable"
+name = "comparison-cli"
+resolved_path = "/usr/local/bin/comparison-cli"
+args = ["--version"]
+expected_exit = 0
+stdout_contains = "comparison-cli 1.0.0"
+
+[[profiles.system.checks]]
+id = "removed"
+checkpoint = "uninstalled"
+kind = "absent"
+path = "/usr/local/bin/comparison-cli"
+
+[[profiles.system.checks]]
+id = "settings-retained"
+checkpoint = "uninstalled"
+kind = "preserved"
+path = "/home/theseus/.config/comparison-cli/settings"

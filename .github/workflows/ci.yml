@@ -30,3 +30,6 @@ jobs:
 
       - name: Real Docker interrupted rollback acceptance (required)
         run: cargo test --locked --test interrupted_rollback_lifecycle -- --ignored --test-threads=1
+
+      - name: Real comparison Docker and PTY acceptance (required)
+        run: cargo test --locked --test comparison_docker -- --ignored --test-threads=1

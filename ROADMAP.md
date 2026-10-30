@@ -1,6 +1,6 @@
 # Theseus roadmap
 
-Theseus 0.6 ships a shared Docker lifecycle engine, Ratatui workbench, headless
+Theseus 0.7 ships a shared Docker lifecycle engine, Ratatui workbench, headless
 CLI, versioned recipes/reports, private bounded logs, user/system profiles,
 clean/upgrade/reinstall, interrupted-install/upgrade, downgrade and failed-upgrade
 rollback scenarios, interrupted-upgrade rollback, decorative startup/exit animations,
@@ -64,11 +64,21 @@ Scenes are decorative and make no lifecycle-progress or success claim. Active
 quit cancels immediately, and signals/errors/cleanup deadlines bypass exit scenes.
 Actual normal and active Docker PTYs verify controls and terminal restoration.
 
+Comparison suites add explicit baseline variants, profiles/scenarios, exact stages
+and application scopes through the existing engine. Self-contained copy/archive
+and two distinct image-ID fixtures cover both profiles, deliberate scoped differences,
+failed sources, cancellation, owned cleanup and offline JSON. The image fixture is
+Ubuntu 24.04 plus a content-marker derivative, not two distro releases. Real PTYs
+cover preview with explicit start, live/offline selection, active cancellation and
+terminal restoration. Equivalent/Different/Unknown retain source lifecycle outcome
+precedence and exact image/recipe/artifact identity. Comparison artifacts use schema
+1, source report writers remain 6 and journal/ownership remain 1. These scoped
+observations do not establish arbitrary method equivalence or package compatibility.
+
 The following capabilities are planned, not available features.
 
-## Next: comparisons and scalable browsing
+## Next: scalable browsing
 
-- Comparisons between installation methods and image versions.
 - More scalable metadata/log paging for large reports and preview editing.
 
 ## Claude Code plugins

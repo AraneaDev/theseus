@@ -241,7 +241,7 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
             if let Some(path) = &source.report_path {
                 text += &format!(
                     "Source logs/commands: theseus report {}\n",
-                    app.root.join(path).display()
+                    crate::shell::path_argument(&app.root.join(path))
                 );
             }
             if let Some(error) = &source.error {
@@ -251,7 +251,10 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
         for diagnostic in &report.diagnostics {
             text += &format!("{}\n", bounded(diagnostic));
         }
-        text += &format!("Recovery: theseus cleanup {}\n", app.root.display());
+        text += &format!(
+            "Recovery: theseus cleanup {}\n",
+            crate::shell::path_argument(&app.root)
+        );
         if let Some(cell) = report.cells.get(view.row) {
             let total = cell.comparison.differences.len();
             text += &format!(
@@ -263,7 +266,7 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
                 } else {
                     ""
                 },
-                app.root.display()
+                crate::shell::path_argument(&app.root)
             );
             for change in cell.comparison.differences.iter().take(DISPLAY_DIFFERENCES) {
                 text += &format!(

@@ -99,7 +99,7 @@ pub fn run_with_options(mut app: App, options: AnimationOptions) -> Result<i32> 
                         last_path
                             .as_ref()
                             .and_then(|p| p.parent())
-                            .map_or("<pending report>".into(), |p| p.display().to_string()),
+                            .map_or("<pending report>".into(), crate::shell::path_argument),
                         unresolved(&app)
                     ));
                 }
@@ -393,7 +393,7 @@ fn complete_work(app: &mut App, result: Result<WorkResult>) -> Result<()> {
                             "report.json"
                         })
                         .display(),
-                    app.root.display()
+                    crate::shell::path_argument(&app.root)
                 )
             });
             app.status =
@@ -671,7 +671,9 @@ mod comparison_tests {
     #[test]
     fn suite_error_quit_prioritizes_diagnostic_and_suite_recovery_over_cached_outcome() {
         let t = tempfile::tempdir().unwrap();
-        let root = fixtures::saved(t.path());
+        let parent = t.path().join("space ' $(touch INJECTED) ;");
+        std::fs::create_dir(&parent).unwrap();
+        let root = fixtures::saved(&parent);
         let mut app = App::comparison_offline(suites::load_document(&root).unwrap(), root.clone());
         app.active = true;
         complete_work(&mut app, Err(anyhow!("suite final save failed"))).unwrap();
@@ -683,7 +685,32 @@ mod comparison_tests {
             .to_string();
         assert!(error.contains("suite final save failed"));
         assert!(error.contains(&root.join("comparison.json").display().to_string()));
-        assert!(error.contains("theseus cleanup"));
+        let command = error
+            .lines()
+            .find_map(|line| line.strip_prefix("Recovery: "))
+            .unwrap();
+        let bin = t.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let receiver = bin.join("theseus");
+        std::fs::write(
+            &receiver,
+            "#!/bin/sh\nprintf '%s\\n' \"$#\" \"$1\" \"$2\"\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&receiver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", command])
+            .env("PATH", &bin)
+            .current_dir(t.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            format!("2\ncleanup\n{}\n", root.display())
+        );
+        assert!(!t.path().join("INJECTED").exists());
         assert_eq!(app.exit_code(), 2);
         assert!(unresolved(&app).contains("source journals"));
         let document = LoadedComparison {

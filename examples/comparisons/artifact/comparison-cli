@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+case "${1:---version}" in
+--version) echo 'comparison-cli 1.0.0' ;;
+configure) mkdir -p "$XDG_CONFIG_HOME/comparison-cli"; printf 'colour=blue\n' > "$XDG_CONFIG_HOME/comparison-cli/settings" ;;
+smoke) test "$(cat "$XDG_CONFIG_HOME/comparison-cli/settings")" = colour=blue; echo healthy ;;
+*) exit 2 ;;
+esac

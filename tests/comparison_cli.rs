@@ -116,3 +116,39 @@ fn headless_compare_records_single_source_failure_and_suite_recovery_without_doc
     assert!(!out.stderr.contains(&0x1b));
     assert!(!t.path().join(".theseus-runs").exists());
 }
+
+#[test]
+fn headless_recovery_command_preserves_quoted_root() {
+    use std::os::unix::fs::symlink;
+    let t = tempfile::tempdir().unwrap();
+    let parent = t.path().join("space ' $(touch INJECTED) ;");
+    fs::create_dir(&parent).unwrap();
+    let path = support::recipe_suite(&parent);
+    let out = cli()
+        .args(["compare", "--suite"])
+        .arg(path)
+        .arg("--headless")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let error = String::from_utf8(out.stderr).unwrap();
+    let command = error
+        .lines()
+        .find_map(|line| line.strip_prefix("Recovery: "))
+        .unwrap();
+    let bin = t.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    symlink(env!("CARGO_BIN_EXE_theseus"), bin.join("theseus")).unwrap();
+    let out = Command::new("/bin/sh")
+        .args(["-c", command])
+        .current_dir(t.path())
+        .env("PATH", bin)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!t.path().join("INJECTED").exists());
+}

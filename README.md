@@ -379,6 +379,34 @@ Reports identify both comparison stages and retain changed-child evidence on the
 comparison checkpoint. Use exact-path `preserved` for retention against configured state;
 it does not recursively assert a directory’s children.
 
+## Comparison suites (0.7)
+
+Compare declared installation methods or actual image IDs through the same engine:
+
+```sh
+theseus compare --suite examples/comparisons/methods.toml             # preview; r starts
+theseus compare --suite examples/comparisons/methods.toml --headless
+theseus comparison 'examples/comparisons/.theseus-comparisons/ID' --json
+theseus cleanup 'examples/comparisons/.theseus-comparisons/ID'
+```
+
+The [self-contained comparison walkthrough](examples/comparisons/README.md) includes
+copy/archive methods, two distinct actual image IDs on the same Ubuntu base,
+validation/build commands, limits, controls, source logs and safe cleanup.
+Variants run sequentially with fresh owned containers for the same selected matrix.
+Scopes compare relative keys and all captured file metadata/content hashes and child
+membership. Equivalent includes verified absence at both ends; Different makes the
+suite Failed; Unknown evidence makes it Incomplete. Source lifecycle failures retain
+their precedence even when scoped observations match. Inspect exact image IDs,
+recipe/artifact digests and source reports; mutable tag names imply no ordering or
+compatibility. These are declared observations, not universal installer equivalence.
+
+Comparison manifests and saved artifacts use schema 1; source reports still write
+schema 6. Offline viewing/JSON recomputes results and checks contained source digests
+without Docker. JSON returns 0 for valid evidence regardless of suite outcome.
+The UI labels its 100-difference display prefix and 512-character text elision;
+use the displayed safely quoted JSON command for complete bounded stored evidence.
+
 ## Outcomes, limits, and recovery
 
 Reports distinguish failed expectations, incomplete observations, cancelled work,
@@ -499,7 +527,7 @@ cargo fmt --check
 cargo clippy --offline --locked --all-targets -- -D warnings
 cargo test --offline --locked
 cargo build --offline --locked --release
-cargo test --offline --locked --test docker_lifecycle --test interruption_lifecycle --test downgrade_lifecycle --test rollback_lifecycle --test interrupted_rollback_lifecycle -- --ignored --test-threads=1
+cargo test --offline --locked --test docker_lifecycle --test interruption_lifecycle --test downgrade_lifecycle --test rollback_lifecycle --test interrupted_rollback_lifecycle --test comparison_docker -- --ignored --test-threads=1
 ```
 
 Regular tests include wide/narrow TestBackend behavior and actual Unix PTY
@@ -525,7 +553,7 @@ Interrupted-rollback acceptance adds both profiles/policies with same-ID stop an
 restart, original/immediate/fresh reference boundaries, typed runtime/reader proof,
 faults that block restoration and exact owned teardown. Default animation PTYs
 exercise frames, skips, discarded input, opt-outs, active cancellation, signals,
-errors and terminal restoration. All five ignored Docker test binaries are
+errors and terminal restoration. All six ignored Docker test binaries are
 explicitly required in CI. Actual PTYs exercise narrow live selection, new-report
 comparison visibility, offline viewing, and terminal recovery.
 
