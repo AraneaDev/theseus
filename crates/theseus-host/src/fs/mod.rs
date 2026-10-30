@@ -285,9 +285,27 @@ impl HostDir {
         name: &OsStr,
         write: &mut dyn FnMut(&mut File) -> io::Result<()>,
     ) -> io::Result<CommitScope> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let names = std::iter::repeat_with(|| {
+            let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Numeric-only, valid 8.3 names avoid case aliases and a distinct
+            // generated NTFS short name. Collisions remain exclusive-create errors.
+            let value =
+                serial.wrapping_add(u64::from(std::process::id()) * 1_000_000) % 100_000_000_000;
+            OsString::from(format!("{:08}.{:03}", value / 1_000, value % 1_000))
+        })
+        .take(128);
+        self.publish_with_names(name, write, names)
+    }
+    fn publish_with_names(
+        &self,
+        name: &OsStr,
+        write: &mut dyn FnMut(&mut File) -> io::Result<()>,
+        names: impl Iterator<Item = OsString>,
+    ) -> io::Result<CommitScope> {
         let mut pending = publication_step(PublishStage::Reserve, || {
             validate_name(name)?;
-            self.reserve_publication()
+            self.reserve_publication_names(name, names)
         })
         .map_err(|e| publication_error(PublishStage::Reserve, e, None))?;
         let result = (|| {
@@ -323,21 +341,25 @@ impl HostDir {
             publication_error(stage, source, cleanup)
         })
     }
-    fn reserve_publication(&self) -> io::Result<PendingPublication<'_>> {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        self.reserve_publication_names(
-            std::iter::repeat_with(|| {
-                let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                OsString::from(format!(".theseus-publish-{}-{serial}", std::process::id()))
-            })
-            .take(128),
-        )
-    }
     fn reserve_publication_names(
         &self,
+        destination: &OsStr,
         names: impl Iterator<Item = OsString>,
     ) -> io::Result<PendingPublication<'_>> {
+        // The candidate alphabet is ASCII digits and one dot. Normal NTFS/APFS
+        // canonical/case rules cannot turn non-ASCII into those characters.
+        // Dropping non-ASCII conservatively excludes aliases with ignorable
+        // characters; this key never changes validation or the real destination.
+        let destination_ascii: Vec<u8> = destination
+            .as_encoded_bytes()
+            .iter()
+            .copied()
+            .filter(u8::is_ascii)
+            .collect();
         for name in names {
+            if name.as_encoded_bytes() == destination_ascii {
+                continue;
+            }
             match platform::open_file(&self.directory, &name, true) {
                 Ok(file) => {
                     return Ok(PendingPublication {
@@ -388,13 +410,98 @@ mod publication_tests {
         Ok(result.unwrap_err())
     }
     #[test]
+    fn absent_destination_is_never_reserved_as_its_own_temporary() -> io::Result<()> {
+        let destinations = [
+            OsString::from("01234567.890"),
+            OsString::from("0123\u{200d}4567.890"),
+        ]
+        .into_iter();
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let destinations = {
+            use std::os::unix::ffi::OsStringExt;
+            destinations.chain([OsString::from_vec(b"0123\xff4567.890".to_vec())])
+        };
+        #[cfg(windows)]
+        let destinations = {
+            use std::os::windows::ffi::OsStringExt;
+            destinations.chain([OsString::from_wide(&[
+                48, 49, 50, 51, 0xd800, 52, 53, 54, 55, 46, 56, 57, 48,
+            ])])
+        };
+        for destination in destinations {
+            let temp = tempfile::tempdir()?;
+            let path = temp.path().join("run");
+            let root = HostDir::create_private(&path)?;
+            let candidates = || {
+                [
+                    OsString::from("01234567.890"),
+                    OsString::from("01234567.891"),
+                ]
+                .into_iter()
+            };
+            let error = root
+                .publish_with_names(
+                    &destination,
+                    &mut |file| {
+                        file.write_all(b"partial")?;
+                        assert_eq!(
+                            std::fs::metadata(path.join(&destination))
+                                .unwrap_err()
+                                .kind(),
+                            io::ErrorKind::NotFound,
+                            "destination became visible during writer callback"
+                        );
+                        assert_eq!(root.entries()?, vec!["01234567.891"]);
+                        Err(io::Error::other("writer failed before commit"))
+                    },
+                    candidates(),
+                )
+                .unwrap_err();
+            let detail = error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<PublicationError>()
+                .unwrap();
+            assert_eq!(detail.stage(), PublishStage::Write);
+            assert!(!detail.replaced());
+            assert!(detail.cleanup_error().is_none());
+            assert_eq!(
+                std::fs::metadata(path.join(&destination))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::NotFound
+            );
+            assert!(root.entries()?.is_empty());
+            root.publish_with_names(
+                &destination,
+                &mut |file| {
+                    file.write_all(b"complete")?;
+                    assert_eq!(
+                        std::fs::metadata(path.join(&destination))
+                            .unwrap_err()
+                            .kind(),
+                        io::ErrorKind::NotFound
+                    );
+                    Ok(())
+                },
+                candidates(),
+            )?;
+            assert_eq!(std::fs::read(path.join(&destination))?, b"complete");
+            assert_eq!(root.entries()?.len(), 1);
+        }
+        Ok(())
+    }
+    #[test]
     fn reservation_collisions_never_delete_unowned_entries() -> io::Result<()> {
         let temp = tempfile::tempdir()?;
         let root = HostDir::create_private(&temp.path().join("run"))?;
         root.create_file(&RelativePath::parse("collision")?)?
             .write_all(b"unowned")?;
         let error = root
-            .reserve_publication_names([OsString::from("collision")].into_iter())
+            .reserve_publication_names(
+                OsStr::new("report"),
+                [OsString::from("collision")].into_iter(),
+            )
             .err()
             .expect("collision must fail");
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
@@ -404,6 +511,7 @@ mod publication_tests {
         );
         {
             let mut reserved = root.reserve_publication_names(
+                OsStr::new("report"),
                 [OsString::from("collision"), OsString::from("owned")].into_iter(),
             )?;
             reserved.file.write_all(b"temporary")?;

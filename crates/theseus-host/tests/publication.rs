@@ -395,3 +395,100 @@ fn readonly_destination_is_preserved_without_delete_fallback() -> io::Result<()>
     assert!(std::fs::metadata(destination)?.permissions().readonly());
     Ok(())
 }
+
+#[test]
+fn numeric_temporary_keeps_original_prefix_and_case_alias_destinations_absent() -> io::Result<()> {
+    let lower = format!(".theseus-publish-{}-0", std::process::id());
+    for destination in [lower.clone(), lower.to_ascii_uppercase()] {
+        let parent = tempfile::tempdir()?;
+        let path = parent.path().join("run");
+        let root = HostDir::create_private(&path)?;
+        let error = root
+            .publish(OsStr::new(&destination), &mut |file| {
+                file.write_all(b"partial")?;
+                assert_eq!(
+                    std::fs::metadata(path.join(&destination))
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::NotFound
+                );
+                let entries = root.entries()?;
+                assert_eq!(entries.len(), 1);
+                let candidate = entries[0].as_encoded_bytes();
+                assert_eq!(candidate.len(), 12);
+                assert_eq!(candidate[8], b'.');
+                assert!(
+                    candidate[..8]
+                        .iter()
+                        .chain(&candidate[9..])
+                        .all(u8::is_ascii_digit)
+                );
+                Err(io::Error::other("bounded serializer failure"))
+            })
+            .unwrap_err();
+        assert_eq!(detail(&error).stage(), PublishStage::Write);
+        assert_eq!(
+            std::fs::metadata(path.join(&destination))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(root.entries()?.is_empty());
+        root.publish(OsStr::new(&destination), &mut |file| {
+            file.write_all(b"complete")
+        })?;
+        assert_eq!(std::fs::read(path.join(&destination))?, b"complete");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn numeric_temporary_has_no_distinct_native_short_name() -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW},
+    };
+    let parent = tempfile::tempdir()?;
+    let path = parent.path().join("run");
+    let root = HostDir::create_private(&path)?;
+    let error = root
+        .publish(OsStr::new("report.json"), &mut |file| {
+            file.write_all(b"partial")?;
+            let entries = root.entries()?;
+            assert_eq!(entries.len(), 1);
+            let name = path.join(&entries[0]);
+            let mut wide: Vec<u16> = name.as_os_str().encode_wide().collect();
+            wide.push(0);
+            let mut found = WIN32_FIND_DATAW::default();
+            // Test-only lookup in this owned fixture root; production publication
+            // continues to use retained authority, never a reconstructed path.
+            let handle = unsafe { FindFirstFileW(wide.as_ptr(), &mut found) };
+            if handle == INVALID_HANDLE_VALUE {
+                return Err(io::Error::last_os_error());
+            }
+            let closed = unsafe { FindClose(handle) };
+            if closed == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let actual: Vec<u16> = found
+                .cFileName
+                .into_iter()
+                .take_while(|u| *u != 0)
+                .collect();
+            assert_eq!(actual, entries[0].encode_wide().collect::<Vec<_>>());
+            assert_eq!(
+                found.cAlternateFileName[0], 0,
+                "numeric 8.3 temporary acquired a distinct alias"
+            );
+            Err(io::Error::other(
+                "injected writer failure after native short-name query",
+            ))
+        })
+        .unwrap_err();
+    assert_eq!(detail(&error).stage(), PublishStage::Write);
+    assert!(detail(&error).cleanup_error().is_none());
+    assert!(root.entries()?.is_empty());
+    Ok(())
+}
