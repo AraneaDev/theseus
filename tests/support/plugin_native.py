@@ -35,7 +35,7 @@ def prerequisites():
         assert stream.read(4) == b'\x7fELF', 'native acceptance requires an ELF artifact'
     version = os.environ['THESEUS_PLUGIN_CLIENT_VERSION']
     image = subprocess.run(['docker', 'image', 'inspect', IMAGE, '--format', '{{.Id}}'],
-                           capture_output=True, text=True, check=True).stdout.strip()
+                           capture_output=True, text=True, check=True, timeout=10).stdout.strip()
     assert image == IMAGE
     return client, version
 
@@ -146,7 +146,7 @@ def verify_common(binary, evidence, name, path, expected, scope, version, sha, s
     scenario = report['scenarios'][0]
     assert scenario['teardown'] == {'status': 'complete'}, scenario['teardown']
     container = scenario['container_id']
-    inspection = subprocess.run(['docker', 'inspect', container], capture_output=True, text=True)
+    inspection = subprocess.run(['docker', 'inspect', container], capture_output=True, text=True, timeout=10)
     (evidence / (name + '-inspect.stderr')).write_text(inspection.stderr)
     require_container_absent(container, inspection)
     journal = json.loads((path.parent / 'journal.json').read_text())

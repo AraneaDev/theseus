@@ -1,8 +1,9 @@
 //! Declared, bounded plugin lifecycle proof bindings.
-use super::{Expectation, JsonAssertion, JsonPredicate, Profile};
+use super::{Expectation, JsonAssertion, Profile, json::scalar};
 use crate::model::{Checkpoint, StepName};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -110,7 +111,15 @@ pub(crate) fn inventory_assertions(
     cp: Checkpoint,
     assertions: &[JsonAssertion],
 ) -> Result<()> {
-    let roots=assertions.iter().filter(|a|matches!(a,JsonAssertion::ArrayMatch{pointer,identity,..} if pointer.is_empty() && identity.iter().any(|v|v.pointer=="/id" && v.equals_json==serde_json::to_string(&p.id).unwrap()))).collect::<Vec<_>>();
+    let id = Value::String(p.id.clone());
+    let roots = assertions
+        .iter()
+        .filter(|a| {
+            matches!(a, JsonAssertion::ArrayMatch { pointer, identity, .. }
+            if pointer.is_empty() && identity.iter().any(|v|
+                v.pointer == "/id" && scalar(&v.equals_json).is_ok_and(|value| value == id)))
+        })
+        .collect::<Vec<_>>();
     ensure!(roots.len() == 1, "inventory requires one root ArrayMatch");
     let JsonAssertion::ArrayMatch {
         identity,
@@ -121,13 +130,10 @@ pub(crate) fn inventory_assertions(
     else {
         unreachable!()
     };
-    let scalar = |v: &str| serde_json::to_string(v).unwrap();
     ensure!(
-        identity
-            == &vec![JsonPredicate {
-                pointer: "/id".into(),
-                equals_json: scalar(&p.id)
-            }],
+        identity.len() == 1
+            && identity[0].pointer == "/id"
+            && scalar(&identity[0].equals_json).is_ok_and(|value| value == id),
         "inventory identity must match id alone"
     );
     ensure!(
@@ -136,21 +142,22 @@ pub(crate) fn inventory_assertions(
     );
     if cp != Checkpoint::Uninstalled {
         for (pointer, value) in [
-            ("/scope", scalar(p.scope.as_str())),
+            ("/scope", Value::String(p.scope.as_str().into())),
             (
                 "/version",
-                scalar(if cp == Checkpoint::BaseInstalled {
-                    &p.base_version
+                Value::String(if cp == Checkpoint::BaseInstalled {
+                    p.base_version.clone()
                 } else {
-                    &p.target_version
+                    p.target_version.clone()
                 }),
             ),
-            ("/enabled", (cp != Checkpoint::PluginDisabled).to_string()),
+            ("/enabled", Value::Bool(cp != Checkpoint::PluginDisabled)),
         ] {
             ensure!(
                 values
                     .iter()
-                    .any(|v| v.pointer == pointer && v.equals_json == value),
+                    .any(|v| v.pointer == pointer
+                        && scalar(&v.equals_json).is_ok_and(|v| v == value)),
                 "inventory values must bind scope/version/enabled at {cp}"
             );
         }
@@ -198,7 +205,7 @@ pub fn validate_plugin_contract(profile: &Profile) -> Result<()> {
     };
     let client = resolve(&p.client_check, Checkpoint::BaseInstalled)?;
     ensure!(
-        matches!(&client.expectation,Expectation::JsonCommand{expected_exit:0,assertions,..} if assertions.iter().any(|a|matches!(a,JsonAssertion::Equals{pointer,equals_json} if pointer=="/version" && equals_json==&serde_json::to_string(&p.client_version).unwrap()))),
+        matches!(&client.expectation,Expectation::JsonCommand{expected_exit:0,assertions,..} if assertions.iter().any(|a|matches!(a,JsonAssertion::Equals{pointer,equals_json} if pointer=="/version" && scalar(equals_json).is_ok_and(|v| v == Value::String(p.client_version.clone()))))),
         "client check requires JSON version assertion"
     );
     for (cp, c) in &p.checkpoints {

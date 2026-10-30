@@ -167,3 +167,60 @@ fn plugin_features_require_declaration_and_explicit_contract() {
         );
     }
 }
+
+#[test]
+fn accepts_equivalent_plugin_scalar_literals() {
+    for (check, field, literal) in [
+        (0, "client", " \n\"2.1.312 (Claude Code)\"\t "),
+        (1, "id", r#""probe\u0040market""#),
+        (1, "scope", r#" "\u0075ser" "#),
+        (1, "version", r#" "\u0031" "#),
+        (1, "enabled", " \ntrue\t "),
+        (7, "enabled", " \nfalse\t "),
+        (11, "id", r#" "probe\u0040market" "#),
+    ] {
+        let t = fixture::project();
+        let mut v = fixture::declaration("user");
+        let a = &mut v["profiles"]["user"]["checks"][check]["assertions"][0];
+        match field {
+            "client" => a["equals_json"] = literal.into(),
+            "id" => a["identity"][0]["equals_json"] = literal.into(),
+            "scope" => a["values"][0]["equals_json"] = literal.into(),
+            "version" => a["values"][1]["equals_json"] = literal.into(),
+            "enabled" => a["values"][2]["equals_json"] = literal.into(),
+            _ => unreachable!(),
+        }
+        recipe::parse_bytes(&t.path().join("recipe.toml"), &fixture::bytes(&v))
+            .unwrap_or_else(|e| panic!("{check}/{field}: {e}"));
+    }
+}
+
+#[test]
+fn rejects_changed_plugin_scalar_values_and_types() {
+    for (field, literals) in [
+        ("client", [r#""other""#, "true"]),
+        ("id", [r#""other@market""#, "null"]),
+        ("scope", [r#""local""#, "false"]),
+        ("version", [r#""2""#, "1"]),
+        ("enabled", ["false", r#""true""#]),
+    ] {
+        for literal in literals {
+            let t = fixture::project();
+            let mut v = fixture::declaration("user");
+            let check = usize::from(field != "client");
+            let a = &mut v["profiles"]["user"]["checks"][check]["assertions"][0];
+            match field {
+                "client" => a["equals_json"] = literal.into(),
+                "id" => a["identity"][0]["equals_json"] = literal.into(),
+                "scope" => a["values"][0]["equals_json"] = literal.into(),
+                "version" => a["values"][1]["equals_json"] = literal.into(),
+                "enabled" => a["values"][2]["equals_json"] = literal.into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                recipe::parse_bytes(&t.path().join("recipe.toml"), &fixture::bytes(&v)).is_err(),
+                "{field} accepted {literal}"
+            );
+        }
+    }
+}

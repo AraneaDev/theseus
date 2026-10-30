@@ -3,6 +3,7 @@ use super::rollback_validation::{Invocation, command_role_evidence, valid_invoca
 use super::*;
 use crate::recipe::{
     JsonAssertion, PluginContract,
+    json::scalar,
     plugin::{CHECKPOINTS, STEPS, inventory_assertions, validate_contract},
 };
 fn proof<'a>(
@@ -158,7 +159,7 @@ fn complete(s: &ScenarioReport, p: &PluginContract) -> bool {
     let Some(client) = json(s, &p.client_check, Checkpoint::BaseInstalled) else {
         return false;
     };
-    if !client.assertions.iter().any(|a|matches!(a,JsonAssertion::Equals{pointer,equals_json} if pointer=="/version" && equals_json==&serde_json::to_string(&p.client_version).unwrap())){return false;}
+    if !client.assertions.iter().any(|a|matches!(a,JsonAssertion::Equals{pointer,equals_json} if pointer=="/version" && scalar(equals_json).is_ok_and(|v| v == serde_json::Value::String(p.client_version.clone())))){return false;}
     for (cp, c) in &p.checkpoints {
         let Some(inventory) = json(s, &c.inventory, *cp) else {
             return false;

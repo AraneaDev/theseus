@@ -50,3 +50,17 @@ fn prepared_examples_load_all_scopes_without_host_paths_or_forwarded_environment
         );
     }
 }
+
+#[test]
+fn native_harness_inspection_stalls_fail_without_proving_absence() {
+    let output = std::process::Command::new("python3")
+        .arg("tests/support/plugin_native_test.py")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

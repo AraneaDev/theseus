@@ -137,7 +137,7 @@ fn dimensions_and_byte_limit_are_bounded() {
 #[test]
 fn plugin_checkpoint_names_and_custom_stages_keep_existing_matrix_budget() {
     let mut manifest:SuiteManifest=toml::from_str(&SUITE.replace("scenarios=['clean']","scenarios=['plugin_lifecycle']").replace("stages=['configured']","stages=['base_installed','target_installed','plugin_disabled','plugin_enabled','uninstalled','custom-stage']")).unwrap();
-    validate_manifest(&mut manifest).unwrap();
+    validate_manifest(&manifest).unwrap();
     assert_eq!(manifest.stages.len(), 6);
     manifest.scenarios = vec![
         theseus::model::ScenarioKind::Clean,
@@ -150,5 +150,5 @@ fn plugin_checkpoint_names_and_custom_stages_keep_existing_matrix_budget() {
         theseus::model::ScenarioKind::InterruptedRollback,
         theseus::model::ScenarioKind::PluginLifecycle,
     ];
-    assert!(validate_manifest(&mut manifest).is_err());
+    assert!(validate_manifest(&manifest).is_err());
 }

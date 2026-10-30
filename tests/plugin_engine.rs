@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use theseus::{
     engine::{self, CancellationToken, RunOptions, RunResult},
     model::*,
-    recipe::{self, Limits, PluginScope, ValidatedRecipe},
+    recipe::{self, JsonAssertion, Limits, PluginScope, ValidatedRecipe},
     report::ReportStore,
     runner::{CommandRequest, Environment, ExecutedCommand, PreparedEnvironment},
     snapshot::{FileEntry, ObservationStatus, Snapshot},
@@ -432,9 +432,8 @@ fn offline_plugin_proof_cannot_pass_missing_duplicate_or_contradictory_evidence(
         let t = tempfile::tempdir().unwrap();
         let path = t.path().join("report.json");
         std::fs::write(&path, serde_json::to_vec(&report).unwrap()).unwrap();
-        match theseus::report::load(t.path()) {
-            Ok(loaded) => assert_ne!(loaded.outcome, RunOutcome::Passed, "{fault}"),
-            Err(_) => {}
+        if let Ok(loaded) = theseus::report::load(t.path()) {
+            assert_ne!(loaded.outcome, RunOutcome::Passed, "{fault}");
         }
     }
 }
@@ -442,8 +441,8 @@ fn offline_plugin_proof_cannot_pass_missing_duplicate_or_contradictory_evidence(
 fn all_plugin_checkpoint_names_compare_and_source_failure_takes_precedence() {
     use theseus::comparison::{self, SourceReport, SuiteManifest};
     let (result, _) = run(PluginScope::User, "");
-    let mut manifest:SuiteManifest=toml::from_str("schema_version=1\nname='plugins'\nbaseline='a'\nprofiles=['user']\nscenarios=['plugin_lifecycle']\nstages=['base_installed','target_installed','plugin_disabled','plugin_enabled','uninstalled']\n[[variants]]\nid='a'\nrecipe='a.toml'\n[[variants]]\nid='b'\nrecipe='b.toml'\n[[scopes]]\nid='workspace'\nprofile='user'\npath='/workspace'\n").unwrap();
-    comparison::validate_manifest(&mut manifest).unwrap();
+    let manifest:SuiteManifest=toml::from_str("schema_version=1\nname='plugins'\nbaseline='a'\nprofiles=['user']\nscenarios=['plugin_lifecycle']\nstages=['base_installed','target_installed','plugin_disabled','plugin_enabled','uninstalled']\n[[variants]]\nid='a'\nrecipe='a.toml'\n[[variants]]\nid='b'\nrecipe='b.toml'\n[[scopes]]\nid='workspace'\nprofile='user'\npath='/workspace'\n").unwrap();
+    comparison::validate_manifest(&manifest).unwrap();
     let mut sources = vec![
         SourceReport {
             variant_id: "a".into(),
@@ -544,5 +543,133 @@ fn component_literal_proof_requires_its_complete_log_and_shell_invocation() {
         };
         report.recompute_outcome();
         assert_ne!(report.outcome, RunOutcome::Passed, "{fault}");
+    }
+}
+
+#[test]
+fn offline_plugin_bindings_accept_equivalent_scalar_literals() {
+    let (result, _) = run(PluginScope::User, "");
+    for field in ["client", "id", "scope", "version", "enabled"] {
+        let mut report = result.report.clone();
+        for check in report.scenarios[0]
+            .stages
+            .iter_mut()
+            .flat_map(|s| &mut s.checks)
+        {
+            if check.id == "client-version" && field == "client" {
+                let JsonAssertion::Equals { equals_json, .. } =
+                    &mut check.json_expectation.as_mut().unwrap().assertions[0]
+                else {
+                    panic!()
+                };
+                *equals_json = " \n\"2.1.312 (Claude Code)\"\t ".into();
+            } else if check.id.ends_with("-inventory") {
+                let JsonAssertion::ArrayMatch {
+                    identity, values, ..
+                } = &mut check.json_expectation.as_mut().unwrap().assertions[0]
+                else {
+                    panic!()
+                };
+                if field == "id" {
+                    identity[0].equals_json = r#" "probe\u0040market" "#.into();
+                }
+                for value in values {
+                    if value.pointer == format!("/{field}") {
+                        value.equals_json = format!(" \n{}\t ", value.equals_json);
+                    }
+                }
+            }
+        }
+        report.recompute_outcome();
+        assert_eq!(report.outcome, RunOutcome::Passed, "{field}");
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(
+            t.path().join("report.json"),
+            serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            theseus::report::load(t.path()).unwrap().outcome,
+            RunOutcome::Passed,
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn offline_plugin_bindings_reject_changed_scalar_values_and_types() {
+    let (result, _) = run(PluginScope::User, "");
+    for (field, literals) in [
+        ("client", [r#""other""#, "true"]),
+        ("id", [r#""other@market""#, "null"]),
+        ("scope", [r#""local""#, "false"]),
+        ("version", [r#""2""#, "1"]),
+        ("enabled", ["false", r#""true""#]),
+    ] {
+        for literal in literals {
+            let mut report = result.report.clone();
+            let check = report.scenarios[0]
+                .stages
+                .iter_mut()
+                .flat_map(|s| &mut s.checks)
+                .find(|c| {
+                    c.id == if field == "client" {
+                        "client-version"
+                    } else {
+                        "base-inventory"
+                    }
+                })
+                .unwrap();
+            let proof = check.json_expectation.as_mut().unwrap();
+            if field == "client" {
+                let JsonAssertion::Equals { equals_json, .. } = &mut proof.assertions[0] else {
+                    panic!()
+                };
+                *equals_json = literal.into();
+                let JsonAssertionObservation::Equals { actual } = &mut proof.observations[0] else {
+                    panic!()
+                };
+                *actual = JsonValueObservation::Scalar {
+                    value: serde_json::from_str(literal).unwrap(),
+                };
+            } else {
+                let JsonAssertion::ArrayMatch {
+                    identity, values, ..
+                } = &mut proof.assertions[0]
+                else {
+                    panic!()
+                };
+                if field == "id" {
+                    identity[0].equals_json = literal.into();
+                } else {
+                    let i = values
+                        .iter()
+                        .position(|v| v.pointer == format!("/{field}"))
+                        .unwrap();
+                    values[i].equals_json = literal.into();
+                    let JsonAssertionObservation::ArrayMatch { values, .. } =
+                        &mut proof.observations[0]
+                    else {
+                        panic!()
+                    };
+                    values[i] = JsonValueObservation::Scalar {
+                        value: serde_json::from_str(literal).unwrap(),
+                    };
+                }
+            }
+            // Even self-consistent generic proof must bind the plugin contract.
+            assert!(proof.verified_pass(), "{field}: {literal}");
+            report.recompute_outcome();
+            assert_ne!(report.outcome, RunOutcome::Passed, "{field}: {literal}");
+            let t = tempfile::tempdir().unwrap();
+            std::fs::write(
+                t.path().join("report.json"),
+                serde_json::to_vec(&report).unwrap(),
+            )
+            .unwrap();
+            if let Ok(loaded) = theseus::report::load(t.path()) {
+                assert_ne!(loaded.outcome, RunOutcome::Passed, "{field}: {literal}");
+            }
+        }
     }
 }
