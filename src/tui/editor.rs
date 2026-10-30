@@ -65,6 +65,7 @@ impl Editor {
     pub(super) fn text(&self) -> &str {
         &self.text
     }
+    #[cfg(test)]
     pub(super) fn cursor(&self) -> usize {
         self.cursor
     }

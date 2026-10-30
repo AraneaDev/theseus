@@ -1,6 +1,7 @@
 use anyhow::{Result, ensure};
 use crossterm::{
     cursor::Show,
+    event::{DisableBracketedPaste, EnableBracketedPaste},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -15,7 +16,12 @@ pub fn require_tty() -> Result<()> {
 }
 fn restore() {
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+    let _ = execute!(
+        io::stdout(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        Show
+    );
 }
 pub struct Guard;
 impl Guard {
@@ -28,7 +34,7 @@ impl Guard {
         }));
         enable_raw_mode()?;
         let guard = Self;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
         let terminal =
             ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(io::stdout()))?;
         Ok((guard, terminal))

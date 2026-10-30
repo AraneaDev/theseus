@@ -5,6 +5,9 @@ pub fn input(app: &mut App, key: KeyEvent) {
     if key.kind == KeyEventKind::Release {
         return;
     }
+    if super::preview_edit::input(app, key) {
+        return;
+    }
     app.viewport.borrow_mut().update(app, None);
     if filter_input(app, key) {
         return;

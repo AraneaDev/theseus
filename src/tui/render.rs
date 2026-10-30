@@ -16,6 +16,9 @@ fn block(title: &str, focused: bool) -> Block<'_> {
         }))
 }
 pub fn render(frame: &mut Frame, app: &App) {
+    if super::preview_edit::render(frame, app) {
+        return;
+    }
     if app.comparison.is_some() {
         super::comparison::render(frame, app);
         return;
@@ -59,7 +62,11 @@ pub fn render(frame: &mut Frame, app: &App) {
             if app.has_started() {
                 "Theseus | Live evidence pending or unavailable".into()
             } else {
-                "Theseus | Preview — no commands executed".into()
+                if super::preview_edit::dirty(app) {
+                    "Theseus | UNSAVED draft — accepted preview below; no commands executed".into()
+                } else {
+                    "Theseus | Preview — no commands executed".into()
+                }
             }
         });
     frame.render_widget(
@@ -79,7 +86,11 @@ pub fn render(frame: &mut Frame, app: &App) {
                 if app.has_started() {
                     "Live evidence"
                 } else {
-                    "Recipe / command and environment preview"
+                    if super::preview_edit::dirty(app) {
+                        "ACCEPTED recipe preview (draft UNSAVED)"
+                    } else {
+                        "Recipe / command and environment preview"
+                    }
                 },
                 true,
             ))
@@ -103,14 +114,16 @@ pub fn render(frame: &mut Frame, app: &App) {
         selectors(frame, app, parts[0], narrow);
         evidence(frame, app, parts[1]);
     }
-    let hint = if app.editing_filter {
+    let hint = if super::preview_edit::dirty(app) {
+        "UNSAVED draft | e edit d discard q discard/quit | r/p/s disabled until Save Copy or discard".to_string()
+    } else if app.editing_filter {
         format!(
             "Filter (Enter/Esc apply): {}_",
             projection(&app.filter_draft, 512)
         )
     } else {
         format!(
-            "{} | Tab/Enter focus Esc back ↑↓/j/k select ←→ tabs / filter Home/End select [ ] chunks PgUp/Dn scroll CtrlHome/End log m metadata | r run c cancel q quit",
+            "{} | Tab/Enter focus Esc back ↑↓/j/k select ←→ tabs / filter Home/End select [ ] chunks PgUp/Dn scroll CtrlHome/End log m metadata | e edit d discard r run c cancel q quit",
             projection(&app.status, 512)
         )
     };

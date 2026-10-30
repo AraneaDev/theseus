@@ -168,7 +168,11 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
         if view.report.is_none() && app.has_started() {
             " | Live evidence pending or unavailable"
         } else if view.report.is_none() {
-            " | Preview — no commands executed"
+            if super::preview_edit::dirty(app) {
+                " | UNSAVED draft — accepted preview; no commands executed"
+            } else {
+                " | Preview — no commands executed"
+            }
         } else {
             ""
         }
@@ -327,18 +331,30 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
         }
         frame.render_widget(
             Paragraph::new(safe_text(&context))
-                .block(panel("Explicit suite preview — r to start"))
+                .block(panel(if super::preview_edit::dirty(app) {
+                    "ACCEPTED suite preview (draft UNSAVED)"
+                } else {
+                    "Explicit suite preview — r to start"
+                }))
                 .wrap(Wrap { trim: false })
                 .scroll((app.scroll, 0)),
             layout[1],
         );
     }
+    let hint = if super::preview_edit::dirty(app) {
+        "UNSAVED draft | e edit d discard q discard/quit | r/p/s disabled until Save Copy or discard".to_string()
+    } else {
+        format!(
+            "{} | Tab cells/evidence | ↑↓/j/k Home/End select | [ ] chunks PgUp/Dn scroll / filter | e edit d discard r run c cancel q quit",
+            if app.editing_filter {
+                format!("Filter (Enter/Esc apply): {}_", bounded(&app.filter_draft))
+            } else {
+                bounded(&app.status)
+            }
+        )
+    };
     frame.render_widget(
-        Paragraph::new(safe_text(&format!(
-            "{} | Tab cells/evidence | ↑↓/j/k Home/End select | [ ] chunks PgUp/Dn scroll / filter | r run c cancel q quit",
-            if app.editing_filter { format!("Filter (Enter/Esc apply): {}_", bounded(&app.filter_draft)) } else { bounded(&app.status) }
-        )))
-        .wrap(Wrap { trim: false }),
+        Paragraph::new(safe_text(&hint)).wrap(Wrap { trim: false }),
         layout[2],
     );
 }
