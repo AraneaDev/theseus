@@ -1,5 +1,6 @@
 //! CLI parsing is offline; handlers only construct Docker for execution/cleanup.
 use crate::{
+    comparison,
     engine::{self, CancellationToken, RunOptions},
     model::{ProfileName, ScenarioKind},
     recipe, report,
@@ -35,6 +36,19 @@ pub enum Action {
         scenario: ScenarioSelection,
         #[arg(long)]
         pull: bool,
+    },
+    Compare {
+        #[arg(long)]
+        suite: PathBuf,
+        #[arg(long)]
+        headless: bool,
+        #[arg(long)]
+        pull: bool,
+    },
+    Comparison {
+        suite_directory: PathBuf,
+        #[arg(long)]
+        json: bool,
     },
     Report {
         run_directory: PathBuf,
@@ -105,8 +119,85 @@ pub fn execute(cli: Cli) -> Result<i32> {
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(0)
         }
+        Some(Action::Comparison {
+            suite_directory,
+            json,
+        }) => {
+            let document = comparison::load_document(&suite_directory)?;
+            if !json {
+                return crate::tui::run_with_options(
+                    crate::tui::App::comparison_offline(document, suite_directory),
+                    animation,
+                );
+            }
+            println!("{}", serde_json::to_string_pretty(&document.report)?);
+            Ok(0)
+        }
+        Some(Action::Compare {
+            suite,
+            headless,
+            pull,
+        }) => {
+            if !headless {
+                crate::tui::terminal::require_tty()?;
+            }
+            let suite = comparison::load(&suite)?;
+            let options = comparison::SuiteRunOptions {
+                output_root: suite.project_root.join(".theseus-comparisons"),
+                pull,
+            };
+            if !headless {
+                return crate::tui::run_with_options(
+                    crate::tui::App::comparison_preview(suite, options),
+                    animation,
+                );
+            }
+            let cancel = CancellationToken::default();
+            let _signals = crate::tui::Signals::register(&cancel)?;
+            let result = comparison::run(&suite, options, cancel, |_| {})?;
+            println!(
+                "{}",
+                crate::tui::safe_text(&format!("Comparison: {}", result.report_path.display()))
+            );
+            println!("{}", result.report.outcome);
+            for source in &result.report.sources {
+                println!("{}: {}", source.variant_id, source.outcome);
+                if let Some(error) = &source.error {
+                    let root = result.report_path.parent().unwrap();
+                    eprintln!(
+                        "{}",
+                        crate::tui::safe_text(&format!(
+                            "Source {}: {error}\nSource report: {}\nRecovery: theseus cleanup {}",
+                            source.variant_id,
+                            source.report_path.as_ref().map_or_else(
+                                || "<not started>".into(),
+                                |p| root.join(p).display().to_string()
+                            ),
+                            root.display()
+                        ))
+                    );
+                }
+            }
+            for diagnostic in &result.report.diagnostics {
+                eprintln!("{}", crate::tui::safe_text(diagnostic));
+            }
+            Ok(result.report.outcome.exit_code())
+        }
         Some(Action::Cleanup { run_directory }) => {
-            Docker::default().cleanup(&run_directory)?;
+            // Shape is only a routing hint; comparison cleanup validates the entire
+            // envelope and pinned journals before any external removal.
+            if run_directory
+                .file_name()
+                .is_some_and(|n| n == "comparison.json")
+                || run_directory
+                    .join("comparison.json")
+                    .symlink_metadata()
+                    .is_ok()
+            {
+                comparison::cleanup(&run_directory)?;
+            } else {
+                Docker::default().cleanup(&run_directory)?;
+            }
             println!("Journaled resources cleaned up.");
             Ok(0)
         }

@@ -5,6 +5,10 @@ pub fn input(app: &mut App, key: KeyEvent) {
     if key.kind == KeyEventKind::Release {
         return;
     }
+    if app.comparison.is_some() {
+        super::comparison::input(app, key);
+        return;
+    }
     if app.editing_filter {
         match key.code {
             KeyCode::Esc | KeyCode::Enter => app.editing_filter = false,

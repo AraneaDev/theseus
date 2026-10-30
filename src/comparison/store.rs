@@ -208,8 +208,22 @@ pub(super) fn recompute(
 }
 /// Read only pinned, contained evidence and recompute all derived verdicts offline.
 pub fn load_report(path: &Path) -> Result<ComparisonReport> {
+    Ok(load_document(path)?.report)
+}
+/// Validated declaration context alongside recomputed evidence; no recipe files needed.
+#[derive(Debug, Clone)]
+pub struct LoadedComparison {
+    pub manifest: SuiteManifest,
+    pub report: ComparisonReport,
+}
+/// Load declaration context and evidence through the same pinned safe store.
+pub fn load_document(path: &Path) -> Result<LoadedComparison> {
     let (store, artifact) = open(path)?;
-    Ok(recompute(&artifact, &read_sources(&store, &artifact)?))
+    let report = recompute(&artifact, &read_sources(&store, &artifact)?);
+    Ok(LoadedComparison {
+        manifest: artifact.manifest,
+        report,
+    })
 }
 /// Recover only journaled resources; report content/digests are irrelevant to cleanup.
 pub fn cleanup(path: &Path) -> Result<()> {

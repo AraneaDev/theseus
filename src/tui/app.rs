@@ -34,6 +34,7 @@ impl Tab {
 }
 /// UI state contains evidence and selections only; execution belongs to engine::run.
 pub struct App {
+    pub comparison: Option<super::comparison::ComparisonView>,
     pub recipe: Option<ValidatedRecipe>,
     pub options: Option<RunOptions>,
     pub report: Option<RunReport>,
@@ -58,6 +59,7 @@ pub struct App {
 impl App {
     pub fn offline(report: RunReport, root: PathBuf) -> Self {
         Self {
+            comparison: None,
             recipe: None,
             options: None,
             report: Some(report),
@@ -90,6 +92,10 @@ impl App {
     pub fn outcome(&self) -> RunOutcome {
         if self.terminal_error.is_some() {
             RunOutcome::Incomplete
+        } else if let Some(view) = &self.comparison {
+            view.report
+                .as_ref()
+                .map_or(RunOutcome::Passed, |r| r.outcome)
         } else {
             self.report
                 .as_ref()

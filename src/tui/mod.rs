@@ -1,6 +1,7 @@
 //! Responsive live and offline evidence UI; one blocking engine runs on a worker.
 mod animation;
 mod app;
+mod comparison;
 mod input;
 mod render;
 pub mod terminal;
@@ -43,7 +44,7 @@ pub fn run_with_options(mut app: App, options: AnimationOptions) -> Result<i32> 
     let signals = Signals::register(&terminate)?;
     let (guard, mut terminal) = terminal::Guard::enter()?;
     let (events_tx, mut events_rx) = mpsc::channel(32);
-    let mut result_rx: Option<oneshot::Receiver<Result<RunResult>>> = None;
+    let mut result_rx: Option<oneshot::Receiver<Result<WorkResult>>> = None;
     let mut quit_deadline = None;
     let mut last_path: Option<PathBuf> = None;
     let started = Instant::now();
@@ -58,22 +59,12 @@ pub fn run_with_options(mut app: App, options: AnimationOptions) -> Result<i32> 
                 latest = Some(event);
             }
             if let Some(event) = latest {
-                let event: engine::EngineEvent = event;
-                last_path = Some(event.report_path.clone());
-                if let Ok(report) = report::load(&event.report_path) {
-                    app.set_report(report, event.report_path.parent().unwrap().to_path_buf());
-                    app.status = format!(
-                        "Running {:?} {} {}",
-                        event.kind,
-                        event.scenario_id.unwrap_or_default(),
-                        event.stage.unwrap_or_default()
-                    );
-                }
+                apply_event(&mut app, event, &mut last_path);
             }
             if let Some(receiver) = &mut result_rx {
                 match receiver.try_recv() {
                     Ok(result) => {
-                        complete_run(&mut app, result)?;
+                        complete_work(&mut app, result)?;
                         result_rx = None;
                         app.refresh_logs();
                     }
@@ -114,30 +105,27 @@ pub fn run_with_options(mut app: App, options: AnimationOptions) -> Result<i32> 
                 }
             }
             if app.start_requested && !app.quit_requested {
-                app.start_requested = false;
-                let recipe = app.recipe.as_ref().unwrap().clone();
-                let options = app.options.as_ref().unwrap().clone();
-                if let Err(error) = recipe.validate_selection(&options.profiles, &options.scenarios)
-                {
-                    app.status = format!("Cannot start: {error:#}");
-                } else {
-                    let (tx, rx) = oneshot::channel();
-                    result_rx = Some(rx);
-                    let events = events_tx.clone();
-                    let token = cancel.clone();
-                    app.active = true;
-                    app.status = "Starting engine".into();
-                    runtime.spawn_blocking(move || {
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            engine::run(&recipe, options, token, |e| {
-                                let _ = events.try_send(e);
-                            })
-                        }))
-                        .unwrap_or_else(|_| {
-                            Err(anyhow!("engine worker panicked; inspect recovery journal"))
+                match take_work(&mut app) {
+                    Err(error) => app.status = format!("Cannot start: {error:#}"),
+                    Ok(None) => {}
+                    Ok(Some(work)) => {
+                        let (tx, rx) = oneshot::channel();
+                        result_rx = Some(rx);
+                        let events = events_tx.clone();
+                        let token = cancel.clone();
+                        app.active = true;
+                        app.status = "Starting engine".into();
+                        runtime.spawn_blocking(move || {
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    work.run(token, events)
+                                }))
+                                .unwrap_or_else(|_| {
+                                    Err(anyhow!("engine worker panicked; inspect recovery journal"))
+                                });
+                            let _ = tx.send(result);
                         });
-                        let _ = tx.send(result);
-                    });
+                    }
                 }
             }
             if event::poll(Duration::from_millis(50))? {
@@ -246,6 +234,12 @@ fn handle_key(
 }
 
 fn unresolved(app: &App) -> String {
+    if app.comparison.is_some() {
+        return format!(
+            "inspect suite {} and contained source journals; source teardown may be pending",
+            app.root.display()
+        );
+    }
     app.report
         .as_ref()
         .map(|r| {
@@ -264,9 +258,9 @@ fn unresolved(app: &App) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "setup may be pending; inspect journal".into())
 }
-struct Signals(Vec<signal_hook::SigId>);
+pub(crate) struct Signals(Vec<signal_hook::SigId>);
 impl Signals {
-    fn register(cancel: &CancellationToken) -> Result<Self> {
+    pub(crate) fn register(cancel: &CancellationToken) -> Result<Self> {
         let mut signals = Self(Vec::new());
         for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
             signals
@@ -284,13 +278,105 @@ impl Drop for Signals {
     }
 }
 
+enum Work {
+    Run(crate::recipe::ValidatedRecipe, engine::RunOptions),
+    Suite(
+        crate::comparison::ValidatedSuite,
+        crate::comparison::SuiteRunOptions,
+    ),
+}
+enum WorkEvent {
+    Run(engine::EngineEvent),
+    Suite(crate::comparison::ComparisonEvent),
+}
+enum WorkResult {
+    Run(Box<RunResult>),
+    Suite(crate::comparison::ComparisonResult),
+}
+impl Work {
+    fn run(self, token: CancellationToken, events: mpsc::Sender<WorkEvent>) -> Result<WorkResult> {
+        match self {
+            Self::Run(recipe, options) => engine::run(&recipe, options, token, |e| {
+                let _ = events.try_send(WorkEvent::Run(e));
+            })
+            .map(|result| WorkResult::Run(Box::new(result))),
+            Self::Suite(suite, options) => crate::comparison::run(&suite, options, token, |e| {
+                let _ = events.try_send(WorkEvent::Suite(e));
+            })
+            .map(WorkResult::Suite),
+        }
+    }
+}
+fn take_work(app: &mut App) -> Result<Option<Work>> {
+    if !std::mem::take(&mut app.start_requested) || app.active || app.quit_requested {
+        return Ok(None);
+    }
+    if let Some(view) = &app.comparison {
+        if view.report.is_some() {
+            return Ok(None);
+        }
+        return Ok(view
+            .suite
+            .clone()
+            .zip(view.options.clone())
+            .map(|(s, o)| Work::Suite(s, o)));
+    }
+    if app.report.is_some() {
+        return Ok(None);
+    }
+    let Some((recipe, options)) = app.recipe.clone().zip(app.options.clone()) else {
+        return Ok(None);
+    };
+    recipe.validate_selection(&options.profiles, &options.scenarios)?;
+    Ok(Some(Work::Run(recipe, options)))
+}
+fn apply_event(app: &mut App, event: WorkEvent, last_path: &mut Option<PathBuf>) {
+    match event {
+        WorkEvent::Run(event) => {
+            *last_path = Some(event.report_path.clone());
+            app.root = event.report_path.parent().unwrap().to_path_buf();
+            if let Ok(report) = report::load(&event.report_path) {
+                app.set_report(report, app.root.clone());
+                app.status = format!(
+                    "Running {:?} {} {}",
+                    event.kind,
+                    event.scenario_id.unwrap_or_default(),
+                    event.stage.unwrap_or_default()
+                );
+            }
+        }
+        WorkEvent::Suite(event) => {
+            *last_path = Some(event.report_path.clone());
+            app.root = event.report_path.parent().unwrap().to_path_buf();
+            if let Ok(document) = crate::comparison::load_document(&event.report_path) {
+                app.set_comparison_report(document.report, app.root.clone());
+            }
+            app.status = format!(
+                "Running suite | {} {}",
+                event.variant_id.unwrap_or_default(),
+                event.source.map_or(String::new(), |e| format!(
+                    "{:?} {}",
+                    e.kind,
+                    e.stage.unwrap_or_default()
+                ))
+            );
+        }
+    }
+}
 // Shared completion boundary, also exercised without a terminal in regressions.
-fn complete_run(app: &mut App, result: Result<RunResult>) -> Result<()> {
+fn complete_work(app: &mut App, result: Result<WorkResult>) -> Result<()> {
     app.active = false;
     match result {
-        Ok(result) => {
+        Ok(WorkResult::Run(result)) => {
             let root = result.report_path.parent().unwrap().to_path_buf();
             app.set_report(result.report, root);
+            app.status = format!("Finished | {}", result.report_path.display());
+        }
+        Ok(WorkResult::Suite(result)) => {
+            app.set_comparison_report(
+                result.report,
+                result.report_path.parent().unwrap().to_path_buf(),
+            );
             app.status = format!("Finished | {}", result.report_path.display());
         }
         Err(error) => {
@@ -300,7 +386,13 @@ fn complete_run(app: &mut App, result: Result<RunResult>) -> Result<()> {
             } else {
                 format!(
                     "{diagnostic}\nSaved report: {}\nRecovery: theseus cleanup {}",
-                    app.root.join("report.json").display(),
+                    app.root
+                        .join(if app.comparison.is_some() {
+                            "comparison.json"
+                        } else {
+                            "report.json"
+                        })
+                        .display(),
                     app.root.display()
                 )
             });
@@ -309,12 +401,16 @@ fn complete_run(app: &mut App, result: Result<RunResult>) -> Result<()> {
             app.evidence_index = 0;
             app.scroll = 0;
             app.refresh_logs();
-            if app.report.is_none() {
+            if app.report.is_none() && app.comparison.as_ref().is_none_or(|v| v.report.is_none()) {
                 return Err(error);
             }
         }
     }
     Ok(())
+}
+#[cfg(test)]
+fn complete_run(app: &mut App, result: Result<RunResult>) -> Result<()> {
+    complete_work(app, result.map(|result| WorkResult::Run(Box::new(result))))
 }
 
 #[cfg(test)]
@@ -483,5 +579,164 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod comparison_tests {
+    use super::*;
+    use crate::comparison::{self as suites, ComparisonResult, LoadedComparison, SuiteRunOptions};
+    #[allow(dead_code)]
+    mod fixtures {
+        use crate as theseus;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/comparison.rs"
+        ));
+    }
+    #[test]
+    fn suite_start_is_consumed_once_and_original_preview_matrix_is_unchanged() {
+        let t = tempfile::tempdir().unwrap();
+        let path = fixtures::recipe_suite(t.path());
+        let suite = suites::load(&path).unwrap();
+        let mut app = App::comparison_preview(
+            suite,
+            SuiteRunOptions {
+                output_root: t.path().join("output"),
+                pull: true,
+            },
+        );
+        for k in ['p', 's', 'r', 'r'] {
+            input(&mut app, KeyCode::Char(k).into());
+        }
+        let work = take_work(&mut app).unwrap().unwrap();
+        let Work::Suite(suite, options) = work else {
+            panic!("suite must dispatch through suite worker");
+        };
+        assert_eq!(
+            suite.manifest.profiles,
+            vec![crate::model::ProfileName::User]
+        );
+        assert_eq!(
+            suite.manifest.scenarios,
+            vec![crate::model::ScenarioKind::Clean]
+        );
+        assert!(options.pull);
+        assert!(!app.start_requested);
+        assert!(take_work(&mut app).unwrap().is_none());
+        app.active = true;
+        input(&mut app, KeyCode::Char('r').into());
+        assert!(take_work(&mut app).unwrap().is_none());
+        assert!(!t.path().join("output").exists());
+    }
+    #[test]
+    fn suite_ready_completion_retains_cancel_deadline_and_persisted_failed_outcome() {
+        let t = tempfile::tempdir().unwrap();
+        let root = fixtures::saved(t.path());
+        let document = suites::load_document(&root).unwrap();
+        let report = document.report.clone();
+        let mut app = App::comparison_offline(document, root.clone());
+        app.active = true;
+        let cancel = CancellationToken::default();
+        let now = Instant::now();
+        let mut deadline = None;
+        let mut presentation = Presentation::new(true, Duration::ZERO);
+        presentation.frame(Duration::from_secs(6), 100, 30);
+        handle_key(
+            &mut app,
+            &mut presentation,
+            KeyCode::Char('q').into(),
+            &cancel,
+            &CancellationToken::default(),
+            &mut deadline,
+            now,
+        );
+        assert!(cancel.is_cancelled());
+        assert_eq!(deadline, Some(now + Duration::from_secs(5)));
+        complete_work(
+            &mut app,
+            Ok(WorkResult::Suite(ComparisonResult {
+                report,
+                report_path: root.join("comparison.json"),
+            })),
+        )
+        .unwrap();
+        assert_eq!(
+            quit_result(&app, &mut presentation, Duration::from_secs(7))
+                .unwrap()
+                .unwrap(),
+            1
+        );
+    }
+    #[test]
+    fn suite_error_quit_prioritizes_diagnostic_and_suite_recovery_over_cached_outcome() {
+        let t = tempfile::tempdir().unwrap();
+        let root = fixtures::saved(t.path());
+        let mut app = App::comparison_offline(suites::load_document(&root).unwrap(), root.clone());
+        app.active = true;
+        complete_work(&mut app, Err(anyhow!("suite final save failed"))).unwrap();
+        input(&mut app, KeyCode::Char('q').into());
+        let mut p = Presentation::new(false, Duration::ZERO);
+        let error = quit_result(&app, &mut p, Duration::ZERO)
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("suite final save failed"));
+        assert!(error.contains(&root.join("comparison.json").display().to_string()));
+        assert!(error.contains("theseus cleanup"));
+        assert_eq!(app.exit_code(), 2);
+        assert!(unresolved(&app).contains("source journals"));
+        let document = LoadedComparison {
+            manifest: fixtures::manifest(),
+            report: app.comparison.as_ref().unwrap().report.clone().unwrap(),
+        };
+        assert_eq!(document.report.outcome, crate::model::RunOutcome::Failed);
+    }
+    #[test]
+    fn suite_startup_paste_cannot_start_and_live_event_retains_validated_recovery_context() {
+        let t = tempfile::tempdir().unwrap();
+        let path = fixtures::recipe_suite(t.path());
+        let mut app = App::comparison_preview(
+            suites::load(&path).unwrap(),
+            SuiteRunOptions {
+                output_root: t.path().join("output"),
+                pull: false,
+            },
+        );
+        let mut presentation = Presentation::new(true, Duration::ZERO);
+        let cancel = CancellationToken::default();
+        let terminate = CancellationToken::default();
+        let mut deadline = None;
+        for k in ['r', 'p', 's', 'r'] {
+            handle_key(
+                &mut app,
+                &mut presentation,
+                KeyCode::Char(k).into(),
+                &cancel,
+                &terminate,
+                &mut deadline,
+                Instant::now(),
+            );
+        }
+        assert!(!app.start_requested);
+        assert!(take_work(&mut app).unwrap().is_none());
+        assert!(!t.path().join("output").exists());
+        let root = fixtures::saved(t.path());
+        let mut last = None;
+        apply_event(
+            &mut app,
+            WorkEvent::Suite(suites::ComparisonEvent {
+                report_path: root.join("comparison.json"),
+                variant_id: Some("archive".into()),
+                source: None,
+            }),
+            &mut last,
+        );
+        assert_eq!(last, Some(root.join("comparison.json")));
+        assert_eq!(app.root, root);
+        assert_eq!(app.outcome(), crate::model::RunOutcome::Failed);
+        assert_eq!(app.comparison.as_ref().unwrap().manifest.baseline, "copy");
+        input(&mut app, KeyCode::Char('r').into());
+        assert!(take_work(&mut app).unwrap().is_none());
     }
 }

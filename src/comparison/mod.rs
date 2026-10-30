@@ -9,7 +9,7 @@ pub use manifest::{ValidatedSuite, ValidatedVariant, load, validate_manifest};
 pub use model::*;
 pub use run::{ComparisonEvent, ComparisonResult, SuiteRunOptions, run, run_with};
 pub use scope::compare_scope;
-pub use store::{cleanup, cleanup_with, load_report};
+pub use store::{LoadedComparison, cleanup, cleanup_with, load_document, load_report};
 
 use crate::{
     model::{ProfileName, RunOutcome, RunReport, ScenarioKind},

@@ -1,5 +1,6 @@
 /target/
 .theseus-runs/
+.theseus-comparisons/
 /.worktrees/
 docs/superpowers/
 /.superpowers/

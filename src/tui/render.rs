@@ -16,6 +16,10 @@ fn block(title: &str, focused: bool) -> Block<'_> {
         }))
 }
 pub fn render(frame: &mut Frame, app: &App) {
+    if app.comparison.is_some() {
+        super::comparison::render(frame, app);
+        return;
+    }
     let area = frame.area();
     let narrow = area.width < 85;
     let main = Layout::vertical([
