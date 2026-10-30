@@ -355,7 +355,7 @@ impl McpSession {
                     }
                     let cursor = cursor
                         .as_str()
-                        .filter(|c| bounded_text(c, 256))
+                        .filter(|c| !c.is_empty())
                         .ok_or("invalid tools cursor")?;
                     if !self.cursors.insert(cursor.into()) {
                         return Err("repeated tools cursor".into());

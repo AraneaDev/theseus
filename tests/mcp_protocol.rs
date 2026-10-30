@@ -635,3 +635,64 @@ fn success_proof_rejects_nonresponse_frames_and_unaccounted_bytes() {
     changed.stdout_bytes += 1;
     assert!(!changed.valid());
 }
+
+#[test]
+fn opaque_escaped_nul_cursor_roundtrips_and_complete_inventory_passes() {
+    // Rejecting or changing an opaque cursor must prevent this second-page success.
+    for protocol in [McpProtocol::Modern20260728, McpProtocol::Legacy20251125] {
+        let mut p = probe();
+        p.protocol = protocol;
+        let mut s = McpSession::new(p).unwrap();
+        startup(&mut s);
+        let first = sent(&mut s);
+        let mut first_page = page(first["id"].clone(), &[], Some("\0"));
+        if protocol == McpProtocol::Legacy20251125 {
+            for field in ["resultType", "ttlMs", "cacheScope"] {
+                first_page["result"].as_object_mut().unwrap().remove(field);
+            }
+        }
+        reply(&mut s, first_page);
+        let pending = s.pending_write();
+        assert!(!pending.is_empty(), "opaque cursor must queue page two");
+        let wire = std::str::from_utf8(pending).unwrap();
+        assert!(wire.contains(r#""cursor":"\u0000""#));
+        assert!(!pending.contains(&0), "cursor NUL must be JSON-escaped");
+        let second = sent(&mut s);
+        assert_eq!(second["params"]["cursor"], json!("\0"));
+        assert_eq!(second["id"], 2);
+        let mut final_page = page(second["id"].clone(), &["hello_v2"], None);
+        if protocol == McpProtocol::Legacy20251125 {
+            for field in ["resultType", "ttlMs", "cacheScope"] {
+                final_page["result"].as_object_mut().unwrap().remove(field);
+            }
+        }
+        reply(&mut s, final_page);
+        s.eof();
+        let evidence = s.finish(McpShutdown::Graceful);
+        assert!(evidence.verified_pass());
+        assert_eq!(
+            evidence.protocol_outcome(),
+            theseus::model::CheckOutcome::Passed
+        );
+    }
+}
+
+#[test]
+fn repeated_opaque_nul_cursor_is_a_protocol_failure() {
+    let mut s = McpSession::new(probe()).unwrap();
+    startup(&mut s);
+    let first = sent(&mut s);
+    reply(&mut s, page(first["id"].clone(), &[], Some("\0")));
+    assert!(
+        !s.pending_write().is_empty(),
+        "first opaque cursor must be accepted"
+    );
+    let second = sent(&mut s);
+    reply(&mut s, page(second["id"].clone(), &[], Some("\0")));
+    s.eof();
+    issue(
+        s,
+        McpIssueKind::Protocol,
+        theseus::model::CheckOutcome::Failed,
+    );
+}
