@@ -125,6 +125,23 @@ pub(super) fn record(r: Record<'_>, out: &mut dyn Write) -> fmt::Result {
             a.files.len(),
             a.files
         ),
+        Record::Mcp(p) => write!(
+            out,
+            "MCP {} | {:?} | scope: {} | alias: {}\nClient version: {} | client artifact: {}\nClient claim: {}\nProof boundary: native registration/health and independent typed stdio discovery are separate observations; no authentication, model invocation or tool execution. Whole-container teardown is authoritative containment.\nCheckpoint contracts: {:?}",
+            p.adapter,
+            p.delivery,
+            p.scope,
+            p.client_alias,
+            p.client_version,
+            p.client_artifact,
+            match p.client_claim {
+                crate::recipe::McpClientClaim::ConfigurationOnly =>
+                    "configuration only; native activation not exposed/tested",
+                crate::recipe::McpClientClaim::NativeHealth =>
+                    "native health; target alias/source only",
+            },
+            p.checkpoints
+        ),
         Record::SourcePath(root, path) => {
             out.write_str("Source logs/commands: theseus report ")?;
             shell_path(out, root, Some(path))
@@ -175,6 +192,53 @@ fn check(c: &CheckResult, out: &mut dyn Write) -> fmt::Result {
             write!(out, " unavailable")?;
         }
     }
+    if c.mcp_required {
+        if let Some(p) = &c.mcp {
+            write!(
+                out,
+                "\nMCP protocol: {} | complete={} capture_complete={} verified={}\nShutdown: {:?} | stdout bytes={} notifications={}",
+                p.probe.protocol.version(),
+                p.protocol_complete,
+                p.stdout_complete,
+                p.verified_pass(),
+                p.shutdown,
+                p.stdout_bytes,
+                p.notification_count
+            )?;
+            // Render facts from retained received responses, including mismatches.
+            // Expected identity/inventory must never substitute for observations.
+            for line in &p.response_lines {
+                if let Ok(frame) = crate::strict_json::parse(line) {
+                    let result = &frame["result"];
+                    if let Some(identity) = result
+                        .get("serverInfo")
+                        .or_else(|| result.pointer("/_meta/io.modelcontextprotocol~1serverInfo"))
+                    {
+                        write!(
+                            out,
+                            "\nObserved server: name={:?} version={:?}",
+                            observed_text(&identity["name"], 256),
+                            observed_text(&identity["version"], 256)
+                        )?;
+                    }
+                    if let Some(tools) = result["tools"].as_array() {
+                        write!(out, "\nObserved tools:")?;
+                        for tool in tools {
+                            write!(out, " {:?}", observed_text(&tool["name"], 128))?;
+                        }
+                        if tools.is_empty() {
+                            write!(out, " <empty>")?;
+                        }
+                    }
+                }
+            }
+            if let Some(issue) = &p.issue {
+                write!(out, "\nMCP issue {:?}: {}", issue.kind, issue.message)?;
+            }
+        } else {
+            write!(out, "\nMCP proof: unavailable")?;
+        }
+    }
     if let Some(p) = &c.path {
         write!(out, "\nScope: {p}")?;
     }
@@ -185,6 +249,12 @@ fn check(c: &CheckResult, out: &mut dyn Write) -> fmt::Result {
         write!(out, "\nComparison: {} -> {}", c.before_stage, c.after_stage)?;
     }
     Ok(())
+}
+fn observed_text(value: &serde_json::Value, limit: usize) -> String {
+    value
+        .as_str()
+        .map(|s| Record::Text(s).summary(limit))
+        .unwrap_or_else(|| "<non-string>".into())
 }
 // Stream POSIX quoting before projection; source paths can be large stored fields.
 fn shell_path(out: &mut dyn Write, root: &Path, relative: Option<&str>) -> fmt::Result {

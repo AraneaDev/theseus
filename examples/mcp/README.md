@@ -38,6 +38,13 @@ use. Codex global means private `CODEX_HOME`, without a
 native CLI scope flag. Codex uses native add/upsert, list/get JSON and remove;
 **native activation is not exposed/tested**, and no Connected claim is made.
 Every active checkpoint independently probes the actual stdio response bytes.
+Claude project fixtures explicitly approve only `probe` through
+`enabledMcpjsonServers` in the disposable guest's private user `settings.json`.
+Without that seed, the actual 2.1.312 client reports Pending approval and the
+NativeHealth check fails. This rehearses a declared preapproved configuration;
+it does not test an interactive approval prompt or workspace trust. The setting
+is documented in the [official settings reference](https://code.claude.com/docs/en/settings-reference#enabledmcpjsonservers)
+and was confirmed by a same-client guest A/B health check.
 Disabled and removed checkpoints do not launch the server through a typed probe.
 The small fixture server accepts the simple string/integer request IDs used by
 these version-bound clients; it is not a general-purpose MCP implementation.
@@ -88,7 +95,44 @@ model use, tools/call, host configuration fidelity or companion activation.
 `tests/support/mcp.rs` is explicitly SYNTHETIC: raw native-shaped documents and
 McpSession-generated response evidence exercise contract and engine behavior.
 The matrix test supplies an inert ELF-header byte fixture that is never executed.
-Neither test satisfies vendor-native acceptance. Actual supplied-client acceptance
-and presentation are a separate task, with guest version/artifact proof and owned
-container cleanup required. Retained reports check internal consistency of finite
-observations and invocation bindings, not authenticated reconstruction of raw logs.
+Neither test satisfies vendor-native acceptance. Actual supplied-client acceptance is opt-in and separate from this synthetic matrix.
+
+Supply both exact native ELF paths and an already prepared immutable image ID:
+
+```sh
+export THESEUS_MCP_CLAUDE_CLIENT=/explicit/path/to/claude
+export THESEUS_MCP_CODEX_CLIENT=/explicit/path/to/codex
+export THESEUS_MCP_TEST_IMAGE=sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+cargo test --offline --locked --test mcp_lifecycle -- --ignored --nocapture
+cargo test --offline --locked --test mcp_tui -- --ignored --nocapture
+```
+
+Without these inputs tests stay ignored/unrun; explicit invocation fails clearly,
+with no client discovery, download or replay substitution. The CLI harness covers
+18 native combinations: standalone Clean/Upgrade in all listed scopes and plugin
+user lifecycle, each with modern and legacy direct probes. Guest versions and
+artifact hashes bind the actual supplied files. Independent host verification parses
+persisted response bytes and compares `hello_v1`/`hello_v2`, rather than trusting
+request traces or Connected. Deliberate duplicate/stale registration, setting loss,
+wrong inventory, malformed response, ignored EOF, blocked input, timeout and cancel
+faults follow successful native base/update observations. Test-only direct faults
+use explicit probe environment; native health is checked separately. Cancellation
+requires a unique target-v2 marker containing the actual Theseus request ID and
+UID10001 on that direct probe's own stderr, then forbids later guest actions.
+
+Evidence under ignored `.superpowers` contains exact source/public-binary digests,
+client size/SHA-256/actual guest version, image ID, preparation/CLI argv, input
+manifests, native health output, independent response facts, journals and strict
+missing-target inspection for every owned ID. Native binaries and private generated
+workspaces are never committed. The public PTY harness checks current selected
+detail cells in live/offline/cancel sessions, actual narrow/wide resizing, bounded
+raw logs/metadata, explicit native claim boundaries, terminal restoration, a Docker
+sentinel and unchanged offline reports. This is a text-cell oracle, not physical or
+human PNG review. Required Linux CI runs self-contained transport fixtures using
+its explicitly prepared image ID; vendor-native tests require supplied artifacts.
+
+Retained reports check internal consistency of finite observations and invocation
+bindings, not authenticated reconstruction of raw logs. MCP recipe/report fields
+require schema 8; recipes 1–7 retain semantics and reports 1–8 remain readable.
+The shared-engine Theseus MCP interface and controller/native OS portability are
+separate roadmap milestones.

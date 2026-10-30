@@ -135,16 +135,23 @@ fn lifecycle(app: &App) -> Records<'_> {
         })),
     };
     let plugin = app.scenario().and_then(|s| s.plugin.as_ref());
+    let mcp = app.scenario().and_then(|s| s.mcp.as_ref());
     Box::new(
         plugin
             .into_iter()
             .filter(|_| matches!(app.tab, Tab::Stages | Tab::Findings))
             .map(Record::Plugin)
             .chain(
+                mcp.into_iter()
+                    .filter(|_| matches!(app.tab, Tab::Stages | Tab::Findings))
+                    .map(Record::Mcp),
+            )
+            .chain(
                 app.report
                     .iter()
                     .filter(move |_| {
-                        plugin.is_some() && matches!(app.tab, Tab::Stages | Tab::Findings)
+                        (plugin.is_some() || mcp.is_some())
+                            && matches!(app.tab, Tab::Stages | Tab::Findings)
                     })
                     .flat_map(|r| r.artifacts.iter().map(Record::Artifact)),
             )

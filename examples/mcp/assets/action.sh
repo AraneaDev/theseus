@@ -14,6 +14,11 @@ cd /workspace
 seed() {
  printf '%s\n' '{"hasCompletedOnboarding":true,"mcpServers":{"companion":{"command":"/bin/true","args":[]}},"projects":{"/workspace":{"mcpServers":{}}}}' > "$CLAUDE_CONFIG_DIR/.claude.json"
  printf '%s\n' '{"mcpServers":{}}' > /workspace/.mcp.json
+ # Named approval lives only in this disposable guest's private user settings.
+ # Project files cannot approve themselves in an untrusted workspace.
+ if test "$delivery" = standalone && test "$scope" = project; then
+  printf '%s\n' '{"enabledMcpjsonServers":["probe"]}' > "$CLAUDE_CONFIG_DIR/settings.json"
+ fi
 }
 raw() {
  printf '{"client":'; cat "$CLAUDE_CONFIG_DIR/.claude.json"

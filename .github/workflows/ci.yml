@@ -13,9 +13,12 @@ jobs:
       - run: cargo test --locked
       - run: cargo build --locked --release
       - name: Prepare Docker acceptance image
+        id: docker_fixture
         run: |
           docker info
           docker pull ubuntu:24.04
+          image_id=$(docker image inspect ubuntu:24.04 --format '{{.Id}}')
+          echo "image_id=$image_id" >> "$GITHUB_OUTPUT"
       - name: Real Docker lifecycle acceptance (required)
         run: cargo test --locked --test docker_lifecycle -- --ignored --test-threads=1
 
@@ -33,3 +36,17 @@ jobs:
 
       - name: Real comparison Docker and PTY acceptance (required)
         run: cargo test --locked --test comparison_docker -- --ignored --test-threads=1
+
+      - name: Real Docker MCP stdio acceptance (required)
+        env:
+          THESEUS_MCP_TEST_IMAGE: ${{ steps.docker_fixture.outputs.image_id }}
+          THESEUS_MCP_TEST_EVIDENCE: ${{ runner.temp }}/mcp-transport
+        run: cargo test --locked --test mcp_docker -- --ignored --test-threads=1 --nocapture
+
+      - name: Retain MCP transport evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-transport-linux
+          path: ${{ runner.temp }}/mcp-transport
+          if-no-files-found: warn

@@ -13,19 +13,29 @@ use theseus::{
     recipe, report,
     runner::{CommandRequest, Docker, Environment, ExecutedMcp},
 };
-const IMAGE: &str = "sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55";
+fn immutable_image_id(image: &str) -> bool {
+    image.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
 struct Guest {
     docker: Docker,
     resource: OwnedResource,
     store: report::ReportStore,
     _root: tempfile::TempDir,
+    image_id: String,
 }
 impl Guest {
     fn new() -> Self {
-        assert_eq!(
-            std::env::var("THESEUS_MCP_TEST_IMAGE").unwrap(),
-            IMAGE,
-            "explicit cached-image opt-in required"
+        let image = std::env::var("THESEUS_MCP_TEST_IMAGE").expect(
+            "explicit prepared image ID THESEUS_MCP_TEST_IMAGE required; no pull or fallback",
+        );
+        assert!(
+            immutable_image_id(&image),
+            "explicit full immutable sha256 image ID required"
         );
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("target")).unwrap();
@@ -35,12 +45,13 @@ impl Guest {
         )
         .unwrap();
         let text =
-            include_str!("fixtures/recipes/v2_clean.toml").replace("debian:bookworm-slim", IMAGE);
+            include_str!("fixtures/recipes/v2_clean.toml").replace("debian:bookworm-slim", &image);
         let recipe =
             recipe::parse_bytes(&root.path().join("recipe.toml"), text.as_bytes()).unwrap();
         let mut docker = Docker::default();
         let cancel = CancellationToken::default();
-        docker.prepare(&recipe, false, &cancel).unwrap();
+        let prepared = docker.prepare(&recipe, false, &cancel).unwrap();
+        assert_eq!(prepared.image_id, image);
         let resource = docker
             .create("mcp-transport-test", "user-clean", &recipe)
             .unwrap();
@@ -50,6 +61,7 @@ impl Guest {
             resource,
             store: report::create(&root.path().join("run")).unwrap(),
             _root: root,
+            image_id: prepared.image_id,
         };
         guest
             .docker
@@ -118,7 +130,7 @@ impl Guest {
                     std::fs::copy(self.store.root().join(&log.path), directory.join(name)).unwrap();
                 }
             }
-            std::fs::write(directory.join("observation.json"),serde_json::to_vec_pretty(&serde_json::json!({"record":observed.command.record,"evidence":observed.evidence,"container_available":observed.container_available})).unwrap()).unwrap();
+            std::fs::write(directory.join("observation.json"),serde_json::to_vec_pretty(&serde_json::json!({"image_id":self.image_id,"record":observed.command.record,"evidence":observed.evidence,"container_available":observed.container_available})).unwrap()).unwrap();
         }
         observed
     }
@@ -324,4 +336,19 @@ fn truncated_successful_prefix_with_cancellation_remains_saveable_incomplete_evi
     assert!(evidence.valid() && !evidence.protocol_complete);
     assert_eq!(evidence.issue.as_ref().unwrap().kind, McpIssueKind::Limit);
     assert_eq!(loaded.outcome, RunOutcome::Cancelled);
+}
+
+#[test]
+fn transport_image_requires_explicit_full_immutable_identity() {
+    assert!(immutable_image_id(&format!("sha256:{}", "a".repeat(64))));
+    for bad in [
+        "",
+        "ubuntu:24.04",
+        "sha256:abc",
+        "sha256:",
+        &format!("sha256:{}", "A".repeat(64)),
+        &format!("sha256:{}\n", "a".repeat(64)),
+    ] {
+        assert!(!immutable_image_id(bad), "accepted {bad:?}");
+    }
 }

@@ -1,10 +1,11 @@
 # Theseus roadmap
 
-Theseus 0.10 ships a shared Docker lifecycle engine, Ratatui workbench, headless
+Theseus 0.11 ships a shared Docker lifecycle engine, Ratatui workbench, headless
 CLI, versioned recipes/reports, private bounded logs, user/system profiles,
 clean/upgrade/reinstall, interrupted-install/upgrade, downgrade and failed-upgrade
 rollback scenarios, interrupted-upgrade rollback, decorative startup/exit animations,
-explicit assertions, cancellation and verified recovery.
+explicit assertions, cancellation, verified recovery and bounded MCP lifecycle
+registration/discovery checks.
 Self-contained fixtures establish these declared container contracts. A separate
 real Phrourion binary-copy rehearsal covers clean/upgrade and reinstall.
 Reinstall uses explicit schema-2 declarations and stable path/subtree
@@ -110,21 +111,40 @@ readers need not read 7. Journals/ownership/comparison stay version 1. Typed JSO
 observations establish report consistency, not authenticated reports or independent
 query replay. See [plugin fixtures](examples/plugins/README.md).
 
+## Complete: MCP lifecycle and client registration (0.11)
+
+- Standalone Clean/Upgrade and plugin install/update/disable/enable/remove reuse
+  the shared engine, schema-8 contracts and conservative outcomes.
+- Explicit modern `2026-07-28` and legacy `2025-11-25` stdio probes verify received
+  identity and complete named tool inventory, with bounded I/O, shutdown and cleanup.
+- Claude Code 2.1.312 standalone user/project/local and plugin user bind native
+  target health separately; Codex CLI 0.166.0 global is configuration only, with
+  native activation not exposed/tested. Every active checkpoint requires an
+  independent typed probe; companion/settings preservation and exact source/argv
+  bindings remain mandatory.
+- Live/saved evidence separates client claim from protocol observations and raw
+  paged logs. Reports write 8/read 1–8; journals/ownership/comparison remain 1.
+
+See [MCP fixtures and explicit native acceptance](examples/mcp/README.md).
 The following capabilities are planned, not available features.
 
-## MCP lifecycle and client registration
+## Next: controller portability and native OS adapters
 
-- Rehearse standalone and plugin-provided MCP server installations.
-- Support explicit client configuration adapters, startup/handshake/discovery
-  checks, registration preservation and duplicate detection.
+- Required Linux, macOS and Windows CI by default as controller portability lands.
+  Current required execution gates cover Linux; unsupported OS jobs are not added
+  as successful placeholders.
+- Machine/VM adapters where containers cannot establish service/session fidelity.
+- Native macOS and Windows environment adapters with OS-specific contracts;
+  unavailable native acceptance remains explicitly pending.
+
+## Shared-engine MCP interface
+
 - Expose recipe inspection, run creation, status, cancellation and evidence through
   an MCP interface using the same engine and outcome semantics.
 
-## Services, desktop applications and other operating systems
+## Services and desktop applications
 
-- Machine/VM adapters where containers cannot establish service/session fidelity.
 - Observe systemd units, launcher entries and application process lifecycles.
-- Native macOS and Windows environment adapters with OS-specific contracts.
 
 Theseus will continue to require explicit lifecycle contracts and distinguish
 observations from assumptions. New interfaces must share the scenario engine.
