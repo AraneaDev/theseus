@@ -2,10 +2,11 @@
 import fcntl, json, os, pathlib, pty, select, shutil, signal, struct, subprocess, sys, tempfile, termios, time
 from terminal_screen import Screen
 from docker_absence import require_container_absent
+from comparison_cleanup import fallback_cleanup
 binary = str(pathlib.Path(sys.argv[1]).resolve())
 case = sys.argv[2]
 repo = pathlib.Path(__file__).resolve().parents[2]
-evidence = pathlib.Path(tempfile.mkdtemp(prefix='theseus-comparison-task4-' + case + '-'))
+evidence = pathlib.Path(tempfile.mkdtemp(prefix=os.environ.get('THESEUS_COMPARISON_EVIDENCE_PREFIX', 'theseus-comparison-task4-') + case + '-'))
 print('Evidence:', evidence, flush=True)
 owned_tags = []
 roots = []
@@ -196,7 +197,7 @@ try:
             assert all(c['comparison']['status']=='equivalent' for c in result['cells'])
     print('PASS',case,flush=True)
 finally:
-    for root in roots:
-        for saved in root.glob('.theseus-comparisons/*/comparison.json'):
-            subprocess.run([binary,'cleanup',str(saved)],capture_output=True)
-    for tag in owned_tags:command(['docker','image','rm',tag],'remove-owned-marker')
+    try:
+        fallback_cleanup(binary, roots, evidence, sys.exc_info()[1])
+    finally:
+        for tag in owned_tags:command(['docker','image','rm',tag],'remove-owned-marker')

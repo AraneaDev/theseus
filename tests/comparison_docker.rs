@@ -46,3 +46,17 @@ fn headless_cancellation_each_profile_prevents_next_variant_and_cleans_up() {
 fn real_pty_comparison_preview_live_offline_cancel_and_restore() {
     acceptance("pty");
 }
+
+#[test]
+fn fallback_cleanup_retains_diagnostics_and_original_assertion() {
+    let output = std::process::Command::new("python3")
+        .arg("tests/support/test_comparison_cleanup.py")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
