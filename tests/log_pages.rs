@@ -116,14 +116,22 @@ fn no_follow_regular_files_and_fingerprints() {
     fs::remove_file(store.root().join("logs/stdout")).unwrap();
     #[cfg(unix)]
     {
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            store.root().join("logs/stdout"),
-            rustix::fs::FileType::Fifo,
-            rustix::fs::Mode::RUSR,
-            0,
-        )
-        .unwrap();
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        let fifo = store.root().join("logs/stdout");
+        // Darwin has no mknodat binding. Match the host-package real FIFO
+        // fixture and preserve its original owner-read-only permissions.
+        let status = std::process::Command::new("mkfifo")
+            .args(["-m", "400"])
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "could not create the real FIFO fixture");
+        let metadata = fs::symlink_metadata(&fifo).unwrap();
+        assert!(
+            metadata.file_type().is_fifo(),
+            "fixture must be an actual FIFO"
+        );
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o400);
         assert!(store.read_log_page(&r, 0, 1).is_err());
         fs::remove_file(store.root().join("logs/stdout")).unwrap();
     }
