@@ -371,13 +371,10 @@ fn replacing_writer_file_cannot_redirect_temporary_cleanup() -> io::Result<()> {
 #[cfg(windows)]
 #[test]
 fn readonly_destination_is_preserved_without_delete_fallback() -> io::Result<()> {
-    struct Restore(std::path::PathBuf);
+    struct Restore(std::path::PathBuf, std::fs::Permissions);
     impl Drop for Restore {
         fn drop(&mut self) {
-            if let Ok(mut permissions) = std::fs::metadata(&self.0).map(|m| m.permissions()) {
-                permissions.set_readonly(false);
-                let _ = std::fs::set_permissions(&self.0, permissions);
-            }
+            let _ = std::fs::set_permissions(&self.0, self.1.clone());
         }
     }
     let parent = tempfile::tempdir()?;
@@ -385,8 +382,8 @@ fn readonly_destination_is_preserved_without_delete_fallback() -> io::Result<()>
     let root = HostDir::create_private(&path)?;
     publish(&root, b"old")?;
     let destination = path.join("report.json");
-    let _restore = Restore(destination.clone());
     let mut permissions = std::fs::metadata(&destination)?.permissions();
+    let _restore = Restore(destination.clone(), permissions.clone());
     permissions.set_readonly(true);
     std::fs::set_permissions(&destination, permissions)?;
     let error = publish(&root, b"new").unwrap_err();
