@@ -50,13 +50,17 @@ fn retained_root_and_file_survive_replacement() -> io::Result<()> {
     old.write_all(b"same")?;
     let times = std::fs::FileTimes::new().set_modified(old.metadata()?.modified()?);
     let original = fingerprint(&old)?;
-    std::fs::rename(path.join("file"), path.join("old"))?;
+    std::fs::rename(path.join("file"), path.join("old"))
+        .map_err(|e| io::Error::new(e.kind(), format!("rename retained file: {e}")))?;
     let mut replacement = root.create_file(&name)?;
     replacement.write_all(b"same")?;
-    replacement.set_times(times)?;
+    replacement
+        .set_times(times)
+        .map_err(|e| io::Error::new(e.kind(), format!("set replacement time: {e}")))?;
     assert_ne!(fingerprint(&old)?, fingerprint(&replacement)?);
     assert_eq!(fingerprint(&old)?.len, original.len);
-    std::fs::rename(&path, parent.path().join("moved"))?;
+    std::fs::rename(&path, parent.path().join("moved"))
+        .map_err(|e| io::Error::new(e.kind(), format!("rename retained root: {e}")))?;
     let new_root = HostDir::create_private(&path)?;
     new_root.create_file(&RelativePath::parse("other")?)?;
     assert_eq!(root.entries()?.len(), 2);
@@ -152,13 +156,18 @@ fn strict_root_rejects_parent_components() -> io::Result<()> {
     let trusted = temp.path().canonicalize()?;
     let root = HostDir::create_private(&trusted.join("run"))?;
     root.create_child("child".as_ref())?;
+    // PathBuf::join normalizes '..' for Windows verbatim paths returned by
+    // canonicalize. Append native text to actually deliver the unsafe component.
+    let mut raw = trusted.join("run/child").into_os_string();
+    raw.push(std::path::MAIN_SEPARATOR_STR);
+    raw.push("..");
+    let unsafe_path = std::path::PathBuf::from(raw);
     assert!(
-        HostDir::open(
-            &trusted.join("run/child/.."),
-            RootPolicy::AllComponentsNoFollow
-        )
-        .is_err()
+        unsafe_path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
     );
+    assert!(HostDir::open(&unsafe_path, RootPolicy::AllComponentsNoFollow).is_err());
     Ok(())
 }
 

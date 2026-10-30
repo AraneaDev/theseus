@@ -357,9 +357,8 @@ fn supported_profile(
 }
 
 pub(in crate::fs) fn entries(directory: &File) -> io::Result<Vec<OsString>> {
-    // A new relative '.' handle gets an independent enumeration cursor. A duplicated
-    // handle shares a cursor and would race another entries() call.
-    let directory = enumeration_handle(directory)?;
+    // HostDir serializes this entire restart/continuation sequence on its retained
+    // directory handle. No path or undocumented native self-name is re-opened.
     let mut storage = vec![0u64; 8192];
     let capacity = storage.len() * size_of::<u64>();
     let mut names = Vec::new();
@@ -431,11 +430,6 @@ pub(in crate::fs) fn entries(directory: &File) -> io::Result<Vec<OsString>> {
     }
     names.sort();
     Ok(names)
-}
-fn enumeration_handle(directory: &File) -> io::Result<File> {
-    // Trusted internal self-component: never accepted from an untrusted reference.
-    // NtCreateFile uses the pinned root, with an independent enumeration cursor.
-    relative_open(directory, OsStr::new("."), true, false)
 }
 pub fn read_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) -> io::Result<()> {
     while !bytes.is_empty() {

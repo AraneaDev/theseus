@@ -57,7 +57,7 @@ jobs:
       - name: Native package tests
         shell: pwsh
         run: |
-          cargo test --locked -p theseus-host --all-targets 2>&1 |
+          cargo test --locked -p theseus-host --all-targets --no-fail-fast 2>&1 |
             Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'tests.log')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload native package evidence

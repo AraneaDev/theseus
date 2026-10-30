@@ -31,12 +31,16 @@ pub enum RootPolicy {
 pub struct HostDir {
     pub(super) directory: File,
     display: PathBuf,
+    #[cfg(windows)]
+    enumeration: std::sync::Mutex<()>,
 }
 impl HostDir {
     pub fn open(path: &Path, policy: RootPolicy) -> io::Result<Self> {
         Ok(Self {
             directory: platform::open_root(path, policy)?,
             display: path.to_owned(),
+            #[cfg(windows)]
+            enumeration: std::sync::Mutex::new(()),
         })
     }
     /// Create missing private parents, accepting existing ancestor aliases, and
@@ -69,6 +73,8 @@ impl HostDir {
         Ok(Self {
             directory: platform::open_creation_parent(path)?,
             display: path.to_owned(),
+            #[cfg(windows)]
+            enumeration: std::sync::Mutex::new(()),
         })
     }
     pub fn open_child(&self, path: &RelativePath) -> io::Result<Self> {
@@ -79,12 +85,16 @@ impl HostDir {
         Ok(Self {
             directory: platform::create_dir(&self.directory, name)?,
             display: self.display.join(name),
+            #[cfg(windows)]
+            enumeration: std::sync::Mutex::new(()),
         })
     }
     fn walk(&self, components: &[String], create: bool) -> io::Result<Self> {
         let mut dir = Self {
             directory: self.directory.try_clone()?,
             display: self.display.clone(),
+            #[cfg(windows)]
+            enumeration: std::sync::Mutex::new(()),
         };
         for component in components {
             let name = OsStr::new(component);
@@ -102,6 +112,8 @@ impl HostDir {
             dir = Self {
                 directory,
                 display: dir.display.join(name),
+                #[cfg(windows)]
+                enumeration: std::sync::Mutex::new(()),
             };
         }
         Ok(dir)
@@ -122,6 +134,13 @@ impl HostDir {
     }
     /// Enumerate the retained object, independent of its former pathname.
     pub fn entries(&self) -> io::Result<Vec<OsString>> {
+        // Windows enumeration advances this retained handle's cursor. HostDir is
+        // not Clone, and temporary internal clones are used only for child opens.
+        #[cfg(windows)]
+        let _cursor = self
+            .enumeration
+            .lock()
+            .map_err(|_| io::Error::other("directory enumeration lock poisoned"))?;
         platform::entries(&self.directory)
     }
 }
