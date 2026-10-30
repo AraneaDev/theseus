@@ -3,11 +3,11 @@
 //! free live I/O to manufacture a deadline: Drop retains an unresolved allocation.
 use crate::process::{HostCleanup, OwnedSpawnCleanup, SpawnFailure};
 use crate::windows_security::PrivateSecurity;
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::fs::File;
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::ptr::{null, null_mut};
+use std::ptr::{NonNull, null, null_mut};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Security::{Cryptography::*, SECURITY_ATTRIBUTES};
 use windows_sys::Win32::Storage::FileSystem::*;
@@ -24,21 +24,47 @@ fn code(error: &io::Error, value: u32) -> bool {
     error.raw_os_error() == Some(value as i32)
 }
 
-// The allocation never moves while its OVERLAPPED or buffer is visible to the
-// kernel. Fields are touched only before submission or after observed completion.
+// Kernel-visible allocations have a raw owner, not a Box that is reborrowed
+// mutably when an endpoint moves or is polled. All access to Operation is shared;
+// native mutation is confined to UnsafeCells, controller metadata to Cells.
 struct Operation {
     handle: OwnedHandle,
     event: OwnedHandle,
     overlapped: UnsafeCell<OVERLAPPED>,
     buffer: UnsafeCell<[u8; BUFFER]>,
-    pending: bool,
-    setup_peer: Option<File>,
+    pending: Cell<bool>,
+    setup_peer: Cell<Option<File>>,
 }
-// SAFETY: Box gives stable addresses; exclusive endpoint methods serialize access.
-// No thread-local completion routine is used. Owned handles may move across threads.
-unsafe impl Send for Operation {}
+struct OperationOwner(NonNull<Operation>);
+impl OperationOwner {
+    fn get(&self) -> &Operation {
+        // SAFETY: new initializes exactly one allocation and the only reclaim
+        // site is this owner's Drop after observed completion. Never make an
+        // exclusive reference to this allocation while kernel access is possible.
+        unsafe { self.0.as_ref() }
+    }
+}
+// SAFETY: Moving this raw owner transfers Rust access without touching/retagging
+// the allocation. No completion callback has thread affinity. Endpoint methods
+// require &mut self, and this owner is !Sync: there cannot be concurrent Rust
+// callers. Kernel access is only through stable raw pointers into UnsafeCells.
+unsafe impl Send for OperationOwner {}
+impl Drop for OperationOwner {
+    fn drop(&mut self) {
+        if !self.get().pending.get() {
+            // SAFETY: this is the sole Box::from_raw for the sole Box::into_raw.
+            // A false pending flag proves no submission remains kernel-owned.
+            // No Operation reference escapes the endpoint/owner's borrow.
+            unsafe {
+                drop(Box::from_raw(self.0.as_ptr()));
+            }
+        }
+        // Exceptional unresolved completion retains the entire allocation,
+        // including both handles and any setup peer. Never free live native I/O.
+    }
+}
 impl Operation {
-    fn new(handle: OwnedHandle) -> io::Result<Box<Self>> {
+    fn new(handle: OwnedHandle) -> io::Result<OperationOwner> {
         let event = unsafe { CreateEventW(null(), 1, 0, null()) };
         if event.is_null() {
             return Err(io::Error::last_os_error());
@@ -48,17 +74,21 @@ impl Operation {
             hEvent: event.as_raw_handle(),
             ..Default::default()
         };
-        Ok(Box::new(Self {
+        let allocation = Box::new(Self {
             handle,
             event,
             overlapped: UnsafeCell::new(overlapped),
             buffer: UnsafeCell::new([0; BUFFER]),
-            pending: false,
-            setup_peer: None,
-        }))
+            pending: Cell::new(false),
+            setup_peer: Cell::new(None),
+        });
+        // Box's unique reference ends before any pointer is submitted to Windows.
+        Ok(OperationOwner(
+            NonNull::new(Box::into_raw(allocation)).unwrap(),
+        ))
     }
-    fn reset(&mut self) -> io::Result<()> {
-        assert!(!self.pending, "operation must complete before reuse");
+    fn reset(&self) -> io::Result<()> {
+        assert!(!self.pending.get(), "operation must complete before reuse");
         if unsafe { ResetEvent(self.event.as_raw_handle()) } == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -71,7 +101,7 @@ impl Operation {
         }
         Ok(())
     }
-    fn result(&mut self, wait: bool) -> io::Result<usize> {
+    fn result(&self, wait: bool) -> io::Result<usize> {
         // Wait only on our retained operation event, never the pipe handle. A
         // signaled event precedes inspection of kernel-written operation storage.
         let timeout = if wait { INFINITE } else { 0 };
@@ -90,7 +120,7 @@ impl Operation {
             )
         };
         if success != 0 {
-            self.pending = false;
+            self.pending.set(false);
             return Ok(count as usize);
         }
         let error = io::Error::last_os_error();
@@ -99,10 +129,10 @@ impl Operation {
         }
         // With valid retained handles and the signaled dedicated event, this is
         // the terminal operation status (including cancellation), not a request.
-        self.pending = false;
+        self.pending.set(false);
         Err(error)
     }
-    fn submitted(&mut self, success: i32) -> io::Result<usize> {
+    fn submitted(&self, success: i32) -> io::Result<usize> {
         if success != 0 {
             // Immediate completion also has a valid completed OVERLAPPED. Read
             // its count through the documented API rather than directly racing it.
@@ -116,25 +146,28 @@ impl Operation {
                 )
             } != 0
             {
+                self.pending.set(false);
                 return Ok(count as usize);
             }
             let error = io::Error::last_os_error();
             if code(&error, ERROR_IO_INCOMPLETE) || code(&error, ERROR_IO_PENDING) {
-                self.pending = true;
+                self.pending.set(true);
                 return Err(blocked());
             }
+            self.pending.set(false);
             return Err(error);
         }
         let error = io::Error::last_os_error();
         if code(&error, ERROR_IO_PENDING) {
-            self.pending = true;
+            self.pending.set(true);
             return Err(blocked());
         }
+        self.pending.set(false);
         Err(error)
     }
 }
 struct Endpoint {
-    operation: Option<Box<Operation>>,
+    operation: Option<OperationOwner>,
     stopped: bool,
 }
 impl std::fmt::Debug for Endpoint {
@@ -143,25 +176,32 @@ impl std::fmt::Debug for Endpoint {
             .field("stopped", &self.stopped)
             .field(
                 "pending",
-                &self.operation.as_ref().is_some_and(|op| op.pending),
+                &self
+                    .operation
+                    .as_ref()
+                    .is_some_and(|owner| owner.get().pending.get()),
             )
             .finish()
     }
 }
 impl Endpoint {
-    fn active(&mut self) -> io::Result<&mut Operation> {
+    fn active(&self) -> io::Result<&Operation> {
         if self.stopped {
             return Err(stopped());
         }
-        self.operation.as_deref_mut().ok_or_else(stopped)
+        self.operation
+            .as_ref()
+            .map(OperationOwner::get)
+            .ok_or_else(stopped)
     }
     fn stop(&mut self) -> io::Result<()> {
         self.stopped = true; // Publish stop BEFORE requesting cancellation.
-        let Some(op) = &mut self.operation else {
+        let Some(owner) = &self.operation else {
             return Ok(());
         };
+        let op = owner.get();
         let mut cancellation_error = None;
-        if op.pending {
+        if op.pending.get() {
             if unsafe { CancelIoEx(op.handle.as_raw_handle(), op.overlapped.get()) } == 0 {
                 let error = io::Error::last_os_error();
                 if !code(&error, ERROR_NOT_FOUND) {
@@ -171,7 +211,7 @@ impl Endpoint {
             // ERROR_NOT_FOUND only means the cancellation request lost a race.
             // Regardless of its result, observe completion before releasing anything.
             let result = op.result(true);
-            if op.pending {
+            if op.pending.get() {
                 return result.map(|_| ());
             }
             if let Err(error) = result {
@@ -190,17 +230,12 @@ impl Endpoint {
 impl Drop for Endpoint {
     fn drop(&mut self) {
         let _ = self.stop();
-        if self.operation.as_ref().is_some_and(|op| op.pending) {
-            // Exceptional kernel/API failure cannot justify releasing live storage.
-            // Explicit cleanup callers retain this owner and diagnostics for retry.
-            if let Some(op) = self.operation.take() {
-                std::mem::forget(op);
-            }
-        }
+        // If stop could not observe completion, OperationOwner::drop retains the
+        // allocation. Otherwise stop has already released its completed owner.
     }
 }
 
-fn server(reading: bool) -> io::Result<(Box<Operation>, Vec<u16>)> {
+fn server(reading: bool) -> io::Result<(OperationOwner, Vec<u16>)> {
     let mut random = [0u8; 16];
     let status = unsafe {
         BCryptGenRandom(
@@ -250,7 +285,8 @@ fn server(reading: bool) -> io::Result<(Box<Operation>, Vec<u16>)> {
     Ok((Operation::new(handle)?, name))
 }
 fn pair(reading: bool) -> Result<(Endpoint, File), SpawnFailure> {
-    let (mut operation, name) = server(reading).map_err(SpawnFailure::never)?;
+    let (owner, name) = server(reading).map_err(SpawnFailure::never)?;
+    let operation = owner.get();
     // Open our synchronous client first. No wait-for-client blocking call: with a
     // fresh first-instance server this either connects immediately or fails.
     let access = if reading { GENERIC_WRITE } else { GENERIC_READ };
@@ -268,14 +304,19 @@ fn pair(reading: bool) -> Result<(Endpoint, File), SpawnFailure> {
     if raw == INVALID_HANDLE_VALUE {
         return Err(SpawnFailure::never(io::Error::last_os_error()));
     }
-    operation.setup_peer = Some(unsafe { File::from_raw_handle(raw) });
+    operation
+        .setup_peer
+        .set(Some(unsafe { File::from_raw_handle(raw) }));
     operation.reset().map_err(SpawnFailure::never)?;
+    // Arm ownership before submission; there is no fallible Rust work between
+    // this store and the FFI call. Only a terminal call/completion disarms it.
+    operation.pending.set(true);
     let success =
         unsafe { ConnectNamedPipe(operation.handle.as_raw_handle(), operation.overlapped.get()) };
     if success == 0 {
         let error = io::Error::last_os_error();
         if code(&error, ERROR_IO_PENDING) {
-            operation.pending = true;
+            operation.pending.set(true);
             // Unexpected but still owned. Bound connection setup and retain the
             // complete owner on failure, including its peer and operation memory.
             if unsafe { WaitForSingleObject(operation.event.as_raw_handle(), 1000) }
@@ -283,7 +324,7 @@ fn pair(reading: bool) -> Result<(Endpoint, File), SpawnFailure> {
             {
                 return Err(setup_failure(
                     Endpoint {
-                        operation: Some(operation),
+                        operation: Some(owner),
                         stopped: false,
                     },
                     reading,
@@ -296,28 +337,33 @@ fn pair(reading: bool) -> Result<(Endpoint, File), SpawnFailure> {
             if let Err(error) = operation.result(false) {
                 return Err(setup_failure(
                     Endpoint {
-                        operation: Some(operation),
+                        operation: Some(owner),
                         stopped: false,
                     },
                     reading,
                     error,
                 ));
             }
-        } else if !code(&error, ERROR_PIPE_CONNECTED) {
-            return Err(setup_failure(
-                Endpoint {
-                    operation: Some(operation),
-                    stopped: false,
-                },
-                reading,
-                error,
-            ));
+        } else {
+            operation.pending.set(false);
+            if !code(&error, ERROR_PIPE_CONNECTED) {
+                return Err(setup_failure(
+                    Endpoint {
+                        operation: Some(owner),
+                        stopped: false,
+                    },
+                    reading,
+                    error,
+                ));
+            }
         }
+    } else {
+        operation.pending.set(false);
     }
     let peer = operation.setup_peer.take().expect("owned setup peer");
     Ok((
         Endpoint {
-            operation: Some(operation),
+            operation: Some(owner),
             stopped: false,
         },
         peer,
@@ -386,10 +432,11 @@ impl PipeReader {
         }
         if self.ready.is_empty() && !self.eof {
             let op = self.endpoint.active()?;
-            let result = if op.pending {
+            let result = if op.pending.get() {
                 op.result(false)
             } else {
                 op.reset()?;
+                op.pending.set(true);
                 let success = unsafe {
                     ReadFile(
                         op.handle.as_raw_handle(),
@@ -407,6 +454,7 @@ impl PipeReader {
         if count > 0 {
             let op = self.endpoint.active()?;
             // Completion was observed before any Rust reference into this buffer.
+            assert!(!op.pending.get());
             out[..count].copy_from_slice(unsafe {
                 &(&*op.buffer.get())[self.ready.start..self.ready.start + count]
             });
@@ -422,21 +470,25 @@ impl PipeReader {
 pub struct PipeWriter {
     endpoint: Endpoint,
     submitted: usize,
+    // Controller-only copy: never submitted to Windows. Pending retry validation
+    // must not read even an immutable slice of the native WriteFile buffer.
+    retry: Box<[u8; BUFFER]>,
 }
 impl PipeWriter {
     fn new(endpoint: Endpoint) -> Self {
         Self {
             endpoint,
             submitted: 0,
+            retry: Box::new([0; BUFFER]),
         }
     }
     /// Pending writes own a bounded copy and return WouldBlock. Retry the same
     /// prefix until acknowledged; changing it is InvalidInput, never an ack.
     pub fn try_write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let op = self.endpoint.active()?;
-        let result = if op.pending {
+        let result = if op.pending.get() {
             if bytes.len() < self.submitted
-                || bytes[..self.submitted] != unsafe { (&*op.buffer.get())[..self.submitted] }
+                || bytes[..self.submitted] != self.retry[..self.submitted]
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -450,9 +502,14 @@ impl PipeWriter {
             }
             op.reset()?;
             self.submitted = bytes.len().min(BUFFER);
+            self.retry[..self.submitted].copy_from_slice(&bytes[..self.submitted]);
+            // reset succeeded with pending=false. This is the only writer buffer
+            // access, and its Rust reference ends before WriteFile begins.
             unsafe {
-                (&mut *op.buffer.get())[..self.submitted].copy_from_slice(&bytes[..self.submitted]);
+                (&mut *op.buffer.get())[..self.submitted]
+                    .copy_from_slice(&self.retry[..self.submitted]);
             }
+            op.pending.set(true);
             let success = unsafe {
                 WriteFile(
                     op.handle.as_raw_handle(),
@@ -464,7 +521,7 @@ impl PipeWriter {
             };
             op.submitted(success)
         };
-        if !op.pending {
+        if !op.pending.get() {
             self.submitted = 0;
         }
         match result {

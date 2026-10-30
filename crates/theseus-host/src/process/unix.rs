@@ -199,6 +199,20 @@ mod tests {
     }
 
     #[test]
+    fn owned_pipe_ends_are_cloexec_and_only_controller_is_nonblocking() -> io::Result<()> {
+        use rustix::fs::{OFlags, fcntl_getfl};
+        use rustix::io::{FdFlags, fcntl_getfd};
+        for reading in [true, false] {
+            let (controller, child) = pair(reading)?;
+            assert!(fcntl_getfd(&controller)?.contains(FdFlags::CLOEXEC));
+            assert!(fcntl_getfd(&child)?.contains(FdFlags::CLOEXEC));
+            assert!(fcntl_getfl(&controller)?.contains(OFlags::NONBLOCK));
+            assert!(!fcntl_getfl(&child)?.contains(OFlags::NONBLOCK));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn external_reap_disarms_group_before_any_later_signal() {
         let mut native = Command::new("/bin/sh");
         native.args(["-c", "exit 0"]).process_group(0);
@@ -219,7 +233,12 @@ mod tests {
 
 /// Controller end only is nonblocking; child stdin/stdout retain blocking semantics.
 fn pair(reading: bool) -> io::Result<(File, File)> {
-    let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+    // std uses pipe2(O_CLOEXEC) where supported and checked CLOEXEC setup on
+    // Darwin. Returned descriptors are CLOEXEC; Darwin creation is not atomic
+    // against unrelated foreign forks during std's setup interval.
+    let (read, write) = std::io::pipe()?;
+    let read = std::os::fd::OwnedFd::from(read);
+    let write = std::os::fd::OwnedFd::from(write);
     let (controller, child) = if reading {
         (read, write)
     } else {

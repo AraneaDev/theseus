@@ -46,7 +46,16 @@ fn raw_zero_byte_write_then_payload_then_peer_close_never_premature_eof() {
                 reader.try_read(&mut [0; 8]).unwrap_err().kind(),
                 io::ErrorKind::WouldBlock
             );
-            assert!(reader.endpoint.operation.as_ref().unwrap().pending);
+            assert!(
+                reader
+                    .endpoint
+                    .operation
+                    .as_ref()
+                    .unwrap()
+                    .get()
+                    .pending
+                    .get()
+            );
         }
         raw_zero(&peer);
         let until = Instant::now() + Duration::from_millis(20);
@@ -87,8 +96,8 @@ fn fill(writer: &mut PipeWriter, bytes: &[u8]) -> usize {
                 assert!(accepted < 4 * 1024 * 1024);
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                let op = writer.endpoint.operation.as_ref().unwrap();
-                assert!(op.pending);
+                let op = writer.endpoint.operation.as_ref().unwrap().get();
+                assert!(op.pending.get());
                 if unsafe { WaitForSingleObject(op.event.as_raw_handle(), 100) } == WAIT_TIMEOUT {
                     return accepted;
                 }
@@ -100,17 +109,30 @@ fn fill(writer: &mut PipeWriter, bytes: &[u8]) -> usize {
 #[test]
 fn pending_write_owns_copy_and_validates_retry_before_acknowledgment() {
     let (mut writer, mut peer) = writer().unwrap();
-    let bytes = vec![b'x'; BUFFER];
+    let mut bytes = vec![b'x'; BUFFER];
     let mut accepted = fill(&mut writer, &bytes);
-    assert!(writer.endpoint.operation.as_ref().unwrap().pending);
+    assert!(
+        writer
+            .endpoint
+            .operation
+            .as_ref()
+            .unwrap()
+            .get()
+            .pending
+            .get()
+    );
     assert_eq!(
         writer.try_write(b"different").unwrap_err().kind(),
         io::ErrorKind::InvalidInput
     );
+    // Mutating the caller's old allocation cannot change a native in-flight write
+    // or the separate retry snapshot. Never inspect the native pending buffer.
+    bytes.fill(b'y');
     assert_eq!(
-        unsafe { &(&*writer.endpoint.operation.as_ref().unwrap().buffer.get())[..BUFFER] },
-        bytes
+        writer.try_write(&bytes).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
     );
+    bytes.fill(b'x');
     let until = Instant::now() + Duration::from_secs(5);
     std::thread::scope(|scope| {
         let read = scope.spawn(move || {
@@ -156,21 +178,22 @@ fn failed_pending_write_never_acknowledges_delivery() {
 }
 #[test]
 fn pending_connect_failure_guard_owns_setup_even_without_child() {
-    let (mut operation, _name) = server(true).unwrap();
-    operation.reset().unwrap();
-    assert_eq!(
-        unsafe { ConnectNamedPipe(operation.handle.as_raw_handle(), operation.overlapped.get()) },
-        0
-    );
-    assert_eq!(
-        io::Error::last_os_error().raw_os_error(),
-        Some(ERROR_IO_PENDING as i32)
-    );
-    operation.pending = true;
+    let (owner, _name) = server(true).unwrap();
     let endpoint = Endpoint {
-        operation: Some(operation),
+        operation: Some(owner),
         stopped: false,
     };
+    let operation = endpoint.active().unwrap();
+    operation.reset().unwrap();
+    operation.pending.set(true);
+    let success =
+        unsafe { ConnectNamedPipe(operation.handle.as_raw_handle(), operation.overlapped.get()) };
+    let error = io::Error::last_os_error();
+    if success != 0 || !code(&error, ERROR_IO_PENDING) {
+        operation.pending.set(false);
+    }
+    assert_eq!(success, 0);
+    assert_eq!(error.raw_os_error(), Some(ERROR_IO_PENDING as i32));
     let mut failure = setup_failure(endpoint, true, io::Error::other("original setup failure"));
     assert_eq!(failure.launch, crate::process::LaunchPhase::NeverCreated);
     assert_eq!(failure.error.to_string(), "original setup failure");
@@ -184,7 +207,9 @@ fn pending_connect_failure_guard_owns_setup_even_without_child() {
             .operation
             .as_ref()
             .unwrap()
+            .get()
             .pending
+            .get()
     );
     let start = Instant::now();
     assert!(guard.try_complete().unwrap());
@@ -199,7 +224,7 @@ fn completed_read_cancel_not_found_still_observes_completion() {
         io::ErrorKind::WouldBlock
     );
     peer.write_all(b"done").unwrap();
-    let operation = reader.endpoint.operation.as_ref().unwrap();
+    let operation = reader.endpoint.operation.as_ref().unwrap().get();
     assert_eq!(
         unsafe { WaitForSingleObject(operation.event.as_raw_handle(), 5000) },
         WAIT_OBJECT_0
@@ -222,7 +247,8 @@ fn completed_read_cancel_not_found_still_observes_completion() {
 #[test]
 fn pipe_objects_have_private_protected_acl_and_noninheritable_controllers() {
     for reading in [true, false] {
-        let (op, name) = server(reading).unwrap();
+        let (owner, name) = server(reading).unwrap();
+        let op = owner.get();
         assert_private(&op.handle).unwrap();
         let mut flags = 0;
         assert_ne!(
@@ -358,4 +384,43 @@ fn assert_private(file: &OwnedHandle) -> io::Result<()> {
         assert!(saw_user && saw_system);
     }
     Ok(())
+}
+
+#[test]
+fn pending_read_and_write_move_to_another_thread_without_moving_native_storage() {
+    let (mut output, mut peer) = reader().unwrap();
+    assert_eq!(
+        output.try_read(&mut [0; 1]).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    std::thread::scope(|scope| {
+        let read = scope.spawn(move || collect(&mut output));
+        peer.write_all(b"moved pending reader").unwrap();
+        drop(peer);
+        assert_eq!(read.join().unwrap(), b"moved pending reader");
+    });
+
+    let (mut input, mut peer) = writer().unwrap();
+    let bytes = vec![b'm'; BUFFER];
+    let accepted = fill(&mut input, &bytes);
+    std::thread::scope(|scope| {
+        let write = scope.spawn(move || {
+            let until = Instant::now() + Duration::from_secs(5);
+            let written = loop {
+                match input.try_write(&bytes) {
+                    Ok(n) => break n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < until);
+                        std::thread::yield_now();
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            };
+            input.close().unwrap();
+            written
+        });
+        let mut received = Vec::new();
+        peer.read_to_end(&mut received).unwrap();
+        assert_eq!(received, vec![b'm'; accepted + write.join().unwrap()]);
+    });
 }
