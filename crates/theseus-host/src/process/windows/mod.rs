@@ -20,6 +20,8 @@ pub struct OwnedChild {
     thread: OwnedHandle,
     job: Job,
     released: bool,
+    job_termination_requested: bool,
+    process_termination_requested: bool,
 }
 impl OwnedChild {
     /// Temporary Task 4 acceptance bridge; Task 5 reuses it for real endpoints.
@@ -41,22 +43,43 @@ impl OwnedChild {
         }
     }
     pub fn terminate_owned(&mut self) -> io::Result<()> {
-        let job_result = self.job.terminate();
-        // Also cover failed membership validation: process authority is independent.
-        let process_result = if !self.exited_reserved()?
-            && unsafe { TerminateProcess(self.process.as_raw_handle(), 1) } == 0
-        {
-            // Process exit may race TerminateProcess. A signaled retained handle
-            // proves the process is gone without reopening by PID.
-            let error = io::Error::last_os_error();
-            if self.exited_reserved()? {
-                Ok(())
-            } else {
-                Err(error)
-            }
-        } else {
+        if self.job_termination_requested && self.process_termination_requested {
+            return Ok(());
+        }
+        // Membership is only an optimization here: an unsuccessful query falls
+        // back to retained process termination. It cannot discard either owner.
+        let member = matches!(self.job.contains(self.process.as_raw_handle()), Ok(true));
+        let job_result = if self.job_termination_requested {
             Ok(())
+        } else {
+            self.job
+                .terminate()
+                .inspect(|_| self.job_termination_requested = true)
         };
+        let process_result =
+            if self.process_termination_requested || (self.job_termination_requested && member) {
+                // TerminateJobObject already requested this process's termination.
+                // TerminateProcess is asynchronous; a second request can fail with
+                // ACCESS_DENIED before the process wait object becomes signaled.
+                Ok(())
+            } else if !self.exited_reserved()?
+                && unsafe { TerminateProcess(self.process.as_raw_handle(), 1) } == 0
+            {
+                let error = io::Error::last_os_error();
+                if self.exited_reserved()? {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            } else {
+                Ok(())
+            };
+        if process_result.is_ok() {
+            self.process_termination_requested = true;
+        }
+        // Track successful requests separately even if the other request failed.
+        // Acceptance is not completion: cleanup still waits for both retained
+        // process exit and zero active job members on every retry.
         job_result.and(process_result)
     }
     pub(crate) fn cleanup(&mut self) -> io::Result<bool> {

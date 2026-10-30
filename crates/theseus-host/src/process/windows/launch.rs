@@ -129,6 +129,7 @@ enum Fault {
     CleanupPending,
     ResumeUncertain,
     SuspendAgain,
+    ReleaseThenResuspend,
     AlreadyResumed,
     ResumeFailure,
     AfterResume,
@@ -248,6 +249,8 @@ fn spawn_impl(
         thread,
         job,
         released: false,
+        job_termination_requested: false,
+        process_termination_requested: false,
     };
     drop(attributes);
     #[cfg(test)]
@@ -286,6 +289,32 @@ fn spawn_impl(
         Fault::SuspendAgain => {
             assert_eq!(unsafe { SuspendThread(child.thread.as_raw_handle()) }, 1);
         }
+        Fault::ReleaseThenResuspend => {
+            assert_eq!(unsafe { ResumeThread(child.thread.as_raw_handle()) }, 1);
+            // The child test keeps its worker alive behind a bounded gate. Its
+            // primary thread waits for that worker, so resuspension cannot race
+            // process exit. The marker also proves actual execution after release.
+            let crate::process::ChildEnvironment::Replace(entries) = &command.environment else {
+                panic!("history fault requires explicit gate")
+            };
+            let ready = std::path::PathBuf::from(
+                &entries
+                    .iter()
+                    .find(|(key, _)| key == "THESEUS_HOST_RESUME_HISTORY_GATE")
+                    .unwrap()
+                    .1,
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !ready.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "history child failed to reach gate"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert_eq!(unsafe { SuspendThread(child.thread.as_raw_handle()) }, 0);
+            assert_eq!(unsafe { SuspendThread(child.thread.as_raw_handle()) }, 1);
+        }
         Fault::AlreadyResumed => {
             assert_eq!(unsafe { ResumeThread(child.thread.as_raw_handle()) }, 1);
         }
@@ -305,12 +334,10 @@ fn spawn_impl(
         } else {
             io::Error::other("unexpected primary-thread suspend count")
         };
-        // >1 proves no release; zero or failed/uncertain release must remain MayRun.
-        let phase = if previous > 1 && previous != u32::MAX {
-            LaunchPhase::CreatedSuspended
-        } else {
-            LaunchPhase::MayRun
-        };
+        // Any unexpected count has unknown history. Even >1 can follow an
+        // earlier release and resuspension; current suspension cannot prove
+        // that user code was never runnable.
+        let phase = LaunchPhase::MayRun;
         return Err(fail(
             child,
             phase,
@@ -427,13 +454,15 @@ mod tests {
             2
         );
         assert!(std::fs::read(out.path()).unwrap().is_empty());
+        guard.child.terminate_owned().unwrap();
+        guard.child.terminate_owned().unwrap();
         complete(&mut failure);
         assert!(std::fs::read(out.path()).unwrap().is_empty());
     }
     #[test]
     fn native_resume_counts_and_failed_resume_preserve_phase() {
         for (fault, phase) in [
-            (Fault::SuspendAgain, LaunchPhase::CreatedSuspended),
+            (Fault::SuspendAgain, LaunchPhase::MayRun),
             (Fault::AlreadyResumed, LaunchPhase::MayRun),
             (Fault::ResumeFailure, LaunchPhase::MayRun),
         ] {
@@ -448,11 +477,81 @@ mod tests {
             .unwrap_err();
             assert_eq!(failure.launch, phase);
             complete(&mut failure);
-            if fault != Fault::AlreadyResumed {
+            if !matches!(fault, Fault::AlreadyResumed | Fault::ReleaseThenResuspend) {
                 assert!(std::fs::read(out.path()).unwrap().is_empty());
             }
         }
     }
+    #[test]
+    fn released_then_resuspended_history_is_always_may_run() {
+        const GATE: &str = "THESEUS_HOST_RESUME_HISTORY_GATE";
+        if let Some(ready) = std::env::var_os(GATE) {
+            // Trusted subprocess role of this same test executable. Parent runs
+            // the assertions; child stays alive for exact-thread resuspension.
+            std::fs::write(ready, b"history child ran").unwrap();
+            std::thread::sleep(Duration::from_secs(15));
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("history-ready");
+        let mut command = marker_command();
+        command.args = vec![
+            "--exact".into(),
+            "process::windows::launch::tests::released_then_resuspended_history_is_always_may_run"
+                .into(),
+        ];
+        command.environment = ChildEnvironment::Replace(vec![(GATE.into(), ready.clone().into())]);
+        let mut failure =
+            spawn_impl(&command, None, None, None, Fault::ReleaseThenResuspend).unwrap_err();
+        assert_eq!(std::fs::read(ready).unwrap(), b"history child ran");
+        assert_eq!(failure.launch, LaunchPhase::MayRun);
+        complete(&mut failure);
+    }
+
+    #[test]
+    fn native_duplicate_termination_control_records_exact_api_results() {
+        use std::io::Write;
+        let mut failures = Vec::new();
+        for attempt in 0..8 {
+            let mut failure =
+                spawn_impl(&marker_command(), None, None, None, Fault::CleanupPending).unwrap_err();
+            let HostCleanup::Pending(guard) = &mut failure.cleanup else {
+                panic!("requires suspended process")
+            };
+            assert!(
+                guard
+                    .child
+                    .job
+                    .contains(guard.child.process.as_raw_handle())
+                    .unwrap()
+            );
+            let job = guard.child.job.terminate();
+            assert!(job.is_ok());
+            // Reproduce the original native sequence independently of the fix.
+            let process = unsafe { TerminateProcess(guard.child.process.as_raw_handle(), 1) };
+            let error = if process == 0 {
+                Some(io::Error::last_os_error().raw_os_error())
+            } else {
+                None
+            };
+            let signaled = guard.child.exited_reserved().unwrap();
+            writeln!(std::io::stdout().lock(), "termination-control attempt={attempt} TerminateJobObject=success TerminateProcess={process} error={error:?} process_signaled={signaled}").unwrap();
+            if let Some(Some(code)) = error {
+                failures.push(code);
+            }
+            // The real successful job request covers this confirmed member.
+            guard.child.job_termination_requested = true;
+            guard.child.process_termination_requested = true;
+            complete(&mut failure);
+        }
+        assert!(
+            failures.iter().all(|code| *code == 5),
+            "unexpected native failure: {failures:?}"
+        );
+        // Timing may allow a redundant request to succeed. The raw native results
+        // establish which exact API failed; no denial is treated as completion.
+    }
+
     #[test]
     fn uncertain_resume_and_post_resume_failure_preserve_may_run() {
         for fault in [Fault::ResumeUncertain, Fault::AfterResume] {

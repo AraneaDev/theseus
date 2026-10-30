@@ -207,3 +207,26 @@ fn file_input_delivers_exact_bytes_and_closes_at_eof() {
     assert!(child.reap_and_release().unwrap().success());
     assert_eq!(std::fs::read(output).unwrap(), bytes);
 }
+
+#[test]
+fn leader_exit_does_not_skip_living_descendant_termination() {
+    let root = tempfile::tempdir().unwrap();
+    let ready = root.path().join("ready");
+    let late = root.path().join("late");
+    let mut cmd = command(&["descendant-marker"]);
+    cmd.args.extend([ready.clone().into(), late.clone().into()]);
+    let mut child = OwnedChild::spawn_files(&cmd, None, None, None).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !child.exited_reserved().unwrap() || !ready.exists() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    child.terminate_owned().unwrap();
+    child.terminate_owned().unwrap();
+    assert!(child.reap_and_release().unwrap().success());
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(
+        !late.exists(),
+        "live descendant survived exited leader cleanup"
+    );
+}

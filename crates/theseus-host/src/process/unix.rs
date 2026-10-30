@@ -10,6 +10,7 @@ pub struct OwnedChild {
     child: Child,
     // None after any consuming wait or ECHILD: numeric identity is no longer reserved.
     group: Option<Pid>,
+    termination_requested: bool,
 }
 impl OwnedChild {
     /// Temporary Task 4 acceptance bridge; Task 5 reuses it for real endpoints.
@@ -37,7 +38,11 @@ impl OwnedChild {
         let child = native.spawn().map_err(SpawnFailure::never)?;
         // std's Unix Child::id is a positive pid_t, which rustix also represents.
         let group = Some(Pid::from_child(&child));
-        Ok(Self { child, group })
+        Ok(Self {
+            child,
+            group,
+            termination_requested: false,
+        })
     }
 
     /// Observe without consuming the waitable leader, which reserves the PGID.
@@ -62,17 +67,25 @@ impl OwnedChild {
 
     /// Signal the group before its leader is reaped. ECHILD permanently disarms it.
     pub fn terminate_owned(&mut self) -> io::Result<()> {
-        if self.group.is_none() {
+        if self.group.is_none() || self.termination_requested {
             return Ok(());
         }
+        #[cfg(target_os = "macos")]
+        let exited = self.exited_reserved()?;
+        #[cfg(not(target_os = "macos"))]
         self.exited_reserved()?;
-        match kill_process_group(
-            self.group.expect("reserved after observation"),
-            Signal::KILL,
-        ) {
-            Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
-            Err(error) => Err(error.into()),
+        let group = self.group.expect("reserved after observation");
+        match kill_process_group(group, Signal::KILL) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+            #[cfg(target_os = "macos")]
+            Err(rustix::io::Errno::PERM)
+                if exited && only_reserved_leader(group) && self.exited_reserved()? => {}
+            Err(error) => return Err(error.into()),
         }
+        // Repeated cleanup polls must not reissue an accepted termination request.
+        // The consuming wait still retains the leader until group signalling ends.
+        self.termination_requested = true;
+        Ok(())
     }
 
     pub fn reap_and_release(mut self) -> io::Result<ExitStatus> {
@@ -104,9 +117,87 @@ impl Drop for OwnedChild {
     }
 }
 
+// XNU killpg1 excludes SZOMB and can report EPERM for a zombie-only group.
+// Accept only a complete group snapshot containing the reserved leader alone.
+// Apple's proc_info.c traverses allproc + zombproc under one proc_list lock;
+// a two-slot buffer distinguishes this exact case from any additional member.
+// proc_listpids returns BYTES (and zero for failure), not a PID count.
+#[cfg(target_os = "macos")]
+fn only_reserved_leader(group: Pid) -> bool {
+    const PROC_PGRP_ONLY: u32 = 2; // xnu/bsd/sys/proc_info.h
+    let mut members = [0 as libc::pid_t; 2];
+    let bytes = unsafe {
+        libc::proc_listpids(
+            PROC_PGRP_ONLY,
+            group.as_raw_nonzero().get() as u32,
+            members.as_mut_ptr().cast(),
+            std::mem::size_of_val(&members) as libc::c_int,
+        )
+    };
+    // Zero/error, full/truncated, malformed, or another PID never proves safety.
+    bytes == std::mem::size_of::<libc::pid_t>() as libc::c_int
+        && members[0] == group.as_raw_nonzero().get()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_group_observation_requires_exact_reserved_leader() {
+        use std::time::{Duration, Instant};
+        let command = NativeCommand {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "exit 0".into()],
+            cwd: None,
+            environment: ChildEnvironment::Inherit,
+        };
+        let mut child = OwnedChild::spawn_files(&command, None, None, None).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !child.exited_reserved().unwrap() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let group = child.group.unwrap();
+        assert!(only_reserved_leader(group));
+        assert_eq!(
+            kill_process_group(group, Signal::KILL),
+            Err(rustix::io::Errno::PERM)
+        );
+        child.terminate_owned().unwrap();
+        assert!(child.reap_and_release().unwrap().success());
+        assert!(
+            !only_reserved_leader(group),
+            "zero/absent group must not count as a complete observation"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_group_observation_rejects_full_buffer_with_live_descendant() {
+        use std::time::{Duration, Instant};
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let command = NativeCommand {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 30 & printf ready; wait".into()],
+            cwd: None,
+            environment: ChildEnvironment::Inherit,
+        };
+        let mut child =
+            OwnedChild::spawn_files(&command, None, Some(output.reopen().unwrap()), None).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::fs::read(output.path()).unwrap() != b"ready" {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            !only_reserved_leader(child.group.unwrap()),
+            "a full/truncated two-slot buffer is not the leader-only case"
+        );
+        child.terminate_owned().unwrap();
+        child.reap_and_release().unwrap();
+    }
+
     #[test]
     fn external_reap_disarms_group_before_any_later_signal() {
         let mut native = Command::new("/bin/sh");
@@ -116,6 +207,7 @@ mod tests {
         let mut owned = OwnedChild {
             child,
             group: Some(pid),
+            termination_requested: false,
         };
         rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::empty()).unwrap();
         assert!(owned.exited_reserved().is_err());
