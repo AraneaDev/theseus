@@ -1,47 +1,66 @@
 name: CI
 on: [push, pull_request]
+permissions:
+  contents: read
 jobs:
   linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Set acceptance evidence path
-        run: |
-          printf 'THESEUS_ACCEPTANCE_EVIDENCE=%s/theseus-acceptance-evidence\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo build --locked --release
+
+  docker:
+    needs: linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - docker_lifecycle
+          - interruption_lifecycle
+          - downgrade_lifecycle
+          - rollback_lifecycle
+          - interrupted_rollback_lifecycle
+          - comparison_docker
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Set acceptance evidence paths
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          evidence_dir="$RUNNER_TEMP/theseus-acceptance-evidence-$TARGET"
+          mkdir -p "$evidence_dir"
+          printf 'THESEUS_ACCEPTANCE_EVIDENCE=%s\n' "$evidence_dir" >> "$GITHUB_ENV"
+          printf 'THESEUS_MCP_TEST_EVIDENCE=%s/mcp-transport\n' "$evidence_dir" >> "$GITHUB_ENV"
       - name: Prepare Docker acceptance image
         run: |
           docker info
           docker pull ubuntu:24.04
-      - name: Real Docker lifecycle acceptance (required)
-        run: cargo test --locked --test docker_lifecycle -- --ignored --test-threads=1
-
-      - name: Real Docker interruption acceptance (required)
-        run: cargo test --locked --test interruption_lifecycle -- --ignored --test-threads=1
-
-      - name: Real Docker downgrade acceptance (required)
-        run: cargo test --locked --test downgrade_lifecycle -- --ignored --test-threads=1
-
-      - name: Real Docker rollback acceptance (required)
-        run: cargo test --locked --test rollback_lifecycle -- --ignored --test-threads=1
-
-      - name: Real Docker interrupted rollback acceptance (required)
-        run: cargo test --locked --test interrupted_rollback_lifecycle -- --ignored --test-threads=1
-
-      - name: Real comparison Docker and PTY acceptance (required)
-        run: cargo test --locked --test comparison_docker -- --ignored --test-threads=1
-
+          image_id="$(docker image inspect --format '{{.Id}}' ubuntu:24.04)"
+          printf 'THESEUS_MCP_TEST_IMAGE=%s\n' "$image_id" >> "$GITHUB_ENV"
+          printf '%s\n' "$image_id" | tee "$THESEUS_ACCEPTANCE_EVIDENCE/docker-image-id.txt"
+      - name: Real Docker acceptance (required)
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo test --locked --test "$TARGET" -- --ignored --test-threads=1
       - name: Upload acceptance evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: linux-acceptance-evidence
-          path: ${{ runner.temp }}/theseus-acceptance-evidence
+          name: linux-acceptance-evidence-${{ matrix.target }}
+          path: ${{ env.THESEUS_ACCEPTANCE_EVIDENCE }}
           retention-days: 7
           if-no-files-found: warn
