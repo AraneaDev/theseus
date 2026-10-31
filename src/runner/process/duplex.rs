@@ -10,7 +10,7 @@ pub(in crate::runner) trait DuplexDriver: Send + 'static {
     fn wants_close(&self) -> bool;
 }
 pub(in crate::runner) struct DuplexOutput<D> {
-    /// The interactive CLI child was successfully spawned.
+    /// Historical MayRun phase; does not assert successful acquisition or guest startup.
     pub acquisition_started: bool,
     pub launch_failure: Option<AcquisitionFailure>,
     pub cleanup_failures: CleanupFailures,
@@ -363,12 +363,13 @@ fn unstarted<D: DuplexDriver>(
     if let Some(failure) = &launch_failure {
         cleanup_failures.retain(&failure.clone().into());
     }
-    let cancelled = cancel.is_cancelled();
+    let mut cancelled = cancel.is_cancelled();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if let Err(failure) = abort() {
             cleanup_failures.retain(&failure);
             append_error(&mut error, format!("abort owned environment: {failure:#}"));
         }
+        cancelled |= cancel.is_cancelled();
         if cancelled {
             driver.cancel();
         }
@@ -667,6 +668,38 @@ mod tests {
             self.got == b"PONG\n"
         }
     }
+    #[test]
+    fn fix_round_one_failed_acquisition_observes_cancellation_requested_by_abort() {
+        let cancel = CancellationToken::default();
+        let out = run_duplex(
+            &mut Command::new("/missing-duplex-executable"),
+            Duration::from_secs(3),
+            &cancel,
+            None,
+            32,
+            32,
+            OneRound {
+                write: b"PING\n".to_vec(),
+                ..Default::default()
+            },
+            || {
+                cancel.cancel();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!out.acquisition_started);
+        assert!(
+            out.process.cancelled,
+            "abort requested cancellation after acquisition failed"
+        );
+        assert_eq!(
+            out.driver.offset, 5,
+            "driver must receive cancellation after abort"
+        );
+        assert!(!out.stdout_eof);
+    }
+
     #[test]
     fn duplex_closes_stdin_after_reply_and_joins_both_streams() {
         let mut command = fixture("duplex-case", &["ping"]);
@@ -1916,7 +1949,9 @@ mod native_launch_failures {
         test_support::{self, LaunchFault},
     };
     #[derive(Default)]
-    struct Idle;
+    struct Idle {
+        cancelled: bool,
+    }
     impl DuplexDriver for Idle {
         fn pending_write(&self) -> &[u8] {
             &[]
@@ -1926,7 +1961,9 @@ mod native_launch_failures {
         }
         fn receive(&mut self, _: &[u8]) {}
         fn eof(&mut self) {}
-        fn cancel(&mut self) {}
+        fn cancel(&mut self) {
+            self.cancelled = true;
+        }
         fn wants_close(&self) -> bool {
             false
         }
@@ -1957,16 +1994,19 @@ mod native_launch_failures {
             let mut command = super::super::test_support::fixture("launch-marker", &[]);
             command.arg(&marker);
             let mut aborted = 0;
+            let cancel = CancellationToken::default();
+            let cleanup_deadline = Instant::now() + Duration::from_secs(3);
             let output = run_duplex_with(
                 &mut command,
                 Duration::from_secs(3),
-                &CancellationToken::default(),
+                &cancel,
                 None,
                 32,
                 32,
-                Idle,
+                Idle::default(),
                 || {
                     aborted += 1;
+                    cancel.cancel();
                     Ok(())
                 },
                 |command| {
@@ -1985,14 +2025,25 @@ mod native_launch_failures {
             )
             .unwrap();
             assert_eq!(aborted, 1, "guest preparation always requires owned abort");
+            assert!(
+                output.process.cancelled && output.driver.cancelled,
+                "native failed-acquisition abort cancellation reaches both output and driver"
+            );
             assert_eq!(output.acquisition_started, expected == LaunchPhase::MayRun);
             let failure = output.launch_failure.unwrap();
             assert_eq!(failure.launch(), expected);
             if expected != LaunchPhase::MayRun {
                 assert!(!marker.exists());
             }
-            assert_eq!(failure.pending(), pending);
+            eprintln!(
+                "native failure phase={expected:?} injected_pending={pending} initial_pending={}",
+                failure.pending()
+            );
             if pending {
+                assert!(
+                    failure.pending(),
+                    "injected pending fault must retain actual authority"
+                );
                 assert!(failure.retry_cleanup().is_err());
                 assert!(failure.pending());
                 assert!(!failure.retry_cleanup().unwrap());
@@ -2005,15 +2056,18 @@ mod native_launch_failures {
                     .expect_err("injected native cleanup still pending");
                 assert!(error.downcast_ref::<CleanupFailures>().is_some());
                 super::super::release_test_fault(&failure);
-                let deadline = Instant::now() + Duration::from_secs(3);
-                while !failure.retry_cleanup().unwrap() {
-                    assert!(Instant::now() < deadline);
-                    thread::sleep(Duration::from_millis(1));
-                }
-                assert!(!failure.pending());
+            }
+            // Ordinary eager cleanup can still be Pending on return: termination
+            // requests are asynchronous. Observe real completion using one clock.
+            while !failure.retry_cleanup().unwrap() {
+                assert!(Instant::now() < cleanup_deadline);
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(!failure.pending());
+            if expected != LaunchPhase::MayRun {
                 assert!(
                     !marker.exists(),
-                    "suspended fixture must never execute even after cleanup"
+                    "pre-resume fixture must never execute, including after cleanup"
                 );
             }
         }

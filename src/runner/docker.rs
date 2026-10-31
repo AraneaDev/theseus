@@ -161,13 +161,17 @@ impl Docker {
         // ReportStore only opens new directories; recovery persists journal with
         // the existing store's safe, private atomic-write boundary.
         let store = crate::report::open_existing(&directory)?;
-        let mut errors = vec![];
-        let mut native_cleanup = process::CleanupFailures::default();
-        for resource in &mut journal.resources {
+        // Validate the whole recovery set before the first external acquisition:
+        // no later validation return may discard an earlier native cleanup owner.
+        for resource in &journal.resources {
             ensure!(
                 resource.labels.get(RUN_LABEL) == Some(&journal.run_id),
                 "journal run ownership mismatch"
             );
+        }
+        let mut errors = vec![];
+        let mut native_cleanup = process::CleanupFailures::default();
+        for resource in &mut journal.resources {
             if resource.removed {
                 continue;
             }
@@ -775,6 +779,58 @@ mod tests {
                 .is_none()
         );
     }
+    #[test]
+    fn fix_round_one_mixed_journal_validation_precedes_all_native_child_acquisition() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = fixture(temp.path(), "argv");
+        let store = crate::report::create(&temp.path().join("run")).unwrap();
+        let resources = ["owned-run", "different-run"]
+            .into_iter()
+            .map(|run| OwnedResource {
+                container_id: "a".repeat(64),
+                labels: BTreeMap::from([
+                    (OWNER_LABEL.into(), "v1".into()),
+                    (RUN_LABEL.into(), run.into()),
+                    (SCENARIO_LABEL.into(), "user-clean".into()),
+                ]),
+                removed: false,
+            })
+            .collect();
+        store
+            .save_journal(&RunJournal {
+                schema_version: crate::model::JOURNAL_SCHEMA_VERSION,
+                run_id: "owned-run".into(),
+                resources,
+                cleanup_errors: vec![],
+            })
+            .unwrap();
+        assert_eq!(
+            crate::report::load_journal(store.root())
+                .unwrap()
+                .resources
+                .len(),
+            2
+        );
+        let mut docker = Docker::new(executable);
+        let mut journal = crate::report::load_journal(store.root()).unwrap();
+        let mismatch = journal.resources.pop().unwrap();
+        store.save_journal(&journal).unwrap();
+        let control_error = docker.cleanup(store.root()).unwrap_err();
+        assert!(
+            temp.path().join("argv").exists(),
+            "valid journal never acquired fixture: {control_error:#}"
+        );
+        std::fs::remove_file(temp.path().join("argv")).unwrap();
+        journal.resources.push(mismatch);
+        store.save_journal(&journal).unwrap();
+        let error = docker.cleanup(store.root()).unwrap_err();
+        assert!(format!("{error:#}").contains("journal run ownership mismatch"));
+        assert!(
+            !temp.path().join("argv").exists(),
+            "mixed journal started a native removal/inspection before validating all run labels"
+        );
+    }
+
     #[test]
     fn archive_cancellation_still_applies_after_cli_exit_with_open_descriptors() {
         let temp = tempfile::tempdir().unwrap();

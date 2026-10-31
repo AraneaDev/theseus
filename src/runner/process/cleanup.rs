@@ -145,11 +145,10 @@ impl CleanupFailures {
         for failure in &panic.0.cleanup.owners {
             self.push(failure);
         }
-        if panic.0.cleanup.pending()
-            && !self
-                .panics
-                .iter()
-                .any(|prior| Arc::ptr_eq(&prior.0, &panic.0))
+        if !self
+            .panics
+            .iter()
+            .any(|prior| Arc::ptr_eq(&prior.0, &panic.0))
         {
             self.panics.push(panic.clone());
         }
@@ -191,21 +190,7 @@ impl CleanupFailures {
     pub(crate) fn resume_unwind(self, original: Box<dyn std::any::Any + Send>) -> ! {
         let cleanup = self.settled();
         if cleanup.pending() {
-            let cause = original
-                .downcast_ref::<&str>()
-                .map(|cause| (*cause).to_string())
-                .or_else(|| original.downcast_ref::<String>().cloned())
-                .or_else(|| {
-                    original
-                        .downcast_ref::<PanicFailure>()
-                        .map(|panic| panic.0.cause.clone())
-                })
-                .unwrap_or_else(|| "non-string panic payload retained".into());
-            std::panic::resume_unwind(Box::new(PanicFailure(Arc::new(CleanupPanic {
-                cause,
-                _original: Mutex::new(original),
-                cleanup,
-            }))));
+            std::panic::resume_unwind(Box::new(PanicFailure::new(original, cleanup)));
         }
         std::panic::resume_unwind(original)
     }
@@ -241,20 +226,47 @@ struct CleanupPanic {
 // native cleanup. Nested panic owners form an acyclic chain, never a registry.
 #[derive(Clone, Debug)]
 struct PanicFailure(Arc<CleanupPanic>);
+impl PanicFailure {
+    fn new(original: Box<dyn std::any::Any + Send>, cleanup: CleanupFailures) -> Self {
+        let cause = original
+            .downcast_ref::<&str>()
+            .map(|cause| (*cause).to_string())
+            .or_else(|| original.downcast_ref::<String>().cloned())
+            .or_else(|| {
+                original
+                    .downcast_ref::<Self>()
+                    .map(|panic| panic.0.cause.clone())
+            })
+            .unwrap_or_else(|| "non-string panic payload retained".into());
+        Self(Arc::new(CleanupPanic {
+            cause,
+            _original: Mutex::new(original),
+            cleanup,
+        }))
+    }
+}
 impl fmt::Display for PanicFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "engine worker panicked: {}; {}",
-            self.0.cause, self.0.cleanup
-        )
+        // Ordinary completed-cleanup behavior keeps its existing diagnostic.
+        // The payload remains owned until all sibling/completion owners are known.
+        if self.0.cleanup.owners.is_empty() {
+            f.write_str("engine worker panicked; inspect recovery journal")
+        } else {
+            write!(
+                f,
+                "engine worker panicked: {}; {}",
+                self.0.cause, self.0.cleanup
+            )
+        }
     }
 }
 impl std::error::Error for PanicFailure {}
 pub(crate) fn worker_panic(payload: Box<dyn std::any::Any + Send>) -> anyhow::Error {
     match payload.downcast::<PanicFailure>() {
         Ok(owner) => anyhow::Error::new(*owner),
-        Err(_) => anyhow::anyhow!("engine worker panicked; inspect recovery journal"),
+        Err(original) => {
+            anyhow::Error::new(PanicFailure::new(original, CleanupFailures::default()))
+        }
     }
 }
 
@@ -531,6 +543,17 @@ mod io_error_boundary_tests {
     }
     #[test]
     fn joined_worker_aggregate_retains_original_panic_payload_and_actual_poisoned_owner() {
+        joined_worker_owner_case(0);
+    }
+    #[test]
+    fn fix_round_one_unwrapped_parser_panic_retains_separate_completion_owner() {
+        joined_worker_owner_case(1);
+    }
+    #[test]
+    fn fix_round_one_unwrapped_parser_panic_retains_separate_sibling_owner() {
+        joined_worker_owner_case(2);
+    }
+    fn joined_worker_owner_case(mode: u8) {
         use super::super::{Drain, HostProcess, archive_worker_precedence, finish_archive_workers};
         use std::sync::atomic::{AtomicBool, Ordering};
         struct Payload(Arc<AtomicBool>);
@@ -568,18 +591,26 @@ mod io_error_boundary_tests {
         cleanup.retain(&failure.clone().into());
         let dropped = Arc::new(AtomicBool::new(false));
         let payload = Payload(dropped.clone());
+        let mut completion = archive_worker_precedence::complete();
+        let parser_cleanup = if mode == 0 {
+            Some(cleanup)
+        } else {
+            if mode == 1 {
+                completion.cleanup = cleanup;
+            }
+            None
+        };
+        let sibling_owner = (mode == 2).then(|| failure.clone());
         let parser = std::thread::spawn(move || -> anyhow::Result<crate::snapshot::Snapshot> {
-            cleanup.resume_unwind(Box::new(payload));
+            if let Some(cleanup) = parser_cleanup {
+                cleanup.resume_unwind(Box::new(payload));
+            }
+            std::panic::resume_unwind(Box::new(payload));
         });
-        let stderr = std::thread::spawn(|| -> anyhow::Result<Drain> {
-            Err(anyhow::anyhow!("stderr write failed"))
+        let stderr = std::thread::spawn(move || -> anyhow::Result<Drain> {
+            Err(sibling_owner.map_or_else(|| anyhow::anyhow!("stderr write failed"), Into::into))
         });
-        let error = finish_archive_workers(
-            archive_worker_precedence::complete(),
-            parser.join(),
-            stderr.join(),
-        )
-        .unwrap_err();
+        let error = finish_archive_workers(completion, parser.join(), stderr.join()).unwrap_err();
         let lost_at_aggregation = dropped.load(Ordering::SeqCst);
         let mut retained = CleanupFailures::default();
         retained.retain(&error);
