@@ -1,3 +1,5 @@
+#[path = "support/native.rs"]
+mod native;
 #[allow(dead_code)]
 #[path = "support/comparison.rs"]
 mod support;
@@ -112,14 +114,17 @@ fn headless_compare_records_single_source_failure_and_suite_recovery_without_doc
     assert!(r.sources[1].report_path.is_none());
     let error = String::from_utf8_lossy(&out.stderr);
     assert!(error.contains(&root.display().to_string()));
-    assert!(error.contains("sources/copy/"));
+    assert!(error.contains(&format!(
+        "sources{}copy{}",
+        std::path::MAIN_SEPARATOR,
+        std::path::MAIN_SEPARATOR
+    )));
     assert!(!out.stderr.contains(&0x1b));
     assert!(!t.path().join(".theseus-runs").exists());
 }
 
 #[test]
 fn headless_recovery_command_preserves_quoted_root() {
-    use std::os::unix::fs::symlink;
     let t = tempfile::tempdir().unwrap();
     let parent = t.path().join("space ' $(touch INJECTED) ;");
     fs::create_dir(&parent).unwrap();
@@ -138,9 +143,12 @@ fn headless_recovery_command_preserves_quoted_root() {
         .unwrap();
     let bin = t.path().join("bin");
     fs::create_dir(&bin).unwrap();
-    symlink(env!("CARGO_BIN_EXE_theseus"), bin.join("theseus")).unwrap();
-    let out = Command::new("/bin/sh")
-        .args(["-c", command])
+    fs::copy(
+        env!("CARGO_BIN_EXE_theseus"),
+        bin.join(format!("theseus{}", std::env::consts::EXE_SUFFIX)),
+    )
+    .unwrap();
+    let out = native::shell(command)
         .current_dir(t.path())
         .env("PATH", bin)
         .output()

@@ -1,21 +1,16 @@
 """Real PTYs: external termination restores idle/live terminals; c keeps browsing."""
-import fcntl
 import json
 import os
 import pathlib
-import pty
-import select
 import shutil
 import signal
-import struct
 import subprocess
 import sys
 import tempfile
-import termios
 import time
 
 sys.dont_write_bytecode = True
-from terminal_screen import Screen
+from terminal_session import NativeSession
 from docker_absence import require_container_absent
 
 binary = str(pathlib.Path(sys.argv[1]).resolve())
@@ -53,19 +48,14 @@ def session(mode, action):
                 selected_scenarios=[], started_at='', finished_at=None, outcome='passed',
                 cancelled=False, scenarios=[], errors=[])))
             args = ['report', str(saved)]
-        master, slave = pty.openpty()
-        before = termios.tcgetattr(slave)
-        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 36, 120, 0, 0))
-        proc = subprocess.Popen([binary, '--no-animation', *args], cwd=root, stdin=slave, stdout=slave,
-                                stderr=slave, env={**os.environ, 'TERM': 'xterm-256color'})
-        data = bytearray()
-        screen = Screen(36, 120)
+        native = NativeSession(binary, ['--no-animation', *args], root, os.environ)
+        proc = native
+        before = native.modes['before']
+        data = native.output.data
+        screen = native.output.screen
         report = None
         def drain():
-            if select.select([master], [], [], .03)[0]:
-                chunk = os.read(master, 65536)
-                data.extend(chunk)
-                screen.feed(chunk)
+            native.pump()
         def until(predicate, timeout):
             deadline = time.monotonic()+timeout
             while not predicate() and time.monotonic() < deadline:
@@ -79,11 +69,11 @@ def session(mode, action):
                 return json.loads(report.read_text())
             return None
         try:
-            until(lambda: b'\x1b[?1049h' in data and not (termios.tcgetattr(slave)[3] & termios.ICANON), 5)
+            until(lambda: b'\x1b[?1049h' in data and native.modes["raw"], 5)
             # Wait for initial rendering before delivering any input/signal.
             until(lambda: b'Preview' in data if mode != 'offline' else b'offline-signal' in data, 5)
             if mode in ('active', 'completed'):
-                os.write(master, b'r')
+                native.key(b'r')
                 if mode == 'active':
                     def child_running():
                         value = saved_report()
@@ -96,34 +86,33 @@ def session(mode, action):
                     until(child_running, 20)
                 else:
                     until(lambda: (value := saved_report()) and value['finished_at'] is not None, 30)
-                    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 36, 121, 0, 0))
+                    native.resize(36, 121)
+                    screen = native.output.screen
                     screen.columns = 121
                     until(lambda: b'Finished' in screen.text(), 5)
             start = time.monotonic()
             if action == 'c':
-                os.write(master, b'c')
+                native.key(b'c')
                 until(lambda: (value := saved_report()) and value['finished_at'] is not None, 7)
                 # Reconstruct the displayed cells: a status update may split
                 # Finished across separate Ratatui diff writes.
-                fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 36, 121, 0, 0))
+                native.resize(36, 121)
+                screen = native.output.screen
                 screen.columns = 121
                 until(lambda: b'Finished' in screen.text(), 5)
                 assert proc.poll() is None, 'c quit rather than allowing report browsing'
-                assert not (termios.tcgetattr(slave)[3] & termios.ICANON)
-                os.write(master, b'\t\t\x1b[C')
+                assert native.modes["raw"]
+                native.key(b'\t\t\x1b[C')
                 drain()
                 assert proc.poll() is None, 'cancelled evidence cannot be browsed'
-                os.write(master, b'q')
+                native.key(b'q')
             else:
                 proc.send_signal(action)
             until(lambda: proc.poll() is not None, 7)
             elapsed = time.monotonic()-start
-            while select.select([master], [], [], .05)[0]:
-                chunk = os.read(master, 65536)
-                data.extend(chunk)
-                screen.feed(chunk)
+            native.pump()
             assert proc.returncode == (130 if mode == 'active' else 0), (mode, action, proc.returncode, data[-3000:])
-            assert termios.tcgetattr(slave) == before, 'termios not restored'
+            native.assert_restored()
             assert b'\x1b[?1049h' in data and b'\x1b[?1049l' in data, 'alternate screen not restored'
             if mode in ('active', 'completed'):
                 value = saved_report()
@@ -136,15 +125,14 @@ def session(mode, action):
             cleanup = ', owned cleanup verified' if mode in ('active', 'completed') else ''
             print(f'PTY {mode} {action}: exit={proc.returncode}, restored{cleanup}, {elapsed:.2f}s')
         finally:
-            pathlib.Path(f'/tmp/theseus-signals-{case}.log').write_bytes(data)
+            (pathlib.Path(tempfile.gettempdir()) / f'theseus-signals-{case}.log').write_bytes(data)
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
             # Recovery on assertion failure also uses the production ownership gate.
             for journal in root.glob('.theseus-runs/*/journal.json'):
                 subprocess.run([binary, 'cleanup', str(journal.parent)], capture_output=True)
-            os.close(master)
-            os.close(slave)
+            native.close()
 
 
 for sig in (signal.SIGINT, signal.SIGTERM):

@@ -1,16 +1,17 @@
 """Actual narrow PTY selection and report-2 browsing using the public example."""
-import fcntl
 import json
 import os
+if os.name != "nt":
+    import fcntl
+    import pty
+    import termios
 import pathlib
-import pty
 import select
 import shutil
 import struct
 import subprocess
 import sys
 import tempfile
-import termios
 import time
 
 sys.dont_write_bytecode = True

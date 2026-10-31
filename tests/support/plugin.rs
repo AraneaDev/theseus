@@ -70,7 +70,7 @@ pub fn stage_plugin(
     scope: &str,
 ) -> tempfile::TempDir {
     let temp = tempfile::tempdir().unwrap();
-    let output = std::process::Command::new("python3")
+    let output = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
         .args(["examples/plugins/prepare.py", "--client"])
         .arg(client)
         .args([

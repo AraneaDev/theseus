@@ -93,7 +93,9 @@ if attempt and mode=='missing-receipt':
     subprocess.run(['docker','exec',args[args.index('--workdir')+2],'rm','-f',path],check=True)
 sys.exit(result.returncode)
 "#, marker=marker.to_str().unwrap(), reference=reference_marker.to_str().unwrap())).unwrap();
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut docker = theseus::runner::Docker::new(executable);
     let result = engine::run_with(&recipe, options, cancel, &mut docker, move |event| {
@@ -768,7 +770,7 @@ fn real_downgrade_timeout_and_cancellation_stop_without_post_attempt_runtime() {
 #[test]
 #[ignore = "requires Docker and Unix PTY"]
 fn real_downgrade_live_and_offline_narrow_pty_both_policies() {
-    let output = Command::new("python3")
+    let output = Command::new(if cfg!(windows) { "python" } else { "python3" })
         .arg("tests/support/tui_downgrade.py")
         .arg(env!("CARGO_BIN_EXE_theseus"))
         .output()

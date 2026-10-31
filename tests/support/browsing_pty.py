@@ -1,6 +1,6 @@
 """Read-only public CLI PTYs over synthetic UI evidence; never a lifecycle claim."""
-import fcntl, hashlib, json, os, pathlib, pty, select, signal, struct, subprocess, sys, termios, time
-from terminal_screen import Screen
+import hashlib, json, os, pathlib, signal, subprocess, sys, time
+from terminal_session import NativeSession, sentinel_environment
 
 binary = str(pathlib.Path(sys.argv[1]).resolve())
 case, root, evidence = sys.argv[2], pathlib.Path(sys.argv[3]), pathlib.Path(sys.argv[4])
@@ -11,15 +11,8 @@ def hashes():
 
 before = hashes()
 (evidence/'source-before.json').write_text(json.dumps(before, indent=2))
-bindir = evidence/'sentinel-bin'
-bindir.mkdir()
 sentinel = evidence/'docker-called'
-docker = bindir/'docker'
-docker.write_text('#!/bin/sh\nprintf called >> "$THESEUS_DOCKER_SENTINEL"\nexit 111\n')
-docker.chmod(0o755)
-environment = {**os.environ, 'TERM': 'xterm-256color',
-               'PATH': str(bindir)+os.pathsep+os.environ['PATH'],
-               'THESEUS_DOCKER_SENTINEL': str(sentinel)}
+environment = sentinel_environment(evidence/'sentinel-bin', sentinel)
 command = 'report' if case == 'report' else 'comparison'
 # The public JSON path independently validates the fixture and recomputation.
 result = subprocess.run([binary, command, str(root), '--json'], env=environment, capture_output=True)
@@ -33,19 +26,14 @@ if case == 'comparison':
 else:
     assert len(document['scenarios'][0]['stages'][0]['snapshots'][0]['entries']) == 70_001
 
-master, slave = pty.openpty()
-attributes = termios.tcgetattr(slave)
-fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 60, 180, 0, 0))
-screen, raw = Screen(60, 180), bytearray()
-proc = subprocess.Popen([binary, command, str(root), '--no-animation'], stdin=slave,
-                        stdout=slave, stderr=slave, cwd=evidence, env=environment)
+native = NativeSession(binary, [command, str(root), '--no-animation'], evidence, environment, 60, 180)
+proc = native
+attributes = native.modes['before']
+screen, raw = native.output.screen, native.output.data
 steps = []
 
 def pump():
-    if select.select([master], [], [], .05)[0]:
-        chunk = os.read(master, 65536)
-        raw.extend(chunk)
-        screen.feed(chunk)
+    native.pump()
 
 def text():
     return screen.text().decode()
@@ -68,7 +56,7 @@ def snapshot(name):
     steps.append(name)
 
 def key(value):
-    os.write(master, value)
+    native.key(value)
 
 def expect(value):
     until(lambda: has(value), value)
@@ -85,7 +73,7 @@ PGUP, PGDN = b'\x1b[5~', b'\x1b[6~'
 CTRLHOME, CTRLEND = b'\x1b[1;5H', b'\x1b[1;5F'
 try:
     expect('Records')
-    assert not (termios.tcgetattr(slave)[3] & termios.ICANON)
+    assert native.modes["raw"]
     if case == 'report':
         key(b'\t\t\x1b[C\x1b[C')  # scenario -> stage -> evidence; Files
         key(END)
@@ -172,27 +160,18 @@ try:
     # Offline r is inert; q exits with the retained report outcome.
     key(b'rq')
     until(lambda: proc.poll() is not None, 'offline exit')
-    while select.select([master], [], [], .05)[0]:
-        pump()
+    native.pump()
     assert proc.returncode == (0 if case == 'report' else 1), (proc.returncode, text())
-    assert termios.tcgetattr(slave) == attributes, 'termios not restored'
+    native.assert_restored()
     assert b'\x1b[?1049h' in raw and b'\x1b[?1049l' in raw, 'alternate screen not restored'
     assert not sentinel.exists(), 'offline JSON/view/r invoked Docker'
     assert hashes() == before, 'offline JSON/view/r changed source bytes'
     (evidence/'source-after.json').write_text(json.dumps(hashes(), indent=2))
 finally:
-    if proc.poll() is None:
-        proc.send_signal(signal.SIGTERM)
-        try:
-            proc.wait(timeout=8)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+    native.close()
     (evidence/'terminal.raw').write_bytes(raw)
     (evidence/'last.screen').write_bytes(screen.text())
-    (evidence/'terminal.json').write_text(json.dumps({'exit': proc.returncode, 'before': attributes,
-        'after': termios.tcgetattr(slave), 'steps': steps}, default=lambda value: list(value)))
-    os.close(master)
-    os.close(slave)
+    (evidence/'terminal.json').write_text(json.dumps({'exit': proc.returncode, 'modes': native.modes,
+        'steps': steps}), encoding='utf-8')
 
 print('PASS synthetic UI', case, len(steps), 'screens; source bytes unchanged; Docker sentinel absent; termios restored')

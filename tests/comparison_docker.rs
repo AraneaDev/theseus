@@ -1,6 +1,6 @@
 //! Public CLI acceptance: every external resource belongs to the Python fixture.
 fn acceptance(case: &str) {
-    let output = std::process::Command::new("python3")
+    let output = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
         .args([
             "tests/support/comparison_pty.py",
             env!("CARGO_BIN_EXE_theseus"),
@@ -49,7 +49,7 @@ fn real_pty_comparison_preview_live_offline_cancel_and_restore() {
 
 #[test]
 fn fallback_cleanup_retains_diagnostics_and_original_assertion() {
-    let output = std::process::Command::new("python3")
+    let output = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
         .arg("tests/support/test_comparison_cleanup.py")
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()

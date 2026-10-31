@@ -1,11 +1,13 @@
 """Public native live/offline/cancel PTYs. Current text cells, not human/PNG review."""
-import fcntl
 import json
 import os
+if os.name != "nt":
+    import fcntl
+    import pty
+    import termios
 from pathlib import Path
 import signal
 import struct
-import termios
 import sys
 from mcp_native import (ERAS, add_test_only_server_faults, attempt, checks, commands, digest,
     direct_ready, fault_recipe, prepare, prerequisites, run_cli, source_manifest, stages, verify)

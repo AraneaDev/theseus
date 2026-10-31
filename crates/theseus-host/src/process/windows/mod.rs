@@ -152,3 +152,6 @@ pub(super) fn spawn_fault(
     };
     launch::spawn_impl(command, stdin, stdout, stderr, fault)
 }
+
+#[cfg(feature = "test-support")]
+pub(super) mod terminal;

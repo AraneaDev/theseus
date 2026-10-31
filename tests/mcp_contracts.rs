@@ -141,27 +141,31 @@ fn prepared_matrix_validates_offline_and_rejects_unsupported_combinations() {
                 for protocol in ["2026-07-28", "2025-11-25"] {
                     serial += 1;
                     let out = root.path().join(format!("case{serial}"));
-                    let result = std::process::Command::new("python3")
-                        .args(["examples/mcp/prepare.py", "--client"])
-                        .arg(&client)
-                        .args([
-                            "--client-version",
-                            version,
-                            "--adapter",
-                            adapter,
-                            "--delivery",
-                            delivery,
-                            "--scope",
-                            scope,
-                            "--scenario",
-                            scenario,
-                            "--protocol",
-                            protocol,
-                            "--output",
-                        ])
-                        .arg(&out)
-                        .output()
-                        .unwrap();
+                    let result = std::process::Command::new(if cfg!(windows) {
+                        "python"
+                    } else {
+                        "python3"
+                    })
+                    .args(["examples/mcp/prepare.py", "--client"])
+                    .arg(&client)
+                    .args([
+                        "--client-version",
+                        version,
+                        "--adapter",
+                        adapter,
+                        "--delivery",
+                        delivery,
+                        "--scope",
+                        scope,
+                        "--scenario",
+                        scenario,
+                        "--protocol",
+                        protocol,
+                        "--output",
+                    ])
+                    .arg(&out)
+                    .output()
+                    .unwrap();
                     assert!(
                         result.status.success(),
                         "{}",
@@ -197,7 +201,7 @@ fn prepared_matrix_validates_offline_and_rejects_unsupported_combinations() {
             "plugin_lifecycle",
         ),
     ] {
-        let status = std::process::Command::new("python3")
+        let status = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
             .args(["examples/mcp/prepare.py", "--client"])
             .arg(&client)
             .args([

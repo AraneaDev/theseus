@@ -22,14 +22,50 @@ impl OwnedChild {
         stdout: Option<File>,
         stderr: Option<File>,
     ) -> Result<Self, SpawnFailure> {
+        Self::spawn_files_with_session(
+            command,
+            stdin,
+            stdout,
+            stderr,
+            #[cfg(feature = "test-support")]
+            false,
+        )
+    }
+
+    fn spawn_files_with_session(
+        command: &NativeCommand,
+        stdin: Option<File>,
+        stdout: Option<File>,
+        stderr: Option<File>,
+        #[cfg(feature = "test-support")] session: bool,
+    ) -> Result<Self, SpawnFailure> {
         command.validate().map_err(SpawnFailure::never)?;
         let mut native = Command::new(&command.program);
         native
             .args(&command.args)
-            .process_group(0)
             .stdin(stdin.map_or_else(Stdio::null, Stdio::from))
             .stdout(stdout.map_or_else(Stdio::null, Stdio::from))
             .stderr(stderr.map_or_else(Stdio::null, Stdio::from));
+        #[cfg(feature = "test-support")]
+        if session {
+            // Only async-signal-safe syscalls run after fork. std has already
+            // installed fd 0, our slave. Do not make a group leader before setsid.
+            unsafe {
+                native.pre_exec(|| {
+                    if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if libc::tcsetpgrp(0, libc::getpid()) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        } else {
+            native.process_group(0);
+        }
+        #[cfg(not(feature = "test-support"))]
+        native.process_group(0);
         if let Some(cwd) = &command.cwd {
             native.current_dir(cwd);
         }
@@ -321,3 +357,6 @@ impl PipeWriter {
 fn stopped() -> io::Error {
     io::Error::new(io::ErrorKind::Interrupted, "pipe endpoint stopped")
 }
+
+#[cfg(feature = "test-support")]
+pub(super) mod terminal;

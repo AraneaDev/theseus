@@ -258,3 +258,7 @@ pub mod test_support {
         )
     }
 }
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod terminal;

@@ -17,7 +17,7 @@ fn acceptance(case: &str, fixture: impl FnOnce(&Path) -> std::path::PathBuf) {
     fs::write(evidence.join("SYNTHETIC-UI-FIXTURE.txt"),
         "Synthetic saved evidence for public CLI browsing acceptance only. No installation was executed.\n").unwrap();
     println!("Synthetic UI evidence: {}", evidence.display());
-    let output = std::process::Command::new("python3")
+    let output = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
         .args([
             "tests/support/browsing_pty.py",
             env!("CARGO_BIN_EXE_theseus"),

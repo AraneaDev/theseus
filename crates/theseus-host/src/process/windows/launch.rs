@@ -17,7 +17,7 @@ struct Attributes {
     heap: HANDLE,
 }
 impl Attributes {
-    fn new(handles: &[HANDLE], jobs: &[HANDLE]) -> io::Result<Self> {
+    fn new(handles: &[HANDLE], jobs: &[HANDLE], pseudoconsole: Option<isize>) -> io::Result<Self> {
         let mut bytes = 0;
         let result = unsafe { InitializeProcThreadAttributeList(null_mut(), 2, 0, &mut bytes) };
         if result != 0
@@ -50,6 +50,9 @@ impl Attributes {
             (PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handles),
             (PROC_THREAD_ATTRIBUTE_JOB_LIST, jobs),
         ] {
+            if key == PROC_THREAD_ATTRIBUTE_HANDLE_LIST && pseudoconsole.is_some() {
+                continue;
+            }
             if unsafe {
                 UpdateProcThreadAttribute(
                     memory,
@@ -57,6 +60,23 @@ impl Attributes {
                     key as usize,
                     values.as_ptr().cast(),
                     std::mem::size_of_val(values),
+                    null_mut(),
+                    null(),
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        if let Some(hpc) = pseudoconsole {
+            // PSEUDOCONSOLE takes the VALUE, unlike JOB_LIST's pointer to an array.
+            if unsafe {
+                UpdateProcThreadAttribute(
+                    memory,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
+                    hpc as *const std::ffi::c_void,
+                    size_of::<isize>(),
                     null_mut(),
                     null(),
                 )
@@ -217,6 +237,32 @@ pub(super) fn spawn_impl(
     stderr: Option<File>,
     #[cfg(any(test, feature = "test-support"))] fault: Fault,
 ) -> Result<OwnedChild, SpawnFailure> {
+    spawn_config(
+        command,
+        stdin,
+        stdout,
+        stderr,
+        #[cfg(any(test, feature = "test-support"))]
+        fault,
+        None,
+    )
+}
+
+#[cfg(feature = "test-support")]
+pub(super) fn spawn_terminal(
+    command: &NativeCommand,
+    hpc: isize,
+) -> Result<OwnedChild, SpawnFailure> {
+    spawn_config(command, None, None, None, Fault::None, Some(hpc))
+}
+fn spawn_config(
+    command: &NativeCommand,
+    stdin: Option<File>,
+    stdout: Option<File>,
+    stderr: Option<File>,
+    #[cfg(any(test, feature = "test-support"))] fault: Fault,
+    pseudoconsole: Option<isize>,
+) -> Result<OwnedChild, SpawnFailure> {
     command.validate().map_err(SpawnFailure::never)?;
     let application = encoding::application(command).map_err(SpawnFailure::never)?;
     let application_wide = encoding::wide(application.as_os_str()).map_err(SpawnFailure::never)?;
@@ -246,13 +292,16 @@ pub(super) fn spawn_impl(
     } else {
         jobs
     };
-    let attributes = Attributes::new(&handles, &jobs).map_err(SpawnFailure::never)?;
+    let attributes =
+        Attributes::new(&handles, &jobs, pseudoconsole).map_err(SpawnFailure::never)?;
     let mut startup = STARTUPINFOEXW::default();
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
-    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    startup.StartupInfo.hStdInput = handles[0];
-    startup.StartupInfo.hStdOutput = handles[1];
-    startup.StartupInfo.hStdError = handles[2];
+    if pseudoconsole.is_none() {
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = handles[0];
+        startup.StartupInfo.hStdOutput = handles[1];
+        startup.StartupInfo.hStdError = handles[2];
+    }
     startup.lpAttributeList = attributes.memory;
     let mut information = PROCESS_INFORMATION::default();
     #[cfg(any(test, feature = "test-support"))]
@@ -269,7 +318,7 @@ pub(super) fn spawn_impl(
             argv.as_mut_ptr(),
             null(),
             null(),
-            1,
+            i32::from(pseudoconsole.is_none()),
             CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
             environment.as_ref().map_or(null(), |v| v.as_ptr().cast()),
             cwd.as_ref().map_or(null(), |v| v.as_ptr()),

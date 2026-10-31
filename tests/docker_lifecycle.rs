@@ -1,5 +1,7 @@
 #[path = "support/docker_absence.rs"]
 mod docker_absence;
+#[path = "support/native.rs"]
+mod native;
 use docker_absence::{absent, container_is_absent};
 use theseus::{
     engine::{self, CancellationToken, EventKind, RunOptions},
@@ -528,7 +530,7 @@ fn real_application_exit_one_and_docker_control_exit_one_are_distinct() {
 #[test]
 #[ignore = "requires Docker and a Unix PTY"]
 fn real_pty_active_signals_cleanup_and_cancel_browsing() {
-    let output = std::process::Command::new("python3")
+    let output = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
         .arg("tests/support/tui_signals.py")
         .arg(env!("CARGO_BIN_EXE_theseus"))
         .arg("--docker")
@@ -545,7 +547,6 @@ fn real_pty_active_signals_cleanup_and_cancel_browsing() {
 
 #[test]
 fn docker_absence_requires_missing_target_and_expected_exit() {
-    use std::os::unix::process::ExitStatusExt;
     for (status, error, absent) in [
         (1, "error: no such object: owned-id\n", true),
         (1, "Error: No such object: owned-id\n", true),
@@ -575,7 +576,7 @@ fn docker_absence_requires_missing_target_and_expected_exit() {
         (1, "", false),
     ] {
         let output = std::process::Output {
-            status: std::process::ExitStatus::from_raw(status << 8),
+            status: native::status(status),
             stdout: b"[]\n".to_vec(),
             stderr: error.as_bytes().to_vec(),
         };
@@ -585,17 +586,31 @@ fn docker_absence_requires_missing_target_and_expected_exit() {
             "{status}: {error}"
         );
     }
+    #[cfg(unix)]
     let signalled = std::process::Output {
-        status: std::process::ExitStatus::from_raw(9),
+        status: {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(9)
+        },
         stdout: vec![],
         stderr: b"error: no such object: owned-id".to_vec(),
     };
+    #[cfg(unix)]
     assert!(!container_is_absent("owned-id", &signalled));
+    #[cfg(windows)]
+    assert!(!container_is_absent(
+        "owned-id",
+        &std::process::Output {
+            status: native::status(0xC000013Au32 as i32),
+            stdout: vec![],
+            stderr: b"error: no such object: owned-id".to_vec()
+        }
+    ));
 }
 
 #[test]
 fn python_docker_absence_requires_missing_target_and_expected_exit() {
-    let output = std::process::Command::new("python3")
+    let output = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
         .arg("tests/support/docker_absence_test.py")
         .output()
         .unwrap();
@@ -875,7 +890,7 @@ fn real_reinstall_timeout_and_cancellation_remove_journaled_container() {
 
 #[test]
 fn python_reinstall_visibility_requires_current_terminal_cells() {
-    let output = std::process::Command::new("python3")
+    let output = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
         .arg("tests/support/tui_reinstall_test.py")
         .output()
         .unwrap();
@@ -890,7 +905,7 @@ fn python_reinstall_visibility_requires_current_terminal_cells() {
 #[test]
 #[ignore = "requires Docker and a Unix PTY"]
 fn real_pty_reinstall_selection_and_new_report_comparison_visibility() {
-    let output = std::process::Command::new("python3")
+    let output = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
         .arg("tests/support/tui_reinstall.py")
         .arg(env!("CARGO_BIN_EXE_theseus"))
         .output()
@@ -1239,6 +1254,7 @@ impl InterruptionBoundary {
     /// Fault injection sits at the Docker transport boundary. Every mutation and
     /// successful inspect still goes through the real daemon and owned resource.
     fn proxy(&mut self, mode: &str) -> std::path::PathBuf {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         use theseus::runner::Environment;
         let executable = self._temporary.path().join("docker-proxy");
@@ -1283,6 +1299,7 @@ sys.stderr.buffer.write(result.stderr)
 sys.exit(result.returncode)
 "#.replace("MODE", &serde_json::to_string(mode).unwrap()).replace("MARKER", &serde_json::to_string(&marker).unwrap());
         std::fs::write(&executable, script).unwrap();
+        #[cfg(unix)]
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         self.docker = theseus::runner::Docker::new(executable);
         let recipe =
@@ -1489,7 +1506,7 @@ fn real_interruption_restart_retains_primary_and_cleanup_errors() {
 #[test]
 #[ignore = "requires Docker and a Unix PTY"]
 fn real_pty_default_animation_active_cancellation_precedes_outro() {
-    let output = std::process::Command::new("python3")
+    let output = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
         .arg("tests/support/tui_animation.py")
         .arg(env!("CARGO_BIN_EXE_theseus"))
         .arg("--docker")

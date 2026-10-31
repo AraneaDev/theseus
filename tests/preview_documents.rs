@@ -11,13 +11,25 @@ const SUITE: &str = "schema_version=1\nname='methods'\nbaseline='a'\nprofiles=['
 
 fn tree() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    fs::create_dir_all(dir.path().join("recipes/target")).unwrap();
-    fs::create_dir(dir.path().join("target")).unwrap();
-    fs::write(dir.path().join("recipe.toml"), RECIPE).unwrap();
+    fs::create_dir_all(dir.path().canonicalize().unwrap().join("recipes/target")).unwrap();
+    fs::create_dir(dir.path().canonicalize().unwrap().join("target")).unwrap();
+    fs::write(
+        dir.path().canonicalize().unwrap().join("recipe.toml"),
+        RECIPE,
+    )
+    .unwrap();
     for name in ["a.toml", "b.toml"] {
-        fs::write(dir.path().join("recipes").join(name), RECIPE).unwrap();
+        fs::write(
+            dir.path()
+                .canonicalize()
+                .unwrap()
+                .join("recipes")
+                .join(name),
+            RECIPE,
+        )
+        .unwrap();
     }
-    fs::write(dir.path().join("suite.toml"), SUITE).unwrap();
+    fs::write(dir.path().canonicalize().unwrap().join("suite.toml"), SUITE).unwrap();
     dir
 }
 
@@ -32,10 +44,10 @@ fn source(path: &Path, kind: DocumentKind, digest: &str) -> PreviewSource {
 #[test]
 fn recipe_bytes_keep_source_root_artifacts_normalization_and_raw_digest() {
     let dir = tree();
-    let original = dir.path().join("recipe.toml");
+    let original = dir.path().canonicalize().unwrap().join("recipe.toml");
     let bytes = fs::read(&original).unwrap();
     let loaded = recipe::load(&original).unwrap();
-    let adjacent = dir.path().join("new.toml");
+    let adjacent = dir.path().canonicalize().unwrap().join("new.toml");
     let parsed = recipe::parse_bytes(&adjacent, &bytes).unwrap();
     assert!(!adjacent.exists());
     assert_eq!(parsed.path, adjacent);
@@ -65,10 +77,10 @@ fn recipe_bytes_keep_source_root_artifacts_normalization_and_raw_digest() {
 #[test]
 fn suite_bytes_keep_variant_roots_matrix_normalization_and_raw_digest() {
     let dir = tree();
-    let original = dir.path().join("suite.toml");
+    let original = dir.path().canonicalize().unwrap().join("suite.toml");
     let bytes = fs::read(&original).unwrap();
     let loaded = comparison::load(&original).unwrap();
-    let adjacent = dir.path().join("new.toml");
+    let adjacent = dir.path().canonicalize().unwrap().join("new.toml");
     let parsed = comparison::parse_bytes(&adjacent, &bytes).unwrap();
     assert!(!adjacent.exists());
     assert_eq!(parsed.path, adjacent);
@@ -114,7 +126,7 @@ fn suite_bytes_keep_variant_roots_matrix_normalization_and_raw_digest() {
 #[test]
 fn recipe_headless_load_retains_its_existing_size_policy() {
     let dir = tree();
-    let path = dir.path().join("recipe.toml");
+    let path = dir.path().canonicalize().unwrap().join("recipe.toml");
     let mut raw = RECIPE.as_bytes().to_vec();
     raw.extend_from_slice(format!("\n#{}", "x".repeat(MAX_DRAFT_BYTES)).as_bytes());
     fs::write(&path, &raw).unwrap();
@@ -126,7 +138,7 @@ fn recipe_headless_load_retains_its_existing_size_policy() {
 #[test]
 fn open_requires_unchanged_utf8_source_within_editor_limit() {
     let dir = tree();
-    let path = dir.path().join("recipe.toml");
+    let path = dir.path().canonicalize().unwrap().join("recipe.toml");
     let accepted = recipe::load(&path).unwrap();
     let source = source(&path, DocumentKind::Recipe, &accepted.digest);
     let draft = DraftDocument::open(source.clone()).unwrap();
@@ -144,14 +156,14 @@ fn recipe_save_copy_writes_exact_bytes_exclusively_and_preserves_original() {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     let dir = tree();
-    let path = dir.path().join("recipe.toml");
+    let path = dir.path().canonicalize().unwrap().join("recipe.toml");
     let before = fs::read(&path).unwrap();
     let accepted = recipe::load(&path).unwrap();
     let mut draft =
         DraftDocument::open(source(&path, DocumentKind::Recipe, &accepted.digest)).unwrap();
     draft.text.push_str("\n# π comment\n");
     let saved = draft.save_copy("new.edited.toml").unwrap();
-    let copy = dir.path().join("new.edited.toml");
+    let copy = dir.path().canonicalize().unwrap().join("new.edited.toml");
     assert_eq!(fs::read(&copy).unwrap(), draft.text.as_bytes());
     assert_eq!(fs::read(&path).unwrap(), before);
     #[cfg(unix)]
@@ -179,7 +191,7 @@ fn recipe_save_copy_writes_exact_bytes_exclusively_and_preserves_original() {
 #[test]
 fn suite_save_copy_reloads_variants_from_original_root() {
     let dir = tree();
-    let path = dir.path().join("suite.toml");
+    let path = dir.path().canonicalize().unwrap().join("suite.toml");
     let accepted = comparison::load(&path).unwrap();
     let mut draft =
         DraftDocument::open(source(&path, DocumentKind::Suite, &accepted.digest)).unwrap();
@@ -187,7 +199,10 @@ fn suite_save_copy_reloads_variants_from_original_root() {
     let ValidatedDocument::Suite(saved) = draft.save_copy("suite.edited.toml").unwrap() else {
         panic!("wrong kind")
     };
-    assert_eq!(saved.path, dir.path().join("suite.edited.toml"));
+    assert_eq!(
+        saved.path,
+        dir.path().canonicalize().unwrap().join("suite.edited.toml")
+    );
     assert_eq!(
         saved.variants[0].recipe.path,
         accepted.variants[0].recipe.path
@@ -205,13 +220,13 @@ fn save_rejects_bad_names_collisions_and_invalid_drafts_without_creation() {
     #[cfg(windows)]
     use std::os::windows::fs::symlink_file as symlink;
     let dir = tree();
-    let path = dir.path().join("recipe.toml");
+    let path = dir.path().canonicalize().unwrap().join("recipe.toml");
     let accepted = recipe::load(&path).unwrap();
     let mut draft =
         DraftDocument::open(source(&path, DocumentKind::Recipe, &accepted.digest)).unwrap();
-    let existing = dir.path().join("existing.toml");
+    let existing = dir.path().canonicalize().unwrap().join("existing.toml");
     fs::write(&existing, "sentinel").unwrap();
-    let link = dir.path().join("link.toml");
+    let link = dir.path().canonicalize().unwrap().join("link.toml");
     symlink(&existing, &link).unwrap();
     for name in [
         "",
@@ -239,18 +254,30 @@ fn save_rejects_bad_names_collisions_and_invalid_drafts_without_creation() {
     draft.text = "not = [toml".into();
     assert!(draft.validate().is_err());
     assert!(draft.save_copy("invalid.toml").is_err());
-    assert!(!dir.path().join("invalid.toml").exists());
+    assert!(
+        !dir.path()
+            .canonicalize()
+            .unwrap()
+            .join("invalid.toml")
+            .exists()
+    );
     draft.text = format!("{}\n#{}", RECIPE, "x".repeat(MAX_DRAFT_BYTES));
     assert!(draft.validate().is_err());
     assert!(draft.save_copy("oversize.toml").is_err());
-    assert!(!dir.path().join("oversize.toml").exists());
+    assert!(
+        !dir.path()
+            .canonicalize()
+            .unwrap()
+            .join("oversize.toml")
+            .exists()
+    );
 }
 #[path = "support/plugin.rs"]
 mod plugin_fixture;
 #[test]
 fn schema7_plugin_draft_edit_and_save_copy_preserve_contract() {
     let dir = plugin_fixture::project();
-    let path = dir.path().join("plugin.toml");
+    let path = dir.path().canonicalize().unwrap().join("plugin.toml");
     let bytes = plugin_fixture::bytes(&plugin_fixture::declaration("local"));
     fs::write(&path, &bytes).unwrap();
     let accepted = recipe::load(&path).unwrap();

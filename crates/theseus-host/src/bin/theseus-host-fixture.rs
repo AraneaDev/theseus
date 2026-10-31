@@ -41,6 +41,9 @@
 mod docker;
 #[path = "fixture/duplex.rs"]
 mod duplex;
+#[cfg(feature = "test-support")]
+#[path = "fixture/terminal.rs"]
+mod terminal;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -450,7 +453,47 @@ fn run(args: &[OsString]) -> FixtureResult {
 }
 
 fn main() {
+    #[cfg(all(windows, feature = "test-support"))]
+    if env::args_os().nth(1).as_deref() == Some(OsStr::new("terminal-client")) {
+        let result = theseus_host::process::terminal::run_client(
+            &env::args_os().skip(2).collect::<Vec<_>>(),
+        );
+        match result {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("terminal client: {error}");
+                drop(error);
+                std::process::exit(2);
+            }
+        }
+    }
+    #[cfg(feature = "test-support")]
+    if env::args_os().nth(1).as_deref() == Some(OsStr::new("terminal")) {
+        if let Err(error) = terminal::run() {
+            eprintln!("terminal: {error}");
+            drop(error);
+            std::process::exit(2);
+        }
+        return;
+    }
     let executable = env::current_exe().expect("fixture executable path");
+    if executable.file_stem() == Some(OsStr::new("docker")) {
+        #[cfg(feature = "test-support")]
+        if env::var_os("THESEUS_DOCKER_TEST_MODE").as_deref() == Some(OsStr::new("cached-error")) {
+            std::fs::write("prepare-ready", b"ready").expect("prepare readiness");
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while std::time::Instant::now() < deadline {
+                if std::fs::read("prepare-gate").is_ok_and(|bytes| bytes == b"x") {
+                    std::process::exit(1);
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            std::process::exit(98);
+        }
+        let sentinel = env::var_os("THESEUS_DOCKER_SENTINEL").expect("native Docker sentinel path");
+        std::fs::write(sentinel, b"called").expect("native Docker sentinel write");
+        std::process::exit(111);
+    }
     if executable.file_stem() == Some(OsStr::new("theseus")) {
         let args: Vec<_> = env::args_os().skip(1).collect();
         if args.len() != 2 || args[0] != "cleanup" {

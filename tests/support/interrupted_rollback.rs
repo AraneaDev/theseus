@@ -273,7 +273,9 @@ if inspect and marker.exists() and mode in ['wrong-id','unverified-restart']:
     print(json.dumps(value)); sys.exit(0)
 sys.exit(subprocess.run(['docker',*args]).returncode)
 "#,marker=marker.to_str().unwrap(),incomplete=incomplete.to_str().unwrap(),calls=trace_path.to_str().unwrap())).unwrap();
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
     if fault == "incomplete-baseline" {
         std::fs::write(&incomplete, "fail exactly one cp").unwrap();

@@ -3,28 +3,23 @@
 Usage: tui_animation.py BINARY [--docker]. Docker mode adds real cancellation;
 ordinary mode stays offline and also runs from the regular Rust TUI tests.
 """
-import fcntl
 import json
 import os
 import pathlib
-import pty
-import select
 import shutil
 import signal
-import struct
 import subprocess
 import sys
 import tempfile
-import termios
 import time
 
 sys.dont_write_bytecode = True
-from terminal_screen import Screen
+from terminal_session import NativeSession, native_fixture
 from docker_absence import require_container_absent
 
 binary = str(pathlib.Path(sys.argv[1]).resolve())
 repo = pathlib.Path(__file__).resolve().parents[2]
-log_root = pathlib.Path(os.environ.get('THESEUS_ANIMATION_EVIDENCE', '/tmp/theseus-animation-pty'))
+log_root = pathlib.Path(os.environ.get('THESEUS_ANIMATION_EVIDENCE', str(pathlib.Path(tempfile.gettempdir())/'theseus-animation-pty')))
 log_root.mkdir(parents=True, exist_ok=True)
 
 
@@ -48,7 +43,7 @@ class Session:
             recipe.write_text(recipe.read_text().replace('THESEUS_FIXTURE_FAULT = ""', 'THESEUS_FIXTURE_FAULT = "cancellation"'))
             args = ('run', '--recipe', 'recipe.toml', '--profile', 'user', '--scenario', 'clean')
         if error:
-            (self.root / '.theseus-runs').symlink_to('/proc', target_is_directory=True)
+            (self.root / '.theseus-runs').write_bytes(b'exclusive collision')
         if args and args[0] == 'report':
             saved = self.root / 'saved'
             saved.mkdir()
@@ -56,18 +51,12 @@ class Session:
             args = ('report', str(saved), *args[2:])
         environment = {**os.environ, 'TERM': term}
         if cached_error:
-            # Hold prepare at a FIFO until Started is actually visible. This
-            # creates a worker persistence failure after the UI cached evidence,
-            # with no Docker daemon or timing-dependent sleeps.
+            # Fixed native peer waits for an explicit complete release record.
             self.gate = self.root / 'prepare-gate'
-            os.mkfifo(self.gate)
-            executable = self.root / 'bin' / 'docker'
+            executable = self.root / 'bin' / ('docker.exe' if os.name == 'nt' else 'docker')
             executable.parent.mkdir()
-            executable.write_text("#!/usr/bin/python3\nimport os, pathlib\n"
-                                  "pathlib.Path('prepare-ready').touch()\n"
-                                  "with open('prepare-gate', 'rb') as gate: gate.read(1)\n"
-                                  "raise SystemExit(1)\n")
-            executable.chmod(0o755)
+            shutil.copy2(native_fixture()[0], executable)
+            environment['THESEUS_DOCKER_TEST_MODE'] = 'cached-error'
             environment['PATH'] = str(executable.parent) + os.pathsep + os.environ['PATH']
         if draw_error:
             # Fail exactly the first scene write, then permit Guard's restoration
@@ -92,42 +81,35 @@ ssize_t write(int fd, const void *buf, size_t count) {
             library = self.root / 'fail_scene_write.so'
             subprocess.run(['cc', '-shared', '-fPIC', str(source), '-o', str(library), '-ldl'], check=True, capture_output=True)
             environment['LD_PRELOAD'] = str(library)
-        self.master, self.slave = pty.openpty()
-        self.before = termios.tcgetattr(self.slave)
         self.rows, self.columns = rows, columns
-        self.resize(rows, columns)
-        self.screen = Screen(rows, columns)
-        self.data = bytearray()
+        self.native = NativeSession(binary, args, self.root, environment, rows, columns)
+        self.proc = self.native
+        self.before = self.native.modes['before']
+        self.screen = self.native.output.screen
+        self.data = self.native.output.data
         self.captions = set()
         self.heroes = set()
         self.hero_order = []
-        self.proc = subprocess.Popen([binary, *args], cwd=self.root, stdin=self.slave,
-                                     stdout=self.slave, stderr=self.slave,
-                                     env=environment)
 
     def resize(self, rows, columns):
-        fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack('HHHH', rows, columns, 0, 0))
-        if hasattr(self, 'screen'):
-            self.screen.rows, self.screen.columns = rows, columns
+        self.native.resize(rows, columns)
+        self.screen = self.native.output.screen
         self.rows, self.columns = rows, columns
 
     def drain(self):
-        if select.select([self.master], [], [], .02)[0]:
-            chunk = os.read(self.master, 65536)
-            self.data.extend(chunk)
-            self.screen.feed(chunk)
-            text = self.screen.text()
-            for caption in [b'Entering the labyrinth', b'The thread is anchored', b'Following the thread home', b'Session ended']:
-                if caption in text:
-                    self.captions.add(caption)
-            if b'T H E S E U S' in text:
-                offset_x, offset_y = (self.columns-40)//2, (self.rows-18)//2
-                for (y,x), cell in self.screen.cells.items():
-                    if cell == '@':
-                        position = (x-offset_x, y-offset_y)
-                        self.heroes.add(position)
-                        if not self.hero_order or self.hero_order[-1] != position:
-                            self.hero_order.append(position)
+        self.native.pump()
+        text = self.screen.text()
+        for caption in [b'Entering the labyrinth', b'The thread is anchored', b'Following the thread home', b'Session ended']:
+            if caption in text:
+                self.captions.add(caption)
+        if b'T H E S E U S' in text:
+            offset_x, offset_y = (self.columns-40)//2, (self.rows-18)//2
+            for (y,x), cell in self.screen.cells.items():
+                if cell == '@':
+                    position = (x-offset_x, y-offset_y)
+                    self.heroes.add(position)
+                    if not self.hero_order or self.hero_order[-1] != position:
+                        self.hero_order.append(position)
 
     def until(self, predicate, timeout=3):
         deadline = time.monotonic() + timeout
@@ -139,7 +121,7 @@ ssize_t write(int fd, const void *buf, size_t count) {
         return text.encode() in self.screen.text()
 
     def key(self, value):
-        os.write(self.master, value)
+        self.native.key(value)
 
     def intro(self):
         self.until(lambda: self.visible('Entering the labyrinth'))
@@ -155,10 +137,9 @@ ssize_t write(int fd, const void *buf, size_t count) {
 
     def finish(self, code=0, timeout=2):
         self.until(lambda: self.proc.poll() is not None, timeout)
-        while select.select([self.master], [], [], .02)[0]:
-            self.drain()
+        self.drain()
         assert self.proc.returncode == code, (self.name, self.proc.returncode, self.data[-3000:])
-        assert termios.tcgetattr(self.slave) == self.before, (self.name, 'termios not restored')
+        self.native.assert_restored()
         for marker in [b'\x1b[?1049h', b'\x1b[?1049l', b'\x1b[?25h']:
             assert marker in self.data, (self.name, 'terminal not restored', marker)
 
@@ -172,8 +153,7 @@ ssize_t write(int fd, const void *buf, size_t count) {
             shutil.copytree(report.parent, dest, dirs_exist_ok=True)
         for journal in self.root.glob('.theseus-runs/*/journal.json'):
             subprocess.run([binary, 'cleanup', str(journal.parent)], capture_output=True, timeout=15)
-        os.close(self.master)
-        os.close(self.slave)
+        self.native.close()
         self.tmp.cleanup()
 
 
@@ -301,7 +281,7 @@ def worker_error(s):
 def cached_worker_error(s):
     s.preview()
     s.key(b'r')
-    s.until(lambda: (s.root / 'prepare-ready').exists() and s.visible('Running Started'))
+    s.until(lambda: (s.root / 'prepare-ready').is_file() and (s.root / 'prepare-ready').read_bytes() == b'ready' and s.visible('Running Started'))
     saved = next(s.root.glob('.theseus-runs/*/report.json'))
     saved.rename(saved.with_name('cached-report.json'))
     saved.mkdir()  # Make the final atomic report rename fail after cached Started.
@@ -377,6 +357,10 @@ else:
     run('cached-worker-error-disabled', cached_worker_error, cached_error=True, args=('--no-animation',))
     run('cached-worker-error-dumb', cached_worker_error, cached_error=True, term='dumb')
     run('cached-worker-error-small', cached_worker_error, cached_error=True, rows=17, columns=39)
-    run('draw-error', draw_failure, draw_error=True)
+    # Linux-only supplemental write(2) interposition. Actual native engine-error
+    # restoration and common guard/join tests run on every host; this is not a
+    # claimed Windows/macOS first-scene syscall fault run.
+    if sys.platform == 'linux':
+        run('draw-error', draw_failure, draw_error=True)
 
 assert executed_cases, f'unknown or unavailable --case: {selected_case!r}'

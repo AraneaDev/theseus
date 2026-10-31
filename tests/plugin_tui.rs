@@ -2,7 +2,7 @@
 #[test]
 #[ignore = "requires Unix PTY, Docker and explicit THESEUS_PLUGIN_CLIENT + THESEUS_PLUGIN_CLIENT_VERSION"]
 fn native_live_offline_proof_browsing_cancel_and_terminal_restoration() {
-    let output = std::process::Command::new("python3")
+    let output = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
         .args([
             "tests/support/plugin_native_pty.py",
             env!("CARGO_BIN_EXE_theseus"),

@@ -1,3 +1,5 @@
+#[path = "support/native.rs"]
+mod native;
 #[test]
 fn mcp_expectation_has_explicit_protocol_and_no_host_forwarding() {
     let check: theseus::recipe::Check = toml::from_str(
@@ -181,7 +183,10 @@ fn typed_probe_is_schema_eight_only_and_roundtrips() {
     for version in [7, 8] {
         let text =
             base.replace("schema_version = 2", &format!("schema_version = {version}")) + check;
-        let result = theseus::recipe::parse_bytes(&dir.path().join("recipe.toml"), text.as_bytes());
+        let result = theseus::recipe::parse_bytes(
+            &dir.path().canonicalize().unwrap().join("recipe.toml"),
+            text.as_bytes(),
+        );
         if version == 7 {
             assert!(result.is_err());
         } else {
@@ -189,8 +194,11 @@ fn typed_probe_is_schema_eight_only_and_roundtrips() {
             let text = toml::to_string(&recipe.recipe).unwrap();
             assert!(text.contains("[profiles.user.checks.probe]"));
             assert!(
-                theseus::recipe::parse_bytes(&dir.path().join("recipe.toml"), text.as_bytes())
-                    .is_ok()
+                theseus::recipe::parse_bytes(
+                    &dir.path().canonicalize().unwrap().join("recipe.toml"),
+                    text.as_bytes()
+                )
+                .is_ok()
             );
         }
     }
@@ -307,8 +315,11 @@ fn unsupported_probe_stops_guest_work_and_marks_unavailable_checks() {
             "\n[[profiles.user.checks]]\nid='{id}'\ncheckpoint='configured'\nkind='mcp_stdio'\n[profiles.user.checks.probe]\nargv=['/inputs/target/server']\nprotocol='2026-07-28'\nserver_name='fixture'\nserver_version='2'\ntools=['hello_v2']\n"
         );
     }
-    let recipe =
-        theseus::recipe::parse_bytes(&root.path().join("recipe.toml"), text.as_bytes()).unwrap();
+    let recipe = theseus::recipe::parse_bytes(
+        &root.path().canonicalize().unwrap().join("recipe.toml"),
+        text.as_bytes(),
+    )
+    .unwrap();
     let mut env = Unsupported {
         calls: vec![],
         stops: 0,
@@ -375,27 +386,10 @@ fn contradictory_launch_is_rejected_before_docker_is_invoked() {
 }
 #[test]
 fn exhausted_preparation_does_not_spawn_interactive_guest_or_use_ordinary_abort() {
-    use std::os::unix::fs::PermissionsExt;
     use theseus::runner::Environment;
     let root = tempfile::tempdir().unwrap();
-    let script = root.path().join("docker");
+    let script = native::docker(root.path(), "mcp-expired");
     let calls = root.path().join("calls");
-    std::fs::write(
-        &script,
-        format!(
-            r#"#!/bin/sh
-printf '%s\n' "$*" >> '{}'
-case "$1 $2" in
- 'exec --user') sleep 2.2; exit 0;;
- 'container inspect') printf 'Error: No such object: %s\n' "$5" >&2; exit 1;;
- *) exit 98;;
-esac
-"#,
-            calls.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
     let (_, o) = observation("hello_v2");
     let probe = o.evidence.probe;
     let request = theseus::runner::CommandRequest {
@@ -533,9 +527,11 @@ fn returned_unavailability_stops_work_but_clean_mismatch_allows_uninstall() {
                 "\n[[profiles.user.checks]]\nid='{id}'\ncheckpoint='{checkpoint}'\nkind='mcp_stdio'\n[profiles.user.checks.probe]\nargv=['/inputs/target/server']\nprotocol='2026-07-28'\nserver_name='fixture'\nserver_version='2'\ntools=['hello_v2']\n"
             );
         }
-        let recipe =
-            theseus::recipe::parse_bytes(&root.path().join("recipe.toml"), text.as_bytes())
-                .unwrap();
+        let recipe = theseus::recipe::parse_bytes(
+            &root.path().canonicalize().unwrap().join("recipe.toml"),
+            text.as_bytes(),
+        )
+        .unwrap();
         let mut env = Supported {
             base: Unsupported {
                 calls: vec![],
@@ -603,8 +599,11 @@ fn preflight_revalidates_probe_launch_fields_before_creating_resources() {
     let mut text = include_str!("fixtures/recipes/v2_clean.toml")
         .replace("schema_version = 2", "schema_version = 8");
     text += "\n[[profiles.user.checks]]\nid='discovery'\ncheckpoint='configured'\nkind='mcp_stdio'\n[profiles.user.checks.probe]\nargv=['/inputs/target/server']\nprotocol='2026-07-28'\nserver_name='fixture'\nserver_version='2'\ntools=['hello_v2']\n";
-    let mut recipe =
-        theseus::recipe::parse_bytes(&root.path().join("recipe.toml"), text.as_bytes()).unwrap();
+    let mut recipe = theseus::recipe::parse_bytes(
+        &root.path().canonicalize().unwrap().join("recipe.toml"),
+        text.as_bytes(),
+    )
+    .unwrap();
     let theseus::recipe::Expectation::McpStdio { probe } = &mut recipe
         .recipe
         .profiles
@@ -638,27 +637,10 @@ fn preflight_revalidates_probe_launch_fields_before_creating_resources() {
 
 #[test]
 fn emergency_cleanup_time_does_not_manufacture_an_execution_timeout() {
-    use std::os::unix::fs::PermissionsExt;
     use theseus::runner::Environment;
     let root = tempfile::tempdir().unwrap();
-    let script = root.path().join("docker");
+    let script = native::docker(root.path(), "mcp-emergency");
     let calls = root.path().join("calls");
-    std::fs::write(
-        &script,
-        format!(
-            r#"#!/bin/sh
-printf '%s\n' "$*" >> '{}'
-case "$1 $2" in
- 'exec --user') sleep 0.8; exit 1;;
- 'container inspect') sleep 1.2; printf 'Error: No such object: %s\n' "$5" >&2; exit 1;;
- *) exit 98;;
-esac
-"#,
-            calls.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
     let (_, o) = observation("hello_v2");
     let probe = o.evidence.probe;
     let request = theseus::runner::CommandRequest {
@@ -710,26 +692,10 @@ esac
 
 #[test]
 fn interactive_cli_spawn_failure_after_successful_preparation_is_not_started() {
-    use std::os::unix::fs::PermissionsExt;
     use theseus::runner::Environment;
     let root = tempfile::tempdir().unwrap();
-    let executable = root.path().join("control");
+    let executable = native::docker(root.path(), "mcp-remove");
     let calls = root.path().join("calls");
-    std::fs::write(
-        &executable,
-        format!(
-            r#"#!/bin/sh
-printf '%s\n' "$*" >> '{}'
-case "$1 $2" in
- 'exec --user') rm -- "$0"; exit 0;;
- *) exit 98;;
-esac
-"#,
-            calls.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
     let (_, observed) = observation("hello_v2");
     let probe = observed.evidence.probe;
     let request = theseus::runner::CommandRequest {

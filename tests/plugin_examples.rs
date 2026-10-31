@@ -8,7 +8,7 @@ use theseus::{
 
 #[test]
 fn guest_version_adapter_bounds_and_exit_status_are_checked_before_json() {
-    let output = std::process::Command::new("python3")
+    let output = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
         .args([
             "tests/support/plugin_prepare_test.py",
             "GuestVersionAdapter",
@@ -53,7 +53,7 @@ fn prepared_examples_load_all_scopes_without_host_paths_or_forwarded_environment
 
 #[test]
 fn native_harness_inspection_stalls_fail_without_proving_absence() {
-    let output = std::process::Command::new("python3")
+    let output = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
         .arg("tests/support/plugin_native_test.py")
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()

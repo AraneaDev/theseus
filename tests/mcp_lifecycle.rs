@@ -2,7 +2,7 @@
 #[test]
 #[ignore = "UNRUN without explicit THESEUS_MCP_CLAUDE_CLIENT, THESEUS_MCP_CODEX_CLIENT, THESEUS_MCP_TEST_IMAGE and reachable Docker"]
 fn supplied_native_matrix_faults_and_strict_owned_cleanup() {
-    let output = std::process::Command::new("python3")
+    let output = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
         .args(["tests/support/mcp_native.py", env!("CARGO_BIN_EXE_theseus")])
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()

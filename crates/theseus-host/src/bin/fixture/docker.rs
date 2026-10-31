@@ -1,5 +1,8 @@
 //! Fixed, bounded Docker command peers for application tests. These do not run
 //! guest argv, contact Docker, invoke a shell, or accept arbitrary filesystem work.
+#[cfg(feature = "test-support")]
+#[path = "acceptance.rs"]
+mod acceptance;
 use std::{
     ffi::OsString,
     io::{self, Write},
@@ -75,6 +78,12 @@ fn tar_sample() -> io::Result<()> {
     out.flush()
 }
 pub(super) fn run(mode: &str, root: &Path, args: &[OsString]) -> io::Result<i32> {
+    #[cfg(feature = "test-support")]
+    if mode.starts_with("comparison-")
+        || matches!(mode, "mcp-expired" | "mcp-emergency" | "mcp-remove")
+    {
+        return acceptance::run(mode, root, args);
+    }
     if args.len() > 128 || args.iter().map(|a| a.len()).sum::<usize>() > 65536 {
         return Err(invalid());
     }

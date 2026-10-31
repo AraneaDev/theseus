@@ -6,7 +6,7 @@ fn accepts_scoped_plugin_contracts() {
     for scope in ["user", "project", "local"] {
         let t = fixture::project();
         let r = recipe::parse_bytes(
-            &t.path().join("recipe.toml"),
+            &t.path().canonicalize().unwrap().join("recipe.toml"),
             &fixture::bytes(&fixture::declaration(scope)),
         )
         .unwrap();
@@ -104,7 +104,7 @@ fn rejects_invalid_plugin_declarations() {
             "equal" => v["profiles"]["user"]["plugin"]["target_version"] = "1".into(),
             _ => unreachable!(),
         }
-        let path = t.path().join("recipe.toml");
+        let path = t.path().canonicalize().unwrap().join("recipe.toml");
         let bytes = fixture::bytes(&v);
         assert!(
             recipe::parse_bytes(&path, &bytes)
@@ -121,7 +121,11 @@ fn inventory_can_add_companion_assertions_without_filtering_target_identity() {
     let t = fixture::project();
     let mut value = fixture::declaration("user");
     value["profiles"]["user"]["checks"][1]["assertions"].as_array_mut().unwrap().push(serde_json::json!({"kind":"array_match","pointer":"","identity":[{"pointer":"/id","equals_json":"\"companion@market\""}],"count":1,"values":[{"pointer":"/enabled","equals_json":"true"}]}));
-    recipe::parse_bytes(&t.path().join("plugin.toml"), &fixture::bytes(&value)).unwrap();
+    recipe::parse_bytes(
+        &t.path().canonicalize().unwrap().join("plugin.toml"),
+        &fixture::bytes(&value),
+    )
+    .unwrap();
 }
 #[test]
 fn plugin_features_require_declaration_and_explicit_contract() {
@@ -152,7 +156,7 @@ fn plugin_features_require_declaration_and_explicit_contract() {
                     .remove("enable_plugin");
             }
         }
-        let path = t.path().join("plugin.toml");
+        let path = t.path().canonicalize().unwrap().join("plugin.toml");
         let bytes = fixture::bytes(&v);
         assert!(
             recipe::parse_bytes(&path, &bytes)
@@ -190,8 +194,11 @@ fn accepts_equivalent_plugin_scalar_literals() {
             "enabled" => a["values"][2]["equals_json"] = literal.into(),
             _ => unreachable!(),
         }
-        recipe::parse_bytes(&t.path().join("recipe.toml"), &fixture::bytes(&v))
-            .unwrap_or_else(|e| panic!("{check}/{field}: {e}"));
+        recipe::parse_bytes(
+            &t.path().canonicalize().unwrap().join("recipe.toml"),
+            &fixture::bytes(&v),
+        )
+        .unwrap_or_else(|e| panic!("{check}/{field}: {e}"));
     }
 }
 
@@ -218,7 +225,11 @@ fn rejects_changed_plugin_scalar_values_and_types() {
                 _ => unreachable!(),
             }
             assert!(
-                recipe::parse_bytes(&t.path().join("recipe.toml"), &fixture::bytes(&v)).is_err(),
+                recipe::parse_bytes(
+                    &t.path().canonicalize().unwrap().join("recipe.toml"),
+                    &fixture::bytes(&v)
+                )
+                .is_err(),
                 "{field} accepted {literal}"
             );
         }

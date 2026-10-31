@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import mcp_native as native
+from guest_shell import run_guest_shell, guest_path
 
 MODERN = [
  {'jsonrpc':'2.0','id':'theseus-discover-1','result':{'resultType':'complete','supportedVersions':['2026-07-28'],'capabilities':{'tools':{}},'ttlMs':0,'cacheScope':'public','_meta':{'io.modelcontextprotocol/serverInfo':{'name':'theseus-fixture','version':'2.0.0'}}}},
@@ -29,8 +30,8 @@ class WireOracle(unittest.TestCase):
             capture=Path(directory)/'health.capture'
             capture.write_text('probe: actual failure detail\n')
             # Explicit synthetic shell producer, never a native client/server.
-            script=native.health_capture("printf receipt; (exit 17)",str(capture))
-            result=native.subprocess.run(['sh','-c',script],capture_output=True,text=True)
+            script=native.health_capture("printf receipt; (exit 17)",guest_path(capture))
+            result=run_guest_shell(['-c',script],capture_output=True,text=True)
             self.assertEqual(result.returncode,17)
             self.assertEqual(result.stdout,'receipt')
             self.assertEqual(result.stderr,'probe: actual failure detail\n')
@@ -93,6 +94,25 @@ class WireOracle(unittest.TestCase):
 
 class CurrentDetailOracle(unittest.TestCase):
     def test_resize_updates_actual_terminal_geometry(self):
+        if os.name == 'nt':
+            from terminal_session import NativeSession, native_fixture
+            import time
+            _, metadata = native_fixture()
+            terminal = NativeSession(metadata['application']['path'], ['--no-animation'],
+                                     native.REPO / 'examples/standalone', os.environ)
+            try:
+                terminal.resize(36, 120)
+                deadline = time.monotonic() + 8
+                while not terminal.output.has(b'Preview') and time.monotonic() < deadline:
+                    terminal.pump()
+                self.assertTrue(terminal.output.has(b'Preview'))
+                self.assertEqual(terminal.modes['dimensions'], [36, 120])
+                terminal.key(b'q')
+                self.assertEqual(terminal.wait(), 0)
+                terminal.assert_restored()
+            finally:
+                terminal.close()
+            return
         import fcntl
         import pty
         import struct

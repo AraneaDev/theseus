@@ -1,9 +1,10 @@
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[path = "support/native.rs"]
+mod native;
 use anyhow::Result;
-use std::{
-    collections::BTreeMap,
-    fs,
-    os::unix::fs::{PermissionsExt, symlink},
-};
+use native::symlink;
+use std::{collections::BTreeMap, fs};
 use theseus::{
     comparison::{self, ComparisonStatus, SuiteRunOptions},
     engine::{CancellationToken, EventKind},
@@ -236,6 +237,8 @@ fn shared_engine_runs_fresh_sources_and_persists_private_portable_evidence() {
                 .unwrap()
                 .starts_with("sources/copy/")
         );
+        // POSIX mode-bit introspection; Windows private DACL is covered by native host tests.
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(&result.report_path)
                 .unwrap()
@@ -244,6 +247,7 @@ fn shared_engine_runs_fresh_sources_and_persists_private_portable_evidence() {
                 & 0o777,
             0o600
         );
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(result.report_path.parent().unwrap())
                 .unwrap()
@@ -260,6 +264,7 @@ fn shared_engine_runs_fresh_sources_and_persists_private_portable_evidence() {
                 .parent()
                 .unwrap()
                 .join(source["path"].as_str().unwrap());
+            #[cfg(unix)]
             assert_eq!(
                 fs::metadata(&source_dir).unwrap().permissions().mode() & 0o777,
                 0o700
@@ -367,7 +372,11 @@ fn source_reference_save_failure_at_started_prevents_even_prepare_and_exposes_re
     assert_eq!(fake.creates, 0);
     assert_eq!(fake.prepares, 0);
     assert!(error.contains(path.unwrap().to_str().unwrap()));
-    assert!(error.contains("sources/copy/"));
+    assert!(error.contains(&format!(
+        "sources{}copy{}",
+        std::path::MAIN_SEPARATOR,
+        std::path::MAIN_SEPARATOR
+    )));
 }
 #[test]
 fn output_symlink_parent_is_rejected_before_mutation() {
@@ -553,52 +562,9 @@ fn unfinished_cleanup_uses_pinned_journals_and_validates_all_ownership_before_re
 // materialization, observation parsing, lifecycle execution and ownership checks
 // all use the production Docker adapter and engine.
 fn docker_transport(directory: &std::path::Path, mode: &str) -> Docker {
-    let script = r#"#!/usr/bin/python3
-import json, pathlib, sys, tarfile
-directory = pathlib.Path(__file__).parent
-state_path = directory / 'docker-state.json'
-state = json.loads(state_path.read_text()) if state_path.exists() else {'observations':0, 'creates':0}
-args = sys.argv[1:]
-with (directory / 'docker-calls.jsonl').open('a') as log: log.write(json.dumps(args) + '\n')
-mode = @MODE@
-def save(): state_path.write_text(json.dumps(state))
-if args[0] == 'version': print('29.0'); sys.exit(0)
-if args[:2] == ['image', 'inspect']:
-    print('sha256:' + 'a'*64 if args[3] == '{{.Id}}' else 'null'); sys.exit(0)
-if args[0] == 'create':
-    state['creates'] += 1
-    state['id'] = format(state['creates'], '064x')
-    state['labels'] = dict(args[i+1].split('=',1) for i, a in enumerate(args) if a == '--label')
-    save(); print(state['id']); sys.exit(0)
-if args[:2] == ['container', 'inspect']:
-    print(json.dumps({'Id':state['id'], 'Config':{'Labels':state['labels']}, 'State':{'Running':True}})); sys.exit(0)
-if args[0] in ['start', 'rm']: sys.exit(0)
-if args[0] == 'cp':
-    if args[-1] != '-': sys.exit(0)
-    if mode == 'archive-transport': print('daemon disconnected', file=sys.stderr); sys.exit(1)
-    if mode == 'archive-io': sys.stdout.buffer.write(b'partial'); sys.exit(0)
-    with tarfile.open(fileobj=sys.stdout.buffer, mode='w|', format=tarfile.USTAR_FORMAT) as archive:
-        root = tarfile.TarInfo('theseus'); root.type = tarfile.DIRTYPE; archive.addfile(root)
-        child = tarfile.TarInfo('theseus/child'); archive.addfile(child)
-    sys.exit(0)
-if args[0] == 'exec':
-    script = args[args.index('-c')+1]
-    if script.startswith('p=$1;'):
-        state['observations'] += 1; save()
-        if mode == 'probe-transport' and state['observations'] == 1:
-            print('daemon disconnected', file=sys.stderr); sys.exit(1)
-        print('nofollow' if mode == 'nofollow' else 'present' if mode in ['limit', 'archive-transport', 'archive-io'] else 'missing', end=''); sys.exit(0)
-    if script.startswith('receipt=') and mode == 'command-transport':
-        print('daemon disconnected', file=sys.stderr); sys.exit(1)
-    if script.startswith('test -f'): print(args[-1].split('/')[1].removeprefix('.theseus-') + ':0')
-    sys.exit(0)
-print('unexpected Docker operation: ' + repr(args), file=sys.stderr); sys.exit(99)
-"#.replace("@MODE@", &serde_json::to_string(mode).unwrap());
-    let executable = directory.join("docker-transport");
-    fs::write(&executable, script).unwrap();
-    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-    Docker::new(executable.as_os_str())
+    Docker::new(native::docker(directory, &format!("comparison-{mode}")))
 }
+
 fn docker_calls(directory: &std::path::Path, operation: &str) -> usize {
     fs::read_to_string(directory.join("docker-calls.jsonl"))
         .unwrap()

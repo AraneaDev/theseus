@@ -190,7 +190,7 @@ impl Environment for ReplayEnvironment {
 fn run(scope: PluginScope, fault: &str) -> (RunResult, ReplayEnvironment) {
     let t = fixture::project();
     let recipe = recipe::parse_bytes(
-        &t.path().join("recipe.toml"),
+        &t.path().canonicalize().unwrap().join("recipe.toml"),
         &fixture::bytes(&fixture::declaration(scope.as_str())),
     )
     .unwrap();
@@ -208,7 +208,7 @@ fn run(scope: PluginScope, fault: &str) -> (RunResult, ReplayEnvironment) {
     let options = RunOptions {
         profiles: vec![ProfileName::User],
         scenarios: vec![ScenarioKind::PluginLifecycle],
-        output_root: t.path().join("runs"),
+        output_root: t.path().canonicalize().unwrap().join("runs"),
         ..RunOptions::all(&recipe)
     };
     let result = engine::run_with(
@@ -430,7 +430,7 @@ fn offline_plugin_proof_cannot_pass_missing_duplicate_or_contradictory_evidence(
             assert_ne!(report.outcome, RunOutcome::Passed, "{fault}");
         }
         let t = tempfile::tempdir().unwrap();
-        let path = t.path().join("report.json");
+        let path = t.path().canonicalize().unwrap().join("report.json");
         std::fs::write(&path, serde_json::to_vec(&report).unwrap()).unwrap();
         if let Ok(loaded) = theseus::report::load(t.path()) {
             assert_ne!(loaded.outcome, RunOutcome::Passed, "{fault}");
@@ -584,7 +584,7 @@ fn offline_plugin_bindings_accept_equivalent_scalar_literals() {
         assert_eq!(report.outcome, RunOutcome::Passed, "{field}");
         let t = tempfile::tempdir().unwrap();
         std::fs::write(
-            t.path().join("report.json"),
+            t.path().canonicalize().unwrap().join("report.json"),
             serde_json::to_vec(&report).unwrap(),
         )
         .unwrap();
@@ -663,7 +663,7 @@ fn offline_plugin_bindings_reject_changed_scalar_values_and_types() {
             assert_ne!(report.outcome, RunOutcome::Passed, "{field}: {literal}");
             let t = tempfile::tempdir().unwrap();
             std::fs::write(
-                t.path().join("report.json"),
+                t.path().canonicalize().unwrap().join("report.json"),
                 serde_json::to_vec(&report).unwrap(),
             )
             .unwrap();

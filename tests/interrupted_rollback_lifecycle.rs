@@ -1,6 +1,8 @@
 //! Real, cooperative interrupted rollback fixtures; no database snapshot guarantee.
 #[path = "support/docker_absence.rs"]
 mod docker_absence;
+#[path = "support/native.rs"]
+mod native;
 use std::process::Command;
 #[path = "support/interrupted_rollback.rs"]
 mod fixture;
@@ -655,7 +657,7 @@ fn real_timeout_and_cancel_at_every_mutation_skip_forward_steps() {
 }
 #[test]
 fn interrupted_rollback_pty_current_detail_regressions() {
-    let output = Command::new("python3")
+    let output = Command::new(if cfg!(windows) { "python" } else { "python3" })
         .arg("tests/support/tui_interrupted_rollback_test.py")
         .output()
         .unwrap();
@@ -669,7 +671,7 @@ fn interrupted_rollback_pty_current_detail_regressions() {
 #[test]
 #[ignore = "requires Docker and Unix PTY"]
 fn real_interrupted_rollback_live_offline_narrow_pty_both_policies() {
-    let output = Command::new("python3")
+    let output = Command::new(if cfg!(windows) { "python" } else { "python3" })
         .arg("tests/support/tui_interrupted_rollback.py")
         .arg(env!("CARGO_BIN_EXE_theseus"))
         .output()
@@ -746,7 +748,7 @@ fn rollback_invalid_paths_and_scope_overlap_reject_offline_before_resources() {
     std::fs::write(outside.path().join("payload"), "outside").unwrap();
     let artifact = temp.path().join("artifact");
     std::fs::create_dir(&artifact).unwrap();
-    std::os::unix::fs::symlink(outside.path().join("payload"), artifact.join("escape")).unwrap();
+    native::symlink(outside.path().join("payload"), artifact.join("escape")).unwrap();
     let source = source.replace("base = \"base\"", "base = \"artifact\"");
     let path = temp.path().join("symlink.toml");
     std::fs::write(&path, source).unwrap();

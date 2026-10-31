@@ -1,24 +1,19 @@
 """Public preview editing acceptance. All fixture and terminal evidence is retained."""
-import fcntl
 import hashlib
 import json
 import os
 import pathlib
 import posixpath
-import pty
-import select
 import shutil
 import signal
-import struct
 import subprocess
 import sys
 import tempfile
-import termios
 import time
 import tomllib
 
 sys.dont_write_bytecode = True
-from terminal_screen import Screen
+from terminal_session import NativeSession, sentinel_environment
 from docker_absence import require_container_absent
 
 binary = str(pathlib.Path(sys.argv[1]).resolve())
@@ -88,32 +83,17 @@ def fixture(kind, name):
 class Session:
     def __init__(self, root, name, args, sentinel=True, animation=False):
         self.root, self.name = root, name
-        self.master, self.slave = pty.openpty()
-        self.before = termios.tcgetattr(self.slave)
-        fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack('HHHH', 42, 140, 0, 0))
-        self.screen = Screen(42, 140)
-        self.raw = bytearray()
         self.sentinel = root / (name + '.docker-called')
-        env = {**os.environ, 'TERM': 'xterm-256color'}
-        if sentinel:
-            bindir = root / (name + '-bin')
-            bindir.mkdir()
-            docker = bindir / 'docker'
-            docker.write_text('#!/bin/sh\nprintf called > "$THESEUS_DOCKER_SENTINEL"\nexit 111\n')
-            docker.chmod(0o755)
-            env.update(PATH=str(bindir) + os.pathsep + os.environ['PATH'],
-                       THESEUS_DOCKER_SENTINEL=str(self.sentinel))
-        self.proc = subprocess.Popen([binary, '--no-animation', *args] if not animation else [binary, *args],
-                                     cwd=root, stdin=self.slave, stdout=self.slave, stderr=self.slave, env=env)
+        env = sentinel_environment(root / (name + '-bin'), self.sentinel) if sentinel else dict(os.environ)
+        self.native = NativeSession(binary, ['--no-animation', *args] if not animation else args,
+                                    root, env, 42, 140)
+        self.proc = self.native
+        self.screen = self.native.output.screen
+        self.raw = self.native.output.data
+        self.before = self.native.modes['before']
 
     def pump(self):
-        if select.select([self.master], [], [], .05)[0]:
-            try:
-                chunk = os.read(self.master, 65536)
-            except OSError:
-                return
-            self.raw.extend(chunk)
-            self.screen.feed(chunk)
+        self.native.pump()
 
     def text(self):
         return self.screen.text().decode('utf8', 'replace')
@@ -125,20 +105,14 @@ class Session:
         assert token in self.text(), (self.name, token, self.proc.poll(), self.text())
 
     def key(self, data):
-        os.write(self.master, data)
+        self.native.key(data)
 
     def snap(self, label):
         (evidence / f'{self.name}-{label}.screen').write_bytes(self.screen.text())
 
     def finish(self, code=0):
-        deadline = time.monotonic() + 15
-        while self.proc.poll() is None and time.monotonic() < deadline:
-            self.pump()
-        assert self.proc.poll() is not None, (self.name, 'did not exit', self.text())
-        while select.select([self.master], [], [], .02)[0]:
-            self.pump()
-        assert self.proc.returncode == code, (self.name, self.proc.returncode, self.text())
-        assert termios.tcgetattr(self.slave) == self.before, 'termios not restored'
+        assert self.proc.wait(15) == code, (self.name, self.proc.returncode, self.text())
+        self.native.assert_restored()
         assert b'\x1b[?1049h' in self.raw and b'\x1b[?1049l' in self.raw, 'alternate screen not restored'
         assert b'\x1b[?2004h' in self.raw and b'\x1b[?2004l' in self.raw, 'bracketed paste not restored'
         assert self.raw.rfind(b'\x1b[?1049l') > self.raw.rfind(b'\x1b[?1049h'), 'alternate screen re-entered after leave'
@@ -146,19 +120,12 @@ class Session:
         assert not self.sentinel.exists(), 'preview invoked Docker'
 
     def close(self):
-        if self.proc.poll() is None:
-            self.proc.send_signal(signal.SIGTERM)
-            try:
-                self.proc.wait(timeout=8)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-                self.proc.wait()
-        (evidence / (self.name + '.raw')).write_bytes(self.raw)
-        (evidence / (self.name + '.terminal.json')).write_text(json.dumps({
-            'exit': self.proc.returncode, 'before': self.before,
-            'after': termios.tcgetattr(self.slave)}, default=list))
-        os.close(self.master)
-        os.close(self.slave)
+        try:
+            self.native.close()
+        finally:
+            (evidence / (self.name + '.raw')).write_bytes(self.raw)
+            (evidence / (self.name + '.terminal.json')).write_text(json.dumps({
+                'exit': self.proc.returncode, 'modes': self.native.modes}, default=list), encoding='utf-8')
 
 
 def args(kind, source):

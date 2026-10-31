@@ -1,15 +1,16 @@
 """Real native live/offline 80-column PTYs. Text screen assertions, retained raw bytes."""
-import fcntl
 import json
 import os
+if os.name != "nt":
+    import fcntl
+    import pty
+    import termios
 from pathlib import Path
-import pty
 import select
 import signal
 import struct
 import subprocess
 import sys
-import termios
 import time
 
 from plugin_native import (attempt, checks, commands, digest, prepare, prerequisites,

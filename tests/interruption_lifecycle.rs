@@ -62,7 +62,9 @@ if mode=='cancel-restart' and args[:2]==['container','start']:
 result=subprocess.run(['docker', *args])
 sys.exit(result.returncode)
 "#, marker = marker.to_str().unwrap())).unwrap();
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
     let monitor = if fault == "cancel-restart" {
         let signal = signal.clone();
@@ -417,7 +419,7 @@ fn real_interruption_cancellation_before_ready_stopped_and_restart_is_130() {
 
 #[test]
 fn python_interruption_visibility_requires_current_terminal_cells() {
-    let output = Command::new("python3")
+    let output = Command::new(if cfg!(windows) { "python" } else { "python3" })
         .arg("tests/support/tui_interruption_test.py")
         .output()
         .unwrap();
@@ -432,7 +434,7 @@ fn python_interruption_visibility_requires_current_terminal_cells() {
 #[test]
 #[ignore = "requires Docker and Unix PTY"]
 fn real_public_example_headless_and_live_offline_pty() {
-    let output = Command::new("python3")
+    let output = Command::new(if cfg!(windows) { "python" } else { "python3" })
         .arg("tests/support/tui_interruption.py")
         .arg(env!("CARGO_BIN_EXE_theseus"))
         .output()

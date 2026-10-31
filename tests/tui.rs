@@ -1,3 +1,5 @@
+#[path = "support/native.rs"]
+mod native;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
 use std::{io::Write, path::Path};
@@ -123,7 +125,9 @@ fn logs_are_loaded_through_private_bounded_storage_and_controls_are_inert() {
     assert!(app.log_text.len() < 70_000);
     assert!(app.log_text.contains("truncated"));
     std::fs::remove_file(root.join("logs/out")).unwrap();
-    std::os::unix::fs::symlink("/etc/passwd", root.join("logs/out")).unwrap();
+    let outside = dir.path().join("outside");
+    std::fs::write(&outside, "root:x:private-outside").unwrap();
+    native::symlink(&outside, root.join("logs/out")).unwrap();
     app.refresh_logs();
     assert!(app.log_text.contains("Cannot read"));
     assert!(!app.log_text.contains("root:x:"));
@@ -195,7 +199,7 @@ fn completed_runs_cannot_accidentally_execute_again() {
 }
 #[test]
 fn actual_pty_startup_exit_and_engine_error_restore_terminal() {
-    let output = std::process::Command::new("python3")
+    let output = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
         .arg("tests/support/tui_pty.py")
         .arg(env!("CARGO_BIN_EXE_theseus"))
         .output()
@@ -325,7 +329,7 @@ fn selection_stays_visible_after_word_wrapped_and_wide_records() {
 
 #[test]
 fn actual_pty_idle_preview_and_offline_signals_restore_terminal() {
-    let output = std::process::Command::new("python3")
+    let output = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
         .arg("tests/support/tui_signals.py")
         .arg(env!("CARGO_BIN_EXE_theseus"))
         .output()
@@ -817,7 +821,7 @@ fn interrupted_rollback_preview_describes_real_barrier_and_original_restoration_
 
 #[test]
 fn actual_pty_default_animation_controls_signals_and_restoration() {
-    let output = std::process::Command::new("python3")
+    let output = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
         .arg("tests/support/tui_animation.py")
         .arg(env!("CARGO_BIN_EXE_theseus"))
         .output()
@@ -876,7 +880,7 @@ mod plugin_fixture;
 fn plugin_preview_and_offline_evidence_show_scope_client_and_proof_boundary() {
     let dir = plugin_fixture::project();
     let recipe = theseus::recipe::parse_bytes(
-        &dir.path().join("plugin.toml"),
+        &dir.path().canonicalize().unwrap().join("plugin.toml"),
         &plugin_fixture::bytes(&plugin_fixture::declaration("project")),
     )
     .unwrap();

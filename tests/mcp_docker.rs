@@ -46,8 +46,11 @@ impl Guest {
         .unwrap();
         let text =
             include_str!("fixtures/recipes/v2_clean.toml").replace("debian:bookworm-slim", &image);
-        let recipe =
-            recipe::parse_bytes(&root.path().join("recipe.toml"), text.as_bytes()).unwrap();
+        let recipe = recipe::parse_bytes(
+            &root.path().canonicalize().unwrap().join("recipe.toml"),
+            text.as_bytes(),
+        )
+        .unwrap();
         let mut docker = Docker::default();
         let cancel = CancellationToken::default();
         let prepared = docker.prepare(&recipe, false, &cancel).unwrap();

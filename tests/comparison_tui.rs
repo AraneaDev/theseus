@@ -1,3 +1,5 @@
+#[path = "support/native.rs"]
+mod native;
 #[allow(dead_code)]
 #[path = "support/comparison.rs"]
 mod support;
@@ -210,7 +212,7 @@ fn large_difference_display_keeps_all_differences_and_full_source_fields_reachab
 
 #[test]
 fn displayed_commands_preserve_spaced_quoted_shell_paths() {
-    use std::{fs, os::unix::fs::symlink, process::Command};
+    use std::fs;
     let t = tempfile::tempdir().unwrap();
     let parent = t.path().join("space ' $(touch INJECTED) ;");
     fs::create_dir(&parent).unwrap();
@@ -219,7 +221,11 @@ fn displayed_commands_preserve_spaced_quoted_shell_paths() {
     let text = screen(&app, 600, 70);
     let bin = t.path().join("bin");
     fs::create_dir(&bin).unwrap();
-    symlink(env!("CARGO_BIN_EXE_theseus"), bin.join("theseus")).unwrap();
+    fs::copy(
+        env!("CARGO_BIN_EXE_theseus"),
+        bin.join(format!("theseus{}", std::env::consts::EXE_SUFFIX)),
+    )
+    .unwrap();
     for (prefix, suffix) in [
         ("Source logs/commands: ", " --json"),
         ("Recovery: ", ""),
@@ -233,9 +239,14 @@ fn displayed_commands_preserve_spaced_quoted_shell_paths() {
             .next()
             .unwrap()
             .trim();
-        let out = Command::new("/bin/sh")
-            .args(["-c", &format!("{command}{suffix}")])
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        let out = native::shell(&format!("{command}{suffix}"))
+            .env(
+                "PATH",
+                std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+                    &std::env::var_os("PATH").unwrap_or_default(),
+                )))
+                .unwrap(),
+            )
             .current_dir(t.path())
             .output()
             .unwrap();

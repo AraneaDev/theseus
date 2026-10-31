@@ -179,7 +179,7 @@ fn malformed_or_oversized_observed_fields_stay_bounded_metadata() {
 #[test]
 #[ignore = "UNRUN without explicit supplied native clients/image, reachable Docker and Unix PTY"]
 fn supplied_native_live_offline_and_cancel_public_pty() {
-    let output = std::process::Command::new("python3")
+    let output = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
         .args([
             "tests/support/mcp_native_pty.py",
             env!("CARGO_BIN_EXE_theseus"),

@@ -393,6 +393,26 @@ pub struct PipeReader {
     eof: bool,
 }
 impl PipeReader {
+    #[cfg(all(test, feature = "test-support"))]
+    pub(in crate::process) fn terminal_buffered_bytes(&self) -> io::Result<usize> {
+        let operation = self.endpoint.active()?;
+        let mut bytes = 0;
+        if unsafe {
+            PeekNamedPipe(
+                operation.handle.as_raw_handle(),
+                null_mut(),
+                0,
+                null_mut(),
+                &mut bytes,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(bytes as usize + self.ready.len())
+    }
+
     fn new(endpoint: Endpoint) -> Self {
         Self {
             endpoint,

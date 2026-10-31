@@ -1,5 +1,8 @@
 """Host-only preparation boundary tests; dummy ELF bytes are never executed."""
 import hashlib
+import os
+import sys
+from guest_shell import run_guest_shell, guest_path
 import json
 import pathlib
 import subprocess
@@ -20,10 +23,10 @@ class GuestVersionAdapter(unittest.TestCase):
             root = pathlib.Path(directory)
             producer = root / 'synthetic-version-producer'
             adapter = root / 'adapter.sh'
-            adapter.write_text(source.replace('/home/theseus/plugin-config', str(root))
-                               .replace('/workspace/plugin-project', str(root))
-                               .replace('/inputs/target/client/claude', shlex.quote(str(producer)))
-                               .replace('/home/theseus/.local/bin/theseus-client', shlex.quote(str(producer))))
+            adapter.write_text(source.replace('/home/theseus/plugin-config', shlex.quote(guest_path(root)))
+                               .replace('/workspace/plugin-project', shlex.quote(guest_path(root)))
+                               .replace('/inputs/target/client/claude', shlex.quote(guest_path(producer)))
+                               .replace('/home/theseus/.local/bin/theseus-client', shlex.quote(guest_path(producer))), encoding='utf-8', newline='\n')
             for output, status, accepted in [
                 (b'a' * 128, 0, True),
                 (b'a' * 128 + b'\n', 0, True),
@@ -33,9 +36,9 @@ class GuestVersionAdapter(unittest.TestCase):
             ]:
                 with self.subTest(bytes=len(output), status=status, accepted=accepted):
                     (root / 'literal-output').write_bytes(output)
-                    producer.write_text('#!/bin/sh\ncat ' + shlex.quote(str(root / 'literal-output')) + '\nexit ' + str(status) + '\n')
+                    producer.write_text('#!/bin/sh\ncat ' + shlex.quote(guest_path(root / 'literal-output')) + '\nexit ' + str(status) + '\n', encoding='utf-8', newline='\n')
                     producer.chmod(0o755)
-                    result = subprocess.run(['sh', str(adapter)], capture_output=True)
+                    result = run_guest_shell([guest_path(adapter)], capture_output=True)
                     if accepted:
                         self.assertEqual(result.returncode, 0, result.stderr)
                         self.assertEqual(json.loads(result.stdout), {'version': 'a' * 128})
@@ -54,7 +57,7 @@ class Preparation(unittest.TestCase):
         self.client.chmod(0o600)
 
     def prepare(self, output=None, client=None, scope='user', version='2.1.312 (Claude Code)', image='ubuntu:24.04'):
-        return subprocess.run(['python3', str(PREPARE), '--client', str(client or self.client),
+        return subprocess.run([sys.executable, str(PREPARE), '--client', str(client or self.client),
             '--client-version', version, '--scope', scope, '--output', str(output or self.root / 'output'),
             '--image', image], capture_output=True, text=True)
 
@@ -65,7 +68,10 @@ class Preparation(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         out = self.root / 'output'
         self.assertEqual((out / 'target/client/claude').read_bytes(), self.data)
-        self.assertEqual((out / 'target/client/claude').stat().st_mode & 0o777, 0o755)
+        if os.name != 'nt':
+            self.assertEqual((out / 'target/client/claude').stat().st_mode & 0o777, 0o755)
+        else:
+            self.assertTrue(os.access(out / 'target/client/claude', os.W_OK))
         manifest = json.loads((out / 'input-manifest.json').read_text())
         self.assertEqual(manifest['client']['sha256'], hashlib.sha256(self.data).hexdigest())
         self.assertEqual(manifest['client']['size'], len(self.data))
@@ -77,7 +83,10 @@ class Preparation(unittest.TestCase):
             self.assertEqual((out / 'target' / relative).read_bytes(), content)
             self.assertEqual((fixture / relative).read_bytes(), content)
         self.assertEqual(self.client.read_bytes(), self.data)
-        self.assertEqual(self.client.stat().st_mode & 0o777, 0o600)
+        if os.name != 'nt':
+            self.assertEqual(self.client.stat().st_mode & 0o777, 0o600)
+        else:
+            self.assertTrue(os.access(self.client, os.W_OK))
         self.assertNotIn(str(self.root), (out / 'theseus.toml').read_text())
 
     def test_collision_does_not_remove_or_overwrite_existing_output(self):
