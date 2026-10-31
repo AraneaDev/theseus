@@ -11,12 +11,18 @@ pub(crate) struct Reader {
 }
 impl Read for Reader {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        match self.file.read(out) {
+        Self::classify_read(self.file.read(out), &self.slave_released)
+    }
+}
+impl Reader {
+    fn classify_read(
+        result: io::Result<usize>,
+        released: &std::sync::atomic::AtomicBool,
+    ) -> io::Result<usize> {
+        match result {
             Err(e)
                 if e.raw_os_error() == Some(libc::EIO)
-                    && self
-                        .slave_released
-                        .load(std::sync::atomic::Ordering::SeqCst) =>
+                    && released.load(std::sync::atomic::Ordering::SeqCst) =>
             {
                 Ok(0)
             }
@@ -55,7 +61,7 @@ impl Terminal {
     ) -> Result<(Self, Reader), Box<dyn std::error::Error>> {
         let mut master = -1;
         let mut slave = -1;
-        let size = libc::winsize {
+        let mut size = libc::winsize {
             ws_row: rows,
             ws_col: columns,
             ws_xpixel: 0,
@@ -66,8 +72,8 @@ impl Terminal {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                &size,
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
             )
         } == -1
         {
@@ -152,9 +158,12 @@ impl Terminal {
         Ok(())
     }
     pub(crate) fn close(&mut self, terminate: bool) -> io::Result<ExitStatus> {
-        let observed = self.slave.take().map(|slave| modes(&slave)).transpose();
-        self.slave_released
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let observed = release_slave(
+            self.slave.take(),
+            &self.slave_released,
+            #[cfg(test)]
+            || {},
+        );
         let mut child = self
             .child
             .take()
@@ -168,5 +177,82 @@ impl Terminal {
         self.after = observed?;
         termination?;
         result
+    }
+}
+
+// The test callback observes the exact interval after the last slave closes.
+fn release_slave(
+    slave: Option<File>,
+    released: &std::sync::atomic::AtomicBool,
+    #[cfg(test)] after_close: impl FnOnce(),
+) -> io::Result<Option<Vec<u64>>> {
+    let observed = slave.as_ref().map(modes).transpose();
+    // Publish while we still own the slave: the reader can only see EIO
+    // from this final close after the release transition is visible.
+    released.store(true, std::sync::atomic::Ordering::SeqCst);
+    drop(slave);
+    #[cfg(test)]
+    after_close();
+    observed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn slave_release_publishes_before_reader_can_observe_last_close() {
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let master = unsafe { File::from_raw_fd(master) };
+        let slave = unsafe { File::from_raw_fd(slave) };
+        let released = std::sync::Arc::new(AtomicBool::new(false));
+        let mut reader = Reader {
+            file: master,
+            slave_released: released.clone(),
+        };
+        let observed = release_slave(Some(slave), &released, || {
+            // Controlled interleaving: execute the independent reader immediately
+            // after the final close, before the closer's next statement.
+            assert!(
+                released.load(Ordering::SeqCst),
+                "last slave closed before release publication"
+            );
+            assert_eq!(reader.read(&mut [0; 1]).unwrap(), 0);
+        })
+        .unwrap();
+        assert!(observed.is_some());
+    }
+
+    #[test]
+    fn slave_release_does_not_classify_pre_cleanup_eio_as_eof() {
+        let released = AtomicBool::new(false);
+        let error = Reader::classify_read(Err(io::Error::from_raw_os_error(libc::EIO)), &released)
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        released.store(true, Ordering::SeqCst);
+        assert_eq!(
+            Reader::classify_read(Err(io::Error::from_raw_os_error(libc::EIO)), &released).unwrap(),
+            0
+        );
+        assert_eq!(
+            Reader::classify_read(Err(io::Error::from_raw_os_error(libc::EBADF)), &released)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EBADF)
+        );
     }
 }

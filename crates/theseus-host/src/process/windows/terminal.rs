@@ -6,7 +6,6 @@ use std::io::{self, Read, Write};
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::process::{Child, ExitStatus, Stdio};
-use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::Console::*;
 
 struct PseudoConsole(HPCON);
@@ -344,7 +343,7 @@ fn evidence(before: &[u32]) -> io::Result<serde_json::Value> {
     )
 }
 
-unsafe extern "system" fn wrapper_control(event: u32) -> BOOL {
+unsafe extern "system" fn wrapper_control(event: u32) -> i32 {
     i32::from(event == CTRL_BREAK_EVENT || event == CTRL_C_EVENT)
 }
 struct Client(Child);
