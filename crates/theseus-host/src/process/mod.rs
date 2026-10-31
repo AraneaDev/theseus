@@ -53,7 +53,7 @@ impl OwnedSpawnCleanup {
         #[cfg(all(windows, feature = "test-support"))]
         if self.cleanup_faults > 0 {
             self.cleanup_faults -= 1;
-            return if self.cleanup_faults % 2 == 0 {
+            return if self.cleanup_faults.is_multiple_of(2) {
                 Ok(false)
             } else {
                 Err(io::Error::other("injected owned cleanup failure"))

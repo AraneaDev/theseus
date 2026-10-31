@@ -38,6 +38,18 @@ pub(crate) struct Terminal {
     after: Option<Vec<u64>>,
     slave_released: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
+// Apple stores termios flags in u64; Linux uses u32. Preserve every bit
+// without a same-width cast/conversion that native strict clippy rejects.
+fn mode_bits(value: libc::tcflag_t) -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        value
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        u64::from(value)
+    }
+}
 fn modes(file: &File) -> io::Result<Vec<u64>> {
     let mut value = std::mem::MaybeUninit::<libc::termios>::uninit();
     if unsafe { libc::tcgetattr(file.as_raw_fd(), value.as_mut_ptr()) } == -1 {
@@ -45,10 +57,10 @@ fn modes(file: &File) -> io::Result<Vec<u64>> {
     }
     let value = unsafe { value.assume_init() };
     let mut result = vec![
-        value.c_iflag as u64,
-        value.c_oflag as u64,
-        value.c_cflag as u64,
-        value.c_lflag as u64,
+        mode_bits(value.c_iflag),
+        mode_bits(value.c_oflag),
+        mode_bits(value.c_cflag),
+        mode_bits(value.c_lflag),
     ];
     result.extend(value.c_cc.iter().map(|v| u64::from(*v)));
     Ok(result)
@@ -133,7 +145,7 @@ impl Terminal {
         };
         Ok(
             serde_json::json!({"kind":"termios", "before":self.before, "current":current,
-            "raw": current.get(3).is_some_and(|v| v & libc::ICANON as u64 == 0)}),
+            "raw": current.get(3).is_some_and(|v| v & mode_bits(libc::ICANON) == 0)}),
         )
     }
     pub(crate) fn exited(&mut self) -> io::Result<bool> {
