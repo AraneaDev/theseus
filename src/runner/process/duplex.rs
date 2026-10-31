@@ -776,6 +776,70 @@ mod tests {
         assert_eq!(evidence.sent_ids.len(), 2);
     }
 
+    fn heartbeat_advances(
+        path: &std::path::Path,
+        before: u64,
+        deadline: Instant,
+    ) -> std::io::Result<bool> {
+        while Instant::now() < deadline {
+            if std::fs::metadata(path)?.len() > before {
+                return Ok(true);
+            }
+            thread::sleep(
+                Duration::from_millis(5).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+        Ok(false)
+    }
+    #[test]
+    fn heartbeat_oracle_accepts_live_growth_and_rejects_retained_dead_child() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let ready = temp.path().join("ready");
+        let heartbeat = temp.path().join("heartbeat");
+        let mut command = fixture("ready-hold", &[]);
+        command.arg(&ready).arg(&heartbeat).arg("30000");
+        let mut child = HostProcess::spawn(&command)?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ready.exists() {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "native heartbeat fixture not ready"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let before = std::fs::metadata(&heartbeat)?.len();
+        let live = heartbeat_advances(&heartbeat, before, deadline)?;
+        let expired_baseline = std::fs::metadata(&heartbeat)?.len();
+        let expired = heartbeat_advances(&heartbeat, expired_baseline, Instant::now())?;
+        child.terminate()?;
+        while !child.exited_without_reaping()? {
+            anyhow::ensure!(Instant::now() < deadline, "owned native child did not exit");
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Only sample the negative baseline after confirmed reserved exit.
+        let stopped_baseline = std::fs::metadata(&heartbeat)?.len();
+        let stopped = heartbeat_advances(
+            &heartbeat,
+            stopped_baseline,
+            Instant::now() + Duration::from_millis(80),
+        )?;
+        let retained = child.child.is_some();
+        child.reap_and_disarm()?;
+        assert!(
+            live,
+            "same oracle must witness growth from a live native child"
+        );
+        assert!(
+            !expired,
+            "an expired observation deadline must not be restarted"
+        );
+        assert!(
+            retained && !stopped,
+            "same oracle must reject an exited child while identity is retained"
+        );
+        Ok(())
+    }
+
     // A blocking stdin write, or treating forced termination as exit 0, breaks this.
     #[test]
     fn unread_stdin_is_bounded_and_aborts_before_group_cleanup() {
@@ -803,8 +867,11 @@ mod tests {
                 leader = std::fs::read_to_string(&pid_file)?.parse::<u32>()?;
                 assert!(leader > 0);
                 let before = std::fs::metadata(&heartbeat)?.len();
-                thread::sleep(Duration::from_millis(40));
-                assert!(std::fs::metadata(&heartbeat)?.len() > before);
+                assert!(heartbeat_advances(
+                    &heartbeat,
+                    before,
+                    began + Duration::from_millis(1850)
+                )?);
                 #[cfg(target_os = "linux")]
                 assert!(std::path::Path::new(&format!("/proc/{leader}")).exists());
                 aborted = true;

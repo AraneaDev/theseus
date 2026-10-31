@@ -1715,11 +1715,21 @@ impl Environment for DowngradeEnvironment {
     }
 }
 fn downgrade_recipe(rejection: bool) -> (tempfile::TempDir, ValidatedRecipe) {
+    downgrade_recipe_from_template(
+        rejection,
+        include_str!("fixtures/recipes/v4_downgrade.toml"),
+    )
+}
+fn downgrade_recipe_from_template(
+    rejection: bool,
+    template: &str,
+) -> (tempfile::TempDir, ValidatedRecipe) {
     let temp = tempfile::tempdir().unwrap();
     for name in ["base", "target"] {
         std::fs::create_dir(temp.path().join(name)).unwrap();
     }
-    let mut text = include_str!("fixtures/recipes/v4_downgrade.toml").to_string();
+    // This repository-owned test template is transformed by literal LF patterns.
+    let mut text = template.replace("\r\n", "\n");
     if rejection {
         text = text.replace("expect = \"compatible\"\ndata_checks = [\"older-data\"]", "expect = \"safe_rejection\"\nexpected_exit = 9\nstdout_contains = \"newer data refusal\"\nbinary_checks = [\"binary-stable\"]\ndata_checks = [\"data-stable\"]");
         text.truncate(
@@ -1733,6 +1743,43 @@ fn downgrade_recipe(rejection: bool) -> (tempfile::TempDir, ValidatedRecipe) {
     let path = temp.path().join("theseus.toml");
     std::fs::write(&path, format!("{text}\n{suffix}")).unwrap();
     (temp, load(&path).expect("downgrade recipe loads"))
+}
+#[test]
+fn downgrade_owned_template_preserves_both_policies_for_lf_and_crlf() {
+    let lf = include_str!("fixtures/recipes/v4_downgrade.toml").replace("\r\n", "\n");
+    let crlf = lf.replace('\n', "\r\n");
+    for template in [&lf, &crlf] {
+        for rejection in [false, true] {
+            let (_temp, loaded) = downgrade_recipe_from_template(rejection, template);
+            let expected = if rejection {
+                DowngradeContract::SafeRejection {
+                    expected_exit: 9,
+                    stdout_contains: "newer data refusal".into(),
+                    binary_checks: vec!["binary-stable".into()],
+                    data_checks: vec!["data-stable".into()],
+                }
+            } else {
+                DowngradeContract::Compatible {
+                    data_checks: vec!["older-data".into()],
+                }
+            };
+            assert_eq!(loaded.recipe.profiles.len(), 2);
+            for profile in loaded.recipe.profiles.values() {
+                assert_eq!(profile.downgrade.as_ref(), Some(&expected));
+                let (id, checkpoint) = if rejection {
+                    ("still-newer", Checkpoint::DowngradeRejected)
+                } else {
+                    ("older", Checkpoint::Downgraded)
+                };
+                assert!(
+                    profile
+                        .checks
+                        .iter()
+                        .any(|check| check.id == id && check.checkpoint == checkpoint)
+                );
+            }
+        }
+    }
 }
 fn run_downgrade(
     rejection: bool,

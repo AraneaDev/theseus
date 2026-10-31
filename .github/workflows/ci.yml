@@ -96,6 +96,19 @@ jobs:
       - name: Native application process and MCP integration
         shell: pwsh
         run: |
+          $theseusTask7Template = Join-Path $env:GITHUB_WORKSPACE 'tests/fixtures/recipes/v4_downgrade.toml'
+          $theseusTask7TemplateBytes = [System.IO.File]::ReadAllBytes($theseusTask7Template)
+          [System.IO.File]::WriteAllBytes((Join-Path $env:THESEUS_HOST_EVIDENCE 'engine-downgrade-template.raw'), $theseusTask7TemplateBytes)
+          $theseusTask7Lf = 0
+          $theseusTask7Crlf = 0
+          for ($theseusTask7Index = 0; $theseusTask7Index -lt $theseusTask7TemplateBytes.Length; $theseusTask7Index++) {
+            if ($theseusTask7TemplateBytes[$theseusTask7Index] -eq 10) {
+              $theseusTask7Lf++
+              if ($theseusTask7Index -gt 0 -and $theseusTask7TemplateBytes[$theseusTask7Index - 1] -eq 13) { $theseusTask7Crlf++ }
+            }
+          }
+          @{ source_sha = $env:GITHUB_SHA; byte_count = $theseusTask7TemplateBytes.Length; lf_bytes = $theseusTask7Lf; crlf_pairs = $theseusTask7Crlf; bare_lf = ($theseusTask7Lf - $theseusTask7Crlf); sha256 = (Get-FileHash -Algorithm SHA256 $theseusTask7Template).Hash } |
+            ConvertTo-Json | Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'engine-template-bytes.json')
           if ($IsMacOS) {
             $theseusTask7TempRoot = python3 -c "import pathlib, tempfile; print(pathlib.Path(tempfile.gettempdir()).resolve())"
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -120,7 +133,7 @@ jobs:
               Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'app-native-cleanup-ui.log')
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
-          cargo test --locked --test engine --test mcp_engine --test mcp_protocol --test mcp_contracts 2>&1 |
+          cargo test --locked --test engine --test mcp_engine --test mcp_protocol --test mcp_contracts --no-fail-fast 2>&1 |
             Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'app-engine-protocol.log')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Native macOS application storage integration
