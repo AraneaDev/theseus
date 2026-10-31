@@ -12,7 +12,28 @@ fn owned_standalone_and_plugin_fixtures_have_canonical_source_parents() {
         assert_eq!(validated.path, canonical_root.join("recipe.toml"));
         // Canonicalize only the fixture input; production still rejects a real
         // noncanonical source parent, even when it resolves inside this root.
-        let noncanonical = canonical_root.join("target").join("..").join("recipe.toml");
+        // Build from the original owned root: pushing onto Windows' canonical
+        // verbatim root would normalize away the very `..` we need to test.
+        let noncanonical = fixture
+            .root
+            .path()
+            .join("target")
+            .join("..")
+            .join("recipe.toml");
+        assert!(
+            noncanonical
+                .components()
+                .any(|component| component == std::path::Component::ParentDir),
+            "negative witness must retain its noncanonical parent: {noncanonical:?}"
+        );
+        assert_eq!(
+            noncanonical
+                .parent()
+                .unwrap()
+                .canonicalize()
+                .expect("negative witness parent must resolve before strict validation"),
+            canonical_root
+        );
         let error = theseus::recipe::parse_bytes(
             &noncanonical,
             toml::to_string(&declaration).unwrap().as_bytes(),

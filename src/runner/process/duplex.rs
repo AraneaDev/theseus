@@ -864,14 +864,15 @@ mod tests {
             },
             || {
                 // The worker must have filled the pipe before the cutoff starts EOF.
-                leader = std::fs::read_to_string(&pid_file)?.parse::<u32>()?;
-                assert!(leader > 0);
                 let before = std::fs::metadata(&heartbeat)?.len();
                 assert!(heartbeat_advances(
                     &heartbeat,
                     before,
                     began + Duration::from_millis(1850)
                 )?);
+                // The fixture writes its complete PID before the first heartbeat.
+                leader = std::fs::read_to_string(&pid_file)?.parse::<u32>()?;
+                assert!(leader > 0);
                 #[cfg(target_os = "linux")]
                 assert!(std::path::Path::new(&format!("/proc/{leader}")).exists());
                 aborted = true;
@@ -1368,6 +1369,7 @@ mod tests {
                 StdinMode::Piped,
             )
             .unwrap();
+            let growth_deadline = process.started + Duration::from_secs(2);
             let (input, output, _stderr) = configure_pipes(&mut process, &mut || Ok(())).unwrap();
             let stop = process.stop.clone();
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -1411,9 +1413,8 @@ mod tests {
                             assert!(!eof && error.is_none(), "stop must release quiet stdout");
                         }
                         let before = std::fs::metadata(&heartbeat)?.len();
-                        thread::sleep(Duration::from_millis(40));
                         assert!(
-                            std::fs::metadata(&heartbeat)?.len() > before,
+                            heartbeat_advances(&heartbeat, before, growth_deadline)?,
                             "native fixture must remain alive during guest abort"
                         );
                         #[cfg(target_os = "linux")]
@@ -1480,13 +1481,14 @@ mod tests {
             assert!(Instant::now() < until);
             thread::sleep(Duration::from_millis(1));
         }
-        let leader: u32 = std::fs::read_to_string(&ready).unwrap().parse().unwrap();
-        assert!(leader > 0);
+        let mut leader = 0u32;
         let mut aborted = false;
         let error = configure_pipes(&mut process, &mut || {
             let before = std::fs::metadata(&heartbeat)?.len();
-            thread::sleep(Duration::from_millis(40));
-            assert!(std::fs::metadata(&heartbeat)?.len() > before);
+            assert!(heartbeat_advances(&heartbeat, before, until)?);
+            // Existence alone can expose the PID file before its write completes.
+            leader = std::fs::read_to_string(&ready)?.parse::<u32>()?;
+            assert!(leader > 0);
             #[cfg(target_os = "linux")]
             assert!(std::path::Path::new(&format!("/proc/{leader}")).exists());
             aborted = true;
@@ -1518,6 +1520,7 @@ mod tests {
         command.arg(&identities).arg(&heartbeat);
         let mut process = HostProcess::spawn(&command).unwrap();
         let began = Instant::now();
+        let growth_deadline = process.started + Duration::from_secs(3);
         while !process.exited_without_reaping().unwrap() {
             assert!(began.elapsed() < Duration::from_secs(2));
             thread::sleep(Duration::from_millis(5));
@@ -1559,9 +1562,8 @@ mod tests {
                 SupervisionEvent::Poll => panic!("leader is already exited"),
                 SupervisionEvent::Abort => {
                     let before = std::fs::metadata(&heartbeat)?.len();
-                    thread::sleep(Duration::from_millis(40));
                     assert!(
-                        std::fs::metadata(&heartbeat)?.len() > before,
+                        heartbeat_advances(&heartbeat, before, growth_deadline)?,
                         "owned native descendant must remain alive through guest abort"
                     );
                     #[cfg(target_os = "linux")]

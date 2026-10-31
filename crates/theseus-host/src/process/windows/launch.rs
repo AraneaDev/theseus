@@ -136,6 +136,32 @@ pub(super) enum Fault {
     AfterResume,
 }
 
+#[cfg(any(test, feature = "test-support"))]
+fn wait_for_history_marker(
+    ready: &std::path::Path,
+    deadline: std::time::Instant,
+) -> io::Result<()> {
+    let mut observed = None;
+    while std::time::Instant::now() < deadline {
+        match std::fs::read(ready) {
+            Ok(bytes) if bytes == b"history child ran" && std::time::Instant::now() < deadline => {
+                return Ok(());
+            }
+            Ok(bytes) => observed = Some(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        std::thread::sleep(
+            std::time::Duration::from_millis(2)
+                .min(deadline.saturating_duration_since(std::time::Instant::now())),
+        );
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("history child did not publish complete marker; observed {observed:?}"),
+    ))
+}
+
 fn fail(
     mut child: OwnedChild,
     launch: LaunchPhase,
@@ -319,12 +345,11 @@ pub(super) fn spawn_impl(
                     .1,
             );
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while !ready.exists() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "history child failed to reach gate"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(2));
+            // Creation is observable before write completion. Resuspend only
+            // after the entire execution witness is readable, under this same
+            // gate deadline. A gate error retains actual cleanup authority.
+            if let Err(error) = wait_for_history_marker(&ready, deadline) {
+                return Err(fail(child, LaunchPhase::MayRun, error, false));
             }
             assert_eq!(unsafe { SuspendThread(child.thread.as_raw_handle()) }, 0);
             assert_eq!(unsafe { SuspendThread(child.thread.as_raw_handle()) }, 1);
@@ -535,7 +560,63 @@ mod tests {
             spawn_impl(&command, None, None, None, Fault::ReleaseThenResuspend).unwrap_err();
         assert_eq!(std::fs::read(ready).unwrap(), b"history child ran");
         assert_eq!(failure.launch, LaunchPhase::MayRun);
+        assert_eq!(
+            failure.error.to_string(),
+            "unexpected primary-thread suspend count",
+            "the history witness must reach exact-thread resuspension, not fail at its gate"
+        );
         complete(&mut failure);
+    }
+
+    #[test]
+    fn history_gate_requires_complete_publication_before_readiness() -> io::Result<()> {
+        use std::io::Write;
+        let root = tempfile::tempdir()?;
+        let ready = root.path().join("partial-history");
+        let rejects_incomplete = || {
+            let error = wait_for_history_marker(&ready, Instant::now() + Duration::from_millis(20))
+                .expect_err("absent, empty, partial and wrong markers cannot release the gate");
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        };
+        rejects_incomplete();
+        let mut publication = File::create(&ready)?;
+        rejects_incomplete();
+        publication.write_all(b"history ")?;
+        publication.flush()?;
+        rejects_incomplete();
+        publication.write_all(b"child ran")?;
+        publication.flush()?;
+        wait_for_history_marker(&ready, Instant::now() + Duration::from_secs(1))?;
+        drop(publication);
+        std::fs::write(&ready, b"history child bad")?;
+        rejects_incomplete();
+        std::fs::write(&ready, b"history child ran")?;
+        assert_eq!(
+            wait_for_history_marker(&ready, Instant::now())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut,
+            "complete bytes cannot restart an expired gate"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn history_gate_read_error_retains_may_run_cleanup_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let mut command = marker_command();
+        // A directory is an owned, deterministic read error. The real child is
+        // released first, so failure must preserve MayRun and native cleanup.
+        command.environment = ChildEnvironment::Replace(vec![(
+            "THESEUS_HOST_RESUME_HISTORY_GATE".into(),
+            root.path().as_os_str().to_owned(),
+        )]);
+        let mut failure =
+            spawn_impl(&command, None, None, None, Fault::ReleaseThenResuspend).unwrap_err();
+        assert_eq!(failure.launch, LaunchPhase::MayRun);
+        assert_ne!(failure.error.kind(), io::ErrorKind::TimedOut);
+        complete(&mut failure);
+        assert_eq!(failure.launch, LaunchPhase::MayRun);
     }
 
     #[test]
