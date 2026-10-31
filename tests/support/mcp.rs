@@ -18,8 +18,9 @@ impl Fixture {
         Self { root }
     }
     pub fn validate(&self, value: &Value) -> anyhow::Result<ValidatedRecipe> {
+        let source_root = self.root.path().canonicalize()?;
         recipe::parse_bytes(
-            &self.root.path().join("recipe.toml"),
+            &source_root.join("recipe.toml"),
             toml::to_string(value)?.as_bytes(),
         )
     }

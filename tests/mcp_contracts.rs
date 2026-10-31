@@ -1,6 +1,31 @@
 #[path = "support/mcp.rs"]
 mod fixture;
 #[test]
+fn owned_standalone_and_plugin_fixtures_have_canonical_source_parents() {
+    let fixture = fixture::Fixture::new();
+    let canonical_root = fixture.root.path().canonicalize().unwrap();
+    for declaration in [fixture::declaration(), fixture::plugin_declaration()] {
+        let validated = fixture
+            .validate(&declaration)
+            .expect("valid owned MCP baseline");
+        assert_eq!(validated.project_root, canonical_root);
+        assert_eq!(validated.path, canonical_root.join("recipe.toml"));
+        // Canonicalize only the fixture input; production still rejects a real
+        // noncanonical source parent, even when it resolves inside this root.
+        let noncanonical = canonical_root.join("target").join("..").join("recipe.toml");
+        let error = theseus::recipe::parse_bytes(
+            &noncanonical,
+            toml::to_string(&declaration).unwrap().as_bytes(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("recipe source directory must be canonical")
+        );
+    }
+}
+#[test]
 fn configuration_only_adapter_cannot_claim_native_health() {
     let f = fixture::Fixture::new();
     let mut value = fixture::declaration();
