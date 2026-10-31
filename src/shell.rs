@@ -1,4 +1,4 @@
-//! POSIX shell presentation only; callers execute commands with argument arrays.
+//! Host recovery-command presentation only; execution uses native argument arrays.
 pub(crate) fn path_argument(path: &std::path::Path) -> String {
     let text = path.to_string_lossy();
     if !text.is_empty()
@@ -8,6 +8,13 @@ pub(crate) fn path_argument(path: &std::path::Path) -> String {
     {
         text.into_owned()
     } else {
-        format!("'{}'", text.replace('\'', "'\"'\"'"))
+        #[cfg(unix)]
+        {
+            format!("'{}'", text.replace('\'', "'\"'\"'"))
+        }
+        #[cfg(windows)]
+        {
+            format!("'{}'", text.replace('\'', "''"))
+        }
     }
 }

@@ -76,8 +76,8 @@ pub fn run_with_options(mut app: App, options: AnimationOptions) -> Result<i32> 
             if let Some(receiver) = &mut result_rx {
                 match receiver.try_recv() {
                     Ok(result) => {
-                        refresh.complete(&mut app, result)?;
                         result_rx = None;
+                        refresh.complete(&mut app, result)?;
                     }
                     Err(oneshot::error::TryRecvError::Closed) => {
                         return Err(anyhow!("engine worker ended without delivering its result"));
@@ -110,8 +110,8 @@ pub fn run_with_options(mut app: App, options: AnimationOptions) -> Result<i32> 
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     work.run(token, events)
                                 }))
-                                .unwrap_or_else(|_| {
-                                    Err(anyhow!("engine worker panicked; inspect recovery journal"))
+                                .unwrap_or_else(|payload| {
+                                    Err(crate::runner::process::worker_panic(payload))
                                 });
                             let _ = tx.send(result);
                         });
@@ -181,14 +181,53 @@ pub fn run_with_options(mut app: App, options: AnimationOptions) -> Result<i32> 
     if app.active {
         cancel.cancel();
     }
-    drop(terminal);
-    drop(guard);
+    let result = finish_runtime(runtime, &cancel, result_rx, result, || {
+        drop(terminal);
+        drop(guard);
+    });
     drop(signals);
-    // Dropping a runtime normally waits indefinitely for blocking work. The engine
-    // retains ownership of its journal; forced quit must restore the terminal now.
-    runtime.shutdown_timeout(Duration::ZERO);
     result
 }
+fn finish_runtime<T>(
+    runtime: tokio::runtime::Runtime,
+    cancel: &CancellationToken,
+    receiver: Option<oneshot::Receiver<Result<T>>>,
+    result: Result<i32>,
+    restore: impl FnOnce(),
+) -> Result<i32> {
+    if receiver.is_some() {
+        cancel.cancel();
+    }
+    // The terminal is restored promptly even when native cleanup cannot yet
+    // finish. A delivered result is not a join: Drop waits for all blocking work.
+    restore();
+    let final_worker = receiver.map(|receiver| {
+        receiver
+            .blocking_recv()
+            .map_err(|_| anyhow!("engine worker ended without delivering its result"))
+            .and_then(|result| result)
+    });
+    drop(runtime);
+    let mut retained = crate::runner::process::CleanupFailures::default();
+    if let Err(error) = &result {
+        retained.retain(error);
+    }
+    if let Some(Err(error)) = &final_worker {
+        retained.retain(error);
+    }
+    if let Err(error) = retained.finish() {
+        return Err(match &result {
+            Err(original) => error.context(format!("{original:#}")),
+            Ok(_) => error,
+        });
+    }
+    match (result, final_worker) {
+        (Err(original), _) => Err(original),
+        (Ok(_), Some(Err(error))) => Err(error),
+        (Ok(code), _) => Ok(code),
+    }
+}
+
 fn quit_result(app: &App, presentation: &mut Presentation, now: Duration) -> Option<Result<i32>> {
     if !app.quit_requested || app.active {
         return None;
@@ -293,23 +332,14 @@ fn unresolved(app: &App) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "setup may be pending; inspect journal".into())
 }
-pub(crate) struct Signals(Vec<signal_hook::SigId>);
+pub(crate) struct Signals {
+    _registration: theseus_host::cancel::CancellationRegistration,
+}
 impl Signals {
     pub(crate) fn register(cancel: &CancellationToken) -> Result<Self> {
-        let mut signals = Self(Vec::new());
-        for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
-            signals
-                .0
-                .push(signal_hook::flag::register(signal, cancel.flag())?);
-        }
-        Ok(signals)
-    }
-}
-impl Drop for Signals {
-    fn drop(&mut self) {
-        for id in self.0.drain(..) {
-            signal_hook::low_level::unregister(id);
-        }
+        Ok(Self {
+            _registration: theseus_host::cancel::CancellationRegistration::install(cancel.flag())?,
+        })
     }
 }
 
@@ -437,6 +467,13 @@ fn complete_work(app: &mut App, result: Result<WorkResult>) -> Result<()> {
             app.status = format!("Finished | {}", result.report_path.display());
         }
         Err(error) => {
+            let mut cleanup = crate::runner::process::CleanupFailures::default();
+            cleanup.retain(&error);
+            // An unresolved native owner must leave the UI with its typed error;
+            // the outer terminal guard restores modes before propagating it.
+            if cleanup.pending() {
+                return Err(error);
+            }
             let diagnostic = format!("Engine error: {error:#}");
             app.terminal_error = Some(if app.root.as_os_str().is_empty() {
                 diagnostic.clone()
@@ -1105,23 +1142,44 @@ mod comparison_tests {
             .unwrap();
         let bin = t.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
-        let receiver = bin.join("theseus");
-        std::fs::write(
-            &receiver,
-            "#!/bin/sh\nprintf '%s\\n' \"$#\" \"$1\" \"$2\"\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&receiver, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let out = std::process::Command::new("/bin/sh")
-            .args(["-c", command])
-            .env("PATH", &bin)
-            .current_dir(t.path())
-            .output()
+        #[cfg(unix)]
+        let out = {
+            let receiver = bin.join("theseus");
+            std::fs::write(
+                &receiver,
+                "#!/bin/sh\nprintf '%s\\n' \"$#\" \"$1\" \"$2\"\n",
+            )
             .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&receiver, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::process::Command::new("/bin/sh")
+                .args(["-c", command])
+                .env("PATH", &bin)
+                .current_dir(t.path())
+                .output()
+                .unwrap()
+        };
+        #[cfg(windows)]
+        let out = {
+            let receiver = bin.join("theseus.exe");
+            std::fs::copy(
+                std::env::var_os("THESEUS_HOST_TEST_FIXTURE")
+                    .expect("build trusted host fixture and set THESEUS_HOST_TEST_FIXTURE"),
+                &receiver,
+            )
+            .unwrap();
+            let powershell = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+                .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+            std::process::Command::new(powershell)
+                .args(["-NoProfile", "-NonInteractive", "-Command", command])
+                .env("PATH", &bin)
+                .current_dir(t.path())
+                .output()
+                .unwrap()
+        };
         assert!(out.status.success());
         assert_eq!(
-            String::from_utf8(out.stdout).unwrap(),
+            String::from_utf8(out.stdout).unwrap().replace("\r\n", "\n"),
             format!("2\ncleanup\n{}\n", root.display())
         );
         assert!(!t.path().join("INJECTED").exists());
@@ -1183,5 +1241,141 @@ mod comparison_tests {
         assert_eq!(app.comparison.as_ref().unwrap().manifest.baseline, "copy");
         input(&mut app, KeyCode::Char('r').into());
         assert!(take_work(&mut app).unwrap().is_none());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod native_cleanup_tests {
+    use super::*;
+    #[test]
+    fn cached_report_cannot_hide_live_native_cleanup_owner() {
+        use crate::runner::process::native_tests::{finish_native, suspended_failure};
+        let (temp, failure) = suspended_failure();
+        let mut app = App::offline(
+            crate::model::RunReport::new("cached"),
+            temp.path().to_path_buf(),
+        );
+        app.active = true;
+        let error = complete_run(&mut app, Err(failure.clone().into()))
+            .expect_err("cached evidence must not discard native cleanup authority");
+        let mut retained = crate::runner::process::CleanupFailures::default();
+        retained.retain(&error);
+        assert!(retained.pending());
+        assert!(!app.active);
+        finish_native(&temp, &failure);
+        retained.finish().unwrap();
+    }
+    #[test]
+    fn restored_runtime_return_preserves_worker_panic_owner_over_original_ui_error() {
+        use crate::runner::process::{
+            CleanupFailures,
+            native_tests::{finish_native, suspended_failure},
+        };
+        let (temp, failure) = suspended_failure();
+        let mut cleanup = CleanupFailures::default();
+        cleanup.retain(&failure.clone().into());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (tx, rx) = oneshot::channel::<Result<()>>();
+        runtime.spawn_blocking(move || {
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                cleanup.resume_unwind(Box::new("original native worker panic"))
+            }))
+            .unwrap_err();
+            tx.send(Err(crate::runner::process::worker_panic(panic)))
+                .unwrap();
+        });
+        let restored = std::cell::Cell::new(false);
+        let error = finish_runtime(
+            runtime,
+            &CancellationToken::default(),
+            Some(rx),
+            Err(anyhow!("original UI timeout")),
+            || restored.set(true),
+        )
+        .unwrap_err();
+        assert!(restored.get());
+        assert!(error.to_string().contains("original UI timeout"));
+        let mut retained = CleanupFailures::default();
+        retained.retain(&error);
+        assert!(retained.pending());
+        finish_native(&temp, &failure);
+        retained.finish().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod worker_join_regressions {
+    use super::*;
+    #[test]
+    fn terminal_restoration_precedes_join_and_delivery_does_not_detach_blocking_worker() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        let restored = Arc::new(AtomicBool::new(false));
+        let observed = restored.clone();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (worker_done_tx, worker_done_rx) = mpsc::channel();
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let (result_tx, result_rx) = oneshot::channel();
+            let (delivered_tx, delivered_rx) = mpsc::channel();
+            runtime.spawn_blocking(move || {
+                result_tx.send(Ok(())).unwrap();
+                delivered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                worker_done_tx.send(()).unwrap();
+            });
+            delivered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let result = finish_runtime(
+                runtime,
+                &CancellationToken::default(),
+                Some(result_rx),
+                Err(anyhow!("original UI cleanup deadline")),
+                || observed.store(true, Ordering::SeqCst),
+            );
+            returned_tx.send(result).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !restored.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let early = returned_rx.recv_timeout(Duration::from_millis(50));
+        // Rescue the controlled peer before assertions, even for the RED run.
+        release_tx.send(()).unwrap();
+        worker_done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        owner.join().unwrap();
+        assert!(
+            early.is_err(),
+            "ordinary return detached a still-running blocking worker"
+        );
+        let result = returned_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("original UI cleanup deadline"),
+            "late worker success must not erase original UI timeout"
+        );
+    }
+    #[test]
+    fn disconnected_worker_result_restores_terminal_then_returns_error() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (tx, rx) = oneshot::channel::<Result<()>>();
+        runtime.spawn_blocking(move || drop(tx));
+        let restored = std::cell::Cell::new(false);
+        let error = finish_runtime(
+            runtime,
+            &CancellationToken::default(),
+            Some(rx),
+            Ok(0),
+            || restored.set(true),
+        )
+        .unwrap_err();
+        assert!(restored.get());
+        assert!(error.to_string().contains("without delivering"));
     }
 }

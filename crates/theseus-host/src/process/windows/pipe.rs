@@ -9,7 +9,7 @@ use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr::{NonNull, null, null_mut};
 use windows_sys::Win32::Foundation::*;
-use windows_sys::Win32::Security::{Cryptography::*, SECURITY_ATTRIBUTES};
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::System::{IO::*, Pipes::*, Threading::*};
 
@@ -238,19 +238,7 @@ impl Drop for Endpoint {
 
 fn server(reading: bool) -> io::Result<(OperationOwner, Vec<u16>)> {
     let mut random = [0u8; 16];
-    let status = unsafe {
-        BCryptGenRandom(
-            null_mut(),
-            random.as_mut_ptr(),
-            random.len() as u32,
-            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-        )
-    };
-    if status < 0 {
-        return Err(io::Error::from_raw_os_error(
-            unsafe { RtlNtStatusToDosError(status) } as i32,
-        ));
-    }
+    crate::random_bytes(&mut random)?;
     let suffix = format!("{:032x}", u128::from_le_bytes(random));
     let name: Vec<u16> = format!(r"\\.\pipe\theseus-{suffix}")
         .encode_utf16()
@@ -375,6 +363,8 @@ fn setup_failure(endpoint: Endpoint, reading: bool, error: io::Error) -> SpawnFa
         child: None,
         readers: Vec::new(),
         writers: Vec::new(),
+        #[cfg(feature = "test-support")]
+        cleanup_faults: 0,
     };
     if reading {
         guard.readers.push(PipeReader::new(endpoint));

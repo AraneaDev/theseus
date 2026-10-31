@@ -37,6 +37,11 @@
 //! Counts are decimal, at most 64 MiB; durations are at most 60,000 ms.
 //! Hex output is at most 64 MiB. No mode reads unrelated environment variables.
 
+#[path = "fixture/docker.rs"]
+mod docker;
+#[path = "fixture/duplex.rs"]
+mod duplex;
+
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
@@ -235,6 +240,84 @@ fn read_until_eof(maximum: u64) -> io::Result<()> {
     io::stdout().lock().write_all(&bytes)
 }
 
+// The Windows parent creates a new console for this fixture only. Event group 0
+// therefore cannot reach the test runner or an unrelated console process.
+// Fixed owned descendant tree: heartbeat proves liveness without PID reopening.
+#[allow(clippy::zombie_processes)]
+fn owned_tree(mode: &str, ready: &OsStr, heartbeat: &OsStr) -> io::Result<()> {
+    if mode == "tree-held" {
+        flood(&mut io::stdout(), 0, 131072)?;
+        flood(&mut io::stderr(), 0, 131072)?;
+    }
+    let child_ready = std::path::Path::new(ready).with_extension("child");
+    let mut child = Command::new(env::current_exe()?)
+        .arg("ready-hold")
+        .arg(&child_ready)
+        .arg(heartbeat)
+        .arg("30000")
+        .stdin(Stdio::null())
+        .spawn()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !child_ready.exists() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::other("fixture descendant not ready"));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::fs::write(ready, format!("{} {}\n", std::process::id(), child.id()))?;
+    if mode == "tree-held" {
+        child.wait()?;
+    } else {
+        std::process::exit(if mode == "tree-exit" { 17 } else { 0 });
+    }
+    Ok(())
+}
+
+fn cancellation_event() -> io::Result<()> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use theseus_host::cancel::CancellationRegistration;
+    for _ in 0..32 {
+        let live = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let registration = CancellationRegistration::install(live.clone())?;
+        let obsolete = CancellationRegistration::install(dropped.clone())?;
+        drop(obsolete);
+        #[cfg(unix)]
+        signal_hook::low_level::raise(signal_hook::consts::SIGINT)?;
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+            if unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !live.load(Ordering::SeqCst) {
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::other(
+                    "control event did not reach live registration",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if dropped.load(Ordering::SeqCst) {
+            return Err(io::Error::other(
+                "control event reached dropped registration",
+            ));
+        }
+        drop(registration);
+    }
+    writeln!(
+        io::stdout().lock(),
+        "32 owned control events: live=true dropped=false"
+    )
+}
+
 fn run(args: &[OsString]) -> FixtureResult {
     let (mode, args) = args
         .split_first()
@@ -257,6 +340,24 @@ fn run(args: &[OsString]) -> FixtureResult {
             }
             Ok(())
         }
+        (Some(mode @ ("tree-held" | "tree-exit" | "tree-exit0")), [ready, heartbeat]) => {
+            owned_tree(mode, ready, heartbeat)
+        }
+        (Some("archive-holder"), [ready]) => {
+            let mut byte = [0];
+            if io::stdin().read(&mut byte)? != 0 {
+                return Err(invalid("archive exit gate must contain no data").into());
+            }
+            std::fs::write(ready, b"leader exited; inherited streams held")?;
+            std::thread::sleep(Duration::from_secs(30));
+            Ok(())
+        }
+        (Some("duplex-case"), [case]) => duplex::run(
+            case.to_str()
+                .ok_or_else(|| invalid("invalid duplex case"))?,
+        ),
+        (Some("exit"), [status]) => std::process::exit(number(status, i32::MAX as u64)? as i32),
+        (Some("cancellation-event"), []) => cancellation_event(),
         (Some("echo-env"), [name]) => {
             if name.is_empty()
                 || name
@@ -315,6 +416,23 @@ fn run(args: &[OsString]) -> FixtureResult {
             flood(&mut io::stderr().lock(), b'E', err)
         }
         (Some("descendant"), [millis]) => descendant(number(millis, 60_000)?),
+        (Some("ready-hold"), [ready, heartbeat, millis]) => {
+            let duration = Duration::from_millis(number(millis, 60_000)?);
+            let mut heartbeat = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(heartbeat)?;
+            std::fs::write(ready, std::process::id().to_string())?;
+            io::stdout().lock().write_all(b"ready")?;
+            io::stdout().lock().flush()?;
+            let until = std::time::Instant::now() + duration;
+            while std::time::Instant::now() < until {
+                heartbeat.write_all(b".")?;
+                heartbeat.flush()?;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(())
+        }
         (Some("hold-pipes" | "ignore-stdin"), [millis]) => {
             std::thread::sleep(Duration::from_millis(number(millis, 60_000)?));
             Ok(())
@@ -332,6 +450,33 @@ fn run(args: &[OsString]) -> FixtureResult {
 }
 
 fn main() {
+    let executable = env::current_exe().expect("fixture executable path");
+    if executable.file_stem() == Some(OsStr::new("theseus")) {
+        let args: Vec<_> = env::args_os().skip(1).collect();
+        if args.len() != 2 || args[0] != "cleanup" {
+            std::process::exit(99);
+        }
+        println!("2\ncleanup\n{}", args[1].to_string_lossy());
+        return;
+    }
+    if let Some(mode) = executable
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("theseus-docker-"))
+    {
+        let result = docker::run(
+            mode,
+            executable.parent().unwrap(),
+            &env::args_os().skip(1).collect::<Vec<_>>(),
+        );
+        match result {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(99);
+            }
+        }
+    }
     if let Err(error) = run(&env::args_os().skip(1).collect::<Vec<_>>()) {
         eprintln!("theseus-host-fixture: {error}");
         // Ordinary failure runs retained cleanup destructors before process exit.

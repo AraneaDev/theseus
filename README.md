@@ -751,12 +751,29 @@ Inspect Docker separately in that exceptional window.
 ## Validation and scope
 
 ```sh
+export THESEUS_HOST_TEST_FIXTURE="$(python3 tests/support/build_host_fixture.py)"
 cargo fmt --check
 cargo clippy --offline --locked --all-targets -- -D warnings
 cargo test --offline --locked
 cargo build --offline --locked --release
 cargo test --offline --locked --test docker_lifecycle --test interruption_lifecycle --test downgrade_lifecycle --test rollback_lifecycle --test interrupted_rollback_lifecycle --test comparison_docker -- --ignored --test-threads=1
 ```
+
+Application process tests require the trusted native fixture built by
+`tests/support/build_host_fixture.py`; this script obtains the executable from
+Cargo's JSON artifact output. Missing `THESEUS_HOST_TEST_FIXTURE` is a test failure.
+In PowerShell, set it with
+`$env:THESEUS_HOST_TEST_FIXTURE = python tests/support/build_host_fixture.py`.
+The fixture is a test tool and is not installed as an application command.
+
+Cancellation registration is scoped to the active CLI/TUI run. Windows console
+Ctrl-C and Ctrl-Break request cancellation; raw TUI Ctrl-C uses its existing key
+handling. Console close, logoff, and shutdown still have Windows-imposed process
+termination deadlines, so these events cannot guarantee completion of cleanup.
+The TUI restores the terminal before joining outstanding engine work; exceptional
+native cleanup can delay process return beyond the interactive quit deadline.
+Host recovery commands use POSIX shell quoting on Unix and PowerShell quoting on
+Windows. Displayed non-Unicode paths may be lossy and are not exact copyable argv.
 
 Regular tests include wide/narrow TestBackend behavior and actual Unix PTY
 startup/error/restoration. Synthetic large-report public CLI PTYs reach records

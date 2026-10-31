@@ -1,7 +1,7 @@
 //! Container boundary shared by the engine and deterministic environment tests.
 mod artifacts;
 mod docker;
-mod process;
+pub(crate) mod process;
 use crate::{
     engine::CancellationToken,
     model::*,

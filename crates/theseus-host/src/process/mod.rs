@@ -33,10 +33,32 @@ pub struct OwnedSpawnCleanup {
     pub(crate) child: Option<Box<OwnedChild>>,
     pub(crate) readers: Vec<PipeReader>,
     pub(crate) writers: Vec<PipeWriter>,
+    #[cfg(all(windows, feature = "test-support"))]
+    pub(crate) cleanup_faults: u32,
 }
 impl OwnedSpawnCleanup {
+    /// Transfer unresolved endpoint ownership without losing native operation storage.
+    pub fn from_endpoints(readers: Vec<PipeReader>, writers: Vec<PipeWriter>) -> Self {
+        Self {
+            child: None,
+            readers,
+            writers,
+            #[cfg(all(windows, feature = "test-support"))]
+            cleanup_faults: 0,
+        }
+    }
+
     /// Retry cleanup using retained authority. On error this guard remains owned.
     pub fn try_complete(&mut self) -> io::Result<bool> {
+        #[cfg(all(windows, feature = "test-support"))]
+        if self.cleanup_faults > 0 {
+            self.cleanup_faults -= 1;
+            return if self.cleanup_faults % 2 == 0 {
+                Ok(false)
+            } else {
+                Err(io::Error::other("injected owned cleanup failure"))
+            };
+        }
         let mut error = None;
         for reader in &mut self.readers {
             if let Err(e) = reader.cancel_and_complete() {
@@ -114,8 +136,32 @@ pub struct AcquiredChild {
 }
 
 impl OwnedChild {
+    /// Transfer retained process authority after an unsuccessful cleanup attempt.
+    pub fn into_cleanup(self) -> OwnedSpawnCleanup {
+        OwnedSpawnCleanup {
+            child: Some(Box::new(self)),
+            readers: vec![],
+            writers: vec![],
+            #[cfg(all(windows, feature = "test-support"))]
+            cleanup_faults: 0,
+        }
+    }
+
     /// Acquire an owned process/group or job and bounded, interruptible endpoints.
     pub fn spawn(command: &NativeCommand, input: InputMode) -> Result<AcquiredChild, SpawnFailure> {
+        Self::acquire(command, input, Self::spawn_files, true)
+    }
+    fn acquire(
+        command: &NativeCommand,
+        input: InputMode,
+        spawn: impl FnOnce(
+            &NativeCommand,
+            Option<std::fs::File>,
+            Option<std::fs::File>,
+            Option<std::fs::File>,
+        ) -> Result<OwnedChild, SpawnFailure>,
+        settle: bool,
+    ) -> Result<AcquiredChild, SpawnFailure> {
         #[cfg(unix)]
         use unix as platform;
         #[cfg(windows)]
@@ -136,7 +182,7 @@ impl OwnedChild {
                     Some(input)
                 }
             };
-            Self::spawn_files(command, input, Some(output), Some(errors))
+            spawn(command, input, Some(output), Some(errors))
         })();
         match result {
             Ok(child) => Ok(AcquiredChild {
@@ -151,11 +197,17 @@ impl OwnedChild {
                         child: None,
                         readers: Vec::new(),
                         writers: Vec::new(),
+                        #[cfg(all(windows, feature = "test-support"))]
+                        cleanup_faults: 0,
                     },
                     HostCleanup::Pending(guard) => guard,
                 };
                 guard.readers.extend(readers);
                 guard.writers.extend(writers);
+                if !settle {
+                    failure.cleanup = HostCleanup::Pending(guard);
+                    return Err(failure);
+                }
                 failure.cleanup = match guard.try_complete() {
                     Ok(true) => HostCleanup::Complete,
                     Ok(false) => HostCleanup::Pending(guard),
@@ -167,5 +219,42 @@ impl OwnedChild {
                 Err(failure)
             }
         }
+    }
+}
+
+/// Per-call native launch faults for application acceptance only. Not enabled in
+/// the normal application dependency or release build.
+#[cfg(all(windows, feature = "test-support"))]
+pub mod test_support {
+    use super::*;
+    pub fn fail_cleanup_attempts(owner: &mut OwnedSpawnCleanup, attempts: u32) {
+        assert!(attempts <= 32, "bounded cleanup fault schedule");
+        owner.cleanup_faults = attempts;
+    }
+
+    #[derive(Clone, Copy)]
+    pub enum LaunchFault {
+        BeforeCreate,
+        CreatedSuspended,
+        ResumeUncertain,
+        CleanupPending,
+        BeforeCreatePending,
+    }
+    pub fn spawn(
+        command: &NativeCommand,
+        input: InputMode,
+        fault: LaunchFault,
+    ) -> Result<AcquiredChild, SpawnFailure> {
+        OwnedChild::acquire(
+            command,
+            input,
+            |command, stdin, stdout, stderr| {
+                super::windows::spawn_fault(command, stdin, stdout, stderr, fault)
+            },
+            !matches!(
+                fault,
+                LaunchFault::CleanupPending | LaunchFault::BeforeCreatePending
+            ),
+        )
     }
 }

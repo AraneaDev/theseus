@@ -69,6 +69,10 @@ impl Docker {
         let timeout = deadline
             .saturating_duration_since(Instant::now())
             .saturating_sub(Duration::from_secs(1));
+        let mut native_cleanup = process::CleanupFailures::default();
+        if let Err(error) = &launch.prepared {
+            native_cleanup.retain(error);
+        }
         let mut evidence;
         let mut stdout = String::new();
         let mut stdout_utf8 = false;
@@ -81,6 +85,7 @@ impl Docker {
             record.cancelled = cancel.is_cancelled();
             record.timed_out = !record.cancelled && timeout <= Duration::from_secs(1);
             if let Err(error) = abort() {
+                native_cleanup.retain(&error);
                 append(&mut record.error, format!("owned MCP cleanup: {error:#}"));
             }
             evidence = session.finish(McpShutdown::NotStarted);
@@ -107,6 +112,16 @@ impl Docker {
             );
             match acquired {
                 Ok(output) => {
+                    if let Err(error) = output.cleanup_failures.finish() {
+                        native_cleanup.retain(&error);
+                    }
+                    if let Some(failure) = &output.launch_failure {
+                        // Owned guest abort already ran. Preserve residual host
+                        // authority through the engine's diagnostic lowering.
+                        if failure.retry_cleanup().is_err() || failure.pending() {
+                            native_cleanup.retain(&failure.clone().into());
+                        }
+                    }
                     record.error = output.process.error;
                     if let Some(error) = output.io_error {
                         append(&mut record.error, error);
@@ -138,10 +153,13 @@ impl Docker {
                                 record.exit_status = Some(status);
                                 stdout_complete = true;
                             }
-                            Err(error) => append(
-                                &mut record.error,
-                                format!("MCP completion unverified: {error:#}"),
-                            ),
+                            Err(error) => {
+                                native_cleanup.retain(&error);
+                                append(
+                                    &mut record.error,
+                                    format!("MCP completion unverified: {error:#}"),
+                                );
+                            }
                         }
                         record.timed_out |= !cancel.is_cancelled() && Instant::now() >= deadline;
                     } else if record.error.is_none() && !record.cancelled && !record.timed_out {
@@ -182,6 +200,7 @@ impl Docker {
                         match self.remove_owned_until(resource, until) {
                             Ok(()) => evidence.shutdown = McpShutdown::ForcedOwnedRemoval,
                             Err(error) => {
+                                native_cleanup.retain(&error);
                                 append(&mut record.error, format!("owned MCP cleanup: {error:#}"))
                             }
                         }
@@ -189,6 +208,12 @@ impl Docker {
                 }
                 Err(error) => {
                     // Exceptional worker/setup failure cannot return its driver.
+                    let phase = error
+                        .downcast_ref::<process::AcquisitionFailure>()
+                        .map_or(theseus_host::process::LaunchPhase::MayRun, |failure| {
+                            failure.launch()
+                        });
+                    native_cleanup.retain(&error);
                     record.error = Some(format!("MCP acquisition failed: {error:#}"));
                     available = false;
                     let until = *cleanup_deadline
@@ -196,13 +221,18 @@ impl Docker {
                     let shutdown = match self.remove_owned_until(resource, until) {
                         Ok(()) => McpShutdown::ForcedOwnedRemoval,
                         Err(error) => {
+                            native_cleanup.retain(&error);
                             append(&mut record.error, format!("owned MCP cleanup: {error:#}"));
                             McpShutdown::Unverified
                         }
                     };
                     evidence = McpSession::new(fallback_probe)
                         .expect("previously validated probe")
-                        .finish(shutdown);
+                        .finish(if phase == theseus_host::process::LaunchPhase::MayRun {
+                            shutdown
+                        } else {
+                            McpShutdown::NotStarted
+                        });
                 }
             }
         }
@@ -235,6 +265,7 @@ impl Docker {
         } else {
             CommandOutcome::Failed
         };
+        native_cleanup.finish()?;
         Ok(ExecutedMcp {
             command: ExecutedCommand {
                 record,
@@ -286,28 +317,11 @@ fn finish_evidence(
 #[cfg(test)]
 mod review_regressions {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     #[test]
     fn cancellation_after_preparation_uses_real_duplex_not_started_disposition() {
         let root = tempfile::tempdir().unwrap();
-        let executable = root.path().join("control");
+        let executable = process::test_support::docker(root.path(), "mcp-control");
         let calls = root.path().join("calls");
-        std::fs::write(
-            &executable,
-            format!(
-                r#"#!/bin/sh
-printf '%s\n' "$*" >> '{}'
-case "$1 $2" in
- 'exec --user') exit 0;;
- 'container inspect') printf 'Error: No such object: %s\n' "$5" >&2; exit 1;;
- *) exit 98;;
-esac
-"#,
-                calls.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut docker = Docker::new(executable);
         let resource = OwnedResource {
             container_id: "a".repeat(64),

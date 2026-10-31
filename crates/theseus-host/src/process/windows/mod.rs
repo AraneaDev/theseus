@@ -22,6 +22,7 @@ pub struct OwnedChild {
     thread: OwnedHandle,
     job: Job,
     released: bool,
+    status: Option<ExitStatus>,
     job_termination_requested: bool,
     process_termination_requested: bool,
 }
@@ -96,17 +97,32 @@ impl OwnedChild {
             Ok(false)
         }
     }
-    pub fn reap_and_release(mut self) -> io::Result<ExitStatus> {
+    /// None and Err retain all process/thread/job handles. Only confirmed native
+    /// process exit plus empty-job accounting permits release and a cached status.
+    pub fn try_reap_and_release(&mut self) -> io::Result<Option<ExitStatus>> {
+        if let Some(status) = self.status {
+            return Ok(Some(status));
+        }
         self.terminate_owned()?;
-        // The caller retains separate endpoint ownership through this process wait.
-        while !self.cleanup()? {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+        if !self.exited_reserved()? || !self.job.empty()? {
+            return Ok(None);
         }
         let mut code = 0;
         if unsafe { GetExitCodeProcess(self.process.as_raw_handle(), &mut code) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(ExitStatus::from_raw(code))
+        let status = ExitStatus::from_raw(code);
+        self.status = Some(status);
+        self.released = true;
+        Ok(Some(status))
+    }
+    pub fn reap_and_release(mut self) -> io::Result<ExitStatus> {
+        loop {
+            if let Some(status) = self.try_reap_and_release()? {
+                return Ok(status);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 }
 impl Drop for OwnedChild {
@@ -117,4 +133,22 @@ impl Drop for OwnedChild {
             // cleanup checks job accounting and process wait before claiming Complete.
         }
     }
+}
+
+#[cfg(feature = "test-support")]
+pub(super) fn spawn_fault(
+    command: &NativeCommand,
+    stdin: Option<File>,
+    stdout: Option<File>,
+    stderr: Option<File>,
+    fault: super::test_support::LaunchFault,
+) -> Result<OwnedChild, SpawnFailure> {
+    use super::test_support::LaunchFault;
+    let fault = match fault {
+        LaunchFault::BeforeCreate | LaunchFault::BeforeCreatePending => launch::Fault::BeforeCreate,
+        LaunchFault::CreatedSuspended => launch::Fault::AfterCreate,
+        LaunchFault::ResumeUncertain => launch::Fault::ResumeUncertain,
+        LaunchFault::CleanupPending => launch::Fault::CleanupPending,
+    };
+    launch::spawn_impl(command, stdin, stdout, stderr, fault)
 }

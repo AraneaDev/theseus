@@ -778,7 +778,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "signal-hook",
  "tempfile",
  "theseus-host",
  "tokio",
@@ -791,6 +790,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "rustix 1.1.5",
+ "signal-hook",
  "tempfile",
  "windows-sys 0.61.2",
 ]

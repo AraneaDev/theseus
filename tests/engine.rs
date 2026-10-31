@@ -37,6 +37,9 @@ impl Environment for Fake {
         _: &ValidatedRecipe,
         _: &CancellationToken,
     ) -> Result<()> {
+        if self.fault == "panic-setup" {
+            panic!("original setup panic");
+        }
         if self.fault == "setup" {
             anyhow::bail!("unsupported fixture image");
         }
@@ -138,6 +141,9 @@ impl Environment for Fake {
         Ok(())
     }
     fn remove(&mut self, _: &OwnedResource) -> Result<()> {
+        if self.fault == "panic-setup" {
+            self.fault = "removed-after-panic";
+        }
         if self.fault == "cleanup" {
             anyhow::bail!("daemon unavailable during cleanup");
         }
@@ -2197,4 +2203,32 @@ fn json_preflight_collects_forwarded_environment_and_preview_exposes_definition(
     assert_eq!(result.report.outcome, RunOutcome::Incomplete);
     assert!(result.report.scenarios.is_empty());
     assert!(result.report.errors.iter().any(|e| e.contains(&missing)));
+}
+
+#[test]
+fn owned_guest_cleanup_precedes_original_setup_panic_propagation() {
+    let (temp, recipe) = recipe();
+    let mut options = RunOptions::all(&recipe);
+    options.output_root = temp.path().join("panic-runs");
+    options.profiles = vec![ProfileName::User];
+    options.scenarios = vec![ScenarioKind::Clean];
+    let mut environment = Fake {
+        fault: "panic-setup",
+    };
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        engine::run_with(
+            &recipe,
+            options,
+            CancellationToken::default(),
+            &mut environment,
+            |_| {},
+        )
+    }))
+    .err()
+    .expect("original panic must propagate");
+    assert_eq!(panic.downcast_ref::<&str>(), Some(&"original setup panic"));
+    assert_eq!(
+        environment.fault, "removed-after-panic",
+        "owned guest teardown was skipped by panic"
+    );
 }

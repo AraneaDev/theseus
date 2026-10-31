@@ -241,7 +241,9 @@ impl Docker {
         let mut command = self.execution_command(resource, &request, &launch, &BTreeMap::new());
         let deadline = launch.deadline;
         let started = launch.started;
+        let mut native_cleanup = process::CleanupFailures::default();
         if let Err(error) = &launch.prepared {
+            native_cleanup.retain(error);
             record.error = Some(format!("application completion unverified: {error:#}"));
             record.cancelled = cancel.is_cancelled();
             record.timed_out = !record.cancelled && Instant::now() >= deadline;
@@ -263,6 +265,7 @@ impl Docker {
                 bytes: 0,
                 truncated: false,
             });
+            native_cleanup.finish()?;
             return Ok(ExecutedCommand {
                 record,
                 stdout: String::new(),
@@ -292,6 +295,9 @@ impl Docker {
             );
             self.verify_completion(resource, &launch, output.status, cancel)
         })();
+        if let Err(error) = &completion {
+            native_cleanup.retain(error);
+        }
         match completion {
             Ok(status) => record.exit_status = Some(status),
             Err(error) if record.error.is_none() && !record.timed_out && !record.cancelled => {
@@ -329,6 +335,7 @@ impl Docker {
             && record.error.is_none()
             && !record.cancelled
             && !record.timed_out;
+        native_cleanup.finish()?;
         Ok(ExecutedCommand {
             record,
             stdout_utf8: std::str::from_utf8(&output.stdout.bytes).is_ok(),

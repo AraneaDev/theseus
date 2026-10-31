@@ -1,3 +1,4 @@
+use theseus_host::process::NativeCommand as Command;
 mod execution;
 mod interruption;
 mod mcp;
@@ -15,7 +16,6 @@ use anyhow::{Context, Result, bail, ensure};
 use std::{
     collections::BTreeMap,
     path::Path,
-    process::Command,
     time::{Duration, Instant},
 };
 
@@ -162,6 +162,7 @@ impl Docker {
         // the existing store's safe, private atomic-write boundary.
         let store = crate::report::open_existing(&directory)?;
         let mut errors = vec![];
+        let mut native_cleanup = process::CleanupFailures::default();
         for resource in &mut journal.resources {
             ensure!(
                 resource.labels.get(RUN_LABEL) == Some(&journal.run_id),
@@ -172,11 +173,16 @@ impl Docker {
             }
             match self.remove(resource) {
                 Ok(()) => resource.removed = true,
-                Err(error) => errors.push(format!("{error:#}")),
+                Err(error) => {
+                    native_cleanup.retain(&error);
+                    errors.push(format!("{error:#}"));
+                }
             }
         }
         journal.cleanup_errors = errors.clone();
-        store.save_journal(&journal)?;
+        let saved = store.save_journal(&journal);
+        native_cleanup.finish()?;
+        saved?;
         ensure!(errors.is_empty(), "cleanup failed: {}", errors.join("; "));
         Ok(())
     }
@@ -217,9 +223,8 @@ impl Docker {
     }
 }
 fn fresh_nonce() -> Result<String> {
-    use std::io::Read;
     let mut bytes = [0; 16];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    theseus_host::random_bytes(&mut bytes)?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 impl Environment for Docker {
@@ -248,6 +253,9 @@ impl Environment for Docker {
         let image_id = match inspected {
             Ok(id) => id,
             Err(error) if pull => {
+                let mut retained = process::CleanupFailures::default();
+                retained.retain(&error);
+                retained.finish()?;
                 self.utility(&["pull", &recipe.recipe.image], cancel)?;
                 self.utility(
                     &[
@@ -261,10 +269,12 @@ impl Environment for Docker {
                 )
                 .with_context(|| format!("inspect pulled image: {error:#}"))?
             }
-            Err(error) => bail!(
-                "image {} is unavailable locally; use --pull to acquire it: {error:#}",
-                recipe.recipe.image
-            ),
+            Err(error) => {
+                return Err(error.context(format!(
+                    "image {} is unavailable locally; use --pull to acquire it",
+                    recipe.recipe.image
+                )));
+            }
         };
         let image_id = image_id.trim().to_string();
         ensure!(
@@ -443,10 +453,12 @@ chmod 755 /home/theseus /workspace /inputs
             snapshots: vec![],
             infrastructure_error: None,
         };
+        let mut native_cleanup = process::CleanupFailures::default();
         for root in roots {
             let snapshot = self
                 .snapshot(resource, root, limits, cancel)
                 .unwrap_or_else(|error| {
+                    native_cleanup.retain(&error);
                     if error.downcast_ref::<process::ArchiveRejected>().is_none()
                         && batch.infrastructure_error.is_none()
                     {
@@ -455,7 +467,11 @@ chmod 755 /home/theseus /workspace /inputs
                     Snapshot::incomplete(root, format!("{error:#}"))
                 });
             batch.snapshots.push(snapshot);
+            if native_cleanup.pending() {
+                break;
+            }
         }
+        native_cleanup.finish()?;
         Ok(batch)
     }
     fn stop(&mut self, resource: &OwnedResource) -> Result<()> {
@@ -475,7 +491,8 @@ chmod 755 /home/theseus /workspace /inputs
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{os::unix::fs::PermissionsExt, thread, time::Instant};
+    use process::test_support::docker as fixture;
+    use std::{thread, time::Instant};
     fn probe_request(id: &str, expected_exit: i32) -> CommandRequest {
         CommandRequest {
             id: id.into(),
@@ -518,26 +535,10 @@ mod tests {
         for interrupted in [false, true] {
             for (valid, truncated) in [(false, false), (true, false), (false, true)] {
                 let temp = tempfile::tempdir().unwrap();
-                let executable = temp.path().join("docker-json-boundary");
-                std::fs::write(&executable, format!(r#"#!/usr/bin/python3
-import sys,json
-args=sys.argv[1:]
-if args[0]=='container':
-    print(json.dumps({{'Id':args[-1], 'Config':{{'Labels':{{'io.theseus.owner':'v1','io.theseus.run':'json','io.theseus.scenario':'capture'}}}},'State':{{'Running':True}}}}))
-    sys.exit(0)
-script=args[args.index('-c')+1]
-if script.startswith('umask') or 'command -v dd' in script: sys.exit(0)
-if 'printf waiting' in script: print('waiting',end=''); sys.exit(0)
-if script.startswith('receipt='):
-    sys.stdout.buffer.write(b'"' + (b'\xef\xbf\xbd' if {valid} else b'\xff') + b'"')
-    sys.exit(0)
-if script.startswith('test -f'):
-    nonce=args[-1].split('/')[1].removeprefix('.theseus-')
-    print(nonce+':0'); sys.exit(0)
-sys.exit(99)
-"#, valid=if valid {"True"} else {"False"})).unwrap();
-                std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
-                    .unwrap();
+                let executable = fixture(
+                    temp.path(),
+                    if valid { "json-valid" } else { "json-invalid" },
+                );
                 let store = crate::report::create(&temp.path().join("run")).unwrap();
                 let resource = OwnedResource {
                     container_id: "a".repeat(64),
@@ -606,13 +607,7 @@ sys.exit(99)
     #[test]
     fn docker_control_exit_one_cannot_satisfy_application_expectation() {
         let temp = tempfile::tempdir().unwrap();
-        let executable = temp.path().join("docker-failure");
-        std::fs::write(
-            &executable,
-            "#!/bin/sh\necho 'control failure' >&2\nexit 1\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = fixture(temp.path(), "failure");
         let store = crate::report::create(&temp.path().join("run")).unwrap();
         let resource = OwnedResource {
             container_id: "a".repeat(64),
@@ -644,33 +639,7 @@ sys.exit(99)
             "read-error",
         ] {
             let temp = tempfile::tempdir().unwrap();
-            let executable = temp.path().join("docker-controlled");
-            std::fs::write(
-                &executable,
-                format!(
-                    r#"#!/usr/bin/python3
-import sys
-args = sys.argv[1:]
-script = args[args.index('-c')+1]
-if script.startswith('umask'): sys.exit(0)
-if script.startswith('receipt='):
-    print('application stdout')
-    print('application stderr', file=sys.stderr)
-    sys.exit(1 if '{mode}' == 'transport' else 0)
-if script.startswith('test -f'):
-    nonce = args[-1].split('/')[1].removeprefix('.theseus-')
-    mode = '{mode}'
-    if mode == 'stale': print('old-nonce:1')
-    if mode == 'invalid': print(nonce + ':999')
-    if mode == 'overflow': print(nonce + ':1' + 'x'*1024)
-    if mode == 'read-error': print(nonce + ':1'); sys.exit(1)
-    sys.exit(0)
-sys.exit(99)
-"#
-                ),
-            )
-            .unwrap();
-            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let executable = fixture(temp.path(), &format!("receipt-{mode}"));
             let store = crate::report::create(&temp.path().join("run")).unwrap();
             let resource = OwnedResource {
                 container_id: "a".repeat(64),
@@ -701,29 +670,7 @@ sys.exit(99)
             for cancelled in [false, true] {
                 let temp = tempfile::tempdir().unwrap();
                 let marker = temp.path().join("control-started");
-                let executable = temp.path().join("docker-control-wait");
-                std::fs::write(
-                    &executable,
-                    format!(
-                        r#"#!/usr/bin/python3
-import sys, time, pathlib
-args = sys.argv[1:]
-if args[0] == 'container':
-    print('No such container:', file=sys.stderr)
-    sys.exit(1)
-script = args[args.index('-c')+1]
-waiting = script.startswith('umask') if '{phase}' == 'prepare' else script.startswith('test -f')
-if waiting:
-    pathlib.Path('{marker}').touch()
-    time.sleep(600)
-sys.exit(0)
-"#,
-                        marker = marker.display()
-                    ),
-                )
-                .unwrap();
-                std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
-                    .unwrap();
+                let executable = fixture(temp.path(), &format!("wait-{phase}"));
                 let cancel = CancellationToken::default();
                 let trigger = cancel.clone();
                 let signal = cancelled.then(|| {
@@ -778,17 +725,7 @@ sys.exit(0)
             return;
         }
         let temp = tempfile::tempdir().unwrap();
-        let executable = temp.path().join("docker-argv");
-        // Capture the actual adapter argv without mutating the process environment.
-        std::fs::write(
-            &executable,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nexit 0\n",
-                temp.path().join("argv").display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = fixture(temp.path(), "argv");
         let store = crate::report::create(&temp.path().join("run")).unwrap();
         let resource = OwnedResource {
             container_id: "a".repeat(64),
@@ -843,14 +780,20 @@ sys.exit(0)
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("bin")).unwrap();
         std::fs::write(temp.path().join("bin/sample"), b"sample").unwrap();
-        let executable = temp.path().join("docker-wrapper");
-        std::fs::write(&executable, format!("#!/bin/sh\ncase \"$1\" in\nexec) printf present ;;\ncp) tar -C '{}' -cf - bin; sleep 2 & exit 0 ;;\n*) exit 99 ;;\nesac\n", temp.path().display())).unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = fixture(temp.path(), "archive");
         let cancel = CancellationToken::default();
         let trigger = cancel.clone();
+        let ready = temp.path().join("archive-peer-ready");
         let signal = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(100));
+            let deadline = Instant::now() + Duration::from_millis(700);
+            while !ready.exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            let established = ready.exists();
+            // A bounded rescue cancels even on failed fixture setup, so the
+            // supervisor still cleans its owned descendants before assertions.
             trigger.cancel();
+            established
         });
         let began = Instant::now();
         let result = Docker::new(executable.as_os_str()).snapshot(
@@ -863,21 +806,23 @@ sys.exit(0)
             Limits::default(),
             &cancel,
         );
-        signal.join().unwrap();
+        assert!(
+            signal.join().unwrap(),
+            "native archive leader-exit/held-stream prerequisite was not established: {result:?}"
+        );
         assert!(
             result.is_err(),
             "archive incorrectly completed after {}ms",
             began.elapsed().as_millis()
         );
-        assert!(format!("{:#}", result.unwrap_err()).contains("cancelled"));
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("cancelled"), "{error}");
         assert!(began.elapsed() < Duration::from_secs(1));
     }
     #[test]
     fn rejects_image_declared_volumes_before_creating_resources() {
         let temp = tempfile::tempdir().unwrap();
-        let executable = temp.path().join("docker-metadata");
-        std::fs::write(&executable, "#!/bin/sh\ncase \"$1:$2\" in\nversion:--format) printf '29.9.2\\n' ;;\nimage:inspect) case \"$4\" in\n'{{.Id}}') printf 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' ;;\n'{{json .Config.Volumes}}') printf '{\"/data\":{}}\\n' ;;\nesac ;;\n*) echo 'unexpected mutation' >&2; exit 99 ;;\nesac\n").unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = fixture(temp.path(), "metadata");
         let recipe =
             crate::recipe::load(Path::new("tests/fixtures/lifecycle/recipe.toml")).unwrap();
         let mut docker = Docker::new(executable.as_os_str());

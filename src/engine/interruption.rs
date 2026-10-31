@@ -83,6 +83,7 @@ pub(super) fn stop<E: Environment, F: FnMut(EngineEvent)>(
             stage.commands.push(executed.record);
         }
         Err(error) => {
+            c.cleanup.retain(&error);
             stage.errors.push(format!("interruption: {error:#}"));
         }
     }
@@ -157,6 +158,7 @@ pub(super) fn restart<E: Environment, F: FnMut(EngineEvent)>(
             }
         }
         Err(error) => {
+            c.cleanup.retain(&error);
             stage.errors.push(format!("restart: {error:#}"));
             state.availability = Availability::Unavailable;
             state.forward = false;

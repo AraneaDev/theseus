@@ -69,6 +69,60 @@ jobs:
           & $theseusTask6Python tests/support/portable_guest_bytes.py 2>&1 |
             Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'portable-guest-bytes.log')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build trusted native application fixture
+        shell: pwsh
+        run: |
+          $theseusTask7Python = if ($IsWindows) { 'python' } else { 'python3' }
+          $theseusTask7Fixture = & $theseusTask7Python tests/support/build_host_fixture.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "THESEUS_HOST_TEST_FIXTURE=$theseusTask7Fixture" >> $env:GITHUB_ENV
+          @{ source_sha = $env:GITHUB_SHA; executable = $theseusTask7Fixture; sha256 = (Get-FileHash -Algorithm SHA256 $theseusTask7Fixture).Hash } |
+            ConvertTo-Json | Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'app-fixture.json')
+      - name: Verify production and test native feature boundaries
+        shell: pwsh
+        run: |
+          $theseusReleaseMetadata = Join-Path $env:THESEUS_HOST_EVIDENCE 'release-artifacts.jsonl'
+          cargo check --locked --release --bin theseus --message-format=json 2> (Join-Path $env:THESEUS_HOST_EVIDENCE 'release-check.stderr') |
+            Tee-Object -FilePath $theseusReleaseMetadata
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $theseusReleaseHost = @(Get-Content $theseusReleaseMetadata | ConvertFrom-Json | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'theseus_host' })
+          if ($theseusReleaseHost.Count -lt 1 -or @($theseusReleaseHost | Where-Object { $_.features -contains 'test-support' }).Count -ne 0) { throw 'Production release unexpectedly enables native faults' }
+          $theseusTestMetadata = Join-Path $env:THESEUS_HOST_EVIDENCE 'app-test-artifacts.jsonl'
+          cargo test --locked --lib --no-run --message-format=json 2> (Join-Path $env:THESEUS_HOST_EVIDENCE 'app-test-build.stderr') |
+            Tee-Object -FilePath $theseusTestMetadata
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $theseusTestHost = @(Get-Content $theseusTestMetadata | ConvertFrom-Json | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'theseus_host' -and $_.features -contains 'test-support' })
+          if ($theseusTestHost.Count -lt 1) { throw 'Application test graph lacks scoped native fault support' }
+      - name: Native application process and MCP integration
+        shell: pwsh
+        run: |
+          if ($IsMacOS) {
+            $theseusTask7TempRoot = python3 -c "import pathlib, tempfile; print(pathlib.Path(tempfile.gettempdir()).resolve())"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $env:TMPDIR = $theseusTask7TempRoot
+            @{ source_sha = $env:GITHUB_SHA; canonical_temp_root = $theseusTask7TempRoot; fixture_policy = 'canonical native temp ancestry; strict production roots unchanged' } |
+              ConvertTo-Json | Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'app-process-fixture-policy.json')
+          }
+          cargo test --locked --lib runner::process -- --nocapture 2>&1 |
+            Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'app-process.log')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --lib runner::docker 2>&1 |
+            Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'app-docker-simulation.log')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --lib suite_error_quit_prioritizes_diagnostic_and_suite_recovery_over_cached_outcome 2>&1 |
+            Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'app-recovery-argv.log')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --lib worker_join_regressions 2>&1 |
+            Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'app-worker-join.log')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($IsWindows) {
+            cargo test --locked --lib native_cleanup_tests -- --nocapture 2>&1 |
+              Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'app-native-cleanup-ui.log')
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          cargo test --locked --test engine --test mcp_engine --test mcp_protocol --test mcp_contracts 2>&1 |
+            Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'app-engine-protocol.log')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Native macOS application storage integration
         if: ${{ runner.os == 'macOS' }}
         shell: pwsh
@@ -109,6 +163,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Build trusted native application fixture
+        run: |
+          theseus_fixture="$(python3 tests/support/build_host_fixture.py)"
+          printf 'THESEUS_HOST_TEST_FIXTURE=%s\n' "$theseus_fixture" >> "$GITHUB_ENV"
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
@@ -136,23 +194,27 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Set acceptance evidence paths
         env:
-          TARGET: ${{ matrix.target }}
+          THESEUS_ACCEPTANCE_TARGET: ${{ matrix.target }}
         run: |
-          evidence_dir="$RUNNER_TEMP/theseus-acceptance-evidence-$TARGET"
-          mkdir -p "$evidence_dir"
-          printf 'THESEUS_ACCEPTANCE_EVIDENCE=%s\n' "$evidence_dir" >> "$GITHUB_ENV"
-          printf 'THESEUS_MCP_TEST_EVIDENCE=%s/mcp-transport\n' "$evidence_dir" >> "$GITHUB_ENV"
+          theseus_evidence_dir="$RUNNER_TEMP/theseus-acceptance-evidence-$THESEUS_ACCEPTANCE_TARGET"
+          mkdir -p "$theseus_evidence_dir"
+          printf 'THESEUS_ACCEPTANCE_EVIDENCE=%s\n' "$theseus_evidence_dir" >> "$GITHUB_ENV"
+          printf 'THESEUS_MCP_TEST_EVIDENCE=%s/mcp-transport\n' "$theseus_evidence_dir" >> "$GITHUB_ENV"
       - name: Prepare Docker acceptance image
         run: |
           docker info
           docker pull ubuntu:24.04
-          image_id="$(docker image inspect --format '{{.Id}}' ubuntu:24.04)"
-          printf 'THESEUS_MCP_TEST_IMAGE=%s\n' "$image_id" >> "$GITHUB_ENV"
-          printf '%s\n' "$image_id" | tee "$THESEUS_ACCEPTANCE_EVIDENCE/docker-image-id.txt"
+          theseus_image_id="$(docker image inspect --format '{{.Id}}' ubuntu:24.04)"
+          printf 'THESEUS_MCP_TEST_IMAGE=%s\n' "$theseus_image_id" >> "$GITHUB_ENV"
+          printf '%s\n' "$theseus_image_id" | tee "$THESEUS_ACCEPTANCE_EVIDENCE/docker-image-id.txt"
+      - name: Build trusted native application fixture
+        run: |
+          theseus_fixture="$(python3 tests/support/build_host_fixture.py)"
+          printf 'THESEUS_HOST_TEST_FIXTURE=%s\n' "$theseus_fixture" >> "$GITHUB_ENV"
       - name: Real Docker acceptance (required)
         env:
-          TARGET: ${{ matrix.target }}
-        run: cargo test --locked --test "$TARGET" -- --ignored --test-threads=1
+          THESEUS_ACCEPTANCE_TARGET: ${{ matrix.target }}
+        run: cargo test --locked --test "$THESEUS_ACCEPTANCE_TARGET" -- --ignored --test-threads=1
       - name: Upload acceptance evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

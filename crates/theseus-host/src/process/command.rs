@@ -19,6 +19,35 @@ pub struct NativeCommand {
 }
 
 impl NativeCommand {
+    pub fn new(program: impl AsRef<std::ffi::OsStr>) -> Self {
+        Self {
+            program: program.as_ref().to_owned(),
+            args: Vec::new(),
+            cwd: None,
+            environment: ChildEnvironment::Inherit,
+        }
+    }
+    pub fn arg(&mut self, argument: impl AsRef<std::ffi::OsStr>) -> &mut Self {
+        self.args.push(argument.as_ref().to_owned());
+        self
+    }
+    pub fn args<I, S>(&mut self, arguments: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        self.args.extend(
+            arguments
+                .into_iter()
+                .map(|argument| argument.as_ref().to_owned()),
+        );
+        self
+    }
+    pub fn current_dir(&mut self, directory: impl AsRef<std::path::Path>) -> &mut Self {
+        self.cwd = Some(directory.as_ref().to_owned());
+        self
+    }
+
     pub(crate) fn validate(&self) -> io::Result<()> {
         let nul = |s: &std::ffi::OsStr| s.as_encoded_bytes().contains(&0);
         if self.program.is_empty()

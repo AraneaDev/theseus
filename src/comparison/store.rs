@@ -268,12 +268,16 @@ pub fn cleanup_with(path: &Path, environment: &mut impl Environment) -> Result<(
         sources.push((source_store, journal));
     }
     let mut errors = vec![];
+    let mut cleanup = crate::runner::process::CleanupFailures::default();
     for (store, mut journal) in sources {
         journal.cleanup_errors.clear();
         for resource in journal.resources.iter_mut().filter(|r| !r.removed) {
             match environment.remove(resource) {
                 Ok(()) => resource.removed = true,
-                Err(error) => journal.cleanup_errors.push(format!("{error:#}")),
+                Err(error) => {
+                    cleanup.retain(&error);
+                    journal.cleanup_errors.push(format!("{error:#}"));
+                }
             }
         }
         errors.extend(journal.cleanup_errors.clone());
@@ -284,6 +288,7 @@ pub fn cleanup_with(path: &Path, environment: &mut impl Environment) -> Result<(
             ));
         }
     }
+    cleanup.finish()?;
     ensure!(
         errors.is_empty(),
         "comparison cleanup failed: {}",

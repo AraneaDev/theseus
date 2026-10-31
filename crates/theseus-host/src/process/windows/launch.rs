@@ -113,14 +113,15 @@ pub(super) fn spawn(
         stdin,
         stdout,
         stderr,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         Fault::None,
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, PartialEq)]
-enum Fault {
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) enum Fault {
     None,
     BeforeCreate,
     InvalidJob,
@@ -139,9 +140,9 @@ fn fail(
     mut child: OwnedChild,
     launch: LaunchPhase,
     error: io::Error,
-    #[cfg(test)] pending: bool,
+    #[cfg(any(test, feature = "test-support"))] pending: bool,
 ) -> SpawnFailure {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if pending {
         return SpawnFailure {
             launch,
@@ -149,6 +150,8 @@ fn fail(
                 child: Some(Box::new(child)),
                 readers: Vec::new(),
                 writers: Vec::new(),
+                #[cfg(feature = "test-support")]
+                cleanup_faults: 0,
             }),
             error,
             cleanup_errors: vec![io::Error::other("injected cleanup failure")],
@@ -169,6 +172,8 @@ fn fail(
             child: Some(Box::new(child)),
             readers: Vec::new(),
             writers: Vec::new(),
+            #[cfg(feature = "test-support")]
+            cleanup_faults: 0,
         })
     };
     SpawnFailure {
@@ -179,12 +184,12 @@ fn fail(
     }
 }
 
-fn spawn_impl(
+pub(super) fn spawn_impl(
     command: &NativeCommand,
     stdin: Option<File>,
     stdout: Option<File>,
     stderr: Option<File>,
-    #[cfg(test)] fault: Fault,
+    #[cfg(any(test, feature = "test-support"))] fault: Fault,
 ) -> Result<OwnedChild, SpawnFailure> {
     command.validate().map_err(SpawnFailure::never)?;
     let application = encoding::application(command).map_err(SpawnFailure::never)?;
@@ -209,7 +214,7 @@ fn spawn_impl(
     ];
     let jobs = [job.raw()];
     // A real non-job kernel handle forces native JOB_LIST validation failure.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let jobs = if fault == Fault::InvalidJob {
         [input.as_raw_handle()]
     } else {
@@ -224,7 +229,7 @@ fn spawn_impl(
     startup.StartupInfo.hStdError = handles[2];
     startup.lpAttributeList = attributes.memory;
     let mut information = PROCESS_INFORMATION::default();
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if fault == Fault::BeforeCreate {
         return Err(SpawnFailure::never(io::Error::other(
             "injected before-create failure",
@@ -257,11 +262,12 @@ fn spawn_impl(
         thread,
         job,
         released: false,
+        status: None,
         job_termination_requested: false,
         process_termination_requested: false,
     };
     drop(attributes);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if matches!(fault, Fault::AfterCreate | Fault::CleanupPending) {
         return Err(fail(
             child,
@@ -279,11 +285,11 @@ fn spawn_impl(
             child,
             LaunchPhase::CreatedSuspended,
             error,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             false,
         ));
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if fault == Fault::BeforeResume {
         return Err(fail(
             child,
@@ -292,7 +298,7 @@ fn spawn_impl(
             false,
         ));
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     match fault {
         Fault::SuspendAgain => {
             assert_eq!(unsafe { SuspendThread(child.thread.as_raw_handle()) }, 1);
@@ -329,7 +335,7 @@ fn spawn_impl(
         _ => {}
     }
     let resume_handle = child.thread.as_raw_handle();
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let resume_handle = if fault == Fault::ResumeFailure {
         child.process.as_raw_handle()
     } else {
@@ -350,11 +356,11 @@ fn spawn_impl(
             child,
             phase,
             error,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             false,
         ));
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if matches!(fault, Fault::ResumeUncertain | Fault::AfterResume) {
         return Err(fail(
             child,

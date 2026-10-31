@@ -161,118 +161,163 @@ pub(crate) fn run_with_parent(
     // Suite Started observers may cancel after failing to persist recovery refs.
     // Do not call prepare (which can pull images) after that boundary fails.
     // Standalone runs retain their existing pre-cancelled scenario evidence.
-    let prepared = (|| {
-        ensure!(
-            parent.is_none() || !cancel.is_cancelled(),
-            "cancelled before environment preparation"
-        );
-        preflight_env(recipe, &options)
-    })()
-    .and_then(|()| environment.prepare(recipe, options.pull, &cancel));
-    match prepared {
-        Err(error) => {
-            report.errors.push(format!("preflight: {error:#}"));
-        }
-        Ok(prepared) => {
-            report.image_id = Some(prepared.image_id);
-            report.artifacts = prepared.artifacts;
-            for profile in &options.profiles {
-                for scenario in &options.scenarios {
-                    let index = report.scenarios.len();
-                    let sid = format!("{profile}-{scenario}");
-                    report
-                        .scenarios
-                        .push(ScenarioReport::new(&sid, *profile, *scenario));
-                    report.scenarios[index].mcp = recipe.recipe.profiles[profile].mcp.clone();
-                    if *scenario == ScenarioKind::PluginLifecycle {
-                        report.scenarios[index].plugin =
-                            recipe.recipe.profiles[profile].plugin.clone();
-                    }
-                    if *scenario == ScenarioKind::Downgrade {
-                        report.scenarios[index].downgrade =
-                            recipe.recipe.profiles[profile].downgrade.clone();
-                    }
-                    if *scenario == ScenarioKind::InterruptedRollback {
-                        report.scenarios[index].interrupted_rollback =
-                            recipe.recipe.profiles[profile].interrupted_rollback.clone();
-                    }
-                    if *scenario == ScenarioKind::Rollback {
-                        report.scenarios[index].rollback =
-                            recipe.recipe.profiles[profile].rollback.clone();
-                    }
-                    let result = stages::scenario(stages::ScenarioContext {
-                        recipe,
-                        options: &options,
-                        cancel: &cancel,
-                        environment,
-                        store: &store,
-                        report: &mut report,
-                        index,
-                        journal: &mut journal,
-                        emit: &mut emit,
-                    });
-                    let interrupted = result.is_err() || cancel.is_cancelled();
-                    if let Err(error) = result {
-                        report.scenarios[index]
-                            .errors
-                            .push(format!("scenario: {error:#}"));
-                    }
-                    if interrupted {
-                        mark_remaining_checks(
-                            recipe,
-                            &mut report.scenarios[index],
-                            cancel.is_cancelled(),
-                        );
-                    }
-                    if let Some(resource) = journal.resources.iter_mut().find(|r| {
-                        Some(&r.container_id) == report.scenarios[index].container_id.as_ref()
-                    }) {
-                        match environment.remove(resource) {
-                            Ok(()) => {
-                                resource.removed = true;
-                                report.scenarios[index].teardown = TeardownStatus::Complete;
-                            }
-                            Err(error) => {
-                                let reason = format!("{error:#}");
-                                journal.cleanup_errors.push(reason.clone());
-                                report.scenarios[index].teardown =
-                                    TeardownStatus::Failed { reason };
-                            }
-                        }
-                    } else if report.scenarios[index].container_id.is_none() {
-                        report.scenarios[index].teardown = TeardownStatus::Complete;
-                    }
-                    if let Err(error) = store.save_journal(&journal) {
+    let mut cleanup = crate::runner::process::CleanupFailures::default();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let prepared = (|| {
+            ensure!(
+                parent.is_none() || !cancel.is_cancelled(),
+                "cancelled before environment preparation"
+            );
+            preflight_env(recipe, &options)
+        })()
+        .and_then(|()| environment.prepare(recipe, options.pull, &cancel));
+        match prepared {
+            Err(error) => {
+                cleanup.retain(&error);
+                report.errors.push(format!("preflight: {error:#}"));
+            }
+            Ok(prepared) => {
+                report.image_id = Some(prepared.image_id);
+                report.artifacts = prepared.artifacts;
+                'profiles: for profile in &options.profiles {
+                    for scenario in &options.scenarios {
+                        let index = report.scenarios.len();
+                        let sid = format!("{profile}-{scenario}");
                         report
-                            .errors
-                            .push(format!("save cleanup journal: {error:#}"));
+                            .scenarios
+                            .push(ScenarioReport::new(&sid, *profile, *scenario));
+                        report.scenarios[index].mcp = recipe.recipe.profiles[profile].mcp.clone();
+                        if *scenario == ScenarioKind::PluginLifecycle {
+                            report.scenarios[index].plugin =
+                                recipe.recipe.profiles[profile].plugin.clone();
+                        }
+                        if *scenario == ScenarioKind::Downgrade {
+                            report.scenarios[index].downgrade =
+                                recipe.recipe.profiles[profile].downgrade.clone();
+                        }
+                        if *scenario == ScenarioKind::InterruptedRollback {
+                            report.scenarios[index].interrupted_rollback =
+                                recipe.recipe.profiles[profile].interrupted_rollback.clone();
+                        }
+                        if *scenario == ScenarioKind::Rollback {
+                            report.scenarios[index].rollback =
+                                recipe.recipe.profiles[profile].rollback.clone();
+                        }
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            stages::scenario(stages::ScenarioContext {
+                                recipe,
+                                options: &options,
+                                cancel: &cancel,
+                                environment,
+                                store: &store,
+                                report: &mut report,
+                                index,
+                                journal: &mut journal,
+                                emit: &mut emit,
+                                cleanup: &mut cleanup,
+                            })
+                        }));
+                        let mut panic = None;
+                        let result = match result {
+                            Ok(result) => result,
+                            Err(original) => {
+                                cleanup.retain_panic(original.as_ref());
+                                panic = Some(original);
+                                Err(anyhow::anyhow!(
+                                    "scenario panicked; owned guest cleanup required"
+                                ))
+                            }
+                        };
+                        let interrupted = result.is_err() || cancel.is_cancelled();
+                        if let Err(error) = result {
+                            cleanup.retain(&error);
+                            report.scenarios[index]
+                                .errors
+                                .push(format!("scenario: {error:#}"));
+                        }
+                        if interrupted {
+                            mark_remaining_checks(
+                                recipe,
+                                &mut report.scenarios[index],
+                                cancel.is_cancelled(),
+                            );
+                        }
+                        if let Some(resource) = journal.resources.iter_mut().find(|r| {
+                            Some(&r.container_id) == report.scenarios[index].container_id.as_ref()
+                        }) {
+                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                environment.remove(resource)
+                            })) {
+                                Ok(Ok(())) => {
+                                    resource.removed = true;
+                                    report.scenarios[index].teardown = TeardownStatus::Complete;
+                                }
+                                Ok(Err(error)) => {
+                                    cleanup.retain(&error);
+                                    let reason = format!("{error:#}");
+                                    journal.cleanup_errors.push(reason.clone());
+                                    report.scenarios[index].teardown =
+                                        TeardownStatus::Failed { reason };
+                                }
+                                Err(original) => {
+                                    cleanup.retain_panic(original.as_ref());
+                                    if panic.is_none() {
+                                        panic = Some(original);
+                                    }
+                                    let reason = "owned guest teardown panicked".to_string();
+                                    journal.cleanup_errors.push(reason.clone());
+                                    report.scenarios[index].teardown =
+                                        TeardownStatus::Failed { reason };
+                                }
+                            }
+                        } else if report.scenarios[index].container_id.is_none() {
+                            report.scenarios[index].teardown = TeardownStatus::Complete;
+                        }
+                        if let Err(error) = store.save_journal(&journal) {
+                            report
+                                .errors
+                                .push(format!("save cleanup journal: {error:#}"));
+                        }
+                        if let Some(original) = panic {
+                            std::panic::resume_unwind(original);
+                        }
+                        save_event(
+                            &store,
+                            &mut report,
+                            &mut emit,
+                            EventKind::ScenarioFinished,
+                            Some(sid),
+                            None,
+                        )?;
+                        if cleanup.pending() {
+                            break 'profiles;
+                        }
                     }
-                    save_event(
-                        &store,
-                        &mut report,
-                        &mut emit,
-                        EventKind::ScenarioFinished,
-                        Some(sid),
-                        None,
-                    )?;
                 }
             }
         }
+        report.cancelled |= cancel.is_cancelled();
+        report.finished_at = Some(now());
+        save_event(
+            &store,
+            &mut report,
+            &mut emit,
+            EventKind::Finished,
+            None,
+            None,
+        )?;
+        Ok(RunResult {
+            report,
+            report_path: store.report_path(),
+        })
+    }));
+    match result {
+        Ok(result) => {
+            cleanup.finish()?;
+            result
+        }
+        Err(original) => cleanup.resume_unwind(original),
     }
-    report.cancelled |= cancel.is_cancelled();
-    report.finished_at = Some(now());
-    save_event(
-        &store,
-        &mut report,
-        &mut emit,
-        EventKind::Finished,
-        None,
-        None,
-    )?;
-    Ok(RunResult {
-        report,
-        report_path: store.report_path(),
-    })
 }
 fn preflight_env(recipe: &ValidatedRecipe, options: &RunOptions) -> Result<()> {
     for name in &options.profiles {

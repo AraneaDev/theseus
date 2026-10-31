@@ -120,6 +120,10 @@ dd if="$1/ready/receipt" iflag=nofollow,nonblock bs=1 count=34 2>/dev/null
         );
         let (mut record, mut launch) =
             self.prepare_interrupted_execution(resource, &request, store, cancel)?;
+        let mut native_cleanup = process::CleanupFailures::default();
+        if let Err(error) = &launch.prepared {
+            native_cleanup.retain(error);
+        }
         let mut proof = InterruptionEvidence {
             mechanism: InterruptionMechanism::ContainerSigkill,
             readiness_verified: false,
@@ -135,6 +139,7 @@ dd if="$1/ready/receipt" iflag=nofollow,nonblock bs=1 count=34 2>/dev/null
         let mut output = None;
         match prepared {
             Err(error) => {
+                native_cleanup.retain(&error);
                 record.error = Some(format!("interruption preparation unverified: {error:#}"))
             }
             Ok(helper) => {
@@ -188,6 +193,7 @@ dd if="$1/ready/receipt" iflag=nofollow,nonblock bs=1 count=34 2>/dev/null
                 );
                 match result {
                     Err(error) => {
+                        native_cleanup.retain(&error);
                         record.error = Some(format!("interruption execution unverified: {error:#}"))
                     }
                     Ok(result) => {
@@ -208,6 +214,7 @@ dd if="$1/ready/receipt" iflag=nofollow,nonblock bs=1 count=34 2>/dev/null
                             ) {
                                 Ok(status) => record.exit_status = Some(status),
                                 Err(error) => {
+                                    native_cleanup.retain(&error);
                                     record.error = Some(format!(
                                         "application completion unverified: {error:#}"
                                     ))
@@ -230,6 +237,7 @@ dd if="$1/ready/receipt" iflag=nofollow,nonblock bs=1 count=34 2>/dev/null
             || (!deliberate && record.exit_status.is_none()))
             && let Err(error) = self.stop(resource)
         {
+            native_cleanup.retain(&error);
             let reason = format!("owned interruption cleanup failed: {error:#}");
             record.error = Some(
                 record
@@ -267,6 +275,7 @@ dd if="$1/ready/receipt" iflag=nofollow,nonblock bs=1 count=34 2>/dev/null
             && !record.timed_out
             && !record.cancelled
             && output.as_ref().is_some_and(|out| !out.stdout.truncated);
+        native_cleanup.finish()?;
         Ok(ExecutedCommand {
             record,
             stdout_utf8: output
@@ -309,9 +318,13 @@ dd if="$1/ready/receipt" iflag=nofollow,nonblock bs=1 count=34 2>/dev/null
             Ok(proof) => Ok(proof),
             Err(error) => match self.stop(resource) {
                 Ok(()) => Err(error),
-                Err(cleanup) => Err(anyhow::anyhow!(
-                    "{error:#}; owned restart cleanup failed: {cleanup:#}"
-                )),
+                Err(cleanup) => {
+                    let mut retained = process::CleanupFailures::default();
+                    retained.retain(&error);
+                    retained.retain(&cleanup);
+                    retained.finish()?;
+                    Err(error.context(format!("owned restart cleanup failed: {cleanup:#}")))
+                }
             },
         }
     }
@@ -320,28 +333,11 @@ dd if="$1/ready/receipt" iflag=nofollow,nonblock bs=1 count=34 2>/dev/null
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn interruption_initial_control_has_one_second_cap_with_longer_command_budget() {
         let temporary = tempfile::tempdir().unwrap();
-        let executable = temporary.path().join("docker");
-        std::fs::write(
-            &executable,
-            r#"#!/usr/bin/python3
-import sys,time,json
-args=sys.argv[1:]
-if args[0]=='container':
-    print(json.dumps({'Id':args[-1], 'Config':{'Labels':{'io.theseus.owner':'v1','io.theseus.run':'run','io.theseus.scenario':'boundary'}},'State':{'Running':True}}))
-    sys.exit(0)
-if args[0]=='rm': sys.exit(0)
-if args[args.index('-c')+1].startswith('umask'):
-    time.sleep(3)
-sys.exit(0)
-"#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = process::test_support::docker(temporary.path(), "interruption");
         let store = crate::report::create(&temporary.path().join("run")).unwrap();
         let resource = OwnedResource {
             container_id: "a".repeat(64),

@@ -17,6 +17,7 @@ pub(super) struct ScenarioContext<'a, E, F> {
     pub index: usize,
     pub journal: &'a mut RunJournal,
     pub emit: &'a mut F,
+    pub cleanup: &'a mut crate::runner::process::CleanupFailures,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Availability {
@@ -205,6 +206,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                 self.cancel,
             )
             .unwrap_or_else(|error| {
+                self.cleanup.retain(&error);
                 self.recipe
                     .recipe
                     .observe
@@ -215,6 +217,9 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
     }
     pub(super) fn capture(&mut self, state: &mut State, stage: &mut StageReport) -> bool {
         stage.snapshots = self.observation(state);
+        if self.cleanup.pending() {
+            state.availability = Availability::Unavailable;
+        }
         let complete = !stage.snapshots.is_empty()
             && stage.snapshots.iter().all(|snapshot| {
                 !matches!(
@@ -294,6 +299,10 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
             ) {
                 Ok(executed) => executed,
                 Err(error) => {
+                    self.cleanup.retain(&error);
+                    if self.cleanup.pending() {
+                        state.availability = Availability::Unavailable;
+                    }
                     let mut record = CommandRecord::new(request.id, request.phase);
                     record.identity = request.identity;
                     record.argv = request.argv;
@@ -315,6 +324,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                 self.report.cancelled = true;
             }
             if let Err(error) = self.environment.stop(&state.resource) {
+                self.cleanup.retain(&error);
                 let text = format!("stop descendants: {error:#}");
                 stage.errors.push(text.clone());
                 executed.record.error = Some(text);
@@ -677,6 +687,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                 ) {
                     Ok(observed) => observed,
                     Err(error) => {
+                        self.cleanup.retain(&error);
                         state.availability = Availability::Unavailable;
                         let mut record = CommandRecord::new(request.id, request.phase);
                         record.identity = request.identity;
@@ -691,6 +702,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                             CommandOutcome::Error
                         };
                         if let Err(error) = self.environment.stop(&state.resource) {
+                            self.cleanup.retain(&error);
                             stage
                                 .errors
                                 .push(format!("stop after MCP infrastructure error: {error:#}"));

@@ -87,6 +87,7 @@ pub fn run_with(
         variant_id: None,
         source: None,
     });
+    let mut cleanup = crate::runner::process::CleanupFailures::default();
     let mut failure = None;
     for variant in &suite.variants {
         if cancel.is_cancelled() || failure.is_some() {
@@ -152,6 +153,9 @@ pub fn run_with(
                 }
             },
         );
+        if let Err(error) = &result {
+            cleanup.retain(error);
+        }
         let mut stop = failure.is_some() || cancel.is_cancelled();
         if let Some(path) = &source_path {
             let source = artifact.sources.last_mut().expect("Started reference");
@@ -220,6 +224,7 @@ pub fn run_with(
     if let Err(error) = store::save(&store, &artifact) {
         failure.get_or_insert(error);
     }
+    cleanup.finish()?;
     if let Some(error) = failure {
         return Err(error).with_context(|| {
             format!(

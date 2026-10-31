@@ -11,6 +11,7 @@ pub struct OwnedChild {
     // None after any consuming wait or ECHILD: numeric identity is no longer reserved.
     group: Option<Pid>,
     termination_requested: bool,
+    status: Option<ExitStatus>,
 }
 impl OwnedChild {
     /// Shared null/file launch primitive for owned endpoints and mechanism tests.
@@ -42,6 +43,7 @@ impl OwnedChild {
             child,
             group,
             termination_requested: false,
+            status: None,
         })
     }
 
@@ -88,11 +90,29 @@ impl OwnedChild {
         Ok(())
     }
 
-    pub fn reap_and_release(mut self) -> io::Result<ExitStatus> {
+    /// Observe and release using the retained child. None and Err keep this owner.
+    /// A confirmed status is cached so repeated completion observation is safe.
+    pub fn try_reap_and_release(&mut self) -> io::Result<Option<ExitStatus>> {
+        if let Some(status) = self.status {
+            return Ok(Some(status));
+        }
         self.terminate_owned()?;
-        // Never allow Drop to signal a number after a consuming wait, even on error.
+        if !self.exited_reserved()? {
+            return Ok(None);
+        }
+        // Signalling is finished. Disarm before the consuming wait, even on error.
         self.group = None;
-        self.child.wait()
+        let status = self.child.wait()?;
+        self.status = Some(status);
+        Ok(Some(status))
+    }
+    pub fn reap_and_release(mut self) -> io::Result<ExitStatus> {
+        loop {
+            if let Some(status) = self.try_reap_and_release()? {
+                return Ok(status);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     pub(crate) fn cleanup(&mut self) -> io::Result<bool> {
@@ -222,10 +242,20 @@ mod tests {
             child,
             group: Some(pid),
             termination_requested: false,
+            status: None,
         };
         rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::empty()).unwrap();
         assert!(owned.exited_reserved().is_err());
         assert!(owned.group.is_none());
+        assert!(owned.try_reap_and_release().is_err());
+        assert!(
+            owned.status.is_none(),
+            "external reap cannot fabricate a confirmed status"
+        );
+        assert!(
+            owned.group.is_none(),
+            "borrowed retry must never rearm numeric identity"
+        );
         owned.terminate_owned().unwrap();
         assert!(owned.cleanup().unwrap());
     }

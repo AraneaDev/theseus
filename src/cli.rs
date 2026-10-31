@@ -247,18 +247,10 @@ pub fn execute(cli: Cli) -> Result<i32> {
                 );
             }
             let cancel = CancellationToken::default();
-            let sigint = signal_hook::flag::register(signal_hook::consts::SIGINT, cancel.flag())?;
-            let sigterm =
-                match signal_hook::flag::register(signal_hook::consts::SIGTERM, cancel.flag()) {
-                    Ok(id) => id,
-                    Err(error) => {
-                        signal_hook::low_level::unregister(sigint);
-                        return Err(error.into());
-                    }
-                };
+            let registration =
+                theseus_host::cancel::CancellationRegistration::install(cancel.flag())?;
             let result = engine::run(&recipe, options, cancel, |_| {});
-            signal_hook::low_level::unregister(sigint);
-            signal_hook::low_level::unregister(sigterm);
+            drop(registration);
             let result = result?;
             let counts = result.report.counts();
             println!("Report: {}", result.report_path.display());
