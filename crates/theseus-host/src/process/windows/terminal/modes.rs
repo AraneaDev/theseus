@@ -86,7 +86,7 @@ pub(super) fn legacy(arguments: &[std::ffi::OsString]) -> Result<i32, Box<dyn st
         return Err(invalid("legacy control requires adverse baseline").into());
     }
     let baseline = Baseline::apply(profile)?;
-    let mut output = OpenOptions::new().read(true).write(true).open("CONOUT$")?;
+    let mut output = io::BufWriter::new(OpenOptions::new().read(true).write(true).open("CONOUT$")?);
     // Actual locked crossterm calls, not a model or an old Theseus executable.
     enable_raw_mode()?;
     execute!(output, EnterAlternateScreen, EnableBracketedPaste)?;

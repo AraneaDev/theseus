@@ -33,7 +33,7 @@ rewrite, polling sleep, key resend, thread, library version or feature change.
 
 Required first-party native controls are in
 `crates/theseus-host/src/process/unix/terminal/events.rs`: concurrent resize plus
-a single key, 2051 queued keys across reads, an escape split at byte 1024, and
+a single key, 2051 queued keys across reads, an incomplete CSI consumed before its final byte, and
 new input after draining (including zero-timeout polling). They run the actual
 library in an owned PTY. The unmodified archive source demonstrated missing
 input/resize; the patched source passed the controls locally on Linux. This

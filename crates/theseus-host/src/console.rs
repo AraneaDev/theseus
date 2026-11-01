@@ -2,7 +2,9 @@
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::windows::io::AsRawHandle;
-use windows_sys::Win32::System::Console::{GetConsoleMode, SetConsoleMode};
+use windows_sys::Win32::System::Console::{
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, SetConsoleMode,
+};
 
 pub struct ConsoleModeSnapshot {
     input: File,
@@ -43,6 +45,19 @@ impl ConsoleModeSnapshot {
             input_mode,
             output_mode,
         })
+    }
+    /// Prepare only unfinished escape cleanup on this retained output handle.
+    /// The caller must restore the exact snapshot last, including on failure.
+    pub fn prepare_escape_cleanup(&self) -> io::Result<()> {
+        let current = mode(&self.output, "prepare console escape cleanup")?;
+        if current & ENABLE_VIRTUAL_TERMINAL_PROCESSING == 0 {
+            set(
+                &self.output,
+                current | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+                "enable VT for unfinished console cleanup",
+            )?;
+        }
+        Ok(())
     }
     /// Call after leaving the alternate screen and all other terminal writes.
     /// Both buffers are attempted even when the first restoration fails.

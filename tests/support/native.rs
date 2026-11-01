@@ -6,11 +6,37 @@ pub fn docker(directory: &Path, mode: &str) -> PathBuf {
         "theseus-docker-{mode}{}",
         std::env::consts::EXE_SUFFIX
     ));
-    std::fs::copy(
+    let source = PathBuf::from(
         std::env::var_os("THESEUS_HOST_TEST_FIXTURE").expect("build required native fixture"),
-        &executable,
-    )
-    .unwrap();
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // These aliases only execute or rename/unlink their own directory entry.
+        // Never write/chmod the shared pinned inode. Unlike copying, publication
+        // opens no executable writer for a concurrent Unix fork to inherit.
+        let pinned = std::fs::symlink_metadata(&source).unwrap();
+        assert!(
+            pinned.is_file(),
+            "pinned native fixture must be a regular file"
+        );
+        match std::fs::hard_link(&source, &executable) {
+            Ok(()) => (),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
+            Err(error) => panic!(
+                "immutable native aliases require the pinned fixture and test TempDir on the same filesystem (use the same TMPDIR): {error}"
+            ),
+        }
+        let alias = std::fs::symlink_metadata(&executable).unwrap();
+        assert!(
+            alias.is_file() && (alias.dev(), alias.ino()) == (pinned.dev(), pinned.ino()),
+            "native alias must be a regular non-symlink to the pinned fixture inode"
+        );
+    }
+    // Windows has explicit launch handle lists and different loaded-image rename
+    // semantics. Preserve its independent copied executable behavior.
+    #[cfg(windows)]
+    std::fs::copy(&source, &executable).unwrap();
     executable
 }
 #[cfg(unix)]

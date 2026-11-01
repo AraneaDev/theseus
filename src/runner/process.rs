@@ -921,8 +921,12 @@ pub(super) fn utility(command: &mut Command, cancel: &CancellationToken) -> Resu
     Ok(String::from_utf8(output.stdout.bytes)?)
 }
 #[cfg(test)]
+#[path = "../../tests/support/native.rs"]
+mod test_native;
+#[cfg(test)]
 pub(crate) mod test_support {
     use super::Command;
+    pub(crate) use super::test_native::docker;
     pub(crate) fn fixture(mode: &str, args: &[&str]) -> Command {
         let mut command =
             Command::new(std::env::var_os("THESEUS_HOST_TEST_FIXTURE").expect(
@@ -944,16 +948,60 @@ pub(crate) mod test_support {
             std::fs::File::open(temporary.path()).unwrap()
         }
     }
-    pub(crate) fn docker(directory: &std::path::Path, mode: &str) -> std::path::PathBuf {
-        let name = format!("theseus-docker-{mode}{}", std::env::consts::EXE_SUFFIX);
-        let path = directory.join(name);
-        std::fs::copy(
-            std::env::var_os("THESEUS_HOST_TEST_FIXTURE")
-                .expect("build trusted fixture and set THESEUS_HOST_TEST_FIXTURE"),
-            &path,
-        )
-        .unwrap();
-        path
+    #[cfg(unix)]
+    #[test]
+    fn immutable_docker_alias_preserves_pin_and_native_dispatch() {
+        use std::os::unix::fs::MetadataExt;
+        let source =
+            std::path::PathBuf::from(std::env::var_os("THESEUS_HOST_TEST_FIXTURE").unwrap());
+        let before = std::fs::symlink_metadata(&source).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let alias = docker(root.path(), "metadata");
+        let linked = std::fs::symlink_metadata(&alias).unwrap();
+        assert!(linked.is_file());
+        assert_eq!((linked.dev(), linked.ino()), (before.dev(), before.ino()));
+        assert_eq!(docker(root.path(), "metadata"), alias);
+        let output = std::process::Command::new(&alias)
+            .args(["version", "--format", "{{.Server.Version}}"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"29.9.2\n");
+        assert!(output.stderr.is_empty());
+        std::fs::remove_file(alias).unwrap();
+        let output = std::process::Command::new(&source)
+            .args(["echo-bytes", "41"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"A");
+        let after = std::fs::symlink_metadata(source).unwrap();
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!((after.mode(), after.len()), (before.mode(), before.len()));
+        println!(
+            "ACTUAL immutable fixture alias: same dev/inode, idempotent publication, native alias dispatch, source executes after unlink, mode/length unchanged"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn immutable_docker_alias_rejects_unrelated_file_and_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let alias = root.path().join("theseus-docker-metadata");
+        std::fs::write(&alias, b"unrelated").unwrap();
+        assert!(std::panic::catch_unwind(|| docker(root.path(), "metadata")).is_err());
+        assert_eq!(std::fs::read(&alias).unwrap(), b"unrelated");
+        std::fs::remove_file(&alias).unwrap();
+        let outside = root.path().join("outside");
+        std::fs::write(&outside, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&outside, &alias).unwrap();
+        assert!(std::panic::catch_unwind(|| docker(root.path(), "metadata")).is_err());
+        assert!(
+            std::fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(outside).unwrap(), b"untouched");
     }
 }
 

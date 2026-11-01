@@ -25,67 +25,107 @@ enum RestoreStep {
     Alternate,
     Cursor,
 }
-fn restore_steps(mut attempt: impl FnMut(RestoreStep) -> io::Result<()>) -> Result<()> {
+fn restore_steps(
+    completed: &mut [bool; 4],
+    mut prepare: impl FnMut() -> Result<()>,
+    mut attempt: impl FnMut(RestoreStep) -> io::Result<()>,
+) -> Result<()> {
     let mut errors = Vec::new();
-    for step in [
+    let mut prepared = false;
+    for (index, step) in [
         RestoreStep::Raw,
         RestoreStep::Paste,
         RestoreStep::Alternate,
         RestoreStep::Cursor,
-    ] {
-        if let Err(error) = attempt(step) {
-            errors.push(format!("{step:?}: {error}"));
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if completed[index] {
+            continue;
+        }
+        if index > 0 && !prepared {
+            if let Err(error) = prepare() {
+                errors.push(format!("prepare escape cleanup: {error:#}"));
+                // No escape is safe to mark complete when its prerequisite fails.
+                // Raw was attempted, and exact restoration still runs last.
+                break;
+            }
+            prepared = true;
+        }
+        match attempt(step) {
+            Ok(()) => completed[index] = true,
+            Err(error) => errors.push(format!("{step:?}: {error}")),
         }
     }
     ensure!(errors.is_empty(), "terminal cleanup: {}", errors.join("; "));
     Ok(())
 }
-fn restore_screen() -> Result<()> {
-    restore_steps(|step| match step {
+fn restore_step(step: RestoreStep) -> io::Result<()> {
+    match step {
         RestoreStep::Raw => disable_raw_mode(),
         RestoreStep::Paste => execute!(io::stdout(), DisableBracketedPaste),
         RestoreStep::Alternate => execute!(io::stdout(), LeaveAlternateScreen),
         RestoreStep::Cursor => execute!(io::stdout(), Show),
-    })
+    }
 }
 
-// No global strong owner. Screen escapes run once: after restoring an originally
-// clear Windows VT bit, replaying those escapes could print them as literal text.
-// Exact native modes can safely be retried after Drop or a hook interruption.
+// Only successful steps are complete. Errors and unwinds leave work retryable;
+// successful escapes must not replay after restoring an originally clear VT bit.
 struct Restoration {
-    screen: Box<dyn Fn() -> Result<()> + Send + Sync>,
+    step: Box<dyn Fn(RestoreStep) -> io::Result<()> + Send + Sync>,
+    prepare: Box<dyn Fn() -> Result<()> + Send + Sync>,
     exact: Box<dyn Fn() -> Result<()> + Send + Sync>,
-    screen_result: Mutex<Option<Option<String>>>,
+    completed: Mutex<[bool; 4]>,
+}
+struct ExactOnExit<'a> {
+    callback: &'a (dyn Fn() -> Result<()> + Send + Sync),
+    active: bool,
+}
+impl ExactOnExit<'_> {
+    fn finish(mut self) -> Result<()> {
+        self.active = false;
+        (self.callback)()
+    }
+}
+impl Drop for ExactOnExit<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = (self.callback)();
+        }
+    }
 }
 impl Restoration {
     fn run(&self, wait: bool) -> Result<()> {
         let mut state = if wait {
             Some(
-                self.screen_result
+                self.completed
                     .lock()
                     .unwrap_or_else(|error| error.into_inner()),
             )
         } else {
-            match self.screen_result.try_lock() {
+            match self.completed.try_lock() {
                 Ok(state) => Some(state),
                 Err(TryLockError::Poisoned(error)) => Some(error.into_inner()),
-                // The hook may run on the thread already performing cleanup.
-                // Never reacquire its lock; exact mode restoration is independent.
+                // A panic hook may run inside a step on this same thread. It may
+                // restore exact modes but must not reacquire the progress lock.
                 Err(TryLockError::WouldBlock) => None,
             }
         };
-        let screen_error = state.as_mut().and_then(|state| {
-            if state.is_none() {
-                **state = Some(Some("terminal cleanup interrupted by panic".into()));
-                **state = Some((self.screen)().err().map(|error| format!("{error:#}")));
-            }
-            state.as_ref().and_then(Clone::clone)
-        });
-        let exact = (self.exact)();
-        match (screen_error, exact) {
-            (Some(screen), Err(error)) => Err(error.context(screen)),
-            (Some(screen), Ok(())) => Err(anyhow::anyhow!(screen)),
-            (None, result) => result,
+        let exact = ExactOnExit {
+            callback: &*self.exact,
+            active: true,
+        };
+        let screen = match state.as_mut() {
+            Some(state) => restore_steps(state, &self.prepare, &self.step),
+            None => Ok(()),
+        };
+        // Also runs on a preparation/step unwind via ExactOnExit::drop. No panic
+        // sentinel can permanently skip the unfinished step on a later attempt.
+        match (screen, exact.finish()) {
+            (Err(screen), Err(error)) => Err(error.context(format!("{screen:#}"))),
+            (Err(screen), Ok(())) => Err(screen),
+            (Ok(()), result) => result,
         }
     }
 }
@@ -107,16 +147,23 @@ impl Guard {
     pub fn enter() -> Result<(Self, Terminal)> {
         require_tty()?;
         #[cfg(windows)]
-        let snapshot = theseus_host::console::ConsoleModeSnapshot::capture()?;
+        let snapshot = Arc::new(theseus_host::console::ConsoleModeSnapshot::capture()?);
+        #[cfg(windows)]
+        let preparation = snapshot.clone();
         let guard = Self {
             state: Arc::new(Restoration {
-                screen: Box::new(restore_screen),
+                step: Box::new(restore_step),
+                prepare: Box::new(move || {
+                    #[cfg(windows)]
+                    preparation.prepare_escape_cleanup()?;
+                    Ok(())
+                }),
                 exact: Box::new(move || {
                     #[cfg(windows)]
                     snapshot.restore()?;
                     Ok(())
                 }),
-                screen_result: Mutex::new(None),
+                completed: Mutex::new([false; 4]),
             }),
         };
         let weak = Arc::downgrade(&guard.state);
@@ -153,29 +200,265 @@ mod tests {
     fn controlled(screen: Arc<AtomicUsize>, exact: Arc<AtomicUsize>) -> Guard {
         Guard {
             state: Arc::new(Restoration {
-                screen: Box::new(move || {
-                    screen.fetch_add(1, Ordering::SeqCst);
+                step: Box::new(move |step| {
+                    if step == RestoreStep::Raw {
+                        screen.fetch_add(1, Ordering::SeqCst);
+                    }
                     Ok(())
                 }),
+                prepare: Box::new(|| Ok(())),
                 exact: Box::new(move || {
                     exact.fetch_add(1, Ordering::SeqCst);
                     Ok(())
                 }),
-                screen_result: Mutex::new(None),
+                completed: Mutex::new([false; 4]),
+            }),
+        }
+    }
+    fn controlled_steps(
+        attempt: impl Fn(RestoreStep) -> io::Result<()> + Send + Sync + 'static,
+        exact: impl Fn() -> Result<()> + Send + Sync + 'static,
+    ) -> Guard {
+        Guard {
+            state: Arc::new(Restoration {
+                step: Box::new(attempt),
+                prepare: Box::new(|| Ok(())),
+                exact: Box::new(exact),
+                completed: Mutex::new([false; 4]),
             }),
         }
     }
     #[test]
+    fn failed_raw_step_retries_without_replaying_successful_escapes() {
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let raw = Arc::new(AtomicUsize::new(0));
+        let guard = controlled_steps(
+            {
+                let attempts = attempts.clone();
+                let raw = raw.clone();
+                move |step| {
+                    attempts.lock().unwrap().push(step);
+                    if step == RestoreStep::Raw && raw.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return Err(io::Error::other("recoverable raw failure"));
+                    }
+                    Ok(())
+                }
+            },
+            || Ok(()),
+        );
+        assert!(
+            guard
+                .state
+                .run(true)
+                .unwrap_err()
+                .to_string()
+                .contains("recoverable raw failure")
+        );
+        guard.state.run(true).unwrap();
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            [
+                RestoreStep::Raw,
+                RestoreStep::Paste,
+                RestoreStep::Alternate,
+                RestoreStep::Cursor,
+                RestoreStep::Raw
+            ]
+        );
+    }
+    #[test]
+    fn interrupted_step_restores_exact_then_retries_unfinished_work() {
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let interrupted = Arc::new(AtomicUsize::new(0));
+        let exact = Arc::new(AtomicUsize::new(0));
+        let guard = controlled_steps(
+            {
+                let attempts = attempts.clone();
+                move |step| {
+                    attempts.lock().unwrap().push(step);
+                    if step == RestoreStep::Paste && interrupted.fetch_add(1, Ordering::SeqCst) == 0
+                    {
+                        panic!("interrupted paste cleanup");
+                    }
+                    Ok(())
+                }
+            },
+            {
+                let exact = exact.clone();
+                move || {
+                    exact.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        );
+        let interrupted =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| guard.state.run(true)));
+        assert!(interrupted.is_err());
+        assert!(
+            exact.load(Ordering::SeqCst) > 0,
+            "panic skipped exact restoration"
+        );
+        guard.state.run(true).unwrap();
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            [
+                RestoreStep::Raw,
+                RestoreStep::Paste,
+                RestoreStep::Paste,
+                RestoreStep::Alternate,
+                RestoreStep::Cursor
+            ]
+        );
+    }
+    #[test]
+    fn failed_escape_retry_prepares_vt_and_restores_exact_last() {
+        use std::sync::atomic::AtomicBool;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let vt = Arc::new(AtomicBool::new(false));
+        let paste = Arc::new(AtomicUsize::new(0));
+        let state = Restoration {
+            step: Box::new({
+                let events = events.clone();
+                let vt = vt.clone();
+                move |step| {
+                    if step != RestoreStep::Raw {
+                        assert!(vt.load(Ordering::SeqCst), "escape written with VT disabled");
+                    }
+                    events.lock().unwrap().push(match step {
+                        RestoreStep::Raw => "raw",
+                        RestoreStep::Paste => "paste",
+                        RestoreStep::Alternate => "alternate",
+                        RestoreStep::Cursor => "cursor",
+                    });
+                    if step == RestoreStep::Paste && paste.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return Err(io::Error::other("paste failed once"));
+                    }
+                    Ok(())
+                }
+            }),
+            prepare: Box::new({
+                let events = events.clone();
+                let vt = vt.clone();
+                move || {
+                    events.lock().unwrap().push("prepare");
+                    vt.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+            }),
+            exact: Box::new({
+                let events = events.clone();
+                let vt = vt.clone();
+                move || {
+                    events.lock().unwrap().push("exact");
+                    vt.store(false, Ordering::SeqCst);
+                    Ok(())
+                }
+            }),
+            completed: Mutex::new([false; 4]),
+        };
+        assert!(state.run(true).is_err());
+        assert!(!vt.load(Ordering::SeqCst));
+        state.run(true).unwrap();
+        assert!(!vt.load(Ordering::SeqCst));
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "raw",
+                "prepare",
+                "paste",
+                "alternate",
+                "cursor",
+                "exact",
+                "prepare",
+                "paste",
+                "exact"
+            ]
+        );
+    }
+    #[test]
+    fn preparation_failure_keeps_escapes_pending_and_exact_error_visible() {
+        let steps = Arc::new(Mutex::new(Vec::new()));
+        let prepare = AtomicUsize::new(0);
+        let exact = Arc::new(AtomicUsize::new(0));
+        let state = Restoration {
+            step: Box::new({
+                let steps = steps.clone();
+                move |step| {
+                    steps.lock().unwrap().push(step);
+                    Ok(())
+                }
+            }),
+            prepare: Box::new(move || {
+                if prepare.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(anyhow::anyhow!("preparation failed once"));
+                }
+                Ok(())
+            }),
+            exact: Box::new({
+                let exact = exact.clone();
+                move || {
+                    if exact.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return Err(anyhow::anyhow!("exact failed once"));
+                    }
+                    Ok(())
+                }
+            }),
+            completed: Mutex::new([false; 4]),
+        };
+        let error = format!("{:#}", state.run(true).unwrap_err());
+        assert!(error.contains("preparation failed once") && error.contains("exact failed once"));
+        assert_eq!(*steps.lock().unwrap(), [RestoreStep::Raw]);
+        assert_eq!(exact.load(Ordering::SeqCst), 1);
+        state.run(true).unwrap();
+        assert_eq!(
+            *steps.lock().unwrap(),
+            [
+                RestoreStep::Raw,
+                RestoreStep::Paste,
+                RestoreStep::Alternate,
+                RestoreStep::Cursor
+            ]
+        );
+        assert_eq!(exact.load(Ordering::SeqCst), 2);
+    }
+    #[test]
+    fn explicit_error_survives_successful_drop_retry() {
+        let raw = Arc::new(AtomicUsize::new(0));
+        let guard = controlled_steps(
+            {
+                let raw = raw.clone();
+                move |step| {
+                    if step == RestoreStep::Raw && raw.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return Err(io::Error::other("original raw failure"));
+                    }
+                    Ok(())
+                }
+            },
+            || Ok(()),
+        );
+        let error = guard.restore().unwrap_err();
+        assert!(error.to_string().contains("original raw failure"));
+        assert_eq!(
+            raw.load(Ordering::SeqCst),
+            2,
+            "Drop did not recover failed raw step"
+        );
+    }
+    #[test]
     fn cleanup_attempts_alternate_and_cursor_after_raw_and_paste_fail() {
         let mut observed = Vec::new();
-        let error = restore_steps(|step| {
-            observed.push(step);
-            if matches!(step, RestoreStep::Raw | RestoreStep::Paste) {
-                Err(io::Error::other(format!("{step:?} failed")))
-            } else {
-                Ok(())
-            }
-        })
+        let error = restore_steps(
+            &mut [false; 4],
+            || Ok(()),
+            |step| {
+                observed.push(step);
+                if matches!(step, RestoreStep::Raw | RestoreStep::Paste) {
+                    Err(io::Error::other(format!("{step:?} failed")))
+                } else {
+                    Ok(())
+                }
+            },
+        )
         .unwrap_err();
         assert_eq!(
             observed,
@@ -231,7 +514,7 @@ mod tests {
         let screen = Arc::new(AtomicUsize::new(0));
         let exact = Arc::new(AtomicUsize::new(0));
         let guard = controlled(screen.clone(), exact.clone());
-        let held = guard.state.screen_result.lock().unwrap();
+        let held = guard.state.completed.lock().unwrap();
         panic_restore(&Arc::downgrade(&guard.state));
         assert_eq!(screen.load(Ordering::SeqCst), 0);
         assert_eq!(exact.load(Ordering::SeqCst), 1);
