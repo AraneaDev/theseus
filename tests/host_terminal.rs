@@ -41,3 +41,18 @@ fn terminal_protocol_rejects_malformed_bounds_and_joins_on_eof() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn terminal_screen_literal_wrap_and_control_sequences_match_cells() {
+    let output = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
+        .arg("tests/support/terminal_screen_test.py")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("required native Python");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
