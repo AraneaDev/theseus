@@ -454,6 +454,24 @@ fn run(args: &[OsString]) -> FixtureResult {
 
 fn main() {
     #[cfg(all(unix, feature = "test-support"))]
+    if env::args_os().nth(1).as_deref() == Some(OsStr::new("terminal-events")) {
+        let arguments = env::args_os().skip(2).collect::<Vec<_>>();
+        let result = match arguments.as_slice() {
+            [root, mode] => theseus_host::process::terminal::run_event_fixture(
+                std::path::Path::new(root),
+                mode.to_str().unwrap_or(""),
+            ),
+            _ => Err(invalid(
+                "fixed event fixture requires its owned gate directory",
+            )),
+        };
+        if let Err(error) = result {
+            eprintln!("terminal event fixture: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
+    #[cfg(all(unix, feature = "test-support"))]
     if env::args_os().nth(1).as_deref() == Some(OsStr::new("terminal-mode-exit")) {
         let arguments = env::args_os().skip(2).collect::<Vec<_>>();
         let result = match arguments.as_slice() {
@@ -468,6 +486,20 @@ fn main() {
         return;
     }
 
+    #[cfg(all(windows, feature = "test-support"))]
+    if env::args_os().nth(1).as_deref() == Some(OsStr::new("terminal-legacy-client")) {
+        let result = theseus_host::process::terminal::run_legacy_client(
+            &env::args_os().skip(2).collect::<Vec<_>>(),
+        );
+        match result {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("legacy terminal control: {error}");
+                drop(error);
+                std::process::exit(2);
+            }
+        }
+    }
     #[cfg(all(windows, feature = "test-support"))]
     if env::args_os().nth(1).as_deref() == Some(OsStr::new("terminal-client")) {
         let result = theseus_host::process::terminal::run_client(

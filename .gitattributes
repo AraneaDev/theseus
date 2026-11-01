@@ -9,3 +9,6 @@
 /tests/fixtures/**/*.sh text eol=lf
 /tests/fixtures/**/sample-cli text eol=lf
 /tests/fixtures/plugins/replay-client text eol=lf
+
+# Preserve exact upstream archive bytes across native checkouts.
+vendor/crossterm/** -text

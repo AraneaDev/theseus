@@ -39,10 +39,11 @@ class Protocol(unittest.TestCase):
             rows=36, columns=120)
 
     def test_startup_rejects_unknown_fields_dimensions_and_non_theseus(self):
-        for mutation in ('unknown', 'rows', 'program'):
+        for mutation in ('unknown', 'rows', 'program', 'profile'):
             fixture, startup = self.startup()
             if mutation == 'unknown': startup['shell'] = 'forbidden'
             elif mutation == 'rows': startup['rows'] = 0
+            elif mutation == 'profile': startup['console_profile'] = 'arbitrary-mode'
             else: startup['program'] = str(fixture)
             with diagnostic_stderr('startup-' + mutation) as diagnostic:
                 result = subprocess.run([str(fixture), 'terminal'], input=json.dumps(startup).encode()+b'\n',

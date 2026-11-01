@@ -45,6 +45,8 @@ const TRACE_PHASES: &[&str] = &[
     "finish-complete",
     "failed-launch-cleanup-begin",
     "failed-launch-cleanup-complete",
+    "input-write-complete",
+    "reserved-exit-observed",
 ];
 fn trace_phase(phase: &str) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -98,6 +100,35 @@ struct Capture {
     error: Option<String>,
 }
 
+/// Fixed adverse baselines, selected once at private test startup only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConsoleProfile {
+    #[default]
+    Default,
+    EchoOffVtOff,
+    ProcessedOffVtOn,
+}
+impl ConsoleProfile {
+    #[cfg(windows)]
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::EchoOffVtOff => "echo-off-vt-off",
+            Self::ProcessedOffVtOn => "processed-off-vt-on",
+        }
+    }
+    #[cfg(windows)]
+    pub(crate) fn parse(value: &std::ffi::OsStr) -> io::Result<Self> {
+        match value.to_str() {
+            Some("default") => Ok(Self::Default),
+            Some("echo-off-vt-off") => Ok(Self::EchoOffVtOff),
+            Some("processed-off-vt-on") => Ok(Self::ProcessedOffVtOn),
+            _ => Err(io::Error::other("unknown fixed console profile")),
+        }
+    }
+}
+
 pub struct Session {
     native: platform::Terminal,
     capture: Arc<Mutex<Capture>>,
@@ -110,9 +141,27 @@ impl Session {
         rows: u16,
         columns: u16,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::spawn_with_profile(command, rows, columns, ConsoleProfile::Default)
+    }
+    pub fn spawn_with_profile(
+        command: &NativeCommand,
+        rows: u16,
+        columns: u16,
+        profile: ConsoleProfile,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         dimensions(rows, columns)?;
         trace("spawn-begin");
-        let (native, mut input) = platform::Terminal::spawn(command, rows, columns)?;
+        let (native, input) = platform::Terminal::spawn(command, rows, columns, profile)?;
+        Ok(Self::from_native(native, input))
+    }
+    #[cfg(all(test, windows))]
+    pub(crate) fn legacy_control(
+        profile: ConsoleProfile,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let (native, input) = platform::Terminal::spawn_legacy(profile)?;
+        Ok(Self::from_native(native, input))
+    }
+    fn from_native(native: platform::Terminal, mut input: platform::Reader) -> Self {
         let capture = Arc::new(Mutex::new(Capture::default()));
         let output = capture.clone();
         let reader = std::thread::spawn(move || {
@@ -147,12 +196,12 @@ impl Session {
                 }
             }
         });
-        Ok(Self {
+        Self {
             native,
             capture,
             reader: Some(reader),
             status: None,
-        })
+        }
     }
     pub fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
         if bytes.len() > 65536 {
@@ -176,6 +225,7 @@ impl Session {
                 Err(e) => return Err(e),
             }
         }
+        trace("input-write-complete");
         Ok(())
     }
     pub fn resize(&mut self, rows: u16, columns: u16) -> io::Result<()> {
@@ -188,6 +238,7 @@ impl Session {
     pub fn poll(&mut self) -> io::Result<serde_json::Value> {
         trace("first-poll-begin");
         if self.status.is_none() && self.native.exited()? {
+            trace("reserved-exit-observed");
             self.finish(false)?;
         }
         let modes = self.native.modes()?;
@@ -244,4 +295,18 @@ pub fn run_client(arguments: &[std::ffi::OsString]) -> Result<i32, Box<dyn std::
 #[doc(hidden)]
 pub fn run_mode_fixture(restore: bool) -> io::Result<()> {
     platform::run_mode_fixture(restore)
+}
+
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn run_event_fixture(root: &std::path::Path, mode: &str) -> io::Result<()> {
+    platform::run_event_fixture(root, mode)
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn run_legacy_client(
+    arguments: &[std::ffi::OsString],
+) -> Result<i32, Box<dyn std::error::Error>> {
+    platform::run_legacy_client(arguments)
 }

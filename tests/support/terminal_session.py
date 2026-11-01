@@ -37,7 +37,7 @@ def sentinel_environment(directory, sentinel):
 
 
 class NativeSession:
-    def __init__(self, binary, args, cwd, environment, rows=36, columns=120):
+    def __init__(self, binary, args, cwd, environment, rows=36, columns=120, console_profile="default"):
         fixture, self.metadata = native_fixture()
         application = pathlib.Path(self.metadata['application']['path'])
         assert pathlib.Path(binary).is_file(), 'Cargo application executable is required'
@@ -49,10 +49,12 @@ class NativeSession:
         self.modes = None
         self.eof = False
         self.closed = False
+        self.last_operation = "startup"
         self.bridge = subprocess.Popen([str(fixture), 'terminal'], stdin=subprocess.PIPE,
                                        stdout=subprocess.PIPE)
         startup = dict(program=str(application), args=list(args), cwd=str(pathlib.Path(cwd).resolve()),
-                       environment=dict({'TERM': 'xterm-256color'}, **environment), rows=rows, columns=columns)
+                       environment=dict({'TERM': 'xterm-256color'}, **environment), rows=rows, columns=columns,
+                       console_profile=console_profile)
         try:
             self._send(startup)
             assert self._receive() == {'ready': True}, 'native terminal startup failed'
@@ -73,6 +75,7 @@ class NativeSession:
         return json.loads(data)
 
     def request(self, operation, **values):
+        self.last_operation = operation
         self._send(dict(op=operation, **values))
         result = self._receive()
         self.output.feed(bytes(result['bytes']))

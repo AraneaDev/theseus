@@ -96,6 +96,14 @@ jobs:
         env:
           THESEUS_TERMINAL_TRACE: '1'
         run: |
+          if ($IsWindows) {
+            cargo test --locked -p theseus-host --features test-support --lib conpty_legacy_crossterm -- --nocapture --test-threads=1 2>&1 |
+              Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'early-native-legacy-crossterm.log')
+          } else {
+            cargo test --locked -p theseus-host --features test-support --lib pty_resize_and_single_q -- --nocapture --test-threads=1 2>&1 |
+              Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'early-native-resize-key-control.log')
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked --test host_cli --test host_terminal -- --nocapture --test-threads=1 2>&1 |
             Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'early-native-cli-terminal.log')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

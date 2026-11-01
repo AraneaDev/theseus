@@ -660,11 +660,17 @@ mod tests {
                 .unwrap();
             assert_eq!(probe_check(&result, 1), CheckOutcome::Incomplete, "{mode}");
             assert_eq!(result.record.exit_status, None, "{mode}");
-            assert_eq!(result.stdout, "application stdout\n");
+            assert_eq!(
+                result.stdout, "application stdout\n",
+                "{mode}: {:?}",
+                result.record.error
+            );
             assert_eq!(
                 std::fs::read_to_string(store.root().join(result.record.stderr.unwrap().path))
                     .unwrap(),
-                "application stderr\n"
+                "application stderr\n",
+                "{mode}: {:?}",
+                result.record.error
             );
         }
     }

@@ -15,6 +15,8 @@ struct Startup {
     environment: std::collections::BTreeMap<String, String>,
     rows: u16,
     columns: u16,
+    #[serde(default)]
+    console_profile: theseus_host::process::terminal::ConsoleProfile,
 }
 #[derive(Deserialize)]
 #[serde(tag = "op", deny_unknown_fields)]
@@ -76,7 +78,12 @@ pub(super) fn run() -> super::FixtureResult {
             .map(|(k, v)| (k.into(), v.into()))
             .collect(),
     );
-    let mut terminal = Session::spawn(&command, startup.rows, startup.columns)?;
+    let mut terminal = Session::spawn_with_profile(
+        &command,
+        startup.rows,
+        startup.columns,
+        startup.console_profile,
+    )?;
     reply(serde_json::json!({"ready":true}))?;
     let mut total = 0;
     for _ in 0..100_000 {

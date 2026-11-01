@@ -183,7 +183,7 @@ pub fn run_with_options(mut app: App, options: AnimationOptions) -> Result<i32> 
     }
     let result = finish_runtime(runtime, &cancel, result_rx, result, || {
         drop(terminal);
-        drop(guard);
+        guard.restore()
     });
     drop(signals);
     result
@@ -193,14 +193,14 @@ fn finish_runtime<T>(
     cancel: &CancellationToken,
     receiver: Option<oneshot::Receiver<Result<T>>>,
     result: Result<i32>,
-    restore: impl FnOnce(),
+    restore: impl FnOnce() -> Result<()>,
 ) -> Result<i32> {
     if receiver.is_some() {
         cancel.cancel();
     }
     // The terminal is restored promptly even when native cleanup cannot yet
     // finish. A delivered result is not a join: Drop waits for all blocking work.
-    restore();
+    let restoration = restore();
     let final_worker = receiver.map(|receiver| {
         receiver
             .blocking_recv()
@@ -209,23 +209,40 @@ fn finish_runtime<T>(
     });
     drop(runtime);
     let mut retained = crate::runner::process::CleanupFailures::default();
-    if let Err(error) = &result {
-        retained.retain(error);
+    let mut diagnostics = Vec::new();
+    for (stage, error) in [
+        ("UI", result.as_ref().err()),
+        ("terminal restoration", restoration.as_ref().err()),
+        (
+            "worker",
+            final_worker
+                .as_ref()
+                .and_then(|result| result.as_ref().err()),
+        ),
+    ] {
+        if let Some(error) = error {
+            retained.retain(error);
+            diagnostics.push(format!("{stage}: {error:#}"));
+        }
     }
-    if let Some(Err(error)) = &final_worker {
-        retained.retain(error);
-    }
+    // Preserve the existing typed pending/panic owners even if another stage
+    // failed. Formatting adds diagnostics; it never replaces the primary owner.
     if let Err(error) = retained.finish() {
-        return Err(match &result {
-            Err(original) => error.context(format!("{original:#}")),
-            Ok(_) => error,
-        });
+        return Err(error.context(diagnostics.join("; ")));
     }
-    match (result, final_worker) {
-        (Err(original), _) => Err(original),
-        (Ok(_), Some(Err(error))) => Err(error),
-        (Ok(code), _) => Ok(code),
-    }
+    let outcome = match (result, final_worker, restoration) {
+        (Err(original), _, _) => Err(original),
+        (Ok(_), Some(Err(error)), _) => Err(error),
+        (Ok(_), _, Err(error)) => Err(error),
+        (Ok(code), _, Ok(())) => Ok(code),
+    };
+    outcome.map_err(|error| {
+        if diagnostics.len() > 1 {
+            error.context(diagnostics.join("; "))
+        } else {
+            error
+        }
+    })
 }
 
 fn quit_result(app: &App, presentation: &mut Presentation, now: Duration) -> Option<Result<i32>> {
@@ -1290,11 +1307,15 @@ mod native_cleanup_tests {
             &CancellationToken::default(),
             Some(rx),
             Err(anyhow!("original UI timeout")),
-            || restored.set(true),
+            || {
+                restored.set(true);
+                Err(anyhow!("native mode restoration failed"))
+            },
         )
         .unwrap_err();
         assert!(restored.get());
         assert!(error.to_string().contains("original UI timeout"));
+        assert!(error.to_string().contains("native mode restoration failed"));
         let mut retained = CleanupFailures::default();
         retained.retain(&error);
         assert!(retained.pending());
@@ -1334,7 +1355,10 @@ mod worker_join_regressions {
                 &CancellationToken::default(),
                 Some(result_rx),
                 Err(anyhow!("original UI cleanup deadline")),
-                || observed.store(true, Ordering::SeqCst),
+                || {
+                    observed.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
             );
             returned_tx.send(result).unwrap();
         });
@@ -1362,6 +1386,71 @@ mod worker_join_regressions {
         );
     }
     #[test]
+    fn restore_failure_joins_worker_and_keeps_original_error_with_all_diagnostics() {
+        use std::sync::mpsc;
+        #[derive(Debug)]
+        struct Original;
+        impl std::fmt::Display for Original {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "original UI failure")
+            }
+        }
+        impl std::error::Error for Original {}
+        let (release_tx, release_rx) = mpsc::channel();
+        let (restored_tx, restored_rx) = mpsc::channel();
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let (tx, rx) = oneshot::channel::<Result<()>>();
+            runtime.spawn_blocking(move || {
+                release_rx.recv().unwrap();
+                tx.send(Err(anyhow!("late worker failure"))).unwrap();
+            });
+            let result = finish_runtime(
+                runtime,
+                &CancellationToken::default(),
+                Some(rx),
+                Err(Original.into()),
+                || {
+                    restored_tx.send(()).unwrap();
+                    Err(anyhow!("native mode restore failure"))
+                },
+            );
+            returned_tx.send(result).unwrap();
+        });
+        restored_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let early = returned_rx.recv_timeout(Duration::from_millis(50));
+        release_tx.send(()).unwrap();
+        owner.join().unwrap();
+        assert!(early.is_err(), "restoration error must not detach worker");
+        let error = returned_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error.downcast_ref::<Original>().is_some(),
+            "original typed error lost"
+        );
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("native mode restore failure"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("late worker failure"), "{diagnostic}");
+    }
+    #[test]
+    fn restore_failure_cannot_be_successful_exit() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result =
+            finish_runtime::<()>(runtime, &CancellationToken::default(), None, Ok(0), || {
+                Err(anyhow!("restore failed"))
+            });
+        assert!(
+            result.is_err(),
+            "failed terminal restoration became success"
+        );
+    }
+    #[test]
     fn disconnected_worker_result_restores_terminal_then_returns_error() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let (tx, rx) = oneshot::channel::<Result<()>>();
@@ -1372,7 +1461,10 @@ mod worker_join_regressions {
             &CancellationToken::default(),
             Some(rx),
             Ok(0),
-            || restored.set(true),
+            || {
+                restored.set(true);
+                Ok(())
+            },
         )
         .unwrap_err();
         assert!(restored.get());

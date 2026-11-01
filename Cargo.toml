@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/theseus-host"]
+exclude = ["vendor/crossterm"]
 resolver = "3"
 
 [package]
@@ -29,3 +30,6 @@ rustix = { version = "1.1.5", features = ["fs", "process"] }
 
 [dev-dependencies]
 theseus-host = { path = "crates/theseus-host", features = ["test-support"] }
+
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm" }

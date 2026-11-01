@@ -4,6 +4,8 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::process::ExitStatus;
+mod events;
+pub(crate) use events::run as run_event_fixture;
 
 pub(crate) struct Reader {
     file: File,
@@ -77,7 +79,11 @@ impl Terminal {
         command: &NativeCommand,
         rows: u16,
         columns: u16,
+        profile: crate::process::terminal::ConsoleProfile,
     ) -> Result<(Self, Reader), Box<dyn std::error::Error>> {
+        if profile != crate::process::terminal::ConsoleProfile::Default {
+            return Err(io::Error::other("console profiles require Windows").into());
+        }
         let mut master = -1;
         let mut slave = -1;
         let mut size = libc::winsize {

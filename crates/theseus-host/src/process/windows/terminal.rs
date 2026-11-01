@@ -1,6 +1,7 @@
 //! ConPTY-only acceptance plumbing. All handles keep their existing native owners.
 use super::{OwnedChild, launch, pipe};
-use crate::process::terminal::{trace, trace_modes};
+use crate::process::terminal::{ConsoleProfile, trace, trace_modes};
+mod modes;
 use crate::process::{NativeCommand, PipeReader, PipeWriter};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -110,6 +111,24 @@ impl Terminal {
         command: &NativeCommand,
         rows: u16,
         columns: u16,
+        profile: ConsoleProfile,
+    ) -> Result<(Self, Reader), Box<dyn std::error::Error>> {
+        Self::spawn_inner(command, rows, columns, profile, false)
+    }
+    #[cfg(test)]
+    pub(crate) fn spawn_legacy(
+        profile: ConsoleProfile,
+    ) -> Result<(Self, Reader), Box<dyn std::error::Error>> {
+        let fixture = std::env::var_os("THESEUS_HOST_TEST_FIXTURE")
+            .ok_or_else(|| invalid("required pinned fixture"))?;
+        Self::spawn_inner(&NativeCommand::new(fixture), 24, 80, profile, true)
+    }
+    fn spawn_inner(
+        command: &NativeCommand,
+        rows: u16,
+        columns: u16,
+        profile: ConsoleProfile,
+        legacy: bool,
     ) -> Result<(Self, Reader), Box<dyn std::error::Error>> {
         let (input, input_peer) = pipe::writer()?;
         let (output, output_peer) = pipe::reader()?;
@@ -139,8 +158,17 @@ impl Terminal {
             "terminal-client".into(),
             command.program.clone(),
             directory.path().as_os_str().to_owned(),
+            profile.name().into(),
         ];
         wrapper.args.extend(command.args.iter().cloned());
+        if legacy {
+            wrapper.program = command.program.clone();
+            wrapper.args = vec![
+                "terminal-legacy-client".into(),
+                directory.path().as_os_str().to_owned(),
+                profile.name().into(),
+            ];
+        }
         // No inherited stdio pipe handles: the pseudoconsole supplies console handles.
         trace("native-launch-begin");
         let child = match launch::spawn_terminal(&wrapper, hpc) {
@@ -385,7 +413,7 @@ impl Drop for Client {
 pub(crate) fn run_client(
     arguments: &[std::ffi::OsString],
 ) -> Result<i32, Box<dyn std::error::Error>> {
-    if arguments.len() < 2 || arguments.len() > 130 {
+    if arguments.len() < 3 || arguments.len() > 131 {
         return Err(invalid("invalid terminal client arguments").into());
     }
     let program = Path::new(&arguments[0]);
@@ -393,16 +421,23 @@ pub(crate) fn run_client(
         return Err(invalid("terminal client only launches Theseus").into());
     }
     let root = Path::new(&arguments[1]);
-    let before = active_modes()?;
+    let profile = ConsoleProfile::parse(&arguments[2])?;
+    let baseline = modes::Baseline::apply(profile)?;
+    // Attachment does not establish inherited standard handles. Bind the actual
+    // child to owned validated console devices; keep the app IsTerminal check.
+    let input = OpenOptions::new().read(true).write(true).open("CONIN$")?;
+    let output = OpenOptions::new().read(true).write(true).open("CONOUT$")?;
+    modes::query(&input)?;
+    modes::query(&output)?;
     if unsafe { SetConsoleCtrlHandler(Some(wrapper_control), 1) } == 0 {
         return Err(io::Error::last_os_error().into());
     }
     let mut child = Client(
         std::process::Command::new(program)
-            .args(&arguments[2..])
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
+            .args(&arguments[3..])
+            .stdin(Stdio::from(input))
+            .stdout(Stdio::from(output.try_clone()?))
+            .stderr(Stdio::from(output))
             .spawn()?,
     );
     let mut sequence = 1;
@@ -411,8 +446,9 @@ pub(crate) fn run_client(
             publish(
                 root,
                 "complete.json",
-                &serde_json::json!({"phase":"complete","sequence":sequence-1,"modes":evidence(&before)?}),
+                &serde_json::json!({"phase":"complete","sequence":sequence-1,"modes":baseline.evidence()?}),
             )?;
+            baseline.restore()?;
             return Ok(status.code().unwrap_or(130));
         }
         if let Some(request) = read_record(&root.join(format!("request.{sequence}.json")))? {
@@ -431,7 +467,7 @@ pub(crate) fn run_client(
             publish(
                 root,
                 &format!("response.{sequence}.json"),
-                &serde_json::json!({"phase":"active","sequence":sequence,"modes":evidence(&before)?}),
+                &serde_json::json!({"phase":"active","sequence":sequence,"modes":baseline.evidence()?}),
             )?;
             std::fs::remove_file(root.join(format!("request.{sequence}.json")))?;
             sequence += 1;
@@ -592,4 +628,10 @@ mod tests {
             serde_json::json!([0, 7])
         );
     }
+}
+
+pub(crate) fn run_legacy_client(
+    arguments: &[std::ffi::OsString],
+) -> Result<i32, Box<dyn std::error::Error>> {
+    modes::legacy(arguments)
 }
