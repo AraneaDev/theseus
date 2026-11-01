@@ -9,10 +9,11 @@ runtime checks, local Claude Code plugin lifecycles and uninstall in disposable 
 A Ratatui workbench and headless CLI use one scenario engine. Evidence includes commands, private logs, file fingerprints,
 declared check outcomes, and remaining files that need review.
 
-Build on Linux with a current stable Rust toolchain:
+Theseus 0.12 targets native Linux, macOS and Windows controllers with a current
+stable Rust toolchain:
 
 ```sh
-cargo build --release --locked
+cargo build --workspace --release --locked
 cargo install --path . --locked
 theseus --help
 ```
@@ -21,6 +22,46 @@ Docker CLI and a reachable Docker daemon are required for execution and cleanup.
 Validation and saved report viewing work offline. Docker access is configured by
 you; Theseus does not change daemon settings or user groups. Recipes are intended
 for maintainer-controlled inputs. A container is not a hostile-code sandbox.
+
+## Controller portability (0.12)
+
+Default push and pull-request CI requires the full application workspace on:
+
+| Runner | Native architecture / Rust host | Filesystem qualification |
+| --- | --- | --- |
+| Ubuntu 24.04 | x86-64 / `x86_64-unknown-linux-gnu` | Local Linux filesystem |
+| macOS 15 | arm64 / `aarch64-apple-darwin` | Local APFS; strict roots reject aliased ancestors |
+| Windows Server 2025 | x86-64 / `x86_64-pc-windows-msvc` | Local NTFS for writable evidence |
+
+Each native job asserts its compiler host and records the compiler, image and
+actual OS version/build. The Windows runner has reported build 26100; the runner
+label alone does not establish runtime acceptance. Release acceptance requires
+all three native jobs and all seven Ubuntu Docker gates on the same 0.12 source.
+Execution on Windows builds before 26100 remains unverified. Other architectures,
+network filesystems and native macOS/Windows guest environments are outside this
+initial scope.
+
+Unix private creation, no-follow traversal and sync-error propagation remain in
+effect. Windows evidence uses retained identity/reparse checks, file flushing and
+atomic publication on local NTFS; this is not a claim of power-loss directory
+persistence. Strict macOS fixture roots use recorded canonical temporary ancestry;
+normal-root alias acceptance and strict-root rejection are tested separately.
+Native names are filesystem qualified: Linux tests include invalid UTF-8 and
+Windows tests include unpaired UTF-16, while APFS rejects invalid UTF-8 creation.
+Stored report and artifact references remain validated UTF-8 with POSIX `/` paths.
+Windows input execute permissions are declared guest data, as described below.
+
+Native CLI and PTY/ConPTY tests cover actual application input, resize, errors,
+terminal mode restoration, EOF and owned cleanup. Windows records exact active
+input/output mode words for default and adverse starting profiles before harness
+cleanup. Its real pressure/EOF/job/close tests also use a controlled blocking-close
+**MODEL** to check drain/join ordering; that model does not establish older-kernel
+behavior. The Linux-only first-scene `LD_PRELOAD` write-error injection is
+supplemental; native engine-error restoration remains required on every host.
+The coupled test transport does not prove cancellation of inherited
+synchronous stdio for a future public Theseus MCP server. Native guest adapters,
+service/session/GUI or VM behavior and external real-client prerequisites remain
+separate acceptance work; Linux Docker tests do not establish them.
 
 ## Try a complete example
 
@@ -225,8 +266,9 @@ strict absence for every owned ID. The opt-in harness tests both eras, all matri
 scopes, upgrades, plugin disable/enable/removal, preservation and deliberate
 registration/protocol/deadline/cancel/shutdown faults. Missing native inputs remain
 clearly ignored/unrun. Required Linux CI runs self-contained Docker transport
-acceptance without downloading native clients. Native macOS/Windows adapters,
-three-OS CI and the Theseus MCP service interface remain later milestones.
+acceptance without downloading native clients. The 0.12 controller matrix is
+separate from native macOS/Windows guest adapters and the Theseus MCP service
+interface, which remain later milestones.
 
 ## Local Claude Code plugins (0.10)
 
@@ -473,8 +515,9 @@ the example also uses `cmp`, `wc`, and `stat`. The downgrade examples also use
 `head` and `wc`; rollback examples also use `readlink` and `sed`. Unsupported
 tools fail closed as failed/incomplete evidence; Theseus installs no packages.
 Image-declared volumes are rejected. Ubuntu 24.04 is exercised by acceptance; other images must satisfy
-preflight and supported tar observations. Tests do not prove systemd, GUI, kernel,
-macOS, or Windows behavior.
+preflight and supported tar observations. These Linux guest tests do not prove
+systemd, GUI, other guest kernels, or native macOS/Windows guest behavior; native
+controller tests have the separate scope described above.
 
 Clean executes install_target → target_installed checks → configure → configured
 checks → exercise → uninstall → uninstalled checks. Upgrade executes install_base
@@ -752,19 +795,37 @@ Inspect Docker separately in that exceptional window.
 
 ```sh
 export THESEUS_HOST_TEST_FIXTURE="$(python3 tests/support/build_host_fixture.py)"
-cargo fmt --check
-cargo clippy --offline --locked --all-targets -- -D warnings
-cargo test --offline --locked
-cargo build --offline --locked --release
-cargo test --offline --locked --test docker_lifecycle --test interruption_lifecycle --test downgrade_lifecycle --test rollback_lifecycle --test interrupted_rollback_lifecycle --test comparison_docker -- --ignored --test-threads=1
+cargo fmt --all --check
+cargo clippy --offline --locked --workspace --all-targets -- -D warnings
+python3 tests/support/portable_guest_bytes.py
+cargo test --offline --locked --workspace --all-targets --no-fail-fast
+cargo test --offline --locked --test host_cli --test host_terminal -- --nocapture
+cargo build --offline --locked --workspace --release
+cargo test --offline --locked --test docker_lifecycle --test interruption_lifecycle --test downgrade_lifecycle --test rollback_lifecycle --test interrupted_rollback_lifecycle --test comparison_docker --test mcp_docker -- --ignored --test-threads=1
 ```
 
 Application process tests require the trusted native fixture built by
-`tests/support/build_host_fixture.py`; this script obtains the executable from
-Cargo's JSON artifact output. Missing `THESEUS_HOST_TEST_FIXTURE` is a test failure.
+`tests/support/build_host_fixture.py`; this script obtains both the fixture and
+actual application from Cargo's JSON artifact output and copies them to an owned
+temporary directory. `artifacts.json` records their source/features/paths/hashes;
+CI rechecks both hashes after workspace tests so feature rebuilds cannot replace
+the binaries being exercised. Release host features exclude test-support and the
+application test graph includes it. Missing `THESEUS_HOST_TEST_FIXTURE` is a test failure.
 In PowerShell, set it with
 `$env:THESEUS_HOST_TEST_FIXTURE = python tests/support/build_host_fixture.py`.
 The fixture is a test tool and is not installed as an application command.
+
+CI explicitly runs Unix `pty_master_` mode controls, Windows actual-library
+`conpty_legacy_crossterm` controls and the Windows
+`conpty_backpressure_close_model` target with `--features test-support --lib`
+on `theseus-host`, in addition to the native application targets. Ordinary cargo
+test alone does not replace these required acceptance invocations. Python version,
+guest byte-oracle output and raw guest-template bytes/counts/hashes are retained.
+Windows preparers require Python 3.12 or newer. Two repository-owned POSIX guest
+script oracles on Windows additionally require the checked Git-for-Windows Bash;
+it is not used to launch Theseus or establish native host behavior. Missing
+prerequisites fail. Default fixtures require no user credentials, vendor clients,
+models, GUI session or nested VM; external real-client tests have separate inputs.
 
 Cancellation registration is scoped to the active CLI/TUI run. Windows console
 Ctrl-C and Ctrl-Break request cancellation; raw TUI Ctrl-C uses its existing key
@@ -772,6 +833,9 @@ handling. Console close, logoff, and shutdown still have Windows-imposed process
 termination deadlines, so these events cannot guarantee completion of cleanup.
 The TUI restores the terminal before joining outstanding engine work; exceptional
 native cleanup can delay process return beyond the interactive quit deadline.
+Cancellation bounds assume a healthy native kernel. If a kernel operation does
+not resolve, its owned storage must remain retained; no hard kernel-hang deadline
+or detached cleanup success is claimed.
 Host recovery commands use POSIX shell quoting on Unix and PowerShell quoting on
 Windows. Displayed non-Unicode paths may be lossy and are not exact copyable argv.
 
@@ -802,8 +866,8 @@ Interrupted-rollback acceptance adds both profiles/policies with same-ID stop an
 restart, original/immediate/fresh reference boundaries, typed runtime/reader proof,
 faults that block restoration and exact owned teardown. Default animation PTYs
 exercise frames, skips, discarded input, opt-outs, active cancellation, signals,
-errors and terminal restoration. All six ignored Docker test binaries are
-explicitly required in CI. Actual PTYs exercise narrow live selection, new-report
+errors and terminal restoration. All seven ignored Docker test binaries, including
+`mcp_docker`, are explicitly required in CI. Actual PTYs exercise narrow live selection, new-report
 comparison visibility, offline viewing, and terminal recovery.
 
 A separate real Phrourion 0.8.1 → 0.8.2 rehearsal passed all four matrix entries

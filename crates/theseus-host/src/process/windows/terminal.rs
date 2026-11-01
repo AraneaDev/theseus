@@ -479,6 +479,12 @@ pub(crate) fn run_client(
     }
 }
 
+pub(crate) fn run_legacy_client(
+    arguments: &[std::ffi::OsString],
+) -> Result<i32, Box<dyn std::error::Error>> {
+    modes::legacy(arguments)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -628,10 +634,4 @@ mod tests {
             serde_json::json!([0, 7])
         );
     }
-}
-
-pub(crate) fn run_legacy_client(
-    arguments: &[std::ffi::OsString],
-) -> Result<i32, Box<dyn std::error::Error>> {
-    modes::legacy(arguments)
 }

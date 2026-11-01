@@ -1,6 +1,6 @@
 # Theseus roadmap
 
-Theseus 0.11 ships a shared Docker lifecycle engine, Ratatui workbench, headless
+Theseus 0.12 retains the 0.11 shared Docker lifecycle engine, Ratatui workbench, headless
 CLI, versioned recipes/reports, private bounded logs, user/system profiles,
 clean/upgrade/reinstall, interrupted-install/upgrade, downgrade and failed-upgrade
 rollback scenarios, interrupted-upgrade rollback, decorative startup/exit animations,
@@ -126,13 +126,28 @@ query replay. See [plugin fixtures](examples/plugins/README.md).
   paged logs. Reports write 8/read 1–8; journals/ownership/comparison remain 1.
 
 See [MCP fixtures and explicit native acceptance](examples/mcp/README.md).
+
+## Controller portability (0.12)
+
+- Default push/PR CI requires full workspace clippy, all-target tests, optimized
+  release builds and explicit native CLI/terminal controls on Ubuntu 24.04 x86-64,
+  macOS 15 arm64 and Windows Server 2025 x86-64. Release acceptance requires these
+  three native jobs and all seven real Ubuntu Docker suites on the same 0.12 source.
+- Controller evidence covers retained filesystem identities, artifact/cache/storage,
+  native process/pipes, bounded duplex capture, terminal restoration and owned
+  cleanup. Existing report readers accept schemas 1–8; guest paths remain POSIX.
+- Initial writable Windows evidence is local NTFS with file flush/atomic publication,
+  not power-loss directory persistence. Native evidence records the actual OS build;
+  the Windows runner has reported 26100, and pre26100 runtime remains unverified.
+  The controlled blocking-close MODEL is separate from actual native cleanup proof.
+- Linux Docker guests remain the execution environment. Native controller support
+  does not establish native macOS/Windows guest, GUI, service or VM behavior, nor
+  inherited synchronous-stdio cancellation for a future public MCP server.
+
 The following capabilities are planned, not available features.
 
-## Next: controller portability and native OS adapters
+## Next: native OS adapters
 
-- Required Linux, macOS and Windows CI by default as controller portability lands.
-  Current required execution gates cover Linux; unsupported OS jobs are not added
-  as successful placeholders.
 - Machine/VM adapters where containers cannot establish service/session fidelity.
 - Native macOS and Windows environment adapters with OS-specific contracts;
   unavailable native acceptance remains explicitly pending.
