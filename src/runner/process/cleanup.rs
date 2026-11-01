@@ -119,6 +119,11 @@ pub(crate) struct CleanupFailures {
 }
 impl CleanupFailures {
     pub(crate) fn retain(&mut self, error: &anyhow::Error) {
+        // anyhow exposes typed context through downcast_ref, not as a separate
+        // Error::source entry. Keep that aggregate as well as source-chain owners.
+        if let Some(failures) = error.downcast_ref::<Self>() {
+            self.extend(failures);
+        }
         for source in error.chain() {
             if let Some(failure) = source.downcast_ref::<AcquisitionFailure>() {
                 self.push(failure);
@@ -127,13 +132,16 @@ impl CleanupFailures {
                 self.push_panic(panic);
             }
             if let Some(failures) = source.downcast_ref::<Self>() {
-                for failure in &failures.owners {
-                    self.push(failure);
-                }
-                for panic in &failures.panics {
-                    self.push_panic(panic);
-                }
+                self.extend(failures);
             }
+        }
+    }
+    fn extend(&mut self, failures: &Self) {
+        for failure in &failures.owners {
+            self.push(failure);
+        }
+        for panic in &failures.panics {
+            self.push_panic(panic);
         }
     }
     pub(crate) fn retain_panic(&mut self, panic: &(dyn std::any::Any + Send)) {
@@ -166,7 +174,7 @@ impl CleanupFailures {
     pub(crate) fn pending(&self) -> bool {
         self.owners.iter().any(AcquisitionFailure::pending)
     }
-    fn settled(self) -> Self {
+    pub(crate) fn settled(self) -> Self {
         for failure in &self.owners {
             failure.settle();
         }
@@ -526,8 +534,60 @@ pub(crate) mod native_tests {
 }
 
 #[cfg(test)]
-mod io_error_boundary_tests {
+pub(crate) mod io_error_boundary_tests {
     use super::*;
+
+    pub(crate) struct PendingFixture {
+        pub(crate) failure: AcquisitionFailure,
+        _temp: tempfile::TempDir,
+    }
+    impl PendingFixture {
+        pub(crate) fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let ready = temp.path().join("ready");
+            let heartbeat = temp.path().join("heartbeat");
+            let mut command = super::super::test_support::fixture("ready-hold", &[]);
+            command.arg(&ready).arg(&heartbeat).arg("30000");
+            let mut child = super::super::HostProcess::spawn(&command).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !ready.exists() || !heartbeat.exists() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let failure = AcquisitionFailure::from_spawn(
+                SpawnFailure {
+                    launch: LaunchPhase::MayRun,
+                    error: io::Error::other("owned fixture cleanup witness"),
+                    cleanup_errors: vec![],
+                    cleanup: HostCleanup::Pending(child.child.take().unwrap().into_cleanup()),
+                },
+                deadline,
+            );
+            // A real poisoned ownership lock must retain authority, never claim Complete.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _owner = failure.0.cleanup.lock().unwrap();
+                panic!("inject ownership-lock poison");
+            }));
+            Self {
+                failure,
+                _temp: temp,
+            }
+        }
+        pub(crate) fn release_fault(&self) {
+            self.failure.0.cleanup.clear_poison();
+        }
+    }
+    impl Drop for PendingFixture {
+        fn drop(&mut self) {
+            // Rescue the actual child on RED/assertion paths as well as success.
+            self.release_fault();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !self.failure.retry_cleanup().unwrap() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
     #[test]
     fn native_endpoint_failure_is_visible_through_io_error_source_chain() {
         let error = anyhow::Error::new(
@@ -554,7 +614,7 @@ mod io_error_boundary_tests {
         joined_worker_owner_case(2);
     }
     fn joined_worker_owner_case(mode: u8) {
-        use super::super::{Drain, HostProcess, archive_worker_precedence, finish_archive_workers};
+        use super::super::{Drain, archive_worker_precedence, finish_archive_workers};
         use std::sync::atomic::{AtomicBool, Ordering};
         struct Payload(Arc<AtomicBool>);
         impl Drop for Payload {
@@ -562,31 +622,8 @@ mod io_error_boundary_tests {
                 self.0.store(true, Ordering::SeqCst);
             }
         }
-        let temp = tempfile::tempdir().unwrap();
-        let ready = temp.path().join("ready");
-        let heartbeat = temp.path().join("heartbeat");
-        let mut command = super::super::test_support::fixture("ready-hold", &[]);
-        command.arg(&ready).arg(&heartbeat).arg("30000");
-        let mut child = HostProcess::spawn(&command).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while !ready.exists() || !heartbeat.exists() {
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let failure = AcquisitionFailure::from_spawn(
-            SpawnFailure {
-                launch: LaunchPhase::MayRun,
-                error: io::Error::other("owned fixture cleanup witness"),
-                cleanup_errors: vec![],
-                cleanup: HostCleanup::Pending(child.child.take().unwrap().into_cleanup()),
-            },
-            deadline,
-        );
-        // A real poisoned ownership lock must retain authority, never claim Complete.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _owner = failure.0.cleanup.lock().unwrap();
-            panic!("inject ownership-lock poison");
-        }));
+        let fixture = PendingFixture::new();
+        let failure = fixture.failure.clone();
         let mut cleanup = CleanupFailures::default();
         cleanup.retain(&failure.clone().into());
         let dropped = Arc::new(AtomicBool::new(false));
@@ -618,9 +655,9 @@ mod io_error_boundary_tests {
         drop(error);
         let lost_at_lowering = dropped.load(Ordering::SeqCst);
         // Rescue the owned live fixture even when the pre-fix assertion fails.
-        failure.0.cleanup.clear_poison();
+        fixture.release_fault();
         while !failure.retry_cleanup().unwrap() {
-            assert!(Instant::now() < deadline);
+            assert!(Instant::now() < failure.0.deadline);
             std::thread::sleep(Duration::from_millis(1));
         }
         retained.finish().unwrap();

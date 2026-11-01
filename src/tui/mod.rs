@@ -225,11 +225,8 @@ fn finish_runtime<T>(
             diagnostics.push(format!("{stage}: {error:#}"));
         }
     }
-    // Preserve the existing typed pending/panic owners even if another stage
-    // failed. Formatting adds diagnostics; it never replaces the primary owner.
-    if let Err(error) = retained.finish() {
-        return Err(error.context(diagnostics.join("; ")));
-    }
+    let retained = retained.settled();
+    let pending = retained.pending();
     let outcome = match (result, final_worker, restoration) {
         (Err(original), _, _) => Err(original),
         (Ok(_), Some(Err(error)), _) => Err(error),
@@ -237,7 +234,14 @@ fn finish_runtime<T>(
         (Ok(code), _, Ok(())) => Ok(code),
     };
     outcome.map_err(|error| {
-        if diagnostics.len() > 1 {
+        // Typed context retains every pending/panic owner while preserving the
+        // primary error's downcast and original source chain.
+        let error = if pending {
+            error.context(retained)
+        } else {
+            error
+        };
+        if pending || diagnostics.len() > 1 {
             error.context(diagnostics.join("; "))
         } else {
             error
@@ -1327,6 +1331,234 @@ mod native_cleanup_tests {
 #[cfg(test)]
 mod worker_join_regressions {
     use super::*;
+    #[test]
+    fn settled_errors_keep_ui_then_worker_then_restoration_precedence() {
+        for (ui_fails, worker_fails, expected) in [
+            (true, true, "UI"),
+            (false, true, "worker"),
+            (false, false, "restoration"),
+        ] {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let (tx, rx) = oneshot::channel::<Result<()>>();
+            tx.send(if worker_fails {
+                Err(std::io::Error::other("worker").into())
+            } else {
+                Ok(())
+            })
+            .unwrap();
+            let error = finish_runtime(
+                runtime,
+                &CancellationToken::default(),
+                Some(rx),
+                if ui_fails {
+                    Err(std::io::Error::other("UI").into())
+                } else {
+                    Ok(0)
+                },
+                || Err(std::io::Error::other("restoration").into()),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().to_string(),
+                expected
+            );
+        }
+    }
+    #[test]
+    fn pending_cleanup_preserves_original_ui_error_and_every_owner() {
+        pending_primary_error("UI");
+    }
+    #[test]
+    fn pending_cleanup_preserves_primary_worker_error_and_every_owner() {
+        pending_primary_error("worker");
+    }
+    #[test]
+    fn pending_cleanup_preserves_primary_restoration_error_and_every_owner() {
+        pending_primary_error("terminal restoration");
+    }
+    fn pending_primary_error(primary: &'static str) {
+        use crate::runner::process::{CleanupFailures, test_support::PendingFixture, worker_panic};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        #[derive(Debug)]
+        struct Original {
+            stage: &'static str,
+            source: anyhow::Error,
+        }
+        impl std::fmt::Display for Original {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "original {} failure", self.stage)
+            }
+        }
+        impl std::error::Error for Original {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(self.source.as_ref())
+            }
+        }
+        struct Payload(Arc<AtomicBool>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let first = PendingFixture::new();
+        let second = PendingFixture::new();
+        let payload_dropped = Arc::new(AtomicBool::new(false));
+        let mut cleanup = CleanupFailures::default();
+        cleanup.retain(&second.failure.clone().into());
+        if primary == "terminal restoration" {
+            cleanup.retain(&first.failure.clone().into());
+        }
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cleanup.resume_unwind(Box::new(Payload(payload_dropped.clone())));
+        }))
+        .unwrap_err();
+        let panic = worker_panic(panic);
+        let (restoration, worker) = if primary == "terminal restoration" {
+            (panic, Ok(()))
+        } else {
+            (
+                first.failure.clone().into(),
+                Err(Original {
+                    stage: "worker",
+                    source: panic,
+                }
+                .into()),
+            )
+        };
+        let ui = if primary == "UI" {
+            Err(Original {
+                stage: "UI",
+                source: std::io::Error::other("original UI source").into(),
+            }
+            .into())
+        } else {
+            Ok(0)
+        };
+        let (restore_tx, restore_rx) = mpsc::channel();
+        let (deliver_tx, deliver_rx) = mpsc::channel();
+        let (delivered_tx, delivered_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let (tx, rx) = oneshot::channel::<Result<()>>();
+            runtime.spawn_blocking(move || {
+                deliver_rx.recv().unwrap();
+                tx.send(worker).unwrap();
+                delivered_tx.send(()).unwrap();
+                finish_rx.recv().unwrap();
+            });
+            let result =
+                finish_runtime(runtime, &CancellationToken::default(), Some(rx), ui, || {
+                    restore_tx.send(()).unwrap();
+                    Err(Original {
+                        stage: "terminal restoration",
+                        source: restoration,
+                    }
+                    .into())
+                });
+            returned_tx.send(result).unwrap();
+        });
+        restore_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let before_delivery = returned_rx.recv_timeout(Duration::from_millis(50));
+        deliver_tx.send(()).unwrap();
+        delivered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let before_join = returned_rx.recv_timeout(Duration::from_millis(50));
+        finish_tx.send(()).unwrap();
+        owner.join().unwrap();
+        let error = returned_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err();
+        let typed_primary = error.downcast_ref::<Original>().map(|error| error.stage);
+        let original_in_chain = error.chain().any(|source| {
+            source
+                .downcast_ref::<Original>()
+                .is_some_and(|e| e.stage == primary)
+        });
+        let source_retained = error.downcast_ref::<Original>().is_some_and(|original| {
+            std::error::Error::source(original).is_some_and(|source| {
+                if primary == "UI" {
+                    source.downcast_ref::<std::io::Error>().is_some()
+                        && source.to_string() == "original UI source"
+                } else {
+                    source.to_string().contains("engine worker panicked")
+                }
+            })
+        });
+        let diagnostics = format!("{error:#}");
+        let mut retained = CleanupFailures::default();
+        retained.retain(&error);
+        drop(error);
+        let payload_retained = !payload_dropped.load(Ordering::SeqCst);
+        let recollected = retained.pending();
+        first.release_fault();
+        let pending = retained.finish().err();
+        let first_retried = !first.failure.pending();
+        let second_pending = second.failure.pending() && pending.is_some();
+        let mut retained = CleanupFailures::default();
+        if let Some(error) = &pending {
+            retained.retain(error);
+        }
+        drop(pending);
+        let payload_recollected = !payload_dropped.load(Ordering::SeqCst);
+        second.release_fault();
+        let settled = retained.finish().is_ok();
+        let second_retried = !second.failure.pending();
+        // Rescue both real native children before any regression assertion on RED.
+        drop(first);
+        drop(second);
+        assert!(
+            before_delivery.is_err(),
+            "receiver completion was not awaited"
+        );
+        assert!(
+            before_join.is_err(),
+            "delivered result detached its blocking worker"
+        );
+        assert_eq!(typed_primary, Some(primary), "original typed error lost");
+        assert!(
+            original_in_chain && source_retained,
+            "original source chain lost"
+        );
+        assert!(
+            diagnostics.contains("original terminal restoration failure"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("owned fixture cleanup witness"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("non-string panic payload retained"),
+            "{diagnostics}"
+        );
+        if primary != "terminal restoration" {
+            assert!(
+                diagnostics.contains("original worker failure"),
+                "{diagnostics}"
+            );
+        }
+        if primary == "UI" {
+            assert!(diagnostics.contains("original UI source"), "{diagnostics}");
+        }
+        assert!(
+            recollected && first_retried && second_pending && settled && second_retried,
+            "fresh collectors must retry every real owner after each fault release"
+        );
+        assert!(
+            payload_retained && payload_recollected,
+            "original panic payload lost"
+        );
+        assert!(
+            payload_dropped.load(Ordering::SeqCst),
+            "settled payload leaked"
+        );
+    }
     #[test]
     fn terminal_restoration_precedes_join_and_delivery_does_not_detach_blocking_worker() {
         use std::sync::{

@@ -926,6 +926,7 @@ mod test_native;
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::Command;
+    pub(crate) use super::cleanup::io_error_boundary_tests::PendingFixture;
     pub(crate) use super::test_native::docker;
     pub(crate) fn fixture(mode: &str, args: &[&str]) -> Command {
         let mut command =
