@@ -1,5 +1,6 @@
 //! ConPTY-only acceptance plumbing. All handles keep their existing native owners.
 use super::{OwnedChild, launch, pipe};
+use crate::process::terminal::{trace, trace_modes};
 use crate::process::{NativeCommand, PipeReader, PipeWriter};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -11,9 +12,11 @@ use windows_sys::Win32::System::Console::*;
 struct PseudoConsole(HPCON);
 impl Drop for PseudoConsole {
     fn drop(&mut self) {
+        trace("close-native-begin");
         unsafe {
             ClosePseudoConsole(self.0);
         }
+        trace("close-native-complete");
     }
 }
 pub(crate) struct Reader(PipeReader);
@@ -84,6 +87,7 @@ fn validate_response(
 // read endpoint is already closed by these failure callers; settle retained
 // launch cleanup before releasing HPCON. Native completion errors retain owners.
 fn settle_failed_launch(error: &mut crate::process::SpawnFailure) {
+    trace("failed-launch-cleanup-begin");
     if let crate::process::HostCleanup::Pending(owner) = &mut error.cleanup {
         loop {
             match owner.try_complete() {
@@ -99,6 +103,7 @@ fn settle_failed_launch(error: &mut crate::process::SpawnFailure) {
         }
         error.cleanup = crate::process::HostCleanup::Complete;
     }
+    trace("failed-launch-cleanup-complete");
 }
 impl Terminal {
     pub(crate) fn spawn(
@@ -109,6 +114,7 @@ impl Terminal {
         let (input, input_peer) = pipe::writer()?;
         let (output, output_peer) = pipe::reader()?;
         let mut hpc = 0;
+        trace("native-create-begin");
         let result = unsafe {
             CreatePseudoConsole(
                 COORD {
@@ -124,6 +130,7 @@ impl Terminal {
         if result < 0 {
             return Err(invalid(&format!("CreatePseudoConsole HRESULT {result:#x}")).into());
         }
+        trace("native-created");
         let console = PseudoConsole(hpc);
         let directory = tempfile::tempdir()?;
         let mut wrapper = command.clone();
@@ -135,6 +142,7 @@ impl Terminal {
         ];
         wrapper.args.extend(command.args.iter().cloned());
         // No inherited stdio pipe handles: the pseudoconsole supplies console handles.
+        trace("native-launch-begin");
         let child = match launch::spawn_terminal(&wrapper, hpc) {
             Ok(child) => child,
             Err(mut error) => {
@@ -148,6 +156,7 @@ impl Terminal {
                 return Err(error.into());
             }
         };
+        trace("native-launched");
         drop(input_peer);
         drop(output_peer);
         Ok((
@@ -174,6 +183,7 @@ impl Terminal {
                 .clone()
                 .ok_or_else(|| invalid("no terminal mode evidence"));
         }
+        trace("request-begin");
         let sequence = self.sequence.get() + 1;
         if sequence > 100_000 {
             return Err(invalid("terminal telemetry request bound"));
@@ -193,6 +203,8 @@ impl Terminal {
                     .join(format!("response.{sequence}.json")),
             )? {
                 let modes = validate_response(&value, sequence, "active")?;
+                trace("client-ready");
+                trace_modes("first-active-modes", &modes);
                 std::fs::remove_file(
                     self.directory
                         .path()
@@ -203,6 +215,8 @@ impl Terminal {
             }
             if let Some(value) = read_record(&self.directory.path().join("complete.json"))? {
                 let modes = validate_response(&value, sequence - 1, "complete")?;
+                trace("client-ready");
+                trace_modes("client-complete-modes", &modes);
                 self.complete.set(true);
                 self.last.replace(Some(modes.clone()));
                 if operation != "modes" {
@@ -211,6 +225,7 @@ impl Terminal {
                 return Ok(modes);
             }
             if std::time::Instant::now() >= deadline {
+                trace("request-deadline");
                 return Err(invalid("terminal telemetry deadline"));
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -252,17 +267,25 @@ impl Terminal {
             .map_or(Ok(true), OwnedChild::exited_reserved)
     }
     pub(crate) fn close(&mut self, terminate: bool) -> io::Result<ExitStatus> {
+        trace("close-begin");
         let observation = self.request("modes");
+        trace("close-observation-returned");
+        if let Ok(modes) = &observation {
+            trace_modes("close-modes", modes);
+        }
         let input = self.input.close();
+        trace("input-close-returned");
         let mut child = self
             .child
             .take()
             .ok_or_else(|| invalid("terminal child released"))?;
+        trace("terminate-begin");
         let termination = if terminate {
             child.terminate_owned()
         } else {
             Ok(())
         };
+        trace("terminate-returned");
         // The independent output reader remains live until real peer EOF. This
         // worker is joined even on current builds whose native close returns early.
         let console = self
@@ -270,8 +293,12 @@ impl Terminal {
             .take()
             .ok_or_else(|| invalid("terminal already closed"))?;
         let closer = close_worker(console, None);
+        trace("job-cleanup-begin");
         let status = child.reap_and_release();
+        trace("job-cleanup-returned");
+        trace("close-join-begin");
         let joined = closer.join();
+        trace("close-join-returned");
         if !matches!(joined, Ok(true)) {
             return Err(invalid(
                 "ConPTY close worker panic or model lacked reader progress",
@@ -295,6 +322,7 @@ fn close_worker(
     model: Option<std::sync::Arc<CloseModel>>,
 ) -> std::thread::JoinHandle<bool> {
     std::thread::spawn(move || {
+        trace("close-worker-start");
         let mut progressed = true;
         if let Some(model) = model {
             use std::sync::atomic::Ordering;
@@ -425,6 +453,7 @@ mod tests {
         let (mut input, input_peer) = pipe::writer().unwrap();
         let (mut output, output_peer) = pipe::reader().unwrap();
         let mut hpc = 0;
+        trace("native-create-begin");
         let result = unsafe {
             CreatePseudoConsole(
                 COORD { X: 80, Y: 24 },
@@ -435,12 +464,14 @@ mod tests {
             )
         };
         assert!(result >= 0, "CreatePseudoConsole HRESULT {result:#x}");
+        trace("native-created");
         let console = PseudoConsole(hpc);
         let mut command = NativeCommand::new(
             std::env::var_os("THESEUS_HOST_TEST_FIXTURE")
                 .expect("required Cargo-built native fixture"),
         );
         command.args(["flood", "1048576", "0"]);
+        trace("native-launch-begin");
         let child = match launch::spawn_terminal(&command, hpc) {
             Ok(child) => child,
             Err(mut error) => {
@@ -452,6 +483,7 @@ mod tests {
                 panic!("{error}");
             }
         };
+        trace("native-launched");
         drop(input_peer);
         drop(output_peer);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
@@ -475,6 +507,7 @@ mod tests {
         model.paused.store(true, Ordering::SeqCst);
         let observer = model.clone();
         let reader = std::thread::spawn(move || -> io::Result<usize> {
+            trace("reader-started");
             let mut bytes = [0; 16384];
             loop {
                 if observer.paused.load(Ordering::SeqCst) {
@@ -482,22 +515,36 @@ mod tests {
                     continue;
                 }
                 match output.try_read(&mut bytes) {
-                    Ok(0) => return Ok(observer.read_bytes.load(Ordering::SeqCst)),
+                    Ok(0) => {
+                        trace("reader-eof");
+                        return Ok(observer.read_bytes.load(Ordering::SeqCst));
+                    }
                     Ok(count) => {
                         observer.read_bytes.fetch_add(count, Ordering::SeqCst);
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         std::thread::sleep(std::time::Duration::from_millis(2))
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        trace("reader-error");
+                        return Err(error);
+                    }
                 }
             }
         });
+        trace("close-begin");
         let closed_input = input.close();
+        trace("input-close-returned");
         let closer = close_worker(console, Some(model.clone()));
+        trace("job-cleanup-begin");
         let cleanup = child.reap_and_release();
+        trace("job-cleanup-returned");
+        trace("close-join-begin");
         let closed = closer.join();
+        trace("close-join-returned");
+        trace("reader-join-begin");
         let drained = reader.join();
+        trace("reader-join-returned");
         closed_input.unwrap();
         let status = cleanup.unwrap();
         assert!(

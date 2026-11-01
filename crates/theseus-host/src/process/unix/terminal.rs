@@ -50,10 +50,17 @@ fn mode_bits(value: libc::tcflag_t) -> u64 {
         u64::from(value)
     }
 }
-fn modes(file: &File) -> io::Result<Vec<u64>> {
+fn modes(file: &File, stage: &str) -> io::Result<Vec<u64>> {
     let mut value = std::mem::MaybeUninit::<libc::termios>::uninit();
     if unsafe { libc::tcgetattr(file.as_raw_fd(), value.as_mut_ptr()) } == -1 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "{stage} termios on owned PTY master fd {}: {error}",
+                file.as_raw_fd()
+            ),
+        ));
     }
     let value = unsafe { value.assume_init() };
     let mut result = vec![
@@ -98,7 +105,7 @@ impl Terminal {
         }
         let flags = rustix::fs::fcntl_getfl(&master)?;
         rustix::fs::fcntl_setfl(&master, flags | rustix::fs::OFlags::NONBLOCK)?;
-        let before = modes(&slave)?;
+        let before = modes(&master, "initial")?;
         let child = OwnedChild::spawn_files_with_session(
             command,
             Some(slave.try_clone()?),
@@ -140,8 +147,11 @@ impl Terminal {
     }
     pub(crate) fn modes(&self) -> io::Result<serde_json::Value> {
         let current = match &self.slave {
-            Some(slave) => modes(slave)?,
-            None => self.after.clone().unwrap_or_default(),
+            Some(_) => modes(&self.master, "live")?,
+            None => self
+                .after
+                .clone()
+                .ok_or_else(|| io::Error::other("final PTY master modes were not captured"))?,
         };
         Ok(
             serde_json::json!({"kind":"termios", "before":self.before, "current":current,
@@ -172,6 +182,7 @@ impl Terminal {
     pub(crate) fn close(&mut self, terminate: bool) -> io::Result<ExitStatus> {
         let observed = release_slave(
             self.slave.take(),
+            &self.master,
             &self.slave_released,
             #[cfg(test)]
             || {},
@@ -195,10 +206,11 @@ impl Terminal {
 // The test callback observes the exact interval after the last slave closes.
 fn release_slave(
     slave: Option<File>,
+    observer: &File,
     released: &std::sync::atomic::AtomicBool,
     #[cfg(test)] after_close: impl FnOnce(),
 ) -> io::Result<Option<Vec<u64>>> {
-    let observed = slave.as_ref().map(modes).transpose();
+    let observed = slave.as_ref().map(|_| modes(observer, "final")).transpose();
     // Publish while we still own the slave: the reader can only see EIO
     // from this final close after the release transition is visible.
     released.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -208,10 +220,112 @@ fn release_slave(
     observed
 }
 
+// Fixed mechanism fixture, separate from the Theseus-only bridge protocol.
+// Only the child mutates its own attached terminal; the observer never does.
+pub(crate) fn run_mode_fixture(restore: bool) -> io::Result<()> {
+    let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+    if unsafe { libc::tcgetattr(0, original.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let original = unsafe { original.assume_init() };
+    let mut changed = original;
+    changed.c_lflag ^= libc::ECHO;
+    if unsafe { libc::tcsetattr(0, libc::TCSANOW, &changed) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut output = io::stdout().lock();
+    output.write_all(b"terminal-mode-ready\n")?;
+    output.flush()?;
+    let mut release = [0; 2];
+    io::stdin().read_exact(&mut release)?;
+    if release != *b"!\n" {
+        return Err(io::Error::other("invalid fixed terminal mode release"));
+    }
+    if restore && unsafe { libc::tcsetattr(0, libc::TCSANOW, &original) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn observe_session_leader_exit(restore: bool) {
+        use crate::process::terminal::Session;
+        let fixture = std::env::var_os("THESEUS_HOST_TEST_FIXTURE")
+            .expect("required Cargo-built native fixture");
+        let mut command = NativeCommand::new(fixture);
+        command.args([
+            "terminal-mode-exit",
+            if restore { "restore" } else { "leave" },
+        ]);
+        let mut session = Session::spawn(&command, 24, 80).unwrap();
+        let observation = (|| -> Result<_, Box<dyn std::error::Error>> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            let mut bytes = Vec::new();
+            let live = loop {
+                let value = session.poll()?;
+                bytes.extend(serde_json::from_value::<Vec<u8>>(value["bytes"].clone())?);
+                if bytes == b"terminal-mode-ready\r\n" {
+                    break value;
+                }
+                if bytes.len() > 256
+                    || !value["status"].is_null()
+                    || std::time::Instant::now() >= deadline
+                {
+                    return Err(io::Error::other(format!(
+                        "complete fixed mode readiness missing: {bytes:?}; {value}"
+                    ))
+                    .into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            };
+            let before: Vec<u64> = serde_json::from_value(live["modes"]["before"].clone())?;
+            let changed: Vec<u64> = serde_json::from_value(live["modes"]["current"].clone())?;
+            session.write(b"!\n")?;
+            let final_value = loop {
+                let value = session.poll()?;
+                if !value["status"].is_null() {
+                    break value;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(io::Error::other("mode fixture did not exit").into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            };
+            Ok((before, changed, final_value))
+        })();
+        // The common owner always closes its parent slave, drains EOF and joins
+        // its reader, even when a readiness/deadline/observation assertion fails.
+        let cleanup = session.finish(true);
+        let (before, changed, final_value) = observation.unwrap();
+        cleanup.unwrap();
+        let mut expected_changed = before.clone();
+        expected_changed[3] ^= mode_bits(libc::ECHO);
+        assert_eq!(changed, expected_changed, "actual live termios mutation");
+        let expected = if restore { &before } else { &changed };
+        assert_eq!(
+            &serde_json::from_value::<Vec<u64>>(final_value["modes"]["current"].clone()).unwrap(),
+            expected
+        );
+        assert_eq!(final_value["status"], 0);
+        assert_eq!(final_value["eof"], true);
+        println!(
+            "native PTY restore={restore} initial={before:?} live={changed:?} final={} reserved_leader_exit=true EOF=true reader_joined=true",
+            final_value["modes"]["current"]
+        );
+    }
+
+    #[test]
+    fn pty_master_preserves_altered_modes_after_session_leader_exit() {
+        observe_session_leader_exit(false);
+    }
+    #[test]
+    fn pty_master_observes_restored_modes_after_session_leader_exit() {
+        observe_session_leader_exit(true);
+    }
 
     #[test]
     fn slave_release_publishes_before_reader_can_observe_last_close() {
@@ -233,10 +347,10 @@ mod tests {
         let slave = unsafe { File::from_raw_fd(slave) };
         let released = std::sync::Arc::new(AtomicBool::new(false));
         let mut reader = Reader {
-            file: master,
+            file: master.try_clone().unwrap(),
             slave_released: released.clone(),
         };
-        let observed = release_slave(Some(slave), &released, || {
+        let observed = release_slave(Some(slave), &master, &released, || {
             // Controlled interleaving: execute the independent reader immediately
             // after the final close, before the closer's next statement.
             assert!(

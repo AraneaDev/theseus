@@ -90,6 +90,20 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $theseusTestHost = @(Get-Content $theseusTestMetadata | ConvertFrom-Json | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'theseus_host' -and $_.features -contains 'test-support' })
           if ($theseusTestHost.Count -lt 1) { throw 'Application test graph lacks scoped native fault support' }
+      - name: Early native CLI and terminal diagnostics (required)
+        timeout-minutes: 5
+        shell: pwsh
+        env:
+          THESEUS_TERMINAL_TRACE: '1'
+        run: |
+          cargo test --locked --test host_cli --test host_terminal -- --nocapture --test-threads=1 2>&1 |
+            Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'early-native-cli-terminal.log')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($IsWindows) {
+            cargo test --locked -p theseus-host --features test-support --lib conpty_backpressure_close_model -- --nocapture --test-threads=1 2>&1 |
+              Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'early-native-conpty-close-model.log')
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
       - name: Full native application and explicit terminal acceptance
         shell: pwsh
         run: |
@@ -122,6 +136,10 @@ jobs:
           if ($IsWindows) {
             cargo test --locked -p theseus-host --features test-support --lib conpty_backpressure_close_model -- --nocapture 2>&1 |
               Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'native-conpty-close-model.log')
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            cargo test --locked -p theseus-host --features test-support --lib pty_master_ -- --nocapture 2>&1 |
+              Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'native-pty-mode-controls.log')
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
           $theseusPinnedArtifacts = Get-Content (Join-Path $env:THESEUS_HOST_EVIDENCE 'native-artifacts.json') | ConvertFrom-Json

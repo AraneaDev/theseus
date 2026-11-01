@@ -22,6 +22,35 @@ fn screen(app: &App, width: u16, height: u16) -> String {
         .map(|c| c.symbol())
         .collect()
 }
+// These two overview assertions require complete native commands in the 60%
+// records pane. Narrow/detail reachability tests keep their fixed dimensions.
+fn overview_width(root: &std::path::Path) -> u16 {
+    let quoted_root = root.to_string_lossy().replace('\'', "'\"'\"'");
+    let records = [
+        format!(
+            "Source logs/commands: theseus report '{quoted_root}/sources/archive/run-archive/report.json'"
+        ),
+        format!("Recovery: theseus cleanup '{quoted_root}'"),
+        format!("Complete evidence: theseus comparison '{quoted_root}' --json"),
+    ];
+    let cells = records
+        .iter()
+        .map(|s| ratatui::text::Line::from(s.as_str()).width())
+        .max()
+        .unwrap();
+    let width = cells
+        .checked_add(8)
+        .and_then(|n| n.checked_mul(5))
+        .expect("overview width overflow")
+        .div_ceil(3)
+        .max(180);
+    assert!(
+        width <= 4096,
+        "native overview fixture exceeds bounded display: {width}"
+    );
+    u16::try_from(width).unwrap()
+}
+
 #[test]
 fn preview_shows_explicit_manifest_and_quit_does_not_run_or_edit_it() {
     let t = tempfile::tempdir().unwrap();
@@ -68,7 +97,7 @@ fn offline_context_rows_unknown_and_source_recovery_are_visible_without_recipes(
         root.join("comparison.json"),
     );
     assert_eq!(app.exit_code(), 1);
-    let text = screen(&app, 180, 48);
+    let text = screen(&app, overview_width(&root), 48);
     for s in [
         "Baseline: copy",
         "/app",
@@ -176,7 +205,7 @@ fn large_difference_display_keeps_all_differences_and_full_source_fields_reachab
     document.report.sources[0].error =
         Some(format!("{}tail-that-must-be-elided", "x".repeat(1000)));
     let mut app = App::comparison_offline(document, root.clone());
-    let text = screen(&app, 180, 70);
+    let text = screen(&app, overview_width(&root), 70);
     for expected in [
         "sources/copy/run-copy/report.json",
         "theseus cleanup",

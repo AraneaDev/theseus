@@ -9,6 +9,8 @@ from terminal_session import NativeSession
 
 binary = sys.argv[1]
 for action in ('quit', 'raw-control', 'native-control'):
+    if os.environ.get('THESEUS_TERMINAL_TRACE') == '1':
+        print('native terminal case=' + action + ' phase=start', file=sys.stderr, flush=True)
     terminal = NativeSession(binary, ['--no-animation'], 'examples/standalone', os.environ)
     try:
         deadline = time.monotonic() + 8

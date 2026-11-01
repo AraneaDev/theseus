@@ -453,6 +453,21 @@ fn run(args: &[OsString]) -> FixtureResult {
 }
 
 fn main() {
+    #[cfg(all(unix, feature = "test-support"))]
+    if env::args_os().nth(1).as_deref() == Some(OsStr::new("terminal-mode-exit")) {
+        let arguments = env::args_os().skip(2).collect::<Vec<_>>();
+        let result = match arguments.as_slice() {
+            [mode] if mode == "leave" => theseus_host::process::terminal::run_mode_fixture(false),
+            [mode] if mode == "restore" => theseus_host::process::terminal::run_mode_fixture(true),
+            _ => Err(invalid("fixed terminal mode must be leave or restore")),
+        };
+        if let Err(error) = result {
+            eprintln!("terminal mode fixture: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
+
     #[cfg(all(windows, feature = "test-support"))]
     if env::args_os().nth(1).as_deref() == Some(OsStr::new("terminal-client")) {
         let result = theseus_host::process::terminal::run_client(
