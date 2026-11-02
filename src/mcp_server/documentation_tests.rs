@@ -1,9 +1,9 @@
-//! README transcripts go through the actual strict wire/domain parser.
+//! MCP server guide transcripts go through the actual strict wire/domain parser.
 use super::{types::*, wire::WireState};
 
 #[test]
 fn readme_mcp_examples_parse_through_production_wire() {
-    let readme = include_str!("../../README.md").replace("\r\n", "\n");
+    let readme = include_str!("../../docs/agents/mcp-server.md").replace("\r\n", "\n");
     let mut modern_tools = Vec::new();
     for era in ["legacy", "modern"] {
         let marker = format!("<!-- mcp-example:{era} -->");
