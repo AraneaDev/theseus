@@ -32,6 +32,7 @@ fn ordinary_recipe_error_does_not_invent_launch_or_block_admission() {
     assert_eq!(owner.view().native, NativeCleanup::Complete);
     assert_eq!(owner.view().launch, None);
     assert!(!owner.view().cleanup_blocked);
+    assert!(!owner.has_worker_panic());
 }
 
 #[test]
@@ -215,4 +216,134 @@ fn typed_unknown_publication_payload_blocks_even_without_native_launch_fact() {
     assert!(owner.primary().is::<Primary>());
     assert_eq!(owner.view().native, NativeCleanup::Unknown);
     assert!(owner.view().cleanup_blocked);
+}
+
+#[derive(Debug)]
+struct PanickingDiagnostic {
+    successful_displays: usize,
+    displays: AtomicUsize,
+    primary_drops: Arc<AtomicUsize>,
+    panic_drops: Arc<AtomicUsize>,
+}
+impl Drop for PanickingDiagnostic {
+    fn drop(&mut self) {
+        self.primary_drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+impl fmt::Display for PanickingDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.displays.fetch_add(1, Ordering::SeqCst) >= self.successful_displays {
+            std::panic::panic_any(Witness(self.panic_drops.clone()));
+        }
+        f.write_str("diagnostic before finalizer")
+    }
+}
+impl std::error::Error for PanickingDiagnostic {}
+
+#[test]
+fn initial_display_panic_returns_original_primary_native_owner_and_panic_payload() {
+    display_panic_case(0);
+}
+
+#[test]
+fn finalizer_display_panic_returns_original_primary_native_owner_and_panic_payload() {
+    display_panic_case(1);
+}
+
+fn display_panic_case(successful_displays: usize) {
+    let fixture = PendingFixture::new();
+    let primary_drops = Arc::new(AtomicUsize::new(0));
+    let panic_drops = Arc::new(AtomicUsize::new(0));
+    let mut cleanup = CleanupFailures::default();
+    cleanup.retain(&fixture.failure.clone().into());
+    let error = anyhow::Error::new(PanickingDiagnostic {
+        successful_displays,
+        displays: AtomicUsize::new(0),
+        primary_drops: primary_drops.clone(),
+        panic_drops: panic_drops.clone(),
+    })
+    .context(cleanup);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let owner = OwnedError::capture(QueryError::new(ErrorCode::WorkerError, error));
+        if successful_displays == 0 {
+            owner
+        } else {
+            owner.finalize()
+        }
+    }));
+    assert!(
+        result.is_ok(),
+        "diagnostic panic must return the original owner bundle"
+    );
+    let owner = result.unwrap();
+    assert!(owner.primary().is::<PanickingDiagnostic>());
+    assert!(owner.has_worker_panic());
+    assert_eq!(primary_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(panic_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(owner.view().native, NativeCleanup::Pending);
+    assert_eq!(owner.view().launch, Some(Launch::MayRun));
+    assert!(owner.view().cleanup_blocked);
+    assert!(!serde_json::to_vec(owner.view()).unwrap().is_empty());
+    fixture.release_fault();
+    while !fixture.failure.retry_cleanup().unwrap() {
+        std::thread::yield_now();
+    }
+    drop(owner);
+    assert_eq!(primary_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(panic_drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn initial_source_panic_preserves_original_owner_and_marks_unknown_cleanup() {
+    #[derive(Debug)]
+    struct PanickingSource {
+        primary_drops: Arc<AtomicUsize>,
+        panic_drops: Arc<AtomicUsize>,
+    }
+    impl Drop for PanickingSource {
+        fn drop(&mut self) {
+            self.primary_drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl fmt::Display for PanickingSource {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("source panic")
+        }
+    }
+    impl std::error::Error for PanickingSource {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            std::panic::panic_any(Witness(self.panic_drops.clone()));
+        }
+    }
+    let fixture = PendingFixture::new();
+    let primary_drops = Arc::new(AtomicUsize::new(0));
+    let panic_drops = Arc::new(AtomicUsize::new(0));
+    let mut cleanup = CleanupFailures::default();
+    cleanup.retain(&fixture.failure.clone().into());
+    let error = anyhow::Error::new(PanickingSource {
+        primary_drops: primary_drops.clone(),
+        panic_drops: panic_drops.clone(),
+    })
+    .context(cleanup);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        OwnedError::capture(QueryError::new(ErrorCode::WorkerError, error))
+    }));
+    assert!(
+        result.is_ok(),
+        "source traversal panic must not consume original authority"
+    );
+    let owner = result.unwrap();
+    assert!(owner.primary().is::<PanickingSource>());
+    assert!(owner.has_worker_panic());
+    assert_eq!(primary_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(panic_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(owner.view().native, NativeCleanup::Unknown);
+    assert!(owner.view().cleanup_blocked);
+    fixture.release_fault();
+    while !fixture.failure.retry_cleanup().unwrap() {
+        std::thread::yield_now();
+    }
+    drop(owner);
+    assert_eq!(primary_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(panic_drops.load(Ordering::SeqCst), 1);
 }

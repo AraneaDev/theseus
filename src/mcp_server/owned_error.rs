@@ -2,9 +2,12 @@
 use super::types::{
     ErrorCode, FinalSummary, Handle, Launch, NativeCleanup, QueryError, TextPreview,
 };
-use crate::runner::process::CleanupFailures;
+use crate::runner::process::{CleanupFailures, worker_panic};
 use serde::Serialize;
-use std::fmt::{self, Write};
+use std::{
+    fmt::{self, Write},
+    panic::{AssertUnwindSafe, catch_unwind},
+};
 use theseus_host::process::LaunchPhase;
 
 #[derive(Debug, Clone, Serialize)]
@@ -21,34 +24,29 @@ pub(crate) struct OwnedError {
     error: QueryError,
     cleanup: CleanupFailures,
     view: ErrorView,
+    // Every retained cleanup reference is also owned by the original primary or
+    // one of these typed siblings, outside all potentially unwinding callbacks.
+    panics: Vec<anyhow::Error>,
+    has_worker_panic: bool,
 }
 impl OwnedError {
     /// Only the owning worker (or the caller after its actual join) may capture.
     pub(crate) fn capture(error: QueryError) -> Self {
-        let (cleanup, facts) = CleanupFailures::capture_on_worker(&error.source);
-        // Retain authority before invoking even bounded Display implementations.
-        let view = ErrorView {
-            code: error.code,
-            message: bounded_message(&error.source),
-            native: if facts.pending {
-                NativeCleanup::Pending
-            } else if facts.publication_unknown {
-                NativeCleanup::Unknown
-            } else {
-                NativeCleanup::Complete
+        let mut owner = Self {
+            view: ErrorView {
+                code: error.code,
+                message: TextPreview::new("error diagnostic unavailable", false),
+                native: NativeCleanup::Unknown,
+                launch: None,
+                cleanup_blocked: true,
             },
-            launch: facts.launch.map(|phase| match phase {
-                LaunchPhase::NeverCreated => Launch::NeverCreated,
-                LaunchPhase::CreatedSuspended => Launch::CreatedSuspended,
-                LaunchPhase::MayRun => Launch::MayRun,
-            }),
-            cleanup_blocked: facts.pending || facts.publication_unknown,
-        };
-        Self {
             error,
-            cleanup,
-            view,
-        }
+            cleanup: CleanupFailures::default(),
+            panics: Vec::new(),
+            has_worker_panic: false,
+        };
+        owner.refresh();
+        owner
     }
     /// Immutable projection only: no cleanup mutex or native query is touched.
     pub(crate) fn view(&self) -> &ErrorView {
@@ -57,34 +55,113 @@ impl OwnedError {
     pub(crate) fn primary(&self) -> &anyhow::Error {
         &self.error.source
     }
+    /// A panic caught during capture/finalization is fatal even when the original
+    /// query classification was an ordinary domain error. No native calls here.
+    pub(crate) fn has_worker_panic(&self) -> bool {
+        self.has_worker_panic
+    }
     /// Run only on the finalizer occupying the now-free engine slot.
-    pub(crate) fn finalize(self) -> Self {
-        let Self {
-            mut error,
-            cleanup,
-            view,
-        } = self;
-        let remaining = cleanup.settled();
-        if remaining.pending() {
-            // Context retains every unresolved owner without replacing the
-            // original primary's type or dropping the original panic payload.
-            error.source = error.source.context(remaining);
+    pub(crate) fn finalize(mut self) -> Self {
+        let settled = catch_unwind(AssertUnwindSafe(|| {
+            // Settle only freshly retained shared references. Their authoritative
+            // primary and panic siblings, and the previous retention bundle,
+            // all stay in self outside this potentially unwinding closure.
+            let (mut cleanup, _) = CleanupFailures::capture_on_worker(&self.error.source);
+            for panic in &self.panics {
+                cleanup.retain(panic);
+            }
+            let remaining = cleanup.settled();
+            let pending = remaining.pending();
+            (remaining, pending)
+        }));
+        match settled {
+            Ok((remaining, pending)) => {
+                if pending {
+                    self.error.source = self.error.source.context(remaining);
+                }
+                self.refresh();
+            }
+            Err(payload) => self.record_panic(payload, true),
         }
-        let mut finalized = Self::capture(error);
+        self
+    }
+    fn refresh(&mut self) {
+        // Only borrow the original: source() and Display are user implementations
+        // and can unwind. The original and every panic sibling remain outside.
+        let sampled = catch_unwind(AssertUnwindSafe(|| {
+            CleanupFailures::capture_on_worker(&self.error.source)
+        }));
+        let (cleanup, facts) = match sampled {
+            Ok(sampled) => sampled,
+            Err(payload) => {
+                self.record_panic(payload, true);
+                return;
+            }
+        };
+        self.cleanup = cleanup;
+        self.view.native = if facts.pending {
+            NativeCleanup::Pending
+        } else if facts.publication_unknown {
+            NativeCleanup::Unknown
+        } else {
+            NativeCleanup::Complete
+        };
+        self.view.cleanup_blocked = facts.pending || facts.publication_unknown;
+        self.record_launch(facts.launch);
+        // Sibling panic authority need not appear in the primary's source chain.
+        for index in 0..self.panics.len() {
+            let (_, facts) = CleanupFailures::capture_on_worker(&self.panics[index]);
+            self.cleanup.retain(&self.panics[index]);
+            self.record_launch(facts.launch);
+            if facts.pending {
+                self.view.native = NativeCleanup::Pending;
+                self.view.cleanup_blocked = true;
+            }
+        }
+        match catch_unwind(AssertUnwindSafe(|| bounded_message(&self.error.source))) {
+            Ok(message) => self.view.message = message,
+            Err(payload) => self.record_panic(payload, false),
+        }
+    }
+    fn record_panic(&mut self, payload: Box<dyn std::any::Any + Send>, unknown: bool) {
+        // worker_panic uses its concrete ownership wrapper, not the panicking
+        // original's Display/source callbacks. Retain that typed sibling first.
+        self.panics.push(worker_panic(payload));
+        self.has_worker_panic = true;
+        let panic = self.panics.last().expect("just retained panic");
+        let (_, facts) = CleanupFailures::capture_on_worker(panic);
+        self.cleanup.retain(panic);
+        self.record_launch(facts.launch);
+        if facts.pending {
+            self.view.native = NativeCleanup::Pending;
+            self.view.cleanup_blocked = true;
+        } else if unknown {
+            if self.view.native != NativeCleanup::Pending {
+                self.view.native = NativeCleanup::Unknown;
+            }
+            self.view.cleanup_blocked = true;
+        }
+        self.view.message = TextPreview::new("error diagnostic or cleanup worker panicked", false);
+    }
+    fn record_launch(&mut self, phase: Option<LaunchPhase>) {
+        let phase = phase.map(|phase| match phase {
+            LaunchPhase::NeverCreated => Launch::NeverCreated,
+            LaunchPhase::CreatedSuspended => Launch::CreatedSuspended,
+            LaunchPhase::MayRun => Launch::MayRun,
+        });
         let rank = |phase| match phase {
             Launch::NeverCreated => 0,
             Launch::CreatedSuspended => 1,
             Launch::MayRun => 2,
         };
-        if let Some(historical) = view.launch
-            && finalized
+        if let Some(phase) = phase
+            && self
                 .view
                 .launch
-                .is_none_or(|current| rank(historical) > rank(current))
+                .is_none_or(|prior| rank(phase) > rank(prior))
         {
-            finalized.view.launch = Some(historical);
+            self.view.launch = Some(phase);
         }
-        finalized
     }
 }
 
