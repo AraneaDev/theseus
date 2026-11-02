@@ -19,3 +19,6 @@ pub(crate) mod worker;
 pub(crate) mod coordinator;
 pub(crate) mod shutdown;
 pub(crate) mod diagnostics;
+
+#[cfg(test)]
+mod documentation_tests;

@@ -1,0 +1,130 @@
+{
+  "docker": {
+    "docker_lifecycle": [
+      "healthy_fixture_passes_all_four_real_lifecycles",
+      "real_broken_fixtures_reveal_contract_failures_and_review_findings",
+      "real_timeout_and_cancellation_stop_container_descendants",
+      "real_logs_are_drained_and_capped_independently",
+      "actual_archive_overflow_and_symlink_ancestors_are_incomplete",
+      "cleanup_refuses_mismatching_ownership_and_is_idempotent_for_missing_resources",
+      "real_application_exit_one_and_docker_control_exit_one_are_distinct",
+      "real_pty_active_signals_cleanup_and_cancel_browsing",
+      "healthy_reinstall_passes_both_profiles_with_same_container_and_verified_completions",
+      "reinstall_only_faults_reveal_changed_children_and_continue_uninstall",
+      "real_reinstall_timeout_and_cancellation_remove_journaled_container",
+      "real_pty_reinstall_selection_and_new_report_comparison_visibility",
+      "real_interruption_retains_partial_state_and_restarts_without_setup_or_copy",
+      "real_interruption_early_exit_is_failed_contract_with_real_status",
+      "real_interruption_never_ready_or_invalid_receipt_removes_owned_container",
+      "real_interruption_ownership_mismatch_cannot_stop_or_restart_container",
+      "real_interruption_unverified_transport_and_stop_never_mint_planned_success",
+      "real_interruption_cancellation_at_ready_kill_and_stopped_removes_container",
+      "real_interruption_restart_errors_or_cancellation_remove_without_forward_mutation",
+      "real_interruption_early_completion_control_is_bounded_independently_of_command",
+      "real_interruption_restart_retains_primary_and_cleanup_errors",
+      "real_pty_default_animation_active_cancellation_precedes_outro"
+    ],
+    "interruption_lifecycle": [
+      "real_interruption_four_way_matrix_retains_partial_state_then_recovers",
+      "real_interruption_faults_keep_literal_failure_and_no_false_recovery",
+      "real_interruption_cancellation_before_ready_stopped_and_restart_is_130",
+      "real_public_example_headless_and_live_offline_pty",
+      "real_declared_writer_checks_reject_a_changing_writer"
+    ],
+    "downgrade_lifecycle": [
+      "real_downgrade_four_way_matrix_reads_newer_records_or_proves_exact_refusal",
+      "real_compatible_faults_fail_the_actual_old_reader_or_exact_stable_scope",
+      "real_rejection_mutations_fail_exact_binary_data_or_configuration_paths",
+      "real_refusal_wrong_status_marker_success_and_failed_retained_exercise_are_failed",
+      "real_missing_truncated_transport_control_one_and_unavailable_reference_are_incomplete",
+      "real_downgrade_timeout_and_cancellation_stop_without_post_attempt_runtime",
+      "real_downgrade_live_and_offline_narrow_pty_both_policies"
+    ],
+    "rollback_lifecycle": [
+      "real_rollback_four_way_matrix_restores_runtime_and_reads_actual_data",
+      "real_failed_attempt_requires_mutation_status_marker_and_verified_receipt",
+      "real_backup_faults_block_restoration_and_preserve_preexisting_root",
+      "real_noop_partial_and_metadata_restores_fail_independent_proofs",
+      "real_incomplete_runtime_coverage_blocks_forward_mutation",
+      "real_timeout_and_cancel_at_every_mutation_skip_forward_steps",
+      "real_rollback_live_offline_narrow_pty_both_policies",
+      "real_reference_boundaries_capture_check_effects_before_forward_mutation",
+      "real_directory_binary_reference_fails_its_kind_check_without_scope_overlap"
+    ],
+    "interrupted_rollback_lifecycle": [
+      "real_interrupted_rollback_four_way_matrix_restores_runtime_and_reads_actual_data",
+      "real_backup_faults_block_restoration_and_preserve_preexisting_root",
+      "real_noop_partial_and_metadata_restores_fail_independent_proofs",
+      "real_incomplete_runtime_coverage_blocks_forward_mutation",
+      "real_timeout_and_cancel_at_every_mutation_skip_forward_steps",
+      "real_interrupted_rollback_live_offline_narrow_pty_both_policies",
+      "real_reference_boundaries_capture_check_effects_before_forward_mutation",
+      "real_directory_binary_reference_fails_its_kind_check_without_scope_overlap",
+      "real_zero_return_noop_cannot_prove_original_runtime_or_restored_tree",
+      "real_barrier_stop_restart_and_writer_faults_block_rollback",
+      "real_control_timeouts_and_cancellation_boundaries_are_bounded_and_terminal",
+      "real_mixed_ordinary_and_interrupted_entries_keep_distinct_modes_and_owned_ids"
+    ],
+    "comparison_docker": [
+      "copy_archive_same_artifact_both_profiles",
+      "two_distinct_actual_image_ids_both_profiles",
+      "deliberate_scoped_difference_both_profiles",
+      "failed_source_prevents_suite_success_both_profiles",
+      "headless_cancellation_each_profile_prevents_next_variant_and_cleans_up",
+      "real_pty_comparison_preview_live_offline_cancel_and_restore"
+    ],
+    "mcp_docker": [
+      "interactive_both_eras_prove_real_eof_and_application_receipt",
+      "wrong_inventory_is_failed_with_clean_receipt",
+      "ignored_eof_removes_owned_guest_without_claiming_application_exit",
+      "cancellation_preserves_precedence_and_removes_owned_guest",
+      "ownership_mismatch_refuses_removal_and_unrelated_guest_survives",
+      "truncated_successful_prefix_with_cancellation_remains_saveable_incomplete_evidence"
+    ],
+    "mcp_server_docker": [
+      "production_serve_matches_direct_engine_success_failure_cancel_and_recovery"
+    ]
+  },
+  "native": {
+    "early-unix": [
+      "process::unix::terminal::events::tests::pty_resize_and_single_q_both_reach_native_event_reader",
+      "process::unix::terminal::events::tests::pty_resize_and_single_q_control_also_drains_multiple_read_chunks",
+      "process::unix::terminal::events::tests::pty_resize_and_single_q_control_preserves_split_escape_parser",
+      "process::unix::terminal::events::tests::pty_resize_and_single_q_control_accepts_new_input_after_drain"
+    ],
+    "early-windows": [
+      "process::windows::terminal::modes::tests::conpty_legacy_crossterm_controls_demonstrate_exact_mode_drift"
+    ],
+    "runtime-unix": [
+      "process::unix::terminal::tests::pty_master_preserves_altered_modes_after_session_leader_exit",
+      "process::unix::terminal::tests::pty_master_observes_restored_modes_after_session_leader_exit"
+    ],
+    "runtime-windows": [
+      "process::windows::terminal::tests::conpty_backpressure_close_model_joins_reader_and_real_native_cleanup"
+    ],
+    "stdio-rust": [
+      "ordinary_rust_empty_live_input_is_observed_before_eof",
+      "ordinary_rust_complete_qualification_matrix_retains_both_candidates",
+      "direct_failures_are_not_blanket_waived",
+      "early_qualification_failure_is_measured_without_claiming_rollback_injection",
+      "native_incompatibility_requires_exact_failure_and_reversal",
+      "direct_success_requires_eof_restoration_and_exact_output"
+    ],
+    "cli-terminal": [
+      "native_terminal_preview_restores_modes_and_drains_owned_session",
+      "terminal_protocol_rejects_malformed_bounds_and_joins_on_eof",
+      "terminal_screen_literal_wrap_and_control_sequences_match_cells",
+      "terminal_diagnostics_release_pipe_producers_and_preserve_bounded_progress",
+      "actual_native_cli_init_validate_and_offline_report_never_invoke_docker"
+    ],
+    "server-common": [
+      "serve_parses_required_native_roots_and_bounded_deadline_offline",
+      "ordinary_rust_pipe_transcript_has_no_terminal_or_diagnostic_output",
+      "ordinary_rust_supervisor_reaps_exited_leader_with_inherited_pipes",
+      "python_native_supervisor_keeps_transcripts_and_process_identity"
+    ],
+    "server-unix": [
+      "serve_roots_preserve_non_unicode_native_paths"
+    ]
+  }
+}

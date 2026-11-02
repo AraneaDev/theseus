@@ -132,7 +132,7 @@ See [MCP fixtures and explicit native acceptance](examples/mcp/README.md).
 - Default push/PR CI requires full workspace clippy, all-target tests, optimized
   release builds and explicit native CLI/terminal controls on Ubuntu 24.04 x86-64,
   macOS 15 arm64 and Windows Server 2025 x86-64. Release acceptance requires these
-  three native jobs and all seven real Ubuntu Docker suites on the same 0.12 source.
+  three native jobs and all eight real Ubuntu Docker suites on the same 0.12 source.
 - Controller evidence covers retained filesystem identities, artifact/cache/storage,
   native process/pipes, bounded duplex capture, terminal restoration and owned
   cleanup. Existing report readers accept schemas 1–8; guest paths remain POSIX.
@@ -141,23 +141,33 @@ See [MCP fixtures and explicit native acceptance](examples/mcp/README.md).
   the Windows runner has reported 26100, and pre26100 runtime remains unverified.
   The controlled blocking-close MODEL is separate from actual native cleanup proof.
 - Linux Docker guests remain the execution environment. Native controller support
-  does not establish native macOS/Windows guest, GUI, service or VM behavior, nor
-  inherited synchronous-stdio cancellation for a future public MCP server.
+  does not establish native macOS/Windows guest, GUI, service or VM behavior, or any inherited-stdio
+  behavior without the separate MCP acceptance gates.
 
-The following capabilities are planned, not available features.
-
-## Next: native OS adapters
+## Next: native OS adapters (planned)
 
 - Machine/VM adapters where containers cannot establish service/session fidelity.
 - Native macOS and Windows environment adapters with OS-specific contracts;
   unavailable native acceptance remains explicitly pending.
 
-## Shared-engine MCP interface
+## Integrated locally: shared-engine MCP interface; acceptance pending
 
-- Expose recipe inspection, run creation, status, cancellation and evidence through
-  an MCP interface using the same engine and outcome semantics.
+- `theseus serve` exposes exactly `recipe_inspect`, `run_start`, `run_list`,
+  `run_status`, `run_cancel` and `run_evidence` over ordinary inherited pipes,
+  using the shared engine, outcomes and report/journal contracts.
+- Legacy `2025-11-25` and modern `2026-07-28` adapters, explicit launch roots,
+  bounded frames/pages, process-local admission keys, polling and owned shutdown
+  are implemented in source. Exceptional five-second shutdown exits 2 with
+  incomplete cleanup; recovery remains explicit through the existing CLI.
+- Required native preflight and actual-server suites remain in all three host
+  jobs; the real server Docker suite joins the existing seven in one budgeted
+  Linux job. `scripts/validate.py` shares those commands for local pre-push checks
+  and records native OS, source/dirty-tree identity and artifact receipts.
+- Final same-source Linux/macOS/Windows ordinary-pipe/binary acceptance is pending.
+  Local Linux checks, cross-compilation and container tests cannot complete that
+  three-host gate. No release acceptance or hosted verification is claimed here.
 
-## Services and desktop applications
+## Services and desktop applications (planned)
 
 - Observe systemd units, launcher entries and application process lifecycles.
 

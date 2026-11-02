@@ -36,7 +36,7 @@ Default push and pull-request CI requires the full application workspace on:
 Each native job asserts its compiler host and records the compiler, image and
 actual OS version/build. The Windows runner has reported build 26100; the runner
 label alone does not establish runtime acceptance. Release acceptance requires
-all three native jobs and all seven Ubuntu Docker gates on the same 0.12 source.
+all three native jobs and all eight Ubuntu Docker gates on the same 0.12 source.
 Execution on Windows builds before 26100 remains unverified. Other architectures,
 network filesystems and native macOS/Windows guest environments are outside this
 initial scope.
@@ -58,10 +58,128 @@ cleanup. Its real pressure/EOF/job/close tests also use a controlled blocking-cl
 **MODEL** to check drain/join ordering; that model does not establish older-kernel
 behavior. The Linux-only first-scene `LD_PRELOAD` write-error injection is
 supplemental; native engine-error restoration remains required on every host.
-The coupled test transport does not prove cancellation of inherited
-synchronous stdio for a future public Theseus MCP server. Native guest adapters,
+The MCP server has a separate ordinary inherited-pipe qualification and actual
+binary suite; the coupled terminal transport does not establish that acceptance.
+The server source is integrated locally; final same-source Linux/macOS/Windows
+inherited-stdio acceptance is **pending**. Native guest adapters,
 service/session/GUI or VM behavior and external real-client prerequisites remain
 separate acceptance work; Linux Docker tests do not establish them.
+
+## Local six-tool MCP server
+
+`theseus serve` exposes the same lifecycle engine and outcomes over ordinary
+stdin/stdout pipes. It has no model dependency or listening network service.
+Launch it with explicit native filesystem roots:
+
+```sh
+theseus serve --project-root /absolute/project --output-root /absolute/evidence --max-run-seconds 3600
+```
+
+On Windows, supply native paths such as `C:\work\project` and `C:\work\evidence`.
+Both roots are required, acquired once with strict no-follow ancestry checks;
+create canonical directories first on systems with aliased temporary ancestors.
+Tool recipe paths use portable relative `/` paths beneath the project root.
+These roots constrain interface access under your OS authority; recipe scripts
+still run according to their declared execution contract. Startup may create the
+output root. Inspection, discovery, listing, status and evidence reads never
+prepare Docker, pull an image or execute a recipe.
+
+The ordered tool inventory is exactly:
+
+| Tool | Purpose |
+| --- | --- |
+| `recipe_inspect` | Read an overview or page sanitized recipe records. |
+| `run_start` | Admit a digest-bound selection; acceptance is not run success. |
+| `run_list` | Page this server process's admissions. |
+| `run_status` | Poll cached state or request one saved report refresh. |
+| `run_cancel` | Request cancellation of an admitted run. |
+| `run_evidence` | Page saved report records and raw log bytes. |
+
+Legacy MCP `2025-11-25` uses initialize/initialized. Each line below is a
+separate JSON-RPC frame in one legacy session:
+
+<!-- mcp-example:legacy -->
+```json
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"local-client","version":"1"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"recipe_inspect","arguments":{"recipe_path":"theseus.toml"}}}
+```
+
+Modern MCP `2026-07-28` permits direct calls with version and client-capability
+metadata on every request. These are request shapes: replace the all-zero
+`server_instance`, `handle` prefix and `recipe_digest` with the actual values
+returned by this process's inspection/admission before making dependent calls.
+Use fresh RPC IDs; reuse the exact `request_key` and arguments only to retry the
+same admission. The examples are parsed by the production wire/domain tests.
+
+<!-- mcp-example:modern -->
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"name":"recipe_inspect","arguments":{"recipe_path":"theseus.toml"}}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"name":"run_start","arguments":{"server_instance":"00000000000000000000000000000000","request_key":"local-attempt-1","recipe_path":"theseus.toml","recipe_digest":"0000000000000000000000000000000000000000000000000000000000000000","profiles":["user"],"scenarios":["clean"],"pull":false}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"name":"run_list","arguments":{"server_instance":"00000000000000000000000000000000","limit":32}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"name":"run_status","arguments":{"server_instance":"00000000000000000000000000000000","handle":"00000000000000000000000000000000:1","refresh":true}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"name":"run_cancel","arguments":{"server_instance":"00000000000000000000000000000000","handle":"00000000000000000000000000000000:1"}}}
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"name":"run_evidence","arguments":{"server_instance":"00000000000000000000000000000000","handle":"00000000000000000000000000000000:1","selector":{"kind":"catalog","collection":"run"}}}}
+```
+
+Tool results carry `format_version:1`, `server_instance`, `ok` and either `data`
+or a typed `error`, in `structuredContent` and the identical JSON text content.
+Poll at the returned `poll_after_ms` (500). `finished` requires the engine worker
+to return and join; inspect `engine_result.outcome` and counts separately from
+state. Saved evidence is an exact report snapshot; its revision can differ from
+historical engine results if evidence was subsequently replaced.
+
+Recipe reads are capped at 1 MiB. Input and complete output frames are at most
+65,536 bytes **including the newline**; duplicate keys and nesting deeper than 64
+are rejected. RPC IDs are strings of at most 128 UTF-8 bytes or exact signed
+64-bit integers; null and floating-point IDs are rejected. Four slots cover
+processing, queued responses and partial writes. One query worker has a
+30-second response deadline; a late worker remains owned until it returns.
+Only one engine execution/finalizer is active; there is no run queue.
+
+Catalog and run-list pages default to 32 items, accepting 1–32. Record/log pages
+default to 4096 raw bytes, accepting 1–4096. Replies can shrink a page to fit both
+copies of the encoded result. Follow opaque `next_cursor` values, repeating the
+same selector, revision/digest and effective limit. A cursor is process-bound,
+at most 256 ASCII bytes (v1 emits 188 lowercase hex characters). Restart paging
+when the returned error requests it; pagination exposes retained bytes and does
+not recover capture truncation. Reports keep their existing 64 MiB disk-read cap;
+parsed allocations and the engine's live report are additional to that bound.
+
+Inspection returns environment **names** and redacts literal/inherited values;
+it never queries inherited values. Saved command records retain their existing
+public literal metadata and raw logs can contain sensitive output. The recipe's
+`recipe_digest` is the source digest: SHA-256 of exact source bytes, including
+newline representation. It is not an
+immutable snapshot of artifact contents or environment values. `run_start`
+rereads, checks the digest and passes the validated source to the shared engine.
+
+Admissions and idempotency are process-local: at most 128 keys, no eviction or
+reuse until exit. Retrying the same key and canonical arguments recovers the same
+handle; changing its arguments is `idempotency_conflict`. A lost response leaves
+the client uncertain whether admission/execution began until that exact retry or
+polling resolves it. Restarting the server loses the registry and duplicate
+suppression; it does not establish crash-safe exactly-once execution or import
+old reports as live jobs.
+
+`run_cancel` cancels a run by handle. RPC cancellation concerns the outstanding
+request and is best effort: after a start response's final newline, cancelling
+that RPC ID does not cancel the run. Run deadlines request the existing engine
+cancellation token; `--max-run-seconds` accepts 1–86400, default 3600. Input EOF,
+transport failure, OS stop and output stalls shut down the process and request
+active-run cancellation. Shutdown gets five seconds to join owned work; unresolved
+work forces process exit **2**, which means **incomplete cleanup**, not successful
+joining. Runs are not supported background jobs after server exit. Inspect saved
+evidence and explicitly recover verified journaled resources with:
+
+```sh
+theseus cleanup /absolute/evidence/REPORT_ID
+```
+
+Native ordinary-pipe and actual-binary acceptance on all three supported hosts is
+required at the same source before claiming release acceptance. That final gate
+is pending for this implementation. Linux Docker parity supplements these gates;
+it does not implement native macOS/Windows guests, VMs, services or desktop apps.
 
 ## Try a complete example
 
@@ -793,22 +911,52 @@ Inspect Docker separately in that exceptional window.
 
 ## Validation and scope
 
-```sh
-export THESEUS_HOST_TEST_FIXTURE="$(python3 tests/support/build_host_fixture.py)"
-cargo fmt --all --check
-cargo clippy --offline --locked --workspace --all-targets -- -D warnings
-python3 tests/support/portable_guest_bytes.py
-cargo test --offline --locked --workspace --all-targets --no-fail-fast
-cargo test --offline --locked --test host_cli --test host_terminal -- --nocapture
-cargo build --offline --locked --workspace --release
-cargo test --offline --locked --test docker_lifecycle --test interruption_lifecycle --test downgrade_lifecycle --test rollback_lifecycle --test interrupted_rollback_lifecycle --test comparison_docker --test mcp_docker -- --ignored --test-threads=1
-```
+Run the shared CI checks locally before pushing, without registering a runner
+or installing a Git hook. Python 3, a native stable Rust toolchain with rustfmt
+and clippy, and Node.js for the existing observer controls must be available.
+Use Python 3.12 or newer on Windows and the checked Git-for-Windows Bash for
+the two POSIX guest-script byte oracles.
+
+| Native machine | Full local native validation |
+| --- | --- |
+| Linux | `python3 scripts/validate.py native` |
+| macOS | `python3 scripts/validate.py native` |
+| Windows (PowerShell) | `python scripts/validate.py native` |
+
+On Linux, also run `python3 scripts/validate.py docker` for all eight required
+real Docker suites. This uses one trusted fixture build, one test precompile and
+one shared 70-minute acceptance budget. Docker must be reachable; preparation
+pulls `ubuntu:24.04` and records the exact image ID used for the MCP fixtures.
+The server suite uses the real production `serve` binary over ordinary pipes.
+No client, public MCP service, model or credentials are needed.
+
+The script prints its evidence directory (outside the source tree by default).
+`--evidence /absolute/new-directory` chooses a retained location outside the
+source tree. Receipts contain
+exact argv, exit codes, logs, compiler host, OS version/build, source commit,
+tracked/untracked source-byte hash, dirty/diff identity and pinned binary hashes.
+Missing tools/fixtures, artifact replacement, source changes during validation,
+failed spawns and watchdog expiry fail validation. Checked-in required case
+inventories in `scripts/validation_cases.json` bind all eight Docker suites and
+filtered native controls to named passing executions; zero-test or partial runs
+fail even when Cargo returns 0. Not-run cases remain failures.
+CI invokes the same script stages and uploads diagnostic logs even on failure.
+The additional Windows CI observer uploads bounded in-flight close-model
+checkpoints; the native model test itself runs locally too.
+
+One machine validates its **native OS only**. Other native OS results are recorded
+as `NOT_RUN`; cross-compilation and Linux containers do not establish Windows or
+macOS runtime acceptance. Run the same source on those actual operating systems
+for the three-host gate. No hosted CI was executed to establish acceptance of
+this locally integrated MCP implementation.
 
 Application process tests require the trusted native fixture built by
-`tests/support/build_host_fixture.py`; this script obtains both the fixture and
-actual application from Cargo's JSON artifact output and copies them to an owned
-temporary directory. `artifacts.json` records their source/features/paths/hashes;
-CI rechecks both hashes after workspace tests so feature rebuilds cannot replace
+`tests/support/build_host_fixture.py`. It copies the default-feature production
+application before feature builds can replace Cargo output, then separately pins
+the native host fixture, application test graph and supervised MCP fixture.
+Cargo JSON artifact records and graph features identify each executable in an
+owned temporary directory. `artifacts.json` records their source/features/paths/hashes;
+CI rechecks all pinned hashes after workspace tests so feature rebuilds cannot replace
 the binaries being exercised. Release host features exclude test-support and the
 application test graph includes it. Missing `THESEUS_HOST_TEST_FIXTURE` is a test failure.
 In PowerShell, set it with
@@ -866,8 +1014,8 @@ Interrupted-rollback acceptance adds both profiles/policies with same-ID stop an
 restart, original/immediate/fresh reference boundaries, typed runtime/reader proof,
 faults that block restoration and exact owned teardown. Default animation PTYs
 exercise frames, skips, discarded input, opt-outs, active cancellation, signals,
-errors and terminal restoration. All seven ignored Docker test binaries, including
-`mcp_docker`, are explicitly required in CI. Actual PTYs exercise narrow live selection, new-report
+errors and terminal restoration. All eight ignored Docker test binaries, including
+`mcp_docker` and `mcp_server_docker`, are explicitly required in one CI job. Actual PTYs exercise narrow live selection, new-report
 comparison visibility, offline viewing, and terminal recovery.
 
 A separate real Phrourion 0.8.1 → 0.8.2 rehearsal passed all four matrix entries

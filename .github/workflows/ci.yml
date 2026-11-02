@@ -53,27 +53,16 @@ jobs:
       - name: Build trusted native application fixture
         shell: pwsh
         run: |
-          $theseusTask7Python = if ($IsWindows) { 'python' } else { 'python3' }
-          $theseusTask7Fixture = & $theseusTask7Python tests/support/build_host_fixture.py
+          $theseusPython = if ($IsWindows) { 'python' } else { 'python3' }
+          & $theseusPython scripts/validate.py native --stage fixture --evidence $env:THESEUS_HOST_EVIDENCE --expected-host '${{ matrix.host }}'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          "THESEUS_HOST_TEST_FIXTURE=$theseusTask7Fixture" >> $env:GITHUB_ENV
-          Copy-Item (Join-Path (Split-Path $theseusTask7Fixture) 'artifacts.json') (Join-Path $env:THESEUS_HOST_EVIDENCE 'native-artifacts.json')
-          @{ source_sha = $env:GITHUB_SHA; executable = $theseusTask7Fixture; sha256 = (Get-FileHash -Algorithm SHA256 $theseusTask7Fixture).Hash } |
-            ConvertTo-Json | Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'app-fixture.json')
       - name: Ordinary inherited stdio qualification (required)
         timeout-minutes: 8
         shell: pwsh
         run: |
-          $theseusStdioPython = if ($IsWindows) { 'python' } else { 'python3' }
-          & $theseusStdioPython tests/support/mcp_stdio_preflight.py --self-test
+          $theseusPython = if ($IsWindows) { 'python' } else { 'python3' }
+          & $theseusPython scripts/validate.py native --stage stdio --evidence $env:THESEUS_HOST_EVIDENCE --expected-host '${{ matrix.host }}'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p theseus-host --features test-support --test stdio_preflight -- --nocapture 2>&1 |
-            Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'stdio-rust.log')
-          $theseusStdioRustExit = $LASTEXITCODE
-          & $theseusStdioPython tests/support/mcp_stdio_preflight.py --fixture $env:THESEUS_HOST_TEST_FIXTURE --evidence $env:THESEUS_HOST_EVIDENCE 2>&1 |
-            Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'stdio-python-createpipe.log')
-          $theseusStdioPythonExit = $LASTEXITCODE
-          if ($theseusStdioRustExit -ne 0 -or $theseusStdioPythonExit -ne 0) { exit 1 }
       - name: Upload ordinary stdio qualification evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -84,49 +73,35 @@ jobs:
           if-no-files-found: error
       - name: Workspace formatting
         if: ${{ matrix.os == 'ubuntu-24.04' }}
-        run: cargo fmt --all --check
+        shell: pwsh
+        run: |
+          $theseusPython = if ($IsWindows) { 'python' } else { 'python3' }
+          & $theseusPython scripts/validate.py native --stage fmt --evidence $env:THESEUS_HOST_EVIDENCE --expected-host '${{ matrix.host }}'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Native workspace all-target clippy
         shell: pwsh
         run: |
-          cargo clippy --locked --workspace --all-targets -- -D warnings 2>&1 |
-            Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'clippy.log')
+          $theseusPython = if ($IsWindows) { 'python' } else { 'python3' }
+          & $theseusPython scripts/validate.py native --stage clippy --evidence $env:THESEUS_HOST_EVIDENCE --expected-host '${{ matrix.host }}'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Portable owned guest script bytes and preparation boundaries
         shell: pwsh
         run: |
-          $theseusTask6Python = if ($IsWindows) { 'python' } else { 'python3' }
-          & $theseusTask6Python --version 2>&1 | Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'python-version.txt')
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $theseusTask6Python tests/support/portable_guest_bytes.py 2>&1 |
-            Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'portable-guest-bytes.log')
+          $theseusPython = if ($IsWindows) { 'python' } else { 'python3' }
+          & $theseusPython scripts/validate.py native --stage portable --evidence $env:THESEUS_HOST_EVIDENCE --expected-host '${{ matrix.host }}'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify production and test native feature boundaries
         shell: pwsh
         run: |
-          $theseusReleaseMetadata = Join-Path $env:THESEUS_HOST_EVIDENCE 'release-artifacts.jsonl'
-          cargo check --locked --release --bin theseus --message-format=json 2> (Join-Path $env:THESEUS_HOST_EVIDENCE 'release-check.stderr') |
-            Tee-Object -FilePath $theseusReleaseMetadata
+          $theseusPython = if ($IsWindows) { 'python' } else { 'python3' }
+          & $theseusPython scripts/validate.py native --stage features --evidence $env:THESEUS_HOST_EVIDENCE --expected-host '${{ matrix.host }}'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $theseusReleaseHost = @(Get-Content $theseusReleaseMetadata | ConvertFrom-Json | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'theseus_host' })
-          if ($theseusReleaseHost.Count -lt 1 -or @($theseusReleaseHost | Where-Object { $_.features -contains 'test-support' }).Count -ne 0) { throw 'Production release unexpectedly enables native faults' }
-          $theseusTestMetadata = Join-Path $env:THESEUS_HOST_EVIDENCE 'app-test-artifacts.jsonl'
-          cargo test --locked --lib --no-run --message-format=json 2> (Join-Path $env:THESEUS_HOST_EVIDENCE 'app-test-build.stderr') |
-            Tee-Object -FilePath $theseusTestMetadata
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $theseusTestHost = @(Get-Content $theseusTestMetadata | ConvertFrom-Json | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'theseus_host' -and $_.features -contains 'test-support' })
-          if ($theseusTestHost.Count -lt 1) { throw 'Application test graph lacks scoped native fault support' }
       - name: Precompile native diagnostic executables (required)
         shell: pwsh
         run: |
-          cargo test --locked -p theseus-host --features test-support --lib --no-run 2>&1 |
-            Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'native-host-precompile.log')
+          $theseusPython = if ($IsWindows) { 'python' } else { 'python3' }
+          & $theseusPython scripts/validate.py native --stage precompile --evidence $env:THESEUS_HOST_EVIDENCE --expected-host '${{ matrix.host }}'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked --test host_cli --test host_terminal --no-run 2>&1 |
-            Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'native-integration-precompile.log')
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          node tests/support/observe_conpty_model_action_test.cjs
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if ($IsWindows) { ./tests/support/observe_conpty_model_test.ps1 }
       - name: Upload native diagnostic bootstrap
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -138,34 +113,23 @@ jobs:
       - name: Early Windows legacy controls (required)
         if: ${{ runner.os == 'Windows' }}
         timeout-minutes: 1
-        shell: cmd
+        shell: pwsh
         env:
           THESEUS_TERMINAL_TRACE: '1'
         run: |
-          echo THESEUS diagnostic=legacy phase=start
-          cargo test --locked -p theseus-host --features test-support --lib conpty_legacy_crossterm -- --nocapture --test-threads=1 > "%THESEUS_HOST_EVIDENCE%\early-native-legacy-crossterm.log" 2>&1
-          set "theseusDiagnosticExit=%ERRORLEVEL%"
-          if not exist "%THESEUS_HOST_EVIDENCE%\early-native-legacy-crossterm.log" exit /b 1
-          type "%THESEUS_HOST_EVIDENCE%\early-native-legacy-crossterm.log"
-          if errorlevel 1 exit /b 1
-          echo THESEUS diagnostic=legacy phase=returned exit=%theseusDiagnosticExit%
-          exit /b %theseusDiagnosticExit%
+          $theseusPython = if ($IsWindows) { 'python' } else { 'python3' }
+          & $theseusPython scripts/validate.py native --stage early-controls --evidence $env:THESEUS_HOST_EVIDENCE --expected-host '${{ matrix.host }}'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Early Unix resize and key controls (required)
         if: ${{ runner.os != 'Windows' }}
         timeout-minutes: 1
-        shell: bash
+        shell: pwsh
         env:
           THESEUS_TERMINAL_TRACE: '1'
         run: |
-          printf 'THESEUS diagnostic=resize-key phase=start\n'
-          if cargo test --locked -p theseus-host --features test-support --lib pty_resize_and_single_q -- --nocapture --test-threads=1 > "$THESEUS_HOST_EVIDENCE/early-native-resize-key-control.log" 2>&1; then
-            theseus_diagnostic_exit=0
-          else
-            theseus_diagnostic_exit=$?
-          fi
-          cat "$THESEUS_HOST_EVIDENCE/early-native-resize-key-control.log"
-          printf 'THESEUS diagnostic=resize-key phase=returned exit=%s\n' "$theseus_diagnostic_exit"
-          exit "$theseus_diagnostic_exit"
+          $theseusPython = if ($IsWindows) { 'python' } else { 'python3' }
+          & $theseusPython scripts/validate.py native --stage early-controls --evidence $env:THESEUS_HOST_EVIDENCE --expected-host '${{ matrix.host }}'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload native control diagnostic evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -177,34 +141,23 @@ jobs:
       - name: Early Windows CLI and terminal diagnostics (required)
         if: ${{ runner.os == 'Windows' }}
         timeout-minutes: 3
-        shell: cmd
+        shell: pwsh
         env:
           THESEUS_TERMINAL_TRACE: '1'
         run: |
-          echo THESEUS diagnostic=cli-terminal phase=start
-          cargo test --locked --test host_cli --test host_terminal -- --nocapture --test-threads=1 > "%THESEUS_HOST_EVIDENCE%\early-native-cli-terminal.log" 2>&1
-          set "theseusDiagnosticExit=%ERRORLEVEL%"
-          if not exist "%THESEUS_HOST_EVIDENCE%\early-native-cli-terminal.log" exit /b 1
-          type "%THESEUS_HOST_EVIDENCE%\early-native-cli-terminal.log"
-          if errorlevel 1 exit /b 1
-          echo THESEUS diagnostic=cli-terminal phase=returned exit=%theseusDiagnosticExit%
-          exit /b %theseusDiagnosticExit%
+          $theseusPython = if ($IsWindows) { 'python' } else { 'python3' }
+          & $theseusPython scripts/validate.py native --stage early-cli --evidence $env:THESEUS_HOST_EVIDENCE --expected-host '${{ matrix.host }}'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Early Unix CLI and terminal diagnostics (required)
         if: ${{ runner.os != 'Windows' }}
         timeout-minutes: 3
-        shell: bash
+        shell: pwsh
         env:
           THESEUS_TERMINAL_TRACE: '1'
         run: |
-          printf 'THESEUS diagnostic=cli-terminal phase=start\n'
-          if cargo test --locked --test host_cli --test host_terminal -- --nocapture --test-threads=1 > "$THESEUS_HOST_EVIDENCE/early-native-cli-terminal.log" 2>&1; then
-            theseus_diagnostic_exit=0
-          else
-            theseus_diagnostic_exit=$?
-          fi
-          cat "$THESEUS_HOST_EVIDENCE/early-native-cli-terminal.log"
-          printf 'THESEUS diagnostic=cli-terminal phase=returned exit=%s\n' "$theseus_diagnostic_exit"
-          exit "$theseus_diagnostic_exit"
+          $theseusPython = if ($IsWindows) { 'python' } else { 'python3' }
+          & $theseusPython scripts/validate.py native --stage early-cli --evidence $env:THESEUS_HOST_EVIDENCE --expected-host '${{ matrix.host }}'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload native CLI and terminal diagnostic evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -230,71 +183,14 @@ jobs:
       - name: Full native application and explicit terminal acceptance
         shell: pwsh
         run: |
-          function Invoke-TheseusRuntimeGate {
-            param([ValidateSet('workspace', 'cli-terminal', 'windows-model', 'unix-master')][string]$Gate)
-            # Only these repository-owned literal commands can reach an OS shell.
-            switch ($Gate) {
-              'workspace' { $theseusGateCommand = 'cargo test --locked --workspace --all-targets --no-fail-fast'; $theseusGateLog = 'workspace-tests.log' }
-              'cli-terminal' { $theseusGateCommand = 'cargo test --locked --test host_cli --test host_terminal -- --nocapture'; $theseusGateLog = 'native-cli-terminal.log' }
-              'windows-model' { $theseusGateCommand = 'cargo test --locked -p theseus-host --features test-support --lib conpty_backpressure_close_model -- --nocapture'; $theseusGateLog = 'native-conpty-close-model.log' }
-              'unix-master' { $theseusGateCommand = 'cargo test --locked -p theseus-host --features test-support --lib pty_master_ -- --nocapture'; $theseusGateLog = 'native-pty-mode-controls.log' }
-            }
-            $env:THESEUS_RUNTIME_LOG = Join-Path $env:THESEUS_HOST_EVIDENCE $theseusGateLog
-            Write-Output "THESEUS runtime=$Gate phase=start"
-            if ($IsWindows) {
-              $theseusGateScript = Join-Path $env:RUNNER_TEMP "theseus-runtime-$Gate.cmd"
-              $theseusGateRedirect = ' > "%THESEUS_RUNTIME_LOG%" 2>&1'
-              @("$theseusGateCommand$theseusGateRedirect", 'exit /b %ERRORLEVEL%') | Set-Content -Encoding ascii $theseusGateScript
-              & $env:ComSpec /d /c $theseusGateScript
-            } else {
-              $theseusGateScript = Join-Path $env:RUNNER_TEMP "theseus-runtime-$Gate.sh"
-              $theseusGateRedirect = ' > "$THESEUS_RUNTIME_LOG" 2>&1'
-              @("$theseusGateCommand$theseusGateRedirect", 'exit $?') | Set-Content -Encoding ascii $theseusGateScript
-              & bash --noprofile --norc $theseusGateScript
-            }
-            $theseusGateExit = $LASTEXITCODE
-            if (-not (Test-Path -LiteralPath $env:THESEUS_RUNTIME_LOG -PathType Leaf)) { throw "Missing required native runtime log for $Gate" }
-            Get-Content -LiteralPath $env:THESEUS_RUNTIME_LOG
-            Write-Output "THESEUS runtime=$Gate phase=returned exit=$theseusGateExit"
-            if ($theseusGateExit -ne 0) { exit $theseusGateExit }
-          }
-          $theseusTask7Template = Join-Path $env:GITHUB_WORKSPACE 'tests/fixtures/recipes/v4_downgrade.toml'
-          $theseusTask7TemplateBytes = [System.IO.File]::ReadAllBytes($theseusTask7Template)
-          [System.IO.File]::WriteAllBytes((Join-Path $env:THESEUS_HOST_EVIDENCE 'engine-downgrade-template.raw'), $theseusTask7TemplateBytes)
-          $theseusTask7Lf = 0
-          $theseusTask7Crlf = 0
-          for ($theseusTask7Index = 0; $theseusTask7Index -lt $theseusTask7TemplateBytes.Length; $theseusTask7Index++) {
-            if ($theseusTask7TemplateBytes[$theseusTask7Index] -eq 10) {
-              $theseusTask7Lf++
-              if ($theseusTask7Index -gt 0 -and $theseusTask7TemplateBytes[$theseusTask7Index - 1] -eq 13) { $theseusTask7Crlf++ }
-            }
-          }
-          @{ source_sha = $env:GITHUB_SHA; byte_count = $theseusTask7TemplateBytes.Length; lf_bytes = $theseusTask7Lf; crlf_pairs = $theseusTask7Crlf; bare_lf = ($theseusTask7Lf - $theseusTask7Crlf); sha256 = (Get-FileHash -Algorithm SHA256 $theseusTask7Template).Hash } |
-            ConvertTo-Json | Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'engine-template-bytes.json')
-          if ($IsMacOS) {
-            $theseusTask7TempRoot = python3 -c "import pathlib, tempfile; print(pathlib.Path(tempfile.gettempdir()).resolve())"
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            $env:TMPDIR = $theseusTask7TempRoot
-            @{ source_sha = $env:GITHUB_SHA; canonical_temp_root = $theseusTask7TempRoot; fixture_policy = 'canonical native temp ancestry; strict production roots unchanged' } |
-              ConvertTo-Json | Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'app-process-fixture-policy.json')
-          }
-          Invoke-TheseusRuntimeGate workspace
-          Invoke-TheseusRuntimeGate cli-terminal
-          if ($IsWindows) {
-            Invoke-TheseusRuntimeGate windows-model
-          } else {
-            Invoke-TheseusRuntimeGate unix-master
-          }
-          $theseusPinnedArtifacts = Get-Content (Join-Path $env:THESEUS_HOST_EVIDENCE 'native-artifacts.json') | ConvertFrom-Json
-          foreach ($theseusPinnedArtifact in @($theseusPinnedArtifacts.fixture, $theseusPinnedArtifacts.application)) {
-            if ((Get-FileHash -Algorithm SHA256 $theseusPinnedArtifact.path).Hash.ToLowerInvariant() -ne $theseusPinnedArtifact.sha256) { throw 'Pinned native artifact changed during workspace tests' }
-          }
-          $theseusPinnedArtifacts | ConvertTo-Json -Depth 30 | Set-Content (Join-Path $env:THESEUS_HOST_EVIDENCE 'native-artifacts-after.json')
+          $theseusPython = if ($IsWindows) { 'python' } else { 'python3' }
+          & $theseusPython scripts/validate.py native --stage runtime --evidence $env:THESEUS_HOST_EVIDENCE --expected-host '${{ matrix.host }}'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Optimized native workspace build
         shell: pwsh
         run: |
-          cargo build --locked --workspace --release 2>&1 |
-            Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'workspace-release.log')
+          $theseusPython = if ($IsWindows) { 'python' } else { 'python3' }
+          & $theseusPython scripts/validate.py native --stage release --evidence $env:THESEUS_HOST_EVIDENCE --expected-host '${{ matrix.host }}'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload native workspace evidence
         if: ${{ always() }}
@@ -306,11 +202,11 @@ jobs:
           if-no-files-found: error
 
   docker:
-    name: docker (all seven required suites)
+    name: docker (all eight required suites)
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     steps:
-      - name: Initialize total budget and all seven failure receipts
+      - name: Initialize total budget and all eight failure receipts
         timeout-minutes: 1
         shell: bash
         run: |
@@ -319,35 +215,14 @@ jobs:
           mkdir -p "$theseus_evidence_dir"
           printf 'THESEUS_ACCEPTANCE_JOB_STARTED=%s\n' "$theseus_acceptance_started" >> "$GITHUB_ENV"
           printf 'THESEUS_ACCEPTANCE_EVIDENCE=%s\n' "$theseus_evidence_dir" >> "$GITHUB_ENV"
-          printf 'All seven required suites have independent directories and result.json; absent, failed preparation and not-run results are failures.\n' > "$theseus_evidence_dir/README.txt"
+          printf 'All eight required suites have independent directories and result.json; absent, failed preparation and not-run results are failures.\n' > "$theseus_evidence_dir/README.txt"
           printf '%s\n' "$GITHUB_SHA" > "$theseus_evidence_dir/source-sha.txt"
-          for theseus_target in docker_lifecycle interruption_lifecycle downgrade_lifecycle rollback_lifecycle interrupted_rollback_lifecycle comparison_docker mcp_docker; do
+          for theseus_target in docker_lifecycle interruption_lifecycle downgrade_lifecycle rollback_lifecycle interrupted_rollback_lifecycle comparison_docker mcp_docker mcp_server_docker; do
             mkdir -p "$theseus_evidence_dir/$theseus_target"
             printf '{"suite":"%s","status":"not_run_preparation","pass":false}\n' "$theseus_target" > "$theseus_evidence_dir/$theseus_target/result.json"
           done
-          cat > "$RUNNER_TEMP/theseus-acceptance-budget.sh" <<'BUDGET'
-          theseus_budget() {
-            local theseus_maximum=$(( $1 - 15 ))
-            shift
-            local theseus_remaining=$(( 4200 - $(date +%s) + THESEUS_ACCEPTANCE_JOB_STARTED - 15 ))
-            if [ "$theseus_remaining" -le 0 ]; then
-              printf '{"command":"%s","status":"budget_exhausted","exit_code":124}\n' "$1" >> "$THESEUS_ACCEPTANCE_EVIDENCE/budget.jsonl"
-              return 124
-            fi
-            if [ "$theseus_maximum" -gt "$theseus_remaining" ]; then theseus_maximum="$theseus_remaining"; fi
-            local theseus_command_exit=0
-            if timeout --signal=TERM --kill-after=15s "${theseus_maximum}s" "$@"; then
-              theseus_command_exit=0
-            else
-              theseus_command_exit=$?
-            fi
-            printf '{"command":"%s","exit_code":%s,"term_after_seconds":%s,"kill_grace_seconds":15}\n' "$1" "$theseus_command_exit" "$theseus_maximum" >> "$THESEUS_ACCEPTANCE_EVIDENCE/budget.jsonl"
-            return "$theseus_command_exit"
-          }
-          BUDGET
-          printf 'BASH_ENV=%s\n' "$RUNNER_TEMP/theseus-acceptance-budget.sh" >> "$GITHUB_ENV"
       # These fixed setup caps total at most 16 minutes from the first step;
-      # all following commands share that same 70-minute clock (including grace).
+      # all following commands share that same 70-minute clock with 15 seconds reserved for watchdog receipts.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         timeout-minutes: 5
         with:
@@ -358,45 +233,11 @@ jobs:
         id: prepare
         shell: bash
         run: |
-          theseus_budget 4200 docker info
-          theseus_budget 4200 docker pull ubuntu:24.04
-          theseus_image_id="$(theseus_budget 4200 docker image inspect --format '{{.Id}}' ubuntu:24.04)"
-          printf 'THESEUS_MCP_TEST_IMAGE=%s\n' "$theseus_image_id" >> "$GITHUB_ENV"
-          printf '%s\n' "$theseus_image_id" > "$THESEUS_ACCEPTANCE_EVIDENCE/docker-image-id.txt"
-          theseus_fixture="$(theseus_budget 4200 python3 tests/support/build_host_fixture.py)"
-          printf 'THESEUS_HOST_TEST_FIXTURE=%s\n' "$theseus_fixture" >> "$GITHUB_ENV"
-          theseus_budget 4200 cp "$(dirname "$theseus_fixture")/artifacts.json" "$THESEUS_ACCEPTANCE_EVIDENCE/native-artifacts.json"
-          theseus_budget 4200 cargo test --locked --no-run --test docker_lifecycle --test interruption_lifecycle --test downgrade_lifecycle --test rollback_lifecycle --test interrupted_rollback_lifecycle --test comparison_docker --test mcp_docker
-      - name: Real Docker acceptance (all seven required)
+          python3 scripts/validate.py docker --stage prepare --evidence "$THESEUS_ACCEPTANCE_EVIDENCE" --budget-start "$THESEUS_ACCEPTANCE_JOB_STARTED" --expected-host x86_64-unknown-linux-gnu
+      - name: Real Docker acceptance (all eight required)
         shell: bash
         run: |
-          theseus_acceptance_root="$THESEUS_ACCEPTANCE_EVIDENCE"
-          theseus_any_failure=0
-          theseus_watchdog_expired=0
-          for theseus_target in docker_lifecycle interruption_lifecycle downgrade_lifecycle rollback_lifecycle interrupted_rollback_lifecycle comparison_docker mcp_docker; do
-            theseus_suite_dir="$theseus_acceptance_root/$theseus_target"
-            if [ "$theseus_watchdog_expired" -ne 0 ]; then
-              printf '{"suite":"%s","status":"not_run_after_watchdog","pass":false}\n' "$theseus_target" > "$theseus_suite_dir/result.json"
-              continue
-            fi
-            export THESEUS_ACCEPTANCE_TARGET="$theseus_target"
-            export THESEUS_ACCEPTANCE_EVIDENCE="$theseus_suite_dir"
-            export THESEUS_MCP_TEST_EVIDENCE="$theseus_suite_dir/mcp-transport"
-            theseus_suite_started=$(date +%s)
-            if theseus_budget 2700 cargo test --locked --test "$theseus_target" -- --ignored --test-threads=1 > "$theseus_suite_dir/tests.log" 2>&1; then
-              theseus_suite_exit=0
-            else
-              theseus_suite_exit=$?
-              theseus_any_failure=1
-            fi
-            cat "$theseus_suite_dir/tests.log"
-            theseus_suite_seconds=$(( $(date +%s) - theseus_suite_started ))
-            printf '{"suite":"%s","exit_code":%s,"elapsed_seconds":%s}\n' "$theseus_target" "$theseus_suite_exit" "$theseus_suite_seconds" > "$theseus_suite_dir/result.json"
-            if [ "$theseus_suite_exit" -eq 124 ] || [ "$theseus_suite_exit" -eq 137 ]; then
-              theseus_watchdog_expired=1
-            fi
-          done
-          exit "$theseus_any_failure"
+          python3 scripts/validate.py docker --stage run --evidence "$THESEUS_ACCEPTANCE_EVIDENCE" --budget-start "$THESEUS_ACCEPTANCE_JOB_STARTED" --expected-host x86_64-unknown-linux-gnu
       - name: Finalize preparation failure evidence
         if: ${{ always() }}
         timeout-minutes: 1
@@ -404,13 +245,13 @@ jobs:
         env:
           THESEUS_PREPARATION_RESULT: ${{ steps.prepare.outcome }}
         run: |
-          printf '{"preparation":"%s","all_seven_receipts_initialized_before_setup":true}\n' "$THESEUS_PREPARATION_RESULT" > "$THESEUS_ACCEPTANCE_EVIDENCE/preparation.json"
-      - name: Upload all seven acceptance suites and results
+          printf '{"preparation":"%s","all_eight_receipts_initialized_before_setup":true}\n' "$THESEUS_PREPARATION_RESULT" > "$THESEUS_ACCEPTANCE_EVIDENCE/preparation.json"
+      - name: Upload all eight acceptance suites and results
         if: ${{ always() }}
         timeout-minutes: 4
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: linux-acceptance-evidence-all-seven
+          name: linux-acceptance-evidence-all-eight
           path: ${{ env.THESEUS_ACCEPTANCE_EVIDENCE }}
           retention-days: 7
           if-no-files-found: error

@@ -4,3 +4,6 @@
 /.worktrees/
 docs/superpowers/
 /.superpowers/
+
+# Python test helpers may be imported by local and native supervisors.
+__pycache__/
