@@ -1,7 +1,10 @@
+#[path = "../../../stdio/unix_flags.rs"]
+mod unix_flags;
 use super::{Evidence, Observation, Progress, failure};
 use serde_json::json;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use unix_flags::restored_pipe_flags_match;
 
 pub(super) struct Endpoint {
     fd: OwnedFd,
@@ -134,11 +137,11 @@ impl Endpoint {
             let status = unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_SETFL, mode) };
             let error = (status < 0).then(io::Error::last_os_error);
             let actual = unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_GETFL) };
-            evidence.event("restore", self.label, "fcntl(F_SETFL/F_GETFL)", status == 0 && actual == mode, (Some(status as i64), None), json!({"expected":mode,"actual":actual,"errno":error.as_ref().and_then(io::Error::raw_os_error)}))?;
+            evidence.event("restore", self.label, "fcntl(F_SETFL/F_GETFL)", status == 0 && restored_pipe_flags_match(mode, actual), (Some(status as i64), None), json!({"expected":mode,"actual":actual,"errno":error.as_ref().and_then(io::Error::raw_os_error)}))?;
             if let Some(error) = error {
                 return Err(error);
             }
-            if actual != mode {
+            if !restored_pipe_flags_match(mode, actual) {
                 return Err(failure("restored mode differs"));
             }
         }

@@ -14,6 +14,8 @@
 use std::{cell::Cell, fmt, io, marker::PhantomData};
 #[cfg(unix)]
 mod unix;
+#[cfg(any(unix, test))]
+mod unix_flags;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]

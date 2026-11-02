@@ -1,6 +1,8 @@
 #[cfg(feature = "test-support")]
 use super::test_support::{Control, Event, Trace};
-use super::{MAX_OPERATION, ReadStep, WriteStep, invalid, stopped};
+use super::{
+    MAX_OPERATION, ReadStep, WriteStep, invalid, stopped, unix_flags::restored_pipe_flags_match,
+};
 #[cfg(feature = "test-support")]
 use serde_json::json;
 use std::io;
@@ -250,7 +252,7 @@ impl Native {
                     phase: "restore",
                     endpoint: label(reading),
                     api: "fcntl(F_SETFL/F_GETFL)",
-                    ok: status == 0 && actual == flags,
+                    ok: status == 0 && restored_pipe_flags_match(flags, actual),
                     status: Some(status as i64),
                     error: error.as_ref().and_then(io::Error::raw_os_error),
                     observed: json!({"expected":flags,"actual":actual}),
@@ -258,7 +260,7 @@ impl Native {
                 if let Some(error) = error {
                     return Err(error);
                 }
-                if actual != flags {
+                if !restored_pipe_flags_match(flags, actual) {
                     return Err(io::Error::other("restored pipe flags differ"));
                 }
                 endpoint.saved = None;

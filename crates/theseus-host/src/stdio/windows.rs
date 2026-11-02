@@ -21,6 +21,9 @@ use windows_sys::Win32::{
     System::{Console::*, IO::*, Threading::*},
 };
 
+#[path = "windows_profile.rs"]
+mod profile;
+
 // At most 4096 bytes total; no retry with attacker-selected allocation sizes.
 const NAME_UNITS: usize = 2046;
 #[repr(C)]
@@ -150,8 +153,8 @@ impl Native {
         self.settled = false;
         self.input = Some(Arc::new(self.duplicate(true)?));
         self.output = Some(Arc::new(self.duplicate(false)?));
-        self.qualify(true)?;
-        self.qualify(false)?;
+        let input_configuration = self.qualify(true)?;
+        let output_configuration = self.qualify(false)?;
         if unsafe { CompareObjectHandles(self.handle(true), self.handle(false)) } != 0 {
             #[cfg(feature = "test-support")]
             self.trace.push(Event {
@@ -174,44 +177,69 @@ impl Native {
         else {
             unreachable!()
         };
-        let compared = unsafe {
-            CompareStringOrdinal(
-                input_name.units.as_ptr(),
-                (input_name.length / 2) as i32,
-                output_name.units.as_ptr(),
-                (output_name.length / 2) as i32,
-                1,
-            )
-        };
-        if compared == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // Equal names may also denote distinct named-pipe instances; that
-        // ambiguous profile is conservatively unsupported. No handle-number
-        // inequality is treated as underlying pipe identity proof.
-        if compared == CSTR_EQUAL {
+        if input_name.length == 0 || output_name.length == 0 {
+            // Ordinary Rust child pipes may have no name. Empty names provide
+            // no identity: require the already checked whole-pipe configurations
+            // to prove that these cannot be opposite ends of the same pipe.
+            let disjoint = profile::disjoint_unnamed(
+                input_name.length,
+                output_name.length,
+                input_configuration,
+                output_configuration,
+            );
             #[cfg(feature = "test-support")]
             self.trace.push(Event {
-                phase: "alias_rejected",
+                phase: if disjoint { "pipe_identity" } else { "alias_rejected" },
+                endpoint: "control",
+                api: "FilePipeLocalInformation",
+                ok: true,
+                status: None,
+                error: None,
+                observed: json!({"input_name_bytes":input_name.length,"output_name_bytes":output_name.length,"input_configuration":input_configuration,"output_configuration":output_configuration,"opposite_one_way_configurations":disjoint}),
+            });
+            if !disjoint {
+                return Err(invalid("unnamed stdio pipe identity is ambiguous"));
+            }
+        } else {
+            let compared = unsafe {
+                CompareStringOrdinal(
+                    input_name.units.as_ptr(),
+                    (input_name.length / 2) as i32,
+                    output_name.units.as_ptr(),
+                    (output_name.length / 2) as i32,
+                    1,
+                )
+            };
+            if compared == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // Equal names may also denote distinct named-pipe instances; that
+            // ambiguous profile is conservatively unsupported. No handle-number
+            // inequality is treated as underlying pipe identity proof.
+            if compared == CSTR_EQUAL {
+                #[cfg(feature = "test-support")]
+                self.trace.push(Event {
+                    phase: "alias_rejected",
+                    endpoint: "control",
+                    api: "CompareStringOrdinal",
+                    ok: true,
+                    status: Some(compared as i64),
+                    error: None,
+                    observed: json!({"same_pipe_name":true}),
+                });
+                return Err(invalid("stdin and stdout share an ambiguous pipe name"));
+            }
+            #[cfg(feature = "test-support")]
+            self.trace.push(Event {
+                phase: "pipe_identity",
                 endpoint: "control",
                 api: "CompareStringOrdinal",
                 ok: true,
                 status: Some(compared as i64),
                 error: None,
-                observed: json!({"same_pipe_name":true}),
+                observed: json!({"different_checked_names":true,"max_name_bytes":NAME_UNITS*2}),
             });
-            return Err(invalid("stdin and stdout share an ambiguous pipe name"));
         }
-        #[cfg(feature = "test-support")]
-        self.trace.push(Event {
-            phase: "pipe_identity",
-            endpoint: "control",
-            api: "CompareStringOrdinal",
-            ok: true,
-            status: Some(compared as i64),
-            error: None,
-            observed: json!({"different_checked_names":true,"max_name_bytes":NAME_UNITS*2}),
-        });
         #[cfg(feature = "test-support")]
         if self.control == Control::PartialAcquire {
             self.trace.push(Event {phase:"rollback_injection",endpoint:"control",api:"synthetic acquisition failure",ok:true,status:None,error:None,observed:json!({"obligation":"acquired_handles","acquired_endpoints":2,"mutated_endpoints":0,"synthetic":true})});
@@ -342,13 +370,13 @@ impl Native {
         let returned = query.iosb.Information;
         let expected = match &query.output {
             QueryOutput::Name(name)
-                if status >= 0
-                    && completion >= 0
-                    && returned >= 4
-                    && returned <= size as usize
-                    && name.length > 0
-                    && name.length.is_multiple_of(2)
-                    && name.length as usize <= NAME_UNITS * 2 =>
+                if profile::valid_name_reply(
+                    status,
+                    completion,
+                    returned,
+                    name.length,
+                    NAME_UNITS * 2,
+                ) =>
             {
                 Some(4 + name.length as usize)
             }
@@ -366,7 +394,7 @@ impl Native {
         }
         Ok(query.output)
     }
-    fn qualify(&mut self, reading: bool) -> io::Result<()> {
+    fn qualify(&mut self, reading: bool) -> io::Result<u32> {
         let kind = unsafe { GetFileType(self.handle(reading)) };
         #[cfg(feature = "test-support")]
         self.trace.push(Event {
@@ -421,13 +449,13 @@ impl Native {
         let ok =
             pipe.NamedPipeType == 0 && pipe_mode.ReadMode == 0 && pipe_mode.CompletionMode == 0;
         #[cfg(feature = "test-support")]
-        self.trace.push(Event {phase:"qualified",endpoint:label(reading),api:"native pipe profile",ok,status:None,error:None,observed:json!({"access":access.AccessFlags,"mode":mode.Mode,"pipe_type":pipe.NamedPipeType,"remote":remote.IsRemote,"pipe_end":pipe.NamedPipeEnd,"read_mode":pipe_mode.ReadMode,"completion_mode":pipe_mode.CompletionMode})});
+        self.trace.push(Event {phase:"qualified",endpoint:label(reading),api:"native pipe profile",ok,status:None,error:None,observed:json!({"access":access.AccessFlags,"mode":mode.Mode,"pipe_type":pipe.NamedPipeType,"remote":remote.IsRemote,"pipe_end":pipe.NamedPipeEnd,"pipe_configuration":pipe.NamedPipeConfiguration,"read_mode":pipe_mode.ReadMode,"completion_mode":pipe_mode.CompletionMode})});
         if !ok {
             return Err(invalid(
                 "stdio requires local synchronous byte pipes with data access",
             ));
         }
-        Ok(())
+        Ok(pipe.NamedPipeConfiguration)
     }
     pub(super) fn try_read(&mut self, bytes: &mut [u8]) -> io::Result<ReadStep> {
         if self.stopping {
