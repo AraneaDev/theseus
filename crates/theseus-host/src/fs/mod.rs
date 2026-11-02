@@ -35,6 +35,11 @@ pub struct HostDir {
     enumeration: std::sync::Mutex<()>,
 }
 impl HostDir {
+    /// Compare retained native directory identities, independent of their paths.
+    /// Failure to query or validate either directory is returned as an error.
+    pub fn same_object(&self, other: &Self) -> io::Result<bool> {
+        platform::same_directory(&self.directory, &other.directory)
+    }
     pub fn open(path: &Path, policy: RootPolicy) -> io::Result<Self> {
         Ok(Self {
             directory: platform::open_root(path, policy)?,
@@ -682,6 +687,30 @@ mod publication_tests {
         assert!(error.to_string().contains("publication occurred"));
         assert_eq!(content(&root)?, b"complete new bytes");
         assert_eq!(root.entries()?, vec!["report"]);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod directory_identity_tests {
+    use super::*;
+
+    #[test]
+    fn comparison_rejects_regular_file_authority_in_either_position() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let directory = HostDir::create_private(&temp.path().join("directory"))?;
+        let file = HostDir {
+            directory: File::create(temp.path().join("file"))?,
+            display: temp.path().join("directory"),
+            #[cfg(windows)]
+            enumeration: std::sync::Mutex::new(()),
+        };
+        for (left, right) in [(&directory, &file), (&file, &directory)] {
+            assert_eq!(
+                left.same_object(right).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
         Ok(())
     }
 }

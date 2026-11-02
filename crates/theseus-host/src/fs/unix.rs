@@ -81,6 +81,14 @@ pub(super) fn entries(directory: &File) -> io::Result<Vec<OsString>> {
     names.sort();
     Ok(names)
 }
+pub(super) fn same_directory(left: &File, right: &File) -> io::Result<bool> {
+    let left = left.metadata()?;
+    let right = right.metadata()?;
+    if !left.is_dir() || !right.is_dir() {
+        return Err(super::invalid("expected a directory"));
+    }
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileFingerprint {
     pub len: u64,
@@ -88,6 +96,25 @@ pub struct FileFingerprint {
     inode: u64,
     modified: (i64, i64),
     changed: (i64, i64),
+}
+impl FileFingerprint {
+    /// Fixed native change-fingerprint encoding; integer fields are big-endian.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(57);
+        bytes.push(1);
+        for field in [self.len, self.device, self.inode] {
+            bytes.extend_from_slice(&field.to_be_bytes());
+        }
+        for field in [
+            self.modified.0,
+            self.modified.1,
+            self.changed.0,
+            self.changed.1,
+        ] {
+            bytes.extend_from_slice(&field.to_be_bytes());
+        }
+        bytes
+    }
 }
 pub fn fingerprint(file: &File) -> io::Result<FileFingerprint> {
     let m = file.metadata()?;
@@ -143,5 +170,41 @@ mod directory_sync_tests {
                 Some(rustix::io::Errno::BADF.raw_os_error())
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_fingerprint_uses_fixed_big_endian_native_fields() {
+        let value = FileFingerprint {
+            len: 0x0102_0304_0506_0708,
+            device: 0x1112_1314_1516_1718,
+            inode: 0x2122_2324_2526_2728,
+            modified: (-2, 0x3132_3334_3536_3738),
+            changed: (i64::MIN, i64::MAX),
+        };
+        assert_eq!(
+            value.canonical_bytes(),
+            [
+                1, 1, 2, 3, 4, 5, 6, 7, 8, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x21,
+                0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xfe, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x80, 0, 0, 0, 0, 0, 0, 0,
+                0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            ]
+        );
+    }
+
+    #[test]
+    fn regular_file_fingerprint_rejects_a_directory() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let directory = open_root(temp.path(), RootPolicy::LeafNoFollow)?;
+        assert_eq!(
+            fingerprint(&directory).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        Ok(())
     }
 }

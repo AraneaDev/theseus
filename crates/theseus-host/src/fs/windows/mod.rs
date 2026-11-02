@@ -2,6 +2,7 @@
 mod identity;
 mod open;
 mod publish;
+pub(super) use identity::same_directory;
 pub use identity::{FileFingerprint, fingerprint};
 pub use open::read_exact_at;
 pub(super) use open::{
