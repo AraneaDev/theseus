@@ -293,7 +293,7 @@ def native(runner, stage):
     elif stage == 'runtime':
         runner.cargo('workspace-tests', 'test', '--locked', '--workspace', '--all-targets', '--no-fail-fast')
         runner.cargo('native-cli-terminal', 'test', '--locked', '--test', 'host_cli', '--test', 'host_terminal', '--', '--nocapture', required_cases=CASE_INVENTORY['native']['cli-terminal'])
-        test = 'conpty_backpressure_close_model' if windows else 'pty_master_'
+        test = 'conpty_' if windows else 'pty_master_'
         runner.cargo('native-explicit-terminal-controls', 'test', '--locked', '-p', 'theseus-host', '--features', 'test-support', '--lib', test, '--', '--nocapture', '--test-threads=1', timeout=120, required_cases=CASE_INVENTORY['native']['runtime-windows' if windows else 'runtime-unix'])
         metadata = load_pinned(runner)
         write_json(runner.evidence / 'native-artifacts-after.json', metadata)

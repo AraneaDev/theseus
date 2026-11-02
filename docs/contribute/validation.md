@@ -24,6 +24,17 @@ POSIX guest-script byte oracles.
 | macOS | `python3 scripts/validate.py native` |
 | Windows (PowerShell) | `python scripts/validate.py native` |
 
+Windows VT acceptance tests preserve all ten paste-delimiter splits as separate
+`WriteConsoleInputW` batches into the real console reader, proving the first
+batch was consumed without an event before submitting the second. A separate
+required test sends the complete paste through the ConPTY pipe and checks the
+literal Unicode/newline paste, controls, standalone Escape and mode restoration.
+On the Windows 26100 runner, the retained diagnostic showed that splitting the
+raw pipe write after `ESC[2` lost that prefix before any native input record
+reached the reader. These tests therefore make no claim that this ConHost
+preserves VT sequences across arbitrary raw-pipe write boundaries; the diagnostic remains separate
+from release acceptance.
+
 ## Docker acceptance
 
 On Linux, also run `python3 scripts/validate.py docker` for all eight required

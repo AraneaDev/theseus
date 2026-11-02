@@ -100,7 +100,12 @@
       "process::unix::terminal::tests::pty_master_observes_restored_modes_after_session_leader_exit"
     ],
     "runtime-windows": [
-      "process::windows::terminal::tests::conpty_backpressure_close_model_joins_reader_and_real_native_cleanup"
+      "process::windows::terminal::tests::conpty_backpressure_close_model_joins_reader_and_real_native_cleanup",
+      "process::windows::terminal::modes::tests::conpty_legacy_crossterm_controls_demonstrate_exact_mode_drift",
+      "process::windows::terminal::events::tests::conpty_vt_mode_preserves_fixed_paste_records_and_restores_original_mode",
+      "process::windows::terminal::events::tests::conpty_native_raw_repeats_surrogates_and_virtual_key_fallback_keep_order",
+      "process::windows::terminal::events::tests::conpty_fragmented_paste_controls_and_standalone_escape_reach_actual_reader",
+      "process::windows::terminal::events::tests::conpty_complete_pipe_paste_controls_and_standalone_escape_reach_actual_reader"
     ],
     "stdio-rust": [
       "ordinary_rust_empty_live_input_is_observed_before_eof",

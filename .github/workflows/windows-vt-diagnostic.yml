@@ -6,13 +6,14 @@ permissions:
 jobs:
   diagnostic:
     runs-on: windows-2025
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - name: Build source-bound trusted fixture
+        id: fixture
         shell: pwsh
         run: |
           $theseusEvidence = Join-Path $env:RUNNER_TEMP 'theseus-windows-vt-diagnostic'
@@ -45,6 +46,20 @@ jobs:
               receipt['pass'] = True
           finally:
               validation.write_json(evidence / 'diagnostic-only.result.json', receipt)
+      - name: Collect full Windows workspace and native-control results
+        if: ${{ !cancelled() && steps.fixture.outcome == 'success' }}
+        timeout-minutes: 20
+        shell: pwsh
+        run: |
+          python scripts/validate.py native --stage runtime --evidence $env:THESEUS_HOST_EVIDENCE --expected-host x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Collect optimized Windows build result
+        if: ${{ !cancelled() && steps.fixture.outcome == 'success' }}
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          python scripts/validate.py native --stage release --evidence $env:THESEUS_HOST_EVIDENCE --expected-host x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve diagnostic evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

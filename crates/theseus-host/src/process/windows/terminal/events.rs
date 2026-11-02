@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::System::Console::*;
 
 const PASTE: &str = "r\nq ñ😀";
-#[cfg(test)]
 const INPUT: &str = "\x1b[200~r\nq ñ😀\x1b[201~";
 fn publish(root: &Path, name: &str, value: &serde_json::Value) -> io::Result<()> {
     let temporary = root.join(format!("{name}.pending"));
@@ -52,19 +51,65 @@ impl Drop for Restore {
         let _ = self.0.restore();
     }
 }
+fn fragment_consumed(expected: u32, written: u32, queued: u32, event_ready: bool) -> bool {
+    expected != 0 && written == expected && queued == 0 && !event_ready
+}
+fn fixed_fragment_split(mode: &str) -> Option<usize> {
+    mode.strip_prefix("fragments-")?
+        .parse::<usize>()
+        .ok()
+        .filter(|split| (1..6).contains(split) || ((INPUT.len() - 5)..INPUT.len()).contains(split))
+}
+fn write_fragment(input: &File, text: &str) -> io::Result<u32> {
+    let records: Vec<_> = text
+        .encode_utf16()
+        .map(|unit| {
+            let mut record: INPUT_RECORD = unsafe { std::mem::zeroed() };
+            record.EventType = KEY_EVENT as u16;
+            record.Event.KeyEvent = KEY_EVENT_RECORD {
+                bKeyDown: 1,
+                wRepeatCount: 1,
+                wVirtualKeyCode: 0,
+                wVirtualScanCode: 0,
+                uChar: KEY_EVENT_RECORD_0 { UnicodeChar: unit },
+                dwControlKeyState: 0,
+            };
+            record
+        })
+        .collect();
+    let mut written = 0;
+    // SAFETY: fixed bounded literal records and the owned private console handle.
+    if unsafe {
+        WriteConsoleInputW(
+            input.as_raw_handle(),
+            records.as_ptr(),
+            records.len() as u32,
+            &mut written,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if written as usize != records.len() {
+        return Err(io::Error::other("short native fragment write"));
+    }
+    Ok(written)
+}
 pub(crate) fn run(root: &Path, mode: &str) -> io::Result<()> {
-    if !matches!(mode, "raw-legacy" | "raw-vt" | "events" | "records") {
+    let split = fixed_fragment_split(mode);
+    let events_mode = mode == "events" || split.is_some();
+    if !matches!(mode, "raw-legacy" | "raw-vt" | "events" | "records") && split.is_none() {
         return Err(io::Error::other("unknown fixed VT mode"));
     }
     let restore = Restore(ConsoleModeSnapshot::capture()?);
     let input = OpenOptions::new().read(true).write(true).open("CONIN$")?;
     let before = input_mode(&input)?;
     crossterm::terminal::enable_raw_mode()?;
-    if matches!(mode, "raw-vt" | "events") {
+    if mode == "raw-vt" || events_mode {
         restore.0.enable_vt_input()?;
     }
     let active = input_mode(&input)?;
-    if matches!(mode, "events" | "records") {
+    if events_mode || mode == "records" {
         crossterm::event::windows_test_trace::arm();
     }
     publish(
@@ -75,8 +120,47 @@ pub(crate) fn run(root: &Path, mode: &str) -> io::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut records = Vec::new();
     let mut events = Vec::new();
+    let mut fragment_boundary = None;
     let result = (|| -> io::Result<()> {
-        if matches!(mode, "events" | "records") {
+        if events_mode || mode == "records" {
+            if let Some(split) = split {
+                // These exact ten byte splits are all ASCII delimiter boundaries.
+                // Submit separate REAL native batches to the same console reader.
+                let first = &INPUT[..split];
+                let written = write_fragment(&input, first)?;
+                let expected = first.encode_utf16().count() as u32;
+                let mut polls = 0;
+                loop {
+                    polls += 1;
+                    if polls > 64 || Instant::now() >= deadline {
+                        return Err(io::Error::other("native fragment drain deadline"));
+                    }
+                    let event_ready = event::poll(Duration::ZERO)?;
+                    let mut queued = 0;
+                    // SAFETY: retained console and writable count; no second reader.
+                    if unsafe { GetNumberOfConsoleInputEvents(input.as_raw_handle(), &mut queued) }
+                        == 0
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if event_ready {
+                        return Err(io::Error::other(
+                            "partial native fragment dispatched an event",
+                        ));
+                    }
+                    if queued == 0 {
+                        if !fragment_consumed(expected, written, queued, event_ready) {
+                            return Err(io::Error::other("native fragment consumption unproven"));
+                        }
+                        fragment_boundary = Some(
+                            serde_json::json!({"split":split,"first_records":expected,"written":written,"queued":queued,"event_ready":event_ready,"zero_polls":polls}),
+                        );
+                        break;
+                    }
+                }
+                // The first batch has been consumed with no event before this call.
+                write_fragment(&input, &INPUT[split..])?;
+            }
             let expected = if mode == "records" {
                 // A queued opener ESC release must be inert before escape
                 // resolution: require one literal Paste before any other keys.
@@ -291,7 +375,7 @@ pub(crate) fn run(root: &Path, mode: &str) -> io::Result<()> {
     publish(
         root,
         "observed",
-        &serde_json::json!({"mode":mode,"before":before,"active":active,"after":after,"records":records,"reader_trace":reader_trace,"events":events,"error":result.as_ref().err().map(ToString::to_string)}),
+        &serde_json::json!({"mode":mode,"before":before,"active":active,"after":after,"records":records,"reader_trace":reader_trace,"fragment_boundary":fragment_boundary,"events":events,"error":result.as_ref().err().map(ToString::to_string)}),
     )?;
     result?;
     restored
@@ -343,30 +427,29 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let fixture = pinned_fixture_copy(root.path());
         let mut command = NativeCommand::new(fixture);
+        let fixture_mode = if mode == "fragments" {
+            format!("fragments-{}", split.expect("fixed fragment split"))
+        } else {
+            mode.to_owned()
+        };
         command.args([
             std::ffi::OsStr::new("terminal-vt-events"),
             root.path().as_os_str(),
-            std::ffi::OsStr::new(mode),
+            std::ffi::OsStr::new(&fixture_mode),
         ]);
         let mut session = Session::fixture_control(&command, 24, 80).unwrap();
         let mut acknowledged_writes = Vec::new();
         let result = (|| -> io::Result<serde_json::Value> {
             let deadline = Instant::now() + Duration::from_secs(10);
             await_file(&mut session, root.path(), "ready", deadline)?;
-            if mode == "records" {
-                // The private child injects its own fixed records.
-            } else if let Some(split) = split {
-                session.write(&INPUT.as_bytes()[..split])?;
-                acknowledged_writes.push(split);
-                // This is a real separate ConPTY pipe write, not decoder mocking.
-                session.poll()?;
-                session.write(&INPUT.as_bytes()[split..])?;
-                acknowledged_writes.push(INPUT.len() - split);
+            if matches!(mode, "records" | "fragments") {
+                // The child submits actual fixed native records; no ConPTY pipe
+                // prefix is silently coalesced or substituted here.
             } else {
                 session.write(INPUT.as_bytes())?;
                 acknowledged_writes.push(INPUT.len());
             }
-            if mode == "events" {
+            if matches!(mode, "events" | "fragments") {
                 await_file(&mut session, root.path(), "event-0", deadline)?;
                 session.write(b"\x1b[A")?;
                 await_file(&mut session, root.path(), "event-1", deadline)?;
@@ -504,8 +587,37 @@ mod tests {
     #[test]
     fn conpty_fragmented_paste_controls_and_standalone_escape_reach_actual_reader() {
         for split in (1..6).chain((INPUT.len() - 5)..INPUT.len()) {
-            let observed = observe("events", Some(split));
+            let observed = observe("fragments", Some(split));
             assert_eq!(observed["events"].as_array().unwrap().len(), 4);
+            let boundary = &observed["fragment_boundary"];
+            assert_eq!(boundary["split"], split);
+            assert_eq!(boundary["written"], INPUT[..split].encode_utf16().count());
+            assert_eq!(boundary["queued"], 0);
+            assert_eq!(boundary["event_ready"], false);
         }
+    }
+    #[test]
+    fn native_fragment_boundary_rejects_unconsumed_or_premature_input() {
+        assert!(!fragment_consumed(3, 2, 0, false));
+        assert!(!fragment_consumed(3, 3, 1, false));
+        assert!(!fragment_consumed(3, 3, 0, true));
+        assert!(!fragment_consumed(0, 0, 0, false));
+        assert!(fragment_consumed(3, 3, 0, false));
+    }
+    #[test]
+    fn conpty_complete_pipe_paste_controls_and_standalone_escape_reach_actual_reader() {
+        let observed = observe("events", None);
+        assert_eq!(observed["events"].as_array().unwrap().len(), 4);
+        assert_eq!(observed["reader_trace"]["overflow"], false);
+        // Same native reader must receive the entire literal paste, not only a
+        // synthesized decoded event. Alt-code Unicode releases are text too.
+        let units: Vec<u16> = observed["reader_trace"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row[0] == "Record" && row[1] == false && row[3] == 1)
+            .map(|row| row[9][4].as_u64().unwrap() as u16)
+            .collect();
+        assert!(units.starts_with(&INPUT.encode_utf16().collect::<Vec<_>>()));
     }
 }
