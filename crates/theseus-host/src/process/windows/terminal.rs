@@ -115,7 +115,22 @@ impl Terminal {
         columns: u16,
         profile: ConsoleProfile,
     ) -> Result<(Self, Reader), Box<dyn std::error::Error>> {
-        Self::spawn_inner(command, rows, columns, profile, false)
+        Self::spawn_inner(command, rows, columns, profile, false, None)
+    }
+    #[cfg(test)]
+    pub(crate) fn spawn_fixture(
+        command: &NativeCommand,
+        rows: u16,
+        columns: u16,
+    ) -> Result<(Self, Reader), Box<dyn std::error::Error>> {
+        Self::spawn_inner(
+            command,
+            rows,
+            columns,
+            ConsoleProfile::Default,
+            false,
+            Some(command.program.as_os_str()),
+        )
     }
     #[cfg(test)]
     pub(crate) fn spawn_legacy(
@@ -123,7 +138,7 @@ impl Terminal {
     ) -> Result<(Self, Reader), Box<dyn std::error::Error>> {
         let fixture = std::env::var_os("THESEUS_HOST_TEST_FIXTURE")
             .ok_or_else(|| invalid("required pinned fixture"))?;
-        Self::spawn_inner(&NativeCommand::new(fixture), 24, 80, profile, true)
+        Self::spawn_inner(&NativeCommand::new(fixture), 24, 80, profile, true, None)
     }
     fn spawn_inner(
         command: &NativeCommand,
@@ -131,6 +146,7 @@ impl Terminal {
         columns: u16,
         profile: ConsoleProfile,
         legacy: bool,
+        fixture_program: Option<&std::ffi::OsStr>,
     ) -> Result<(Self, Reader), Box<dyn std::error::Error>> {
         let (input, input_peer) = pipe::writer()?;
         let (output, output_peer) = pipe::reader()?;
@@ -155,7 +171,10 @@ impl Terminal {
         let console = PseudoConsole(hpc);
         let directory = tempfile::tempdir()?;
         let mut wrapper = command.clone();
-        wrapper.program = std::env::current_exe()?.into_os_string();
+        wrapper.program = match fixture_program {
+            Some(program) => program.to_owned(),
+            None => std::env::current_exe()?.into_os_string(),
+        };
         wrapper.args = vec![
             "terminal-client".into(),
             command.program.clone(),

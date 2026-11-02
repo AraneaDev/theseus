@@ -235,6 +235,27 @@ pub(crate) fn run(root: &Path, mode: &str) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::process::{NativeCommand, terminal::Session};
+    fn pinned_fixture_copy(root: &Path) -> std::path::PathBuf {
+        let original =
+            std::env::var_os("THESEUS_HOST_TEST_FIXTURE").expect("required pinned fixture");
+        // run_client retains its Theseus-only child guard. The trusted fixture
+        // dispatches terminal-vt-events before its basename-dependent commands.
+        let fixture = root.join("theseus.exe");
+        std::fs::copy(&original, &fixture).unwrap();
+        let mut original = File::open(original).unwrap();
+        let mut copied = File::open(&fixture).unwrap();
+        let mut remaining = original.metadata().unwrap().len();
+        assert_eq!(remaining, copied.metadata().unwrap().len());
+        let (mut expected, mut actual) = ([0; 8192], [0; 8192]);
+        while remaining != 0 {
+            let count = remaining.min(expected.len() as u64) as usize;
+            original.read_exact(&mut expected[..count]).unwrap();
+            copied.read_exact(&mut actual[..count]).unwrap();
+            assert_eq!(&expected[..count], &actual[..count]);
+            remaining -= count as u64;
+        }
+        fixture
+    }
     fn await_file(
         session: &mut Session,
         root: &Path,
@@ -254,15 +275,14 @@ mod tests {
     }
     fn observe(mode: &str, split: Option<usize>) -> serde_json::Value {
         let root = tempfile::tempdir().unwrap();
-        let fixture =
-            std::env::var_os("THESEUS_HOST_TEST_FIXTURE").expect("required pinned fixture");
+        let fixture = pinned_fixture_copy(root.path());
         let mut command = NativeCommand::new(fixture);
         command.args([
             std::ffi::OsStr::new("terminal-vt-events"),
             root.path().as_os_str(),
             std::ffi::OsStr::new(mode),
         ]);
-        let mut session = Session::spawn(&command, 24, 80).unwrap();
+        let mut session = Session::fixture_control(&command, 24, 80).unwrap();
         let result = (|| -> io::Result<serde_json::Value> {
             let deadline = Instant::now() + Duration::from_secs(10);
             await_file(&mut session, root.path(), "ready", deadline)?;

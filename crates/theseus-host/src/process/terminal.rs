@@ -174,6 +174,17 @@ impl Session {
         Ok(Self::from_native(native, input))
     }
     #[cfg(all(test, windows))]
+    pub(crate) fn fixture_control(
+        command: &NativeCommand,
+        rows: u16,
+        columns: u16,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        dimensions(rows, columns)?;
+        trace("spawn-begin");
+        let (native, input) = platform::Terminal::spawn_fixture(command, rows, columns)?;
+        Ok(Self::from_native(native, input))
+    }
+    #[cfg(all(test, windows))]
     pub(crate) fn legacy_control(
         profile: ConsoleProfile,
     ) -> Result<Self, Box<dyn std::error::Error>> {
