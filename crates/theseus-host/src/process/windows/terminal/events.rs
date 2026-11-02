@@ -2,7 +2,9 @@
 use crate::console::ConsoleModeSnapshot;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+#[cfg(test)]
+use std::io::Read;
+use std::io::{self, Write};
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -22,6 +24,7 @@ fn publish(root: &Path, name: &str, value: &serde_json::Value) -> io::Result<()>
     drop(file);
     std::fs::rename(temporary, root.join(name))
 }
+#[cfg(test)]
 fn load(root: &Path, name: &str) -> io::Result<Option<serde_json::Value>> {
     let file = match File::open(root.join(name)) {
         Ok(file) => file,
