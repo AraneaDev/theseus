@@ -484,6 +484,8 @@ mod tests {
     #[global_allocator]
     static ALLOCATION_METER: AllocationMeter = AllocationMeter;
 
+    include!("../mcp_server/evidence_allocation_tests.rs");
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
