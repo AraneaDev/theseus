@@ -77,34 +77,76 @@ pub(crate) fn run(root: &Path, mode: &str) -> io::Result<()> {
             let expected = if mode == "records" {
                 // A queued opener ESC release must be inert before escape
                 // resolution: require one literal Paste before any other keys.
-                let mut queued_records = vec![(27, 0, 1, true), (27, 0, 1, false)];
+                let mut queued_records = vec![(27, 0, 1, true, 0, 0), (27, 0, 1, false, 0, 0)];
                 queued_records.extend(
                     "[200~r\nq\x1b[201~"
                         .encode_utf16()
-                        .map(|unit| (unit, 0, 1, true)),
+                        .map(|unit| (unit, 0, 1, true, 0, 0)),
                 );
                 // Preserve the existing repeat/surrogate/native fallback controls.
                 queued_records.extend([
-                    (120, 0, 3, true),
-                    (0xd83d, 0, 1, true),
-                    (0xd83d, 0, 1, false),
-                    (0xde00, 0, 1, true),
-                    (0xde00, 0, 1, false),
-                    (0, 38, 1, true),
-                    (0, 38, 1, false),
-                    (113, 0, 1, true),
+                    (120, 0, 3, true, 0, 0),
+                    (0xd83d, 0, 1, true, 0, 0),
+                    (0xd83d, 0, 1, false, 0, 0),
+                    (0xde00, 0, 1, true, 0, 0),
+                    (0xde00, 0, 1, false, 0, 0),
+                    (0, 38, 1, true, 0, 0),
+                    (0, 38, 1, false, 0, 0),
+                    (113, 0, 1, true, 0, 0),
+                ]);
+                // Replay the exact full key fields observed from real ConHost
+                // in run 41440785765, including modifier and Alt-code records.
+                queued_records.extend([
+                    (27, 0, 1, true, 0, 0),
+                    (91, 0, 1, true, 0, 0),
+                    (50, 0, 1, true, 0, 0),
+                    (48, 0, 1, true, 0, 0),
+                    (48, 0, 1, true, 0, 0),
+                    (126, 0, 1, true, 0, 0),
+                    (114, 0, 1, true, 0, 0),
+                    (114, 82, 1, false, 19, 0),
+                    (0, 17, 1, true, 29, 8),
+                    (10, 0, 1, true, 0, 0),
+                    (10, 13, 1, false, 28, 8),
+                    (0, 17, 1, false, 29, 0),
+                    (113, 0, 1, true, 0, 0),
+                    (113, 81, 1, false, 16, 0),
+                    (32, 0, 1, true, 0, 0),
+                    (32, 32, 1, false, 57, 0),
+                    (241, 0, 1, true, 0, 0),
+                    (241, 0, 1, false, 0, 0),
+                    (0, 18, 1, true, 56, 2),
+                    (0, 102, 1, true, 77, 2),
+                    (0, 102, 1, false, 77, 2),
+                    (0, 99, 1, true, 81, 2),
+                    (0, 99, 1, false, 81, 2),
+                    (55357, 18, 1, false, 56, 0),
+                    (0, 18, 1, true, 56, 2),
+                    (0, 102, 1, true, 77, 2),
+                    (0, 102, 1, false, 77, 2),
+                    (0, 99, 1, true, 81, 2),
+                    (0, 99, 1, false, 81, 2),
+                    (56832, 18, 1, false, 56, 0),
+                    (27, 0, 1, true, 0, 0),
+                    (91, 0, 1, true, 0, 0),
+                    (50, 0, 1, true, 0, 0),
+                    (48, 0, 1, true, 0, 0),
+                    (49, 0, 1, true, 0, 0),
+                    (126, 0, 1, true, 0, 0),
+                    (0, 16, 1, true, 42, 16),
+                    (33, 0, 1, true, 0, 0),
                 ]);
                 let mut records: Vec<INPUT_RECORD> = Vec::new();
-                for (unit, vkey, repeat, down) in queued_records {
+                for (unit, vkey, repeat, down, scan, control) in queued_records {
                     let mut record: INPUT_RECORD = unsafe { std::mem::zeroed() };
                     record.EventType = KEY_EVENT as u16;
                     record.Event.KeyEvent = KEY_EVENT_RECORD {
                         bKeyDown: i32::from(down),
                         wRepeatCount: repeat,
                         wVirtualKeyCode: vkey,
-                        wVirtualScanCode: 0,
+                        wVirtualScanCode: scan,
                         uChar: KEY_EVENT_RECORD_0 { UnicodeChar: unit },
-                        dwControlKeyState: 0,
+                        dwControlKeyState: control,
                     };
                     records.push(record);
                 }
@@ -130,6 +172,8 @@ pub(crate) fn run(root: &Path, mode: &str) -> io::Result<()> {
                     Event::Key(KeyCode::Char('😀').into()),
                     Event::Key(KeyCode::Up.into()),
                     Event::Key(KeyCode::Char('q').into()),
+                    Event::Paste(PASTE.into()),
+                    Event::Key(KeyCode::Char('!').into()),
                 ]
             } else {
                 vec![
@@ -340,13 +384,24 @@ mod tests {
     fn conpty_vt_mode_preserves_fixed_paste_records_and_restores_original_mode() {
         let legacy = observe("raw-legacy", None);
         let vt = observe("raw-vt", None);
-        let units = |value: &serde_json::Value| -> Vec<u16> {
+        // ConHost emits raw VT key-down text alongside native modifiers and
+        // duplicate releases. Alt release uniquely carries Alt-code Unicode.
+        let text_records = |value: &serde_json::Value| -> Vec<serde_json::Value> {
             value["records"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter(|r| r["down"] == true)
-                .filter_map(|r| r["unit"].as_u64().map(|u| u as u16))
+                .filter(|r| {
+                    (r["down"] == true && r["vkey"] == 0)
+                        || (r["down"] == false && r["vkey"] == 18 && r["unit"] != 0)
+                })
+                .cloned()
+                .collect()
+        };
+        let units = |records: &[serde_json::Value]| -> Vec<u16> {
+            records
+                .iter()
+                .map(|r| r["unit"].as_u64().unwrap() as u16)
                 .collect()
         };
         assert_eq!(
@@ -358,29 +413,67 @@ mod tests {
             u64::from(ENABLE_VIRTUAL_TERMINAL_INPUT)
         );
         assert_eq!(
-            units(&vt),
+            units(&text_records(&vt)),
             format!("{INPUT}!").encode_utf16().collect::<Vec<_>>()
         );
         assert!(
-            !units(&legacy).contains(&27),
+            !legacy["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["unit"] == 27),
             "legacy reader unexpectedly retained paste delimiters"
         );
-        for record in vt["records"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|r| r["down"] == true)
-        {
-            assert_eq!(record["vkey"], 0);
-            assert_eq!(record["scan"], 0);
+        for record in text_records(&vt) {
+            if record["down"] == true {
+                assert_eq!(record["vkey"], 0);
+                assert_eq!(record["scan"], 0);
+            } else {
+                assert_eq!(record["vkey"], 18);
+                assert_eq!(record["scan"], 56);
+                assert!(matches!(record["unit"].as_u64(), Some(55357 | 56832)));
+            }
             assert_eq!(record["control"], 0);
             assert_eq!(record["repeat"], 1);
+        }
+        // Every excluded record remains accounted for, with its full native
+        // shape checked; zero-unit records are never interpreted as paste NUL.
+        for record in vt["records"].as_array().unwrap().iter().filter(|r| {
+            !(r["down"] == true && r["vkey"] == 0)
+                && !(r["down"] == false && r["vkey"] == 18 && r["unit"] != 0)
+        }) {
+            assert_eq!(record["type"], KEY_EVENT);
+            assert_eq!(record["repeat"], 1);
+            let fields = (
+                record["down"].as_bool().unwrap(),
+                record["vkey"].as_u64().unwrap(),
+                record["scan"].as_u64().unwrap(),
+                record["unit"].as_u64().unwrap(),
+                record["control"].as_u64().unwrap(),
+            );
+            assert!(
+                matches!(
+                    fields,
+                    (false, 82, 19, 114, 0)
+                        | (true, 17, 29, 0, 8)
+                        | (false, 13, 28, 10, 8)
+                        | (false, 17, 29, 0, 0)
+                        | (false, 81, 16, 113, 0)
+                        | (false, 32, 57, 32, 0)
+                        | (false, 0, 0, 241, 0)
+                        | (true, 18, 56, 0, 2)
+                        | (_, 102, 77, 0, 2)
+                        | (_, 99, 81, 0, 2)
+                        | (true, 16, 42, 0, 16)
+                ),
+                "unexpected native record: {record}"
+            );
         }
     }
     #[test]
     fn conpty_native_raw_repeats_surrogates_and_virtual_key_fallback_keep_order() {
         let observed = observe("records", None);
-        assert_eq!(observed["events"].as_array().unwrap().len(), 7);
+        assert_eq!(observed["events"].as_array().unwrap().len(), 9);
     }
     #[test]
     fn conpty_fragmented_paste_controls_and_standalone_escape_reach_actual_reader() {
