@@ -1,0 +1,55 @@
+name: Windows VT diagnostic (not release acceptance)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnostic:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build source-bound trusted fixture
+        shell: pwsh
+        run: |
+          $theseusEvidence = Join-Path $env:RUNNER_TEMP 'theseus-windows-vt-diagnostic'
+          "THESEUS_HOST_EVIDENCE=$theseusEvidence" >> $env:GITHUB_ENV
+          python scripts/validate.py native --stage fixture --evidence $theseusEvidence --expected-host x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Repeat the unchanged fragmented-paste assertion with bounded tracing
+        timeout-minutes: 6
+        shell: python
+        run: |
+          import importlib.util, json, os, pathlib, time
+          spec = importlib.util.spec_from_file_location('validation', 'scripts/validate.py')
+          validation = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(validation)
+          evidence = pathlib.Path(os.environ['THESEUS_HOST_EVIDENCE'])
+          identity = validation.source_identity(validation.ROOT)
+          receipt = dict(identity, diagnostic_only=True, release_acceptance=False, completed_repetitions=0)
+          receipt['pass'] = False
+          try:
+              if identity != json.loads((evidence / 'source.json').read_text()):
+                  raise validation.GateFailure('Diagnostic fixture source mismatch')
+              runner = validation.Runner(evidence, deadline=time.time() + 300)
+              validation.load_pinned(runner)
+              case = 'process::windows::terminal::events::tests::conpty_fragmented_paste_controls_and_standalone_escape_reach_actual_reader'
+              for repetition in range(1, 17):
+                  runner.cargo(f'fragmented-paste-{repetition:02}', 'test', '--locked', '-p', 'theseus-host', '--features', 'test-support', '--lib', case, '--', '--exact', '--nocapture', '--test-threads=1', timeout=300, required_cases=[case])
+                  receipt['completed_repetitions'] = repetition
+              if validation.source_identity(validation.ROOT) != identity:
+                  raise validation.GateFailure('Source changed during diagnostic')
+              receipt['pass'] = True
+          finally:
+              validation.write_json(evidence / 'diagnostic-only.result.json', receipt)
+      - name: Preserve diagnostic evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-vt-diagnostic
+          path: ${{ env.THESEUS_HOST_EVIDENCE }}
+          retention-days: 7
+          if-no-files-found: error

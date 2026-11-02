@@ -129,6 +129,7 @@ version = "1.25"
 features = ["full"]
 
 [features]
+theseus-test-support = []
 bracketed-paste = []
 default = [
     "bracketed-paste",

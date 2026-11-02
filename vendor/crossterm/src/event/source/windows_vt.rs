@@ -22,6 +22,19 @@ pub(super) struct VtInput {
     failed: bool,
 }
 impl VtInput {
+    #[cfg(all(windows, feature = "theseus-test-support"))]
+    pub(super) fn trace_state(&self) -> crate::event::windows_test_trace::ParserState {
+        let mut prefix = [0; 8];
+        let count = self.buffer.len().min(prefix.len());
+        prefix[..count].copy_from_slice(&self.buffer[..count]);
+        crate::event::windows_test_trace::ParserState {
+            length: self.buffer.len(),
+            prefix,
+            surrogate: self.surrogate,
+            failed: self.failed,
+        }
+    }
+
     // Win32 virtual-key values, also used by sys/windows/parse.rs. ConHost
     // leaves modifier/Alt-code scaffolding among its raw VT character records.
     pub(super) fn key_kind(

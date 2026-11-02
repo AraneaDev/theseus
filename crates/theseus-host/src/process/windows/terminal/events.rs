@@ -64,6 +64,9 @@ pub(crate) fn run(root: &Path, mode: &str) -> io::Result<()> {
         restore.0.enable_vt_input()?;
     }
     let active = input_mode(&input)?;
+    if matches!(mode, "events" | "records") {
+        crossterm::event::windows_test_trace::arm();
+    }
     publish(
         root,
         "ready",
@@ -264,12 +267,31 @@ pub(crate) fn run(root: &Path, mode: &str) -> io::Result<()> {
         }
         Ok(())
     })();
+    let reader_trace = crossterm::event::windows_test_trace::take().map(|capture| {
+        let entries: Vec<_> = capture.entries.into_iter().map(|entry| {
+            serde_json::json!([
+                format!("{:?}", entry.phase), entry.replay, entry.record_type,
+                entry.classification, format!("{:?}", entry.outcome),
+                entry.parser.length, entry.parser.prefix, entry.parser.surrogate,
+                entry.parser.failed, entry.key.map(|key| [
+                    u32::from(key.down), u32::from(key.repeat), u32::from(key.vkey),
+                    u32::from(key.scan), u32::from(key.unit), key.control
+                ])
+            ])
+        }).collect();
+        serde_json::json!({
+            "fields":["phase","replay","record_type","classification","outcome","parser_length","parser_prefix","surrogate","failed","key"],
+            "key_fields":["down","repeat","vkey","scan","unit","control"],
+            "classification":{"0":"not-key","1":"text","2":"ignore","3":"native"},
+            "limit":512,"overflow":capture.overflow,"entries":entries
+        })
+    });
     let restored = restore.0.restore();
     let after = input_mode(&input)?;
     publish(
         root,
         "observed",
-        &serde_json::json!({"mode":mode,"before":before,"active":active,"after":after,"records":records,"events":events,"error":result.as_ref().err().map(ToString::to_string)}),
+        &serde_json::json!({"mode":mode,"before":before,"active":active,"after":after,"records":records,"reader_trace":reader_trace,"events":events,"error":result.as_ref().err().map(ToString::to_string)}),
     )?;
     result?;
     restored
@@ -327,6 +349,7 @@ mod tests {
             std::ffi::OsStr::new(mode),
         ]);
         let mut session = Session::fixture_control(&command, 24, 80).unwrap();
+        let mut acknowledged_writes = Vec::new();
         let result = (|| -> io::Result<serde_json::Value> {
             let deadline = Instant::now() + Duration::from_secs(10);
             await_file(&mut session, root.path(), "ready", deadline)?;
@@ -334,11 +357,14 @@ mod tests {
                 // The private child injects its own fixed records.
             } else if let Some(split) = split {
                 session.write(&INPUT.as_bytes()[..split])?;
+                acknowledged_writes.push(split);
                 // This is a real separate ConPTY pipe write, not decoder mocking.
                 session.poll()?;
                 session.write(&INPUT.as_bytes()[split..])?;
+                acknowledged_writes.push(INPUT.len() - split);
             } else {
                 session.write(INPUT.as_bytes())?;
+                acknowledged_writes.push(INPUT.len());
             }
             if mode == "events" {
                 await_file(&mut session, root.path(), "event-0", deadline)?;
@@ -371,7 +397,7 @@ mod tests {
             Ok(observed)
         })();
         println!(
-            "ACTUAL ConPTY VT mode={mode} split={split:?} result={result:?} partial={:?}",
+            "ACTUAL ConPTY VT mode={mode} split={split:?} acknowledged_writes={acknowledged_writes:?} result={result:?} partial={:?}",
             load(root.path(), "observed")
         );
         session.finish(true).unwrap();

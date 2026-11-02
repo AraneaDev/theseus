@@ -120,6 +120,10 @@
 
 pub(crate) mod filter;
 pub(crate) mod read;
+#[cfg(feature = "theseus-test-support")]
+#[doc(hidden)]
+pub mod windows_test_trace;
+
 pub(crate) mod source;
 #[cfg(feature = "event-stream")]
 pub(crate) mod stream;

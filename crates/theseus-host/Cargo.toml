@@ -8,7 +8,7 @@ description = "Private native host mechanisms for Theseus"
 
 [features]
 default = []
-test-support = ["dep:serde", "dep:serde_json", "dep:tempfile", "dep:crossterm"]
+test-support = ["dep:serde", "dep:serde_json", "dep:tempfile", "dep:crossterm", "crossterm/theseus-test-support"]
 
 [dependencies]
 crossterm = { version = "0.28.1", optional = true }
