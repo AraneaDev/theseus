@@ -31,6 +31,15 @@ class GateFailure(RuntimeError):
     pass
 
 
+def console(text, *, file=None, end='\n', flush=False):
+    """Escape unrepresentable display characters without changing raw evidence."""
+    stream = sys.stdout if file is None else file
+    encoding = getattr(stream, 'encoding', None)
+    if encoding:
+        text = text.encode(encoding, errors='backslashreplace').decode(encoding)
+    print(text, file=stream, end=end, flush=flush)
+
+
 def write_json(path, value):
     path.write_text(json.dumps(value, indent=2) + '\n', encoding='utf-8')
 
@@ -145,7 +154,7 @@ class Runner:
         started = time.monotonic()
         if self.deadline is not None:
             timeout = min(timeout, self.deadline - time.time() - 15)
-        print(f'THESEUS case={name} command={json.dumps(command)}', flush=True)
+        console(f'THESEUS case={name} command={json.dumps(command)}', flush=True)
         if timeout <= 0:
             receipt.update(status='not_run_budget_exhausted', exit_code=124)
         else:
@@ -176,8 +185,8 @@ class Runner:
         write_json(self.evidence / f'{name}.result.json', receipt)
         if log.exists():
             # Preserve arbitrary native bytes in the file; console display is lossy.
-            print(log.read_bytes().decode('utf-8', errors='replace'), end='', flush=True)
-        print(f'THESEUS case={name} exit={receipt["exit_code"]} status={receipt["status"]}', flush=True)
+            console(log.read_bytes().decode('utf-8', errors='replace'), end='', flush=True)
+        console(f'THESEUS case={name} exit={receipt["exit_code"]} status={receipt["status"]}', flush=True)
         if not receipt['pass']:
             raise GateFailure(f'{name} failed; evidence: {self.evidence}')
         return (self.evidence / f'{name}.stdout' if stdout_only else log).read_text(encoding='utf-8', errors='replace')
@@ -360,7 +369,7 @@ def main():
     if evidence.is_relative_to(ROOT):
         parser.error('Evidence must be outside the source tree so receipts cannot change its identity')
     runner = Runner(evidence, deadline=(args.budget_start or time.time()) + 4200 if args.mode == 'docker' else None)
-    print(f'THESEUS evidence={evidence}', flush=True)
+    console(f'THESEUS evidence={evidence}', flush=True)
     receipt = {'mode': args.mode, 'stage': args.stage or 'all', 'pass': False,
                'native_os': platform.system(), 'native_os_version': platform.version(),
                'native_machine': platform.machine(), 'other_native_operating_systems': 'NOT_RUN',
@@ -387,7 +396,7 @@ def main():
         receipt['pass'] = True
     except (GateFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         receipt['error'] = str(error)
-        print(f'THESEUS FAILED: {error}', file=sys.stderr)
+        console(f'THESEUS FAILED: {error}', file=sys.stderr)
     finally:
         write_json(evidence / f'{args.mode}-{args.stage or "all"}.result.json', receipt)
     return 0 if receipt['pass'] else 1

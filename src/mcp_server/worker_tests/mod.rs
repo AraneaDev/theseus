@@ -492,8 +492,54 @@ fn normalize(value: &mut serde_json::Value, run_id: &str) {
         _ => (),
     }
 }
+// Existing run helpers include fixture preparation, so this is a conservative
+// whole-direct-rehearsal measurement, not a production engine timing metric.
+fn timed_rehearsal<T>(run: impl FnOnce() -> T) -> (T, Duration) {
+    let started = Instant::now();
+    let result = run();
+    (result, started.elapsed())
+}
+fn parity_join_budget(direct_rehearsal: Duration) -> Duration {
+    direct_rehearsal
+        .saturating_mul(4)
+        .saturating_add(Duration::from_secs(5))
+        .clamp(Duration::from_secs(10), Duration::from_secs(120))
+}
+fn joined_parity(worker: &mut EngineWorker, direct_rehearsal: Duration) -> WorkerCompletion {
+    let budget = parity_join_budget(direct_rehearsal);
+    let started = Instant::now();
+    loop {
+        if let Some(completion) = worker.try_join() {
+            println!(
+                "worker parity direct_rehearsal={direct_rehearsal:?} join_wait={:?} budget={budget:?}",
+                started.elapsed()
+            );
+            return completion;
+        }
+        assert!(
+            started.elapsed() < budget,
+            "parity worker did not join: direct_rehearsal={direct_rehearsal:?} join_wait={:?} budget={budget:?}",
+            started.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+#[test]
+fn worker_parity_budget_tracks_rehearsal_with_fixed_floor_and_cap() {
+    assert_eq!(parity_join_budget(Duration::ZERO), Duration::from_secs(10));
+    assert_eq!(
+        parity_join_budget(Duration::from_secs(4)),
+        Duration::from_secs(21)
+    );
+    assert_eq!(
+        parity_join_budget(Duration::from_secs(30)),
+        Duration::from_secs(120)
+    );
+    assert_eq!(parity_join_budget(Duration::MAX), Duration::from_secs(120));
+}
 fn compare_saved<E: Environment + 'static>(
     direct: crate::engine::RunResult,
+    direct_rehearsal: Duration,
     recipe: ValidatedRecipe,
     root: &std::path::Path,
     factory: impl FnOnce() -> E + Send + 'static,
@@ -514,7 +560,7 @@ fn compare_saved<E: Environment + 'static>(
         factory,
     )
     .unwrap();
-    let WorkerCompletion::Engine(completion) = joined(&mut worker) else {
+    let WorkerCompletion::Engine(completion) = joined_parity(&mut worker, direct_rehearsal) else {
         panic!("engine completion")
     };
     let summary = completion.result.unwrap();

@@ -37,6 +37,7 @@ jobs:
                   raise validation.GateFailure('Diagnostic fixture source mismatch')
               runner = validation.Runner(evidence, deadline=time.time() + 300)
               validation.load_pinned(runner)
+              runner.cargo('all-required-conpty-input-and-close', 'test', '--locked', '-p', 'theseus-host', '--features', 'test-support', '--lib', 'conpty_', '--', '--nocapture', '--test-threads=1', timeout=300, required_cases=validation.CASE_INVENTORY['native']['runtime-windows'])
               case = 'process::windows::terminal::events::tests::conpty_fragmented_paste_controls_and_standalone_escape_reach_actual_reader'
               for repetition in range(1, 17):
                   runner.cargo(f'fragmented-paste-{repetition:02}', 'test', '--locked', '-p', 'theseus-host', '--features', 'test-support', '--lib', case, '--', '--exact', '--nocapture', '--test-threads=1', timeout=300, required_cases=[case])
@@ -46,6 +47,14 @@ jobs:
               receipt['pass'] = True
           finally:
               validation.write_json(evidence / 'diagnostic-only.result.json', receipt)
+      - name: Preserve focused diagnostic before full workspace collection
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-vt-preflight
+          path: ${{ env.THESEUS_HOST_EVIDENCE }}
+          retention-days: 7
+          if-no-files-found: error
       - name: Collect full Windows workspace and native-control results
         if: ${{ !cancelled() && steps.fixture.outcome == 'success' }}
         timeout-minutes: 20

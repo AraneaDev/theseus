@@ -41,8 +41,10 @@ fn start(registry: &mut Registry, handle: &Handle, generation: u64) {
 fn recipe() -> ValidatedRecipe {
     // Existing parser validates exact fixture bytes; only fixture construction
     // touches disk. Every registry operation itself is pure and barrier-free.
-    let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/recipes/v2_clean.toml");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/recipes/v2_clean.toml")
+        .canonicalize()
+        .unwrap();
     crate::recipe::parse_bytes(
         &path,
         include_bytes!("../../tests/fixtures/recipes/v2_clean.toml"),

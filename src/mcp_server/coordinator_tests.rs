@@ -623,10 +623,12 @@ fn saved_bindings_published_between_pre_drain_and_join_survive_worker_release() 
     };
     r.apply(&handle, RegistryUpdate::ValidationStarted { generation: 1 });
     let recipe = crate::recipe::parse_bytes(
-        std::path::Path::new(concat!(
+        &std::path::Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/recipes/v2_clean.toml"
-        )),
+        ))
+        .canonicalize()
+        .unwrap(),
         include_bytes!("../../tests/fixtures/recipes/v2_clean.toml"),
     )
     .unwrap();

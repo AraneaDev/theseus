@@ -1,194 +1,5 @@
-use anyhow::Result;
-use std::collections::BTreeMap;
-use theseus::{
-    engine::{self, CancellationToken, RunOptions},
-    model::*,
-    recipe::*,
-    report::ReportStore,
-    runner::{CommandRequest, Environment, ExecutedCommand, PreparedEnvironment},
-    snapshot::Snapshot,
-};
+include!("support/parity/engine.rs");
 
-struct Fake {
-    fault: &'static str,
-}
-impl Environment for Fake {
-    fn prepare(
-        &mut self,
-        _: &ValidatedRecipe,
-        _: bool,
-        _: &CancellationToken,
-    ) -> Result<PreparedEnvironment> {
-        Ok(PreparedEnvironment {
-            image_id: "sha256:fixture".into(),
-            artifacts: vec![],
-        })
-    }
-    fn create(&mut self, run: &str, scenario: &str, _: &ValidatedRecipe) -> Result<OwnedResource> {
-        Ok(OwnedResource {
-            container_id: format!("{run}-{scenario}"),
-            labels: BTreeMap::new(),
-            removed: false,
-        })
-    }
-    fn setup(
-        &mut self,
-        _: &OwnedResource,
-        _: &ValidatedRecipe,
-        _: &CancellationToken,
-    ) -> Result<()> {
-        if self.fault == "panic-setup" {
-            panic!("original setup panic");
-        }
-        if self.fault == "setup" {
-            anyhow::bail!("unsupported fixture image");
-        }
-        Ok(())
-    }
-    fn execute(
-        &mut self,
-        _: &OwnedResource,
-        request: CommandRequest,
-        _: &ReportStore,
-        _: &CancellationToken,
-    ) -> Result<ExecutedCommand> {
-        if request.phase == "check:json" {
-            assert_eq!(request.identity.uid, 10001);
-            assert_eq!(request.identity.gid, 10001);
-            assert_eq!(request.argv, vec!["/bin/sh", "-c", "printf true"]);
-            assert_eq!(
-                request.env.get("JSON_TEST_LITERAL").map(String::as_str),
-                Some("value")
-            );
-            assert_eq!(request.timeout_seconds, 7);
-            assert_eq!(
-                request.log_limit,
-                if self.fault == "json-small" { 2 } else { 4 }
-            );
-            let truncated = self.fault == "json-small";
-            let mut record = CommandRecord::new(&request.id, &request.phase);
-            record.identity = request.identity;
-            record.exit_status = Some(0);
-            record.outcome = CommandOutcome::Succeeded;
-            record.stdout = Some(LogReference {
-                path: "logs/json.stdout".into(),
-                bytes: if truncated { 2 } else { 4 },
-                truncated,
-            });
-            record.stderr = Some(LogReference {
-                path: "logs/json.stderr".into(),
-                bytes: 4,
-                truncated: true,
-            });
-            return Ok(ExecutedCommand {
-                record,
-                stdout: if truncated { "tr" } else { "true" }.into(),
-                stdout_complete: !truncated,
-                stdout_utf8: true,
-            });
-        }
-        let mut record = CommandRecord::new(&request.id, &request.phase);
-        record.identity = request.identity;
-        record.argv = request.argv;
-        record.exit_status = Some(0);
-        record.outcome = CommandOutcome::Succeeded;
-        if self.fault == "install" && request.phase.starts_with("install")
-            || self.fault == "uninstall" && request.phase == "uninstall"
-        {
-            record.exit_status = Some(1);
-            record.outcome = CommandOutcome::Failed;
-        }
-        if self.fault == "check" && request.phase == "check:version" {
-            record.exit_status = Some(1);
-            record.outcome = CommandOutcome::Failed;
-        }
-        if ["timeout", "cancel"].contains(&self.fault) && request.phase.starts_with("install") {
-            record.exit_status = None;
-            record.timed_out = self.fault == "timeout";
-            record.cancelled = self.fault == "cancel";
-            record.outcome = if record.cancelled {
-                CommandOutcome::Cancelled
-            } else {
-                CommandOutcome::TimedOut
-            };
-        }
-        Ok(ExecutedCommand {
-            record,
-            stdout: "2.0".into(),
-            stdout_utf8: true,
-            stdout_complete: true,
-        })
-    }
-    fn observe(
-        &mut self,
-        _: &OwnedResource,
-        roots: &[String],
-        _: Limits,
-        _: &CancellationToken,
-    ) -> Result<Vec<Snapshot>> {
-        Ok(roots
-            .iter()
-            .map(|r| {
-                if self.fault == "overflow" {
-                    Snapshot::incomplete(r, "entry limit exceeded")
-                } else {
-                    Snapshot::missing(r)
-                }
-            })
-            .collect())
-    }
-    fn stop(&mut self, _: &OwnedResource) -> Result<()> {
-        Ok(())
-    }
-    fn remove(&mut self, _: &OwnedResource) -> Result<()> {
-        if self.fault == "panic-setup" {
-            self.fault = "removed-after-panic";
-        }
-        if self.fault == "cleanup" {
-            anyhow::bail!("daemon unavailable during cleanup");
-        }
-        Ok(())
-    }
-}
-fn recipe() -> (tempfile::TempDir, ValidatedRecipe) {
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::create_dir(temp.path().join("input")).unwrap();
-    let mut text = "schema_version=1\nname='fixture'\nimage='ubuntu:24.04'\nobserve=['/home/theseus']\n[artifacts]\nbase='input'\ntarget='input'\n".to_string();
-    for profile in ["user", "system"] {
-        for step in [
-            "install_base",
-            "install_target",
-            "configure",
-            "upgrade",
-            "exercise",
-            "uninstall",
-        ] {
-            text += &format!("[profiles.{profile}.steps.{step}]\nscript='true'\n");
-        }
-        text += &format!(
-            "[[profiles.{profile}.checks]]\nid='version'\ncheckpoint='target_installed'\nkind='command'\nscript='echo 2.0'\nexpected_exit=0\nstdout_contains='2.0'\n"
-        );
-    }
-    let path = temp.path().join("theseus.toml");
-    std::fs::write(&path, text).unwrap();
-    (temp, load(&path).unwrap())
-}
-fn run(fault: &'static str) -> (tempfile::TempDir, theseus::engine::RunResult) {
-    let (temp, recipe) = recipe();
-    let options = RunOptions {
-        output_root: temp.path().join("runs"),
-        ..RunOptions::all(&recipe)
-    };
-    let result = engine::run_with(
-        &recipe,
-        options,
-        CancellationToken::default(),
-        &mut Fake { fault },
-        |_| {},
-    )
-    .unwrap();
-    (temp, result)
-}
 #[test]
 fn complete_matrix_has_real_order_final_evidence_and_cleanup() {
     let (_temp, result) = run("");
@@ -242,6 +53,7 @@ fn complete_matrix_has_real_order_final_evidence_and_cleanup() {
         RunOutcome::Passed
     );
 }
+
 #[test]
 fn nonzero_install_skips_dependents_but_uninstalls_and_observes() {
     let (_, result) = run("install");
@@ -267,6 +79,7 @@ fn nonzero_install_skips_dependents_but_uninstalls_and_observes() {
         assert!(matches!(s.teardown, TeardownStatus::Complete));
     }
 }
+
 #[test]
 fn failed_check_stops_forward_mutation_but_keeps_final_observations() {
     let (_, result) = run("check");
@@ -283,6 +96,7 @@ fn failed_check_stops_forward_mutation_but_keeps_final_observations() {
         assert!(!s.stages.last().unwrap().snapshots.is_empty());
     }
 }
+
 #[test]
 fn uninstall_failure_is_a_contract_failure_with_final_state() {
     let (_, result) = run("uninstall");
@@ -296,6 +110,7 @@ fn uninstall_failure_is_a_contract_failure_with_final_state() {
                 && matches!(s.teardown, TeardownStatus::Complete))
     );
 }
+
 #[test]
 fn timeout_is_incomplete_and_cannot_claim_uninstall_observation() {
     let (_, result) = run("timeout");
@@ -316,6 +131,7 @@ fn timeout_is_incomplete_and_cannot_claim_uninstall_observation() {
         assert!(matches!(s.teardown, TeardownStatus::Complete));
     }
 }
+
 #[test]
 fn cancellation_has_priority_and_preserves_cleanup() {
     let (_, result) = run("cancel");
@@ -328,6 +144,7 @@ fn cancellation_has_priority_and_preserves_cleanup() {
             .all(|s| matches!(s.teardown, TeardownStatus::Complete))
     );
 }
+
 #[test]
 fn observation_overflow_cannot_pass() {
     let (_, result) = run("overflow");
@@ -390,6 +207,7 @@ fn setup_failure_journals_cleanup_and_marks_unperformed_checks_incomplete() {
             .any(|e| e.contains("unsupported fixture image"))
     }));
 }
+
 #[test]
 fn cleanup_failure_preserves_recovery_journal_and_does_not_claim_success() {
     let (_temp, result) = run("cleanup");
@@ -405,6 +223,7 @@ fn cleanup_failure_preserves_recovery_journal_and_does_not_claim_success() {
     assert_eq!(journal.cleanup_errors.len(), 4);
     assert!(journal.resources.iter().all(|r| !r.removed));
 }
+
 #[test]
 fn pre_cancelled_run_records_remaining_checks_without_creating_resources() {
     let (temp, recipe) = recipe();
@@ -489,240 +308,6 @@ fn version_two_clean_defaults_run_without_upgrade_inputs() {
     assert_eq!(result.report.scenarios[0].scenario, ScenarioKind::Clean);
 }
 
-/// Only the container boundary is simulated; lifecycle, assertions, persistence,
-/// observations, diffs, outcome aggregation and cleanup journals are real.
-#[derive(Default)]
-struct ReinstallEnvironment {
-    fault: &'static str,
-    files: BTreeMap<String, BTreeMap<String, theseus::snapshot::FileEntry>>,
-    phase: String,
-}
-fn entry(kind: FileKind, content: &str) -> theseus::snapshot::FileEntry {
-    theseus::snapshot::FileEntry {
-        kind,
-        mode: if kind == FileKind::Directory {
-            0o755
-        } else {
-            0o644
-        },
-        uid: 10001,
-        gid: 10001,
-        size: content.len() as u64,
-        sha256: (kind == FileKind::File).then(|| content.to_owned()),
-        link_target: None,
-    }
-}
-impl Environment for ReinstallEnvironment {
-    fn prepare(
-        &mut self,
-        _: &ValidatedRecipe,
-        _: bool,
-        _: &CancellationToken,
-    ) -> Result<PreparedEnvironment> {
-        Ok(PreparedEnvironment {
-            image_id: "sha256:reinstall".into(),
-            artifacts: vec![],
-        })
-    }
-    fn create(&mut self, run: &str, scenario: &str, _: &ValidatedRecipe) -> Result<OwnedResource> {
-        let id = format!("{run}-{scenario}");
-        self.files.insert(
-            id.clone(),
-            BTreeMap::from([("/home/theseus".into(), entry(FileKind::Directory, ""))]),
-        );
-        Ok(OwnedResource {
-            container_id: id,
-            labels: BTreeMap::new(),
-            removed: false,
-        })
-    }
-    fn setup(
-        &mut self,
-        _: &OwnedResource,
-        _: &ValidatedRecipe,
-        _: &CancellationToken,
-    ) -> Result<()> {
-        Ok(())
-    }
-    fn execute(
-        &mut self,
-        resource: &OwnedResource,
-        request: CommandRequest,
-        _: &ReportStore,
-        _: &CancellationToken,
-    ) -> Result<ExecutedCommand> {
-        self.phase = request.phase.clone();
-        let files = self
-            .files
-            .get_mut(&resource.container_id)
-            .expect("same owned scenario container");
-        let mut record = CommandRecord::new(request.id, &request.phase);
-        record.argv = request.argv;
-        record.identity = request.identity;
-        record.exit_status = Some(0);
-        record.outcome = CommandOutcome::Succeeded;
-        match request.phase.as_str() {
-            "install_target" => {
-                files.insert("/home/theseus/bin".into(), entry(FileKind::File, "target"));
-            }
-            "configure" => {
-                files.insert(
-                    "/home/theseus/config".into(),
-                    entry(FileKind::Directory, ""),
-                );
-                files.insert(
-                    "/home/theseus/config/settings".into(),
-                    entry(FileKind::File, "configured"),
-                );
-                files.insert(
-                    "/home/theseus/log".into(),
-                    entry(FileKind::File, "configured"),
-                );
-            }
-            "exercise_before_reinstall" => {
-                files.insert(
-                    "/home/theseus/log".into(),
-                    entry(FileKind::File, "first exercise"),
-                );
-            }
-            "reinstall" => match self.fault {
-                "reset" => {
-                    files.insert(
-                        "/home/theseus/config/settings".into(),
-                        entry(FileKind::File, "reset"),
-                    );
-                }
-                "duplicate" => {
-                    files.insert(
-                        "/home/theseus/config/settings".into(),
-                        entry(FileKind::File, "configured\nconfigured"),
-                    );
-                }
-                "mode" => {
-                    files.get_mut("/home/theseus/config/settings").unwrap().mode = 0o600;
-                }
-                "add" => {
-                    files.insert(
-                        "/home/theseus/config/extra".into(),
-                        entry(FileKind::File, "new"),
-                    );
-                }
-                "remove" => {
-                    files.remove("/home/theseus/config/settings");
-                }
-                "reject" => {
-                    record.outcome = CommandOutcome::Failed;
-                    record.exit_status = Some(1);
-                }
-                "timeout" | "cancel" => {
-                    record.exit_status = None;
-                    record.timed_out = self.fault == "timeout";
-                    record.cancelled = self.fault == "cancel";
-                    record.outcome = if record.cancelled {
-                        CommandOutcome::Cancelled
-                    } else {
-                        CommandOutcome::TimedOut
-                    };
-                }
-                _ => {}
-            },
-            "check:runtime" => {
-                files.insert(
-                    "/home/theseus/log".into(),
-                    entry(FileKind::File, "check side effect"),
-                );
-            }
-            "exercise_after_reinstall" => {
-                files.insert(
-                    "/home/theseus/log".into(),
-                    entry(FileKind::File, "second exercise"),
-                );
-            }
-            "uninstall" => {
-                files.remove("/home/theseus/bin");
-            }
-            _ => {}
-        }
-        if (self.fault == "first_install" && request.phase == "install_target")
-            || (self.fault == "first_exercise" && request.phase == "exercise_before_reinstall")
-        {
-            record.exit_status = Some(1);
-            record.outcome = CommandOutcome::Failed;
-        }
-        Ok(ExecutedCommand {
-            record,
-            stdout: String::new(),
-            stdout_utf8: true,
-            stdout_complete: true,
-        })
-    }
-    fn observe(
-        &mut self,
-        resource: &OwnedResource,
-        _: &[String],
-        _: Limits,
-        _: &CancellationToken,
-    ) -> Result<Vec<Snapshot>> {
-        Ok(vec![
-            if self.fault == "incomplete" && self.phase == "exercise_before_reinstall" {
-                Snapshot::incomplete("/home/theseus", "reference truncated")
-            } else {
-                Snapshot {
-                    root: "/home/theseus".into(),
-                    completeness: theseus::snapshot::ObservationStatus::Complete,
-                    entries: self.files[&resource.container_id].clone(),
-                }
-            },
-        ])
-    }
-    fn stop(&mut self, _: &OwnedResource) -> Result<()> {
-        Ok(())
-    }
-    fn remove(&mut self, _: &OwnedResource) -> Result<()> {
-        Ok(())
-    }
-}
-fn reinstall_recipe() -> (tempfile::TempDir, ValidatedRecipe) {
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::create_dir(temp.path().join("target")).unwrap();
-    let user = include_str!("fixtures/recipes/v2_reinstall.toml");
-    let system = user[user.find("[profiles.user.steps").unwrap()..]
-        .replace("profiles.user", "profiles.system")
-        .replace("install.sh user", "install.sh system");
-    let path = temp.path().join("theseus.toml");
-    std::fs::write(&path, format!("{user}\n{system}")).unwrap();
-    (temp, load(&path).expect("reinstall fixture must load"))
-}
-fn run_reinstall(
-    fault: &'static str,
-    extra_checks: &str,
-) -> (tempfile::TempDir, engine::RunResult) {
-    let (temp, mut recipe) = reinstall_recipe();
-    if !extra_checks.is_empty() {
-        let text = std::fs::read_to_string(&recipe.path).unwrap();
-        std::fs::write(&recipe.path, format!("{text}\n{extra_checks}")).unwrap();
-        recipe = load(&recipe.path).unwrap();
-    }
-    let options = RunOptions {
-        output_root: temp.path().join("runs"),
-        ..RunOptions::all(&recipe)
-    };
-    let result = engine::run_with(
-        &recipe,
-        options,
-        CancellationToken::default(),
-        &mut ReinstallEnvironment {
-            fault,
-            ..Default::default()
-        },
-        |_| {},
-    )
-    .unwrap();
-    (temp, result)
-}
-fn stage<'a>(scenario: &'a ScenarioReport, name: &str) -> &'a StageReport {
-    scenario.stages.iter().find(|s| s.name == name).unwrap()
-}
 #[test]
 fn reinstall_exact_order_identities_target_and_distinct_profile_containers() {
     let (_temp, result) = run_reinstall("", "");
@@ -813,6 +398,7 @@ fn reinstall_exact_order_identities_target_and_distinct_profile_containers() {
         "before_reinstall"
     );
 }
+
 #[test]
 fn reinstall_reference_follows_first_exercise_and_precedes_check_and_second_exercise() {
     let (_temp, result) = run_reinstall(
@@ -848,6 +434,7 @@ fn reinstall_reference_follows_first_exercise_and_precedes_check_and_second_exer
             .all(|c| c.outcome == CheckOutcome::Passed)
     );
 }
+
 #[test]
 fn preservation_keeps_configured_reference_separate_from_before_reinstall() {
     let (_temp, result) = run_reinstall(
@@ -870,6 +457,7 @@ fn preservation_keeps_configured_reference_separate_from_before_reinstall() {
         CheckOutcome::Failed
     );
 }
+
 #[test]
 fn repeat_detects_reset_duplicates_permissions_and_directory_additions_removals() {
     for fault in ["reset", "duplicate", "mode", "add", "remove"] {
@@ -890,6 +478,7 @@ fn repeat_detects_reset_duplicates_permissions_and_directory_additions_removals(
         }
     }
 }
+
 #[test]
 fn rejected_repeat_skips_second_exercise_but_uninstalls_and_keeps_failure() {
     let (_temp, result) = run_reinstall("reject", "");
@@ -907,6 +496,7 @@ fn rejected_repeat_skips_second_exercise_but_uninstalls_and_keeps_failure() {
         assert!(matches!(scenario.teardown, TeardownStatus::Complete));
     }
 }
+
 #[test]
 fn incomplete_repeat_reference_cannot_pass() {
     let (_temp, result) = run_reinstall("incomplete", "");
@@ -920,6 +510,7 @@ fn incomplete_repeat_reference_cannot_pass() {
         assert!(stage(scenario, "reinstall").commands.is_empty());
     }
 }
+
 #[test]
 fn repeat_timeout_and_cancel_keep_incomplete_evidence_and_owned_cleanup() {
     for (fault, expected) in [
@@ -1008,243 +599,6 @@ fn environment_default_interruption_and_restart_fail_closed() {
     assert!(environment.restart(&resource, &cancel).is_err());
 }
 
-#[derive(Default)]
-struct InterruptionEnvironment {
-    inner: ReinstallEnvironment,
-    fault: &'static str,
-    stopped: bool,
-    setups: usize,
-    restarts: usize,
-    calls: Vec<(String, String)>,
-}
-impl Environment for InterruptionEnvironment {
-    fn prepare(
-        &mut self,
-        r: &ValidatedRecipe,
-        p: bool,
-        c: &CancellationToken,
-    ) -> Result<PreparedEnvironment> {
-        self.inner.prepare(r, p, c)
-    }
-    fn create(&mut self, run: &str, sid: &str, r: &ValidatedRecipe) -> Result<OwnedResource> {
-        let resource = self.inner.create(run, sid, r)?;
-        self.inner
-            .files
-            .get_mut(&resource.container_id)
-            .unwrap()
-            .insert(
-                "/home/theseus/data".into(),
-                entry(FileKind::File, "baseline-data"),
-            );
-        Ok(resource)
-    }
-    fn setup(
-        &mut self,
-        _: &OwnedResource,
-        _: &ValidatedRecipe,
-        _: &CancellationToken,
-    ) -> Result<()> {
-        self.setups += 1;
-        Ok(())
-    }
-    fn execute(
-        &mut self,
-        r: &OwnedResource,
-        q: CommandRequest,
-        _: &ReportStore,
-        cancel: &CancellationToken,
-    ) -> Result<ExecutedCommand> {
-        assert!(!cancel.is_cancelled(), "no command after cancellation");
-        assert!(!self.stopped, "execute requires running container");
-        self.calls.push((r.container_id.clone(), q.phase.clone()));
-        let f = self.inner.files.get_mut(&r.container_id).unwrap();
-        let mut record = CommandRecord::new(q.id, &q.phase);
-        record.identity = q.identity;
-        record.argv = q.argv;
-        record.outcome = CommandOutcome::Succeeded;
-        record.exit_status = Some(0);
-        match q.phase.as_str() {
-            "install_base" => {
-                f.insert("/home/theseus/bin".into(), entry(FileKind::File, "base"));
-            }
-            "configure" => {
-                f.insert(
-                    "/home/theseus/data".into(),
-                    entry(FileKind::File, "configured"),
-                );
-            }
-            "exercise_before_interrupt" => {
-                f.insert(
-                    "/home/theseus/data".into(),
-                    entry(FileKind::File, "exercised"),
-                );
-            }
-            "recover_install" | "recover_upgrade" => {
-                if self.fault == "recovery" {
-                    record.outcome = CommandOutcome::Failed;
-                    record.exit_status = Some(7);
-                } else {
-                    f.remove("/home/theseus/partial");
-                    f.insert("/home/theseus/bin".into(), entry(FileKind::File, "target"));
-                }
-            }
-            "check:partial-writer" => {
-                f.insert(
-                    "/home/theseus/data".into(),
-                    entry(FileKind::File, "partial-check"),
-                );
-            }
-            "uninstall" => {
-                f.remove("/home/theseus/bin");
-                f.remove("/home/theseus/partial");
-            }
-            _ => {}
-        }
-        let stdout = if q.phase.starts_with("resolve:") {
-            "/home/theseus/bin"
-        } else {
-            "2.0"
-        };
-        Ok(ExecutedCommand {
-            record,
-            stdout: stdout.into(),
-            stdout_utf8: true,
-            stdout_complete: true,
-        })
-    }
-    fn execute_interrupted(
-        &mut self,
-        r: &OwnedResource,
-        q: CommandRequest,
-        _: &ReportStore,
-        c: &CancellationToken,
-    ) -> Result<ExecutedCommand> {
-        assert!(!c.is_cancelled(), "no interruption after cancellation");
-        assert!(!self.stopped);
-        self.calls.push((r.container_id.clone(), q.phase.clone()));
-        if self.fault != "partial" {
-            self.inner.files.get_mut(&r.container_id).unwrap().insert(
-                "/home/theseus/partial".into(),
-                entry(FileKind::File, "partial-only"),
-            );
-        }
-        let mut record = CommandRecord::new(q.id, &q.phase);
-        record.identity = q.identity;
-        record.argv = q.argv;
-        record.outcome = CommandOutcome::Interrupted;
-        record.interruption = Some(InterruptionEvidence {
-            mechanism: InterruptionMechanism::ContainerSigkill,
-            readiness_verified: true,
-            stopped_verified: true,
-        });
-        self.stopped = true;
-        if self.fault == "early" {
-            self.stopped = false;
-            record.outcome = CommandOutcome::Failed;
-            record.exit_status = Some(0);
-            record.interruption.as_mut().unwrap().stopped_verified = false;
-            record.interruption.as_mut().unwrap().readiness_verified = false;
-        }
-        if self.fault == "proof" {
-            record.interruption = None;
-        }
-        if self.fault == "cancel-stop" {
-            c.cancel();
-        }
-        Ok(ExecutedCommand {
-            record,
-            stdout: String::new(),
-            stdout_utf8: true,
-            stdout_complete: false,
-        })
-    }
-    fn restart(&mut self, r: &OwnedResource, c: &CancellationToken) -> Result<RestartEvidence> {
-        assert!(self.stopped);
-        assert!(!c.is_cancelled());
-        self.restarts += 1;
-        if self.fault == "restart" {
-            anyhow::bail!("restart unavailable")
-        }
-        self.stopped = false;
-        if self.fault == "cancel-restart" {
-            c.cancel();
-        }
-        Ok(RestartEvidence {
-            container_id: if self.fault == "wrong-id" {
-                "other".into()
-            } else {
-                r.container_id.clone()
-            },
-            running_verified: true,
-        })
-    }
-    fn observe(
-        &mut self,
-        r: &OwnedResource,
-        _: &[String],
-        _: Limits,
-        _: &CancellationToken,
-    ) -> Result<Vec<Snapshot>> {
-        assert!(!self.stopped, "never observe stopped container");
-        if self.fault == "incomplete" && self.restarts > 0 {
-            return Ok(vec![Snapshot::incomplete(
-                "/home/theseus",
-                "partial observation unavailable",
-            )]);
-        }
-        Ok(vec![Snapshot {
-            root: "/home/theseus".into(),
-            completeness: theseus::snapshot::ObservationStatus::Complete,
-            entries: self.inner.files[&r.container_id].clone(),
-        }])
-    }
-    fn stop(&mut self, _: &OwnedResource) -> Result<()> {
-        self.stopped = false;
-        Ok(())
-    }
-    fn remove(&mut self, _: &OwnedResource) -> Result<()> {
-        self.stopped = false;
-        Ok(())
-    }
-}
-fn interruption_recipe() -> (tempfile::TempDir, ValidatedRecipe) {
-    let temp = tempfile::tempdir().unwrap();
-    for d in ["base", "target"] {
-        std::fs::create_dir(temp.path().join(d)).unwrap();
-    }
-    let user = include_str!("fixtures/recipes/v3_interruption.toml");
-    let system = user[user.find("[profiles.user.steps").unwrap()..]
-        .replace("profiles.user", "profiles.system");
-    let path = temp.path().join("theseus.toml");
-    std::fs::write(&path, format!("{user}\n{system}")).unwrap();
-    (temp, load(&path).unwrap())
-}
-fn run_interruption(
-    fault: &'static str,
-) -> (
-    tempfile::TempDir,
-    engine::RunResult,
-    InterruptionEnvironment,
-) {
-    let (temp, recipe) = interruption_recipe();
-    let mut env = InterruptionEnvironment {
-        fault,
-        ..Default::default()
-    };
-    let options = RunOptions {
-        output_root: temp.path().join("runs"),
-        ..RunOptions::all(&recipe)
-    };
-    let result = engine::run_with(
-        &recipe,
-        options,
-        CancellationToken::default(),
-        &mut env,
-        |_| {},
-    )
-    .unwrap();
-    (temp, result, env)
-}
 #[test]
 fn interruption_real_orchestration_order_references_identity_and_same_container() {
     let (_temp, result, env) = run_interruption("");
@@ -1372,6 +726,7 @@ fn interruption_real_orchestration_order_references_identity_and_same_container(
         RunOutcome::Passed
     );
 }
+
 #[test]
 fn interruption_faults_gate_recovery_restart_and_uninstall() {
     for (fault, outcome, restart, recover, uninstall) in [
@@ -1407,6 +762,7 @@ fn interruption_faults_gate_recovery_restart_and_uninstall() {
         );
     }
 }
+
 #[test]
 fn interruption_cancellation_at_event_boundaries_never_mutates_after_cancel() {
     // Exact stage names are independently asserted in the lifecycle-order test.
@@ -1446,6 +802,7 @@ fn interruption_cancellation_at_event_boundaries_never_mutates_after_cancel() {
         }
     }
 }
+
 #[test]
 fn interruption_checks_and_exercise_do_not_rebase_comparison_or_configuration() {
     for preserved in [false, true] {
@@ -1526,224 +883,6 @@ fn interruption_checks_and_exercise_do_not_rebase_comparison_or_configuration() 
     }
 }
 
-#[derive(Default)]
-struct DowngradeEnvironment {
-    inner: ReinstallEnvironment,
-    rejection: bool,
-    fault: &'static str,
-    calls: Vec<(String, String, i32)>,
-    removed: usize,
-}
-impl Environment for DowngradeEnvironment {
-    fn prepare(
-        &mut self,
-        r: &ValidatedRecipe,
-        p: bool,
-        c: &CancellationToken,
-    ) -> Result<PreparedEnvironment> {
-        assert!(r.base_artifact.is_some());
-        self.inner.prepare(r, p, c)
-    }
-    fn create(&mut self, run: &str, sid: &str, r: &ValidatedRecipe) -> Result<OwnedResource> {
-        self.inner.create(run, sid, r)
-    }
-    fn setup(
-        &mut self,
-        r: &OwnedResource,
-        v: &ValidatedRecipe,
-        c: &CancellationToken,
-    ) -> Result<()> {
-        self.inner.setup(r, v, c)
-    }
-    fn execute(
-        &mut self,
-        r: &OwnedResource,
-        q: CommandRequest,
-        _: &ReportStore,
-        c: &CancellationToken,
-    ) -> Result<ExecutedCommand> {
-        assert!(!c.is_cancelled());
-        self.inner.phase = q.phase.clone();
-        self.calls
-            .push((r.container_id.clone(), q.phase.clone(), q.expected_exit));
-        let files = self.inner.files.get_mut(&r.container_id).unwrap();
-        let mut record = CommandRecord::new(q.id, &q.phase);
-        record.identity = q.identity;
-        record.argv = q.argv;
-        record.exit_status = Some(0);
-        record.outcome = CommandOutcome::Succeeded;
-        let mut stdout = "2.0".to_string();
-        if q.phase.starts_with("resolve:") {
-            stdout = "/home/theseus/bin".into();
-        }
-        match q.phase.as_str() {
-            "install_target" => {
-                files.insert(
-                    "/home/theseus/bin".into(),
-                    entry(
-                        if self.fault == "directory-binary" {
-                            FileKind::Directory
-                        } else {
-                            FileKind::File
-                        },
-                        "newer",
-                    ),
-                );
-            }
-            "configure" => {
-                files.insert("/home/theseus/data".into(), entry(FileKind::Directory, ""));
-                files.insert(
-                    "/home/theseus/data/record".into(),
-                    entry(FileKind::File, "configured"),
-                );
-            }
-            "exercise_before_downgrade" => {
-                files.insert(
-                    "/home/theseus/data/record".into(),
-                    entry(FileKind::File, "exercised"),
-                );
-            }
-            "downgrade" => {
-                if self.rejection {
-                    record.exit_status = Some(9);
-                    stdout = "newer data refusal".into();
-                    match self.fault {
-                        "binary" => {
-                            files.insert(
-                                "/home/theseus/bin".into(),
-                                entry(FileKind::File, "changed"),
-                            );
-                        }
-                        "add" => {
-                            files.insert(
-                                "/home/theseus/data/extra".into(),
-                                entry(FileKind::File, "extra"),
-                            );
-                        }
-                        "remove" => {
-                            files.remove("/home/theseus/data/record");
-                        }
-                        "wrong-status" => record.exit_status = Some(8),
-                        "success" => record.exit_status = Some(0),
-                        "marker" => stdout = "different".into(),
-                        "receipt" => record.exit_status = None,
-                        "transport" => record.error = Some("lost control".into()),
-                        "cancel" => {
-                            record.cancelled = true;
-                            record.outcome = CommandOutcome::Cancelled;
-                            c.cancel();
-                        }
-                        "timeout" => {
-                            record.timed_out = true;
-                            record.outcome = CommandOutcome::TimedOut;
-                        }
-                        _ => {}
-                    }
-                } else {
-                    files.insert("/home/theseus/bin".into(), entry(FileKind::File, "older"));
-                    if self.fault == "wrong-status" {
-                        record.exit_status = Some(9);
-                    }
-                }
-                if !record.cancelled {
-                    record.outcome = if record.exit_status == Some(q.expected_exit) {
-                        CommandOutcome::Succeeded
-                    } else {
-                        CommandOutcome::Failed
-                    };
-                }
-            }
-            "check:older" => stdout = "1.0".into(),
-            "check:older-data" => {
-                stdout = "record survives".into();
-                if self.fault == "reader" {
-                    record.exit_status = Some(1);
-                    record.outcome = CommandOutcome::Failed;
-                }
-            }
-            "check:writer" => {
-                files.insert(
-                    "/home/theseus/data/record".into(),
-                    entry(FileKind::File, "check-side-effect"),
-                );
-            }
-            "uninstall" => {
-                files.remove("/home/theseus/bin");
-            }
-            _ => {}
-        }
-        if (self.fault == "initial" && q.phase == "exercise_before_downgrade")
-            || (self.fault == "install" && q.phase == "install_target")
-            || (self.fault == "configure" && q.phase == "configure")
-            || (self.fault == "newer-check" && q.phase == "check:newer")
-        {
-            record.exit_status = Some(1);
-            record.outcome = CommandOutcome::Failed;
-        }
-        Ok(ExecutedCommand {
-            record,
-            stdout,
-            stdout_utf8: true,
-            stdout_complete: self.fault != "truncated" || q.phase != "downgrade",
-        })
-    }
-    fn observe(
-        &mut self,
-        r: &OwnedResource,
-        _: &[String],
-        _: Limits,
-        _: &CancellationToken,
-    ) -> Result<Vec<Snapshot>> {
-        if self.fault == "incomplete" && self.inner.phase == "downgrade" {
-            return Ok(vec![Snapshot::incomplete(
-                "/home/theseus",
-                "post-attempt unavailable",
-            )]);
-        }
-        Ok(vec![Snapshot {
-            root: "/home/theseus".into(),
-            completeness: theseus::snapshot::ObservationStatus::Complete,
-            entries: self.inner.files[&r.container_id].clone(),
-        }])
-    }
-    fn stop(&mut self, _: &OwnedResource) -> Result<()> {
-        Ok(())
-    }
-    fn remove(&mut self, _: &OwnedResource) -> Result<()> {
-        self.removed += 1;
-        Ok(())
-    }
-}
-fn downgrade_recipe(rejection: bool) -> (tempfile::TempDir, ValidatedRecipe) {
-    downgrade_recipe_from_template(
-        rejection,
-        include_str!("fixtures/recipes/v4_downgrade.toml"),
-    )
-}
-fn downgrade_recipe_from_template(
-    rejection: bool,
-    template: &str,
-) -> (tempfile::TempDir, ValidatedRecipe) {
-    let temp = tempfile::tempdir().unwrap();
-    for name in ["base", "target"] {
-        std::fs::create_dir(temp.path().join(name)).unwrap();
-    }
-    // This repository-owned test template is transformed by literal LF patterns.
-    let mut text = template.replace("\r\n", "\n");
-    if rejection {
-        text = text.replace("expect = \"compatible\"\ndata_checks = [\"older-data\"]", "expect = \"safe_rejection\"\nexpected_exit = 9\nstdout_contains = \"newer data refusal\"\nbinary_checks = [\"binary-stable\"]\ndata_checks = [\"data-stable\"]");
-        text.truncate(
-            text.find("[[profiles.user.checks]]\nid = \"older\"")
-                .unwrap(),
-        );
-        text.push_str("\n[[profiles.user.checks]]\nid = \"still-newer\"\ncheckpoint = \"downgrade_rejected\"\nkind = \"executable\"\nname = \"sample-cli\"\nresolved_path = \"/home/theseus/bin\"\nexpected_exit = 0\nstdout_contains = \"2.0\"\n[[profiles.user.checks]]\nid = \"binary-stable\"\ncheckpoint = \"downgrade_rejected\"\nkind = \"unchanged\"\npath = \"/home/theseus/bin\"\n[[profiles.user.checks]]\nid = \"data-stable\"\ncheckpoint = \"downgrade_rejected\"\nkind = \"unchanged\"\npath = \"/home/theseus/data\"\n");
-    }
-    let suffix = text[text.find("[profiles.user.downgrade]").unwrap()..]
-        .replace("profiles.user", "profiles.system");
-    let path = temp.path().join("theseus.toml");
-    std::fs::write(&path, format!("{text}\n{suffix}")).unwrap();
-    (temp, load(&path).expect("downgrade recipe loads"))
-}
 #[test]
 fn downgrade_owned_template_preserves_both_policies_for_lf_and_crlf() {
     let lf = include_str!("fixtures/recipes/v4_downgrade.toml").replace("\r\n", "\n");
@@ -1781,30 +920,7 @@ fn downgrade_owned_template_preserves_both_policies_for_lf_and_crlf() {
         }
     }
 }
-fn run_downgrade(
-    rejection: bool,
-    fault: &'static str,
-) -> (tempfile::TempDir, engine::RunResult, DowngradeEnvironment) {
-    let (temp, recipe) = downgrade_recipe(rejection);
-    let mut env = DowngradeEnvironment {
-        rejection,
-        fault,
-        ..Default::default()
-    };
-    let options = RunOptions {
-        output_root: temp.path().join("runs"),
-        ..RunOptions::all(&recipe)
-    };
-    let result = engine::run_with(
-        &recipe,
-        options,
-        CancellationToken::default(),
-        &mut env,
-        |_| {},
-    )
-    .unwrap();
-    (temp, result, env)
-}
+
 #[test]
 fn downgrade_actual_flow_uses_declared_policy_same_container_and_persists_refusal() {
     for rejection in [false, true] {
@@ -1896,6 +1012,7 @@ fn downgrade_actual_flow_uses_declared_policy_same_container_and_persists_refusa
         }
     }
 }
+
 #[test]
 fn downgrade_actual_failures_preserve_selected_branch_evidence_and_cleanup() {
     for (rejection, fault, outcome) in [
@@ -2039,6 +1156,7 @@ fn downgrade_comparison_precedes_checkpoint_side_effects_and_keeps_configured_re
         );
     }
 }
+
 #[test]
 fn downgrade_cancellation_at_every_event_boundary_prevents_later_mutation() {
     for rejection in [false, true] {
@@ -2137,28 +1255,6 @@ fn downgrade_unperformed_evidence_excludes_the_other_policy_checkpoint() {
     }
 }
 
-fn json_recipe() -> (tempfile::TempDir, ValidatedRecipe) {
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::create_dir(temp.path().join("target")).unwrap();
-    let text = include_str!("fixtures/recipes/v2_clean.toml")
-        .replace("schema_version = 2", "schema_version = 7")
-        + r#"
-[[profiles.user.checks]]
-id = "json"
-checkpoint = "target_installed"
-kind = "json_command"
-script = "printf true"
-timeout_seconds = 7
-expected_exit = 0
-max_stdout_bytes = 4
-env = { JSON_TEST_LITERAL = "value" }
-assertions = [{kind = "equals", pointer = "", equals_json = "true"}]
-"#;
-    let path = temp.path().join("recipe.toml");
-    std::fs::write(&path, text).unwrap();
-    let loaded = load(&path).unwrap();
-    (temp, loaded)
-}
 #[test]
 fn json_runtime_uses_runtime_identity_minimum_log_bound_and_preserves_stderr_independence() {
     for (limit, fault, want) in [
@@ -2209,6 +1305,7 @@ fn json_runtime_uses_runtime_identity_minimum_log_bound_and_preserves_stderr_ind
         }
     }
 }
+
 #[test]
 fn json_preflight_collects_forwarded_environment_and_preview_exposes_definition() {
     let (temp, mut recipe) = json_recipe();

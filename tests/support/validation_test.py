@@ -1,10 +1,12 @@
 """Behavioral checks for the shared local/CI validation driver (no Cargo/Docker)."""
 import importlib.util
+import io
 import json
 import pathlib
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
 sys.dont_write_bytecode = True
@@ -29,6 +31,75 @@ class StageRunner:
 
 
 class ValidationTests(unittest.TestCase):
+    def test_cp1252_console_preserves_raw_utf8_and_required_case_receipt(self):
+        raw = ('running 1 test\ntest required_case ... native \U0001f600\nok\n'
+               'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n').encode('utf-8')
+        diagnostic = 'stderr caf\u00e9 \U0001f600\n'.encode('utf-8')
+        with tempfile.TemporaryDirectory() as temp, io.TextIOWrapper(io.BytesIO(), encoding='cp1252', errors='strict') as console:
+            runner = validation.Runner(pathlib.Path(temp), pathlib.Path.cwd())
+            command = [sys.executable, '-c',
+                       f'import sys; sys.stdout.buffer.write(bytes.fromhex({raw.hex()!r})); sys.stdout.buffer.flush(); '
+                       f'sys.stderr.buffer.write(bytes.fromhex({diagnostic.hex()!r}))']
+            with redirect_stdout(console):
+                try:
+                    output = runner.run('unicode-cargo', command, required_cases=['required_case'], require_tests=True)
+                except UnicodeEncodeError as error:
+                    self.fail(f'Console encoding changed a successful required-case result: {error}')
+            console.flush()
+            self.assertEqual((runner.evidence / 'unicode-cargo.log').read_bytes(), raw + diagnostic)
+            self.assertEqual(output, (raw + diagnostic).decode('utf-8'))
+            receipt = json.loads((runner.evidence / 'unicode-cargo.result.json').read_text())
+            self.assertTrue(receipt['pass'])
+            self.assertEqual(receipt['status'], 'returned')
+            self.assertEqual(receipt['executed_cases'], ['required_case'])
+            self.assertTrue(receipt['test_execution_verified'])
+            rendered = console.buffer.getvalue().decode('cp1252')
+            self.assertIn('native \\U0001f600', rendered)
+            self.assertIn('stderr caf\u00e9 \\U0001f600', rendered)
+            self.assertEqual((console.encoding, console.errors), ('cp1252', 'strict'))
+
+    def test_cp1252_console_preserves_stdout_only_and_stderr_artifacts(self):
+        output = '/owned/fixture-\U0001f600\n'.encode('utf-8')
+        diagnostic = 'compiler \U0001f600\n'.encode('utf-8')
+        with tempfile.TemporaryDirectory() as temp, io.TextIOWrapper(io.BytesIO(), encoding='cp1252', errors='strict') as console:
+            runner = validation.Runner(pathlib.Path(temp), pathlib.Path.cwd())
+            command = [sys.executable, '-c',
+                       f'import sys; sys.stdout.buffer.write(bytes.fromhex({output.hex()!r})); '
+                       f'sys.stderr.buffer.write(bytes.fromhex({diagnostic.hex()!r}))']
+            with redirect_stdout(console):
+                try:
+                    returned = runner.run('unicode-fixture', command, stdout_only=True)
+                except UnicodeEncodeError as error:
+                    self.fail(f'Console encoding changed the fixture stdout contract: {error}')
+            self.assertEqual(returned, output.decode('utf-8'))
+            self.assertEqual((runner.evidence / 'unicode-fixture.stdout').read_bytes(), output)
+            self.assertEqual((runner.evidence / 'unicode-fixture.log').read_bytes(), diagnostic)
+            self.assertTrue(json.loads((runner.evidence / 'unicode-fixture.result.json').read_text())['pass'])
+
+    def test_cp1252_console_preserves_unicode_evidence_path_and_failure_receipt(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                io.TextIOWrapper(io.BytesIO(), encoding='cp1252', errors='strict') as stdout, \
+                io.TextIOWrapper(io.BytesIO(), encoding='cp1252', errors='strict') as stderr:
+            evidence = pathlib.Path(temp) / 'evidence-\U0001f600'
+            message = 'native failure \U0001f600'
+            with patch.object(sys, 'argv', ['validate.py', 'native', '--evidence', str(evidence)]), \
+                    patch.object(validation, 'source_identity', side_effect=validation.GateFailure(message)), \
+                    redirect_stdout(stdout), redirect_stderr(stderr):
+                try:
+                    code = validation.main()
+                except UnicodeEncodeError as error:
+                    self.fail(f'Console encoding replaced the original failure: {error}')
+            stdout.flush()
+            stderr.flush()
+            self.assertEqual(code, 1)
+            receipt = json.loads((evidence / 'native-all.result.json').read_text())
+            self.assertFalse(receipt['pass'])
+            self.assertEqual(receipt['error'], message)
+            self.assertIn('evidence-\\U0001f600', stdout.buffer.getvalue().decode('cp1252'))
+            self.assertIn('native failure \\U0001f600', stderr.buffer.getvalue().decode('cp1252'))
+            self.assertEqual((stdout.encoding, stdout.errors), ('cp1252', 'strict'))
+            self.assertEqual((stderr.encoding, stderr.errors), ('cp1252', 'strict'))
+
     def test_early_trace_is_scoped_before_later_runtime(self):
         key = 'THESEUS_TERMINAL_TRACE'
         for stage in ('early-controls', 'early-cli'):

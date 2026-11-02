@@ -233,9 +233,10 @@ fn comparison_catalog_exposes_every_difference_and_full_source_detail() {
         .find(|r| matches!(r.record, Record::Cleanup(_)))
         .unwrap()
         .record;
-    assert_eq!(
-        cleanup.text(),
-        "Recovery: theseus cleanup '/tmp/suite'\"'\"'s root'"
-    );
+    #[cfg(unix)]
+    let expected_cleanup = "Recovery: theseus cleanup '/tmp/suite'\"'\"'s root'";
+    #[cfg(windows)]
+    let expected_cleanup = "Recovery: theseus cleanup '/tmp/suite''s root'";
+    assert_eq!(cleanup.text(), expected_cleanup);
     assert_eq!(FilterIndex::new(&catalog, "entry-").len(), 70_001);
 }
