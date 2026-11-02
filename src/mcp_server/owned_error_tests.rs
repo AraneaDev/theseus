@@ -28,9 +28,80 @@ fn ordinary_recipe_error_does_not_invent_launch_or_block_admission() {
     let owner = OwnedError::capture(QueryError::new(ErrorCode::RecipeInvalid, Primary.into()));
     assert!(owner.primary().is::<Primary>());
     assert_eq!(owner.view().code, ErrorCode::RecipeInvalid);
-    assert_eq!(owner.view().message.text, "original primary");
+    assert_eq!(
+        owner.view().message.text,
+        "recipe is invalid; use theseus validate for details"
+    );
     assert_eq!(owner.view().native, NativeCleanup::Complete);
     assert_eq!(owner.view().launch, None);
+    assert!(!owner.view().cleanup_blocked);
+    assert!(!owner.has_worker_panic());
+}
+
+// Break caught: public recipe errors expose source excerpts or deserialized env values.
+#[test]
+fn malformed_recipe_env_source_is_omitted_from_public_errors() {
+    assert_recipe_error_is_private(
+        b"schema_version = 1\n[profiles.user.steps.install.env]\nTOKEN = \"synthetic-env-redaction-witness\" broken\n",
+    );
+}
+
+#[test]
+fn invalid_recipe_env_value_type_is_omitted_from_public_errors() {
+    let mut source = include_bytes!("../../tests/fixtures/recipes/v2_clean.toml").to_vec();
+    source.extend_from_slice(
+        b"\n[profiles.user.steps.install_target.env]\nTOKEN = [\"synthetic-env-redaction-witness\"]\n",
+    );
+    // This is valid TOML; recipe deserialization rejects the non-string env value.
+    toml::from_str::<toml::Value>(std::str::from_utf8(&source).unwrap()).unwrap();
+    assert_recipe_error_is_private(&source);
+}
+
+fn assert_recipe_error_is_private(source: &[u8]) {
+    use super::super::{
+        roots::Roots,
+        types::{Failure, Instance},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("recipe.toml");
+    std::fs::write(&path, source).unwrap();
+    let parsed = crate::recipe::parse_bytes(&path, source).unwrap_err();
+    assert!(parsed.is::<toml::de::Error>());
+    assert!(format!("{parsed:#}").contains("synthetic-env-redaction-witness"));
+    let roots = Roots::open(&root, &root.join("output")).unwrap();
+    let error = super::super::roots::read_recipe(&roots, "recipe.toml").unwrap_err();
+    assert_eq!(error.code, ErrorCode::RecipeInvalid);
+    let owner = OwnedError::capture(error);
+    assert_private_recipe_projection(&owner);
+    let owner = owner.finalize();
+    assert_private_recipe_projection(&owner);
+    let failure = Failure::new(
+        Instance::parse(&"a".repeat(32)).unwrap(),
+        owner.view().code,
+        owner.view().message.clone(),
+        None,
+    );
+    let public = serde_json::to_string(&failure).unwrap();
+    assert!(
+        !public.contains("synthetic-env-redaction-witness"),
+        "{public}"
+    );
+    assert!(!public.contains("TOKEN"), "{public}");
+    assert_eq!(std::fs::read(path).unwrap(), source);
+}
+
+fn assert_private_recipe_projection(owner: &OwnedError) {
+    assert!(owner.primary().is::<toml::de::Error>());
+    assert!(format!("{:#}", owner.primary()).contains("synthetic-env-redaction-witness"));
+    let public = serde_json::to_string(owner.view()).unwrap();
+    assert!(
+        !public.contains("synthetic-env-redaction-witness"),
+        "{public}"
+    );
+    assert!(!public.contains("TOKEN"), "{public}");
+    assert_eq!(owner.view().code, ErrorCode::RecipeInvalid);
+    assert_eq!(owner.view().native, NativeCleanup::Complete);
     assert!(!owner.view().cleanup_blocked);
     assert!(!owner.has_worker_panic());
 }
@@ -239,6 +310,50 @@ impl fmt::Display for PanickingDiagnostic {
     }
 }
 impl std::error::Error for PanickingDiagnostic {}
+
+// Recipe-invalid projection must not invoke Display even when private cleanup
+// authority still requires the same capture/finalization and owner lifetime.
+#[test]
+fn recipe_invalid_skips_display_and_retains_original_native_owner() {
+    let fixture = PendingFixture::new();
+    let primary_drops = Arc::new(AtomicUsize::new(0));
+    let panic_drops = Arc::new(AtomicUsize::new(0));
+    let mut cleanup = CleanupFailures::default();
+    cleanup.retain(&fixture.failure.clone().into());
+    let source = anyhow::Error::new(PanickingDiagnostic {
+        successful_displays: 0,
+        displays: AtomicUsize::new(0),
+        primary_drops: primary_drops.clone(),
+        panic_drops: panic_drops.clone(),
+    })
+    .context(cleanup);
+    let owner = OwnedError::capture(QueryError::new(ErrorCode::RecipeInvalid, source));
+    assert_eq!(owner.view().native, NativeCleanup::Pending);
+    assert_eq!(owner.view().launch, Some(Launch::MayRun));
+    assert!(owner.view().cleanup_blocked);
+    let owner = owner.finalize();
+    assert!(owner.view().cleanup_blocked);
+    assert_eq!(primary_drops.load(Ordering::SeqCst), 0);
+    fixture.release_fault();
+    let owner = owner.finalize();
+    assert_eq!(owner.view().native, NativeCleanup::Complete);
+    assert_eq!(owner.view().launch, Some(Launch::MayRun));
+    assert!(!owner.view().cleanup_blocked);
+    assert!(!owner.has_worker_panic());
+    assert_eq!(
+        owner
+            .primary()
+            .downcast_ref::<PanickingDiagnostic>()
+            .unwrap()
+            .displays
+            .load(Ordering::SeqCst),
+        0
+    );
+    assert_eq!(panic_drops.load(Ordering::SeqCst), 0);
+    assert!(!serde_json::to_vec(owner.view()).unwrap().is_empty());
+    drop(owner);
+    assert_eq!(primary_drops.load(Ordering::SeqCst), 1);
+}
 
 #[test]
 fn initial_display_panic_returns_original_primary_native_owner_and_panic_payload() {

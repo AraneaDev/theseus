@@ -124,9 +124,18 @@ impl OwnedError {
                 self.view.cleanup_blocked = true;
             }
         }
-        match catch_unwind(AssertUnwindSafe(|| bounded_message(&self.error.source))) {
-            Ok(message) => self.view.message = message,
-            Err(payload) => self.record_panic(payload, false),
+        if self.error.code == ErrorCode::RecipeInvalid {
+            // Parser/deserializer diagnostics can echo arbitrary recipe source,
+            // including literal env values. Project this classification without
+            // invoking Display; retain the original typed source and all sampled
+            // cleanup facts above for private ownership and finalization.
+            self.view.message =
+                TextPreview::new("recipe is invalid; use theseus validate for details", false);
+        } else {
+            match catch_unwind(AssertUnwindSafe(|| bounded_message(&self.error.source))) {
+                Ok(message) => self.view.message = message,
+                Err(payload) => self.record_panic(payload, false),
+            }
         }
     }
     fn record_panic(&mut self, payload: Box<dyn std::any::Any + Send>, unknown: bool) {

@@ -60,8 +60,10 @@ behavior. The Linux-only first-scene `LD_PRELOAD` write-error injection is
 supplemental; native engine-error restoration remains required on every host.
 The MCP server has a separate ordinary inherited-pipe qualification and actual
 binary suite; the coupled terminal transport does not establish that acceptance.
-The server source is integrated locally; final same-source Linux/macOS/Windows
-inherited-stdio acceptance is **pending**. Native guest adapters,
+Release acceptance requires same-source Linux/macOS/Windows inherited-stdio
+qualification and actual-binary suites; consult the source-specific
+[required CI results](https://github.com/AraneaDev/theseus/actions/workflows/ci.yml).
+Native guest adapters,
 service/session/GUI or VM behavior and external real-client prerequisites remain
 separate acceptance work; Linux Docker tests do not establish them.
 
@@ -147,7 +149,9 @@ not recover capture truncation. Reports keep their existing 64 MiB disk-read cap
 parsed allocations and the engine's live report are additional to that bound.
 
 Inspection returns environment **names** and redacts literal/inherited values;
-it never queries inherited values. Saved command records retain their existing
+it never queries inherited values. Public recipe parse/validation diagnostics
+omit source excerpts and values; local `theseus validate` provides detailed
+diagnostics. Saved command records retain their existing
 public literal metadata and raw logs can contain sensitive output. The recipe's
 `recipe_digest` is the source digest: SHA-256 of exact source bytes, including
 newline representation. It is not an
@@ -177,8 +181,9 @@ theseus cleanup /absolute/evidence/REPORT_ID
 ```
 
 Native ordinary-pipe and actual-binary acceptance on all three supported hosts is
-required at the same source before claiming release acceptance. That final gate
-is pending for this implementation. Linux Docker parity supplements these gates;
+required at the same source before claiming release acceptance; check the
+[source-specific CI results](https://github.com/AraneaDev/theseus/actions/workflows/ci.yml).
+Linux Docker parity supplements these gates;
 it does not implement native macOS/Windows guests, VMs, services or desktop apps.
 
 ## Try a complete example
@@ -947,8 +952,9 @@ checkpoints; the native model test itself runs locally too.
 One machine validates its **native OS only**. Other native OS results are recorded
 as `NOT_RUN`; cross-compilation and Linux containers do not establish Windows or
 macOS runtime acceptance. Run the same source on those actual operating systems
-for the three-host gate. No hosted CI was executed to establish acceptance of
-this locally integrated MCP implementation.
+for the required three-host gate. The
+[CI results](https://github.com/AraneaDev/theseus/actions/workflows/ci.yml) record
+that gate for each source revision.
 
 Application process tests require the trusted native fixture built by
 `tests/support/build_host_fixture.py`. It copies the default-feature production

@@ -132,7 +132,8 @@ See [MCP fixtures and explicit native acceptance](examples/mcp/README.md).
 - Default push/PR CI requires full workspace clippy, all-target tests, optimized
   release builds and explicit native CLI/terminal controls on Ubuntu 24.04 x86-64,
   macOS 15 arm64 and Windows Server 2025 x86-64. Release acceptance requires these
-  three native jobs and all eight real Ubuntu Docker suites on the same 0.12 source.
+  three native jobs and all eight real Ubuntu Docker suites on the same 0.12 source;
+  consult the [source-specific CI results](https://github.com/AraneaDev/theseus/actions/workflows/ci.yml).
 - Controller evidence covers retained filesystem identities, artifact/cache/storage,
   native process/pipes, bounded duplex capture, terminal restoration and owned
   cleanup. Existing report readers accept schemas 1–8; guest paths remain POSIX.
@@ -150,7 +151,7 @@ See [MCP fixtures and explicit native acceptance](examples/mcp/README.md).
 - Native macOS and Windows environment adapters with OS-specific contracts;
   unavailable native acceptance remains explicitly pending.
 
-## Integrated locally: shared-engine MCP interface; acceptance pending
+## Shared-engine MCP interface and required acceptance gates
 
 - `theseus serve` exposes exactly `recipe_inspect`, `run_start`, `run_list`,
   `run_status`, `run_cancel` and `run_evidence` over ordinary inherited pipes,
@@ -163,9 +164,11 @@ See [MCP fixtures and explicit native acceptance](examples/mcp/README.md).
   jobs; the real server Docker suite joins the existing seven in one budgeted
   Linux job. `scripts/validate.py` shares those commands for local pre-push checks
   and records native OS, source/dirty-tree identity and artifact receipts.
-- Final same-source Linux/macOS/Windows ordinary-pipe/binary acceptance is pending.
+- Release acceptance requires same-source Linux/macOS/Windows ordinary-pipe/binary
+  suites in all three native jobs, with status recorded in the
+  [source-specific CI results](https://github.com/AraneaDev/theseus/actions/workflows/ci.yml).
   Local Linux checks, cross-compilation and container tests cannot complete that
-  three-host gate. No release acceptance or hosted verification is claimed here.
+  three-host gate.
 
 ## Services and desktop applications (planned)
 
