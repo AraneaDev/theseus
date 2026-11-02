@@ -72,7 +72,6 @@ def windows_api():
     native = ctypes.WinDLL("ntdll")
     signatures = {
         "GetStdHandle": ([w.DWORD], w.HANDLE),
-        "CompareObjectHandles": ([w.HANDLE, w.HANDLE], w.BOOL),
         "CloseHandle": ([w.HANDLE], w.BOOL),
         "GetCurrentProcess": ([], w.HANDLE),
         "DuplicateHandle": ([w.HANDLE, w.HANDLE, w.HANDLE, ctypes.POINTER(w.HANDLE),
@@ -123,9 +122,15 @@ def child_probe(query, receipt):
             stream.flush()
 
         if query == "compare":
+            # This API is exported by KernelBase, unlike the ordinary handle APIs.
+            # Resolve it only for this candidate, never in the parent launcher.
+            from ctypes import wintypes as w
+            compare = ctypes.WinDLL("kernelbase", use_last_error=True).CompareObjectHandles
+            compare.argtypes = [w.HANDLE, w.HANDLE]
+            compare.restype = w.BOOL
             for repeat in range(2):
                 ctypes.set_last_error(0)
-                result = kernel.CompareObjectHandles(*handles)
+                result = compare(*handles)
                 emit({"query": query, "repeat": repeat, "equal_object": bool(result),
                       "last_error": ctypes.get_last_error()})
             return 0
