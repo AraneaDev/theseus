@@ -5,6 +5,7 @@ pub mod console;
 pub mod fs;
 pub mod process;
 mod random;
+pub mod stdio;
 pub use random::random_bytes;
 
 #[cfg(windows)]

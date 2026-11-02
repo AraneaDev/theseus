@@ -53,7 +53,12 @@ fn ordinary_rust_empty_live_input_is_observed_before_eof() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
     assert!(events.iter().any(|event| event["phase"] == "eof"));
-    assert!(events.iter().any(|event| event["phase"] == "joined"));
+    assert!(events.iter().any(|event| event["phase"]
+        == if cfg!(windows) {
+            "joined"
+        } else {
+            "synchronous_io_stopped"
+        }));
     assert!(events.iter().any(|event| event["phase"] == "restored"));
 }
 
@@ -295,7 +300,20 @@ fn ordinary_case(
         })
         && output.is_empty()
         && started.elapsed() >= Duration::from_secs(5);
+    let production_measured = candidate != "owned_io_experiment"
+        || (has(&events, "production_transport")
+            && events
+                .iter()
+                .filter(|e| {
+                    e["phase"] == "io" && matches!(e["endpoint"].as_str(), Some("stdin" | "stdout"))
+                })
+                .all(|e| {
+                    e["observed"]["requested"]
+                        .as_u64()
+                        .is_some_and(|n| (1..=4096).contains(&n))
+                }));
     let passed = measurement_complete
+        && production_measured
         && !timed_out
         && errors.is_empty()
         && output.iter().all(|byte| *byte == b'O')
@@ -609,7 +627,19 @@ fn normal_case_contract(
     }
     if !has(events, "restored")
         || (candidate == "owned_io_experiment"
-            && events.iter().filter(|e| e["phase"] == "joined").count() != 2)
+            && if cfg!(windows) {
+                events
+                    .iter()
+                    .filter(|e| e["phase"] == "joined" && e["observed"]["actual_join"] == true)
+                    .count()
+                    != 2
+            } else {
+                !events.iter().any(|e| {
+                    e["phase"] == "synchronous_io_stopped"
+                        && e["observed"]["outstanding_operations"] == 0
+                        && e["observed"]["native_workers"] == 0
+                })
+            })
     {
         return false;
     }
@@ -628,6 +658,19 @@ fn normal_case_contract(
                 && has(events, "before_native_call")
                 && has(events, "cancel_request")
                 && has(events, "cancel_complete")
+                && (!cfg!(windows) || {
+                    let cancellations: Vec<_> = events
+                        .iter()
+                        .filter(|e| e["api"] == "CancelSynchronousIo")
+                        .collect();
+                    cancellations
+                        .first()
+                        .is_some_and(|e| e["win32_error"] == 1168)
+                        && cancellations.iter().skip(1).any(|e| e["ok"] == true)
+                        && events
+                            .iter()
+                            .any(|e| e["phase"] == "io" && e["win32_error"] == 995)
+                })
         }
         "cancel-before-call" | "unresolved-shutdown" => output.is_empty(),
         _ => {

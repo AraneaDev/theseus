@@ -96,6 +96,12 @@ def validate(items, candidate, case, returncode):
                               'endpoint', 'api', 'ok', 'raw_status', 'win32_error', 'observed'}
         assert event['format_version'] == 1 and event['candidate'] == candidate and event['case'] == case
     phases = {event['phase'] for event in items}
+    if candidate == 'owned_io_experiment':
+        assert 'production_transport' in phases, 'ordinary pipes did not exercise production transport'
+        for event in items:
+            if event['phase'] == 'io' and event['endpoint'] in {'stdin', 'stdout'}:
+                requested = event['observed'].get('requested')
+                assert isinstance(requested, int) and 1 <= requested <= 4096, 'unbounded native operation'
     if items[-1]['phase'] == 'result':
         assert items[-1]['observed'].get('pass') is (returncode == 0), 'exit/result mismatch'
         assert items[-1]['ok'] is (returncode == 0), 'result ok/exit mismatch'
@@ -127,7 +133,10 @@ def validate(items, candidate, case, returncode):
         return
     assert 'restored' in phases, 'normal completion lacks restoration'
     if candidate == 'owned_io_experiment':
-        assert sum(e['phase'] == 'joined' for e in items) == 2
+        if os.name == 'nt':
+            assert sum(e['phase'] == 'joined' and e['observed'].get('actual_join') is True for e in items) == 2
+        else:
+            assert any(e['phase'] == 'synchronous_io_stopped' and e['observed'].get('outstanding_operations') == 0 and e['observed'].get('native_workers') == 0 for e in items)
     if case == 'full-stdout':
         assert {'output_pending', 'stall'} <= phases
     elif case in {'partial-output', 'slow-drain'}:

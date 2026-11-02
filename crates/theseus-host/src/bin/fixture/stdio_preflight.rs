@@ -235,7 +235,16 @@ pub(super) fn main() -> ! {
         std::process::exit(2)
     };
     if !matches!(candidate, "direct_nowait" | "owned_io_experiment")
-        || (!CASES.contains(&case) && case != "startup-early-failure")
+        || (!CASES.contains(&case)
+            && !matches!(
+                case,
+                "startup-early-failure"
+                    | "retained-restore-failure"
+                    | "pending-write-before-ack"
+                    | "pending-write-cancel"
+                    | "same-pipe-alias"
+                    | "worker-startup-rollback"
+            ))
     {
         std::process::exit(2)
     }
@@ -280,6 +289,9 @@ fn reverse(
 }
 fn run(candidate: &str, case: &str, evidence: &mut Evidence) -> io::Result<()> {
     evidence.mark("started", json!({"pid":std::process::id(),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"stderr":"omitted_unqualified"}))?;
+    if candidate == "owned_io_experiment" {
+        return owned::run(case, evidence);
+    }
     if native::control(case, candidate, evidence)? {
         return Ok(());
     }
@@ -348,21 +360,12 @@ fn run(candidate: &str, case: &str, evidence: &mut Evidence) -> io::Result<()> {
         }
         return Err(error);
     }
-    let operation = if candidate == "owned_io_experiment" {
-        owned::run(
-            input.as_ref().unwrap(),
-            output.as_ref().unwrap(),
-            case,
-            evidence,
-        )
-    } else {
-        direct(
-            input.as_ref().unwrap(),
-            output.as_ref().unwrap(),
-            case,
-            evidence,
-        )
-    };
+    let operation = direct(
+        input.as_ref().unwrap(),
+        output.as_ref().unwrap(),
+        case,
+        evidence,
+    );
     let restored = reverse(
         &mut input,
         &mut output,

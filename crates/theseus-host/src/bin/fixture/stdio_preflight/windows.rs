@@ -340,26 +340,7 @@ pub(super) fn write(endpoint: &Endpoint, bytes: &[u8]) -> Observation {
     let error = (status == 0).then(|| unsafe { GetLastError() } as i32);
     observation(status, count, "WriteFile(synchronous)", false, error)
 }
-pub(super) fn cancel(
-    thread: &std::thread::JoinHandle<()>,
-    evidence: &mut Evidence,
-    record: bool,
-) -> io::Result<()> {
-    let status = unsafe { CancelSynchronousIo(thread.as_raw_handle()) };
-    let error = (status == 0).then(|| unsafe { GetLastError() } as i32);
-    if record {
-        evidence.event(
-            "cancel_request",
-            "worker",
-            "CancelSynchronousIo",
-            status != 0,
-            (Some(status as i64), error),
-            json!({"real_thread_handle":true,"completion_proven":false}),
-        )?;
-    }
-    Ok(())
-}
-fn named(message: bool, overlapped: bool) -> io::Result<(Endpoint, OwnedHandle)> {
+fn named(message: bool, overlapped: bool, blocking: bool) -> io::Result<(Endpoint, OwnedHandle)> {
     let name: Vec<u16> = format!(
         r"\\.\pipe\theseus-stdio-{}-{}",
         std::process::id(),
@@ -384,7 +365,7 @@ fn named(message: bool, overlapped: bool) -> io::Result<(Endpoint, OwnedHandle)>
                 PIPE_TYPE_MESSAGE
             } else {
                 PIPE_TYPE_BYTE
-            } | PIPE_NOWAIT
+            } | if blocking { PIPE_WAIT } else { PIPE_NOWAIT }
                 | PIPE_REJECT_REMOTE_CLIENTS,
             1,
             4096,
@@ -432,7 +413,37 @@ pub(super) fn control(case: &str, candidate: &str, evidence: &mut Evidence) -> i
         evidence.mark("stderr_policy",json!({"numeric_equal":out == err,"stderr_selected":false,"identity_if_different":"not_claimed"}))?;
     }
     if matches!(case, "named-byte" | "message-pipe" | "overlapped-pipe") {
-        let (mut endpoint, peer) = named(case == "message-pipe", case == "overlapped-pipe")?;
+        let (mut endpoint, peer) = named(
+            case == "message-pipe",
+            case == "overlapped-pipe",
+            candidate == "owned_io_experiment",
+        )?;
+        if candidate == "owned_io_experiment" {
+            if case == "named-byte" {
+                let peer = Endpoint {
+                    handle: peer,
+                    label: "stdout",
+                    saved: None,
+                };
+                let written = write(&peer, b"positive");
+                written.record(evidence, "control_peer")?;
+                if !matches!(written.progress?, Progress::Bytes(8)) {
+                    return Err(failure("named pipe peer write"));
+                }
+                if !super::owned::probe(&endpoint, evidence, true)? {
+                    return Err(failure("production named pipe rejected"));
+                }
+            } else {
+                if super::owned::probe(&endpoint, evidence, false)? {
+                    return Err(failure("production accepted unsupported pipe"));
+                }
+                evidence.mark(
+                    "rejected",
+                    json!({"actual_endpoint":true,"production_transport":true}),
+                )?;
+            }
+            return Ok(true);
+        }
         let result = endpoint.qualify(evidence);
         if case != "named-byte" {
             if result.is_ok() {
@@ -528,7 +539,21 @@ pub(super) fn control(case: &str, candidate: &str, evidence: &mut Evidence) -> i
             let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
             let client = std::net::TcpStream::connect(listener.local_addr()?)?;
             let (_server, _) = listener.accept()?;
-            if qualify(client.as_raw_socket() as HANDLE, "stdin", evidence).is_ok() {
+            let accepted = if candidate == "owned_io_experiment" {
+                let copied = duplicate(client.as_raw_socket() as HANDLE, 0, DUPLICATE_SAME_ACCESS)?;
+                super::owned::probe(
+                    &Endpoint {
+                        handle: copied,
+                        label: "stdin",
+                        saved: None,
+                    },
+                    evidence,
+                    false,
+                )?
+            } else {
+                qualify(client.as_raw_socket() as HANDLE, "stdin", evidence).is_ok()
+            };
+            if accepted {
                 return Err(failure("socket accepted"));
             }
             evidence.mark("rejected", json!({"actual_socket":true}))?;
@@ -537,11 +562,84 @@ pub(super) fn control(case: &str, candidate: &str, evidence: &mut Evidence) -> i
         _ => None,
     };
     if let Some(endpoint) = endpoint {
-        if endpoint.qualify(evidence).is_ok() {
+        let accepted = if candidate == "owned_io_experiment" {
+            super::owned::probe(&endpoint, evidence, false)?
+        } else {
+            endpoint.qualify(evidence).is_ok()
+        };
+        if accepted {
             return Err(failure("unsupported endpoint accepted"));
         }
         evidence.mark("rejected", json!({"actual_endpoint":true}))?;
         return Ok(true);
     }
     Ok(false)
+}
+
+pub(super) fn restore_fault(evidence: &mut Evidence) -> io::Result<()> {
+    let mode = PIPE_WAIT;
+    let status = unsafe { SetNamedPipeHandleState(INVALID_HANDLE_VALUE, &mode, null(), null()) };
+    let error = io::Error::last_os_error();
+    evidence.event(
+        "restore_fault",
+        "control",
+        "SetNamedPipeHandleState invalid handle",
+        false,
+        (Some(status as i64), error.raw_os_error()),
+        json!({"injected":true}),
+    )
+}
+
+pub(super) struct InputOverride {
+    saved: HANDLE,
+    index: u32,
+}
+impl Drop for InputOverride {
+    fn drop(&mut self) {
+        if unsafe { SetStdHandle(self.index, self.saved) } == 0 {
+            std::process::exit(2);
+        }
+    }
+}
+impl Endpoint {
+    pub(super) fn install_input(&self) -> io::Result<InputOverride> {
+        let saved = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        if unsafe { SetStdHandle(STD_INPUT_HANDLE, self.handle.as_raw_handle()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(InputOverride {
+            saved,
+            index: STD_INPUT_HANDLE,
+        })
+    }
+}
+
+pub(super) fn self_loop(evidence: &mut Evidence) -> io::Result<()> {
+    let (mut read, mut write) = (null_mut(), null_mut());
+    if unsafe { CreatePipe(&mut read, &mut write, null(), 4096) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let input = Endpoint {
+        handle: unsafe { OwnedHandle::from_raw_handle(read) },
+        label: "stdin",
+        saved: None,
+    };
+    let output = unsafe { OwnedHandle::from_raw_handle(write) };
+    let saved = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    if unsafe { SetStdHandle(STD_OUTPUT_HANDLE, output.as_raw_handle()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let restore = InputOverride {
+        saved,
+        index: STD_OUTPUT_HANDLE,
+    };
+    let accepted = super::owned::probe(&input, evidence, false)?;
+    drop(restore);
+    if accepted {
+        return Err(failure("production accepted one pipe self-loop"));
+    }
+    evidence.mark(
+        "rejected",
+        json!({"actual_self_loop":true,"production_transport":true}),
+    )
 }

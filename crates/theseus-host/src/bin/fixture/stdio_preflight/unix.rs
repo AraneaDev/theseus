@@ -144,13 +144,6 @@ impl Endpoint {
         }
         injected.map_or(Ok(()), Err)
     }
-    pub(super) fn copy(&self) -> io::Result<Self> {
-        Ok(Self {
-            fd: self.fd.try_clone()?,
-            label: self.label,
-            saved: None,
-        })
-    }
 }
 fn observation(status: isize, api: &'static str, reading: bool) -> Observation {
     let error = (status < 0).then(io::Error::last_os_error);
@@ -200,20 +193,7 @@ pub(super) fn write(endpoint: &Endpoint, bytes: &[u8]) -> Observation {
         false,
     )
 }
-pub(super) fn cancel(
-    _thread: &std::thread::JoinHandle<()>,
-    evidence: &mut Evidence,
-    record: bool,
-) -> io::Result<()> {
-    if !record {
-        return Ok(());
-    }
-    evidence.mark(
-        "cancel_request",
-        json!({"api":"atomic stop + nonblocking worker loop","native_cancellation_required":false}),
-    )
-}
-pub(super) fn control(case: &str, _candidate: &str, evidence: &mut Evidence) -> io::Result<bool> {
+pub(super) fn control(case: &str, candidate: &str, evidence: &mut Evidence) -> io::Result<bool> {
     if matches!(case, "message-pipe" | "overlapped-pipe") {
         evidence.mark("platform_scope",json!({"applicable":false,"reason":"Windows-only pipe creation modes; Unix descriptors have no such modes"}))?;
         return Ok(true);
@@ -303,6 +283,17 @@ pub(super) fn control(case: &str, _candidate: &str, evidence: &mut Evidence) -> 
                 label: "stdin",
                 saved: None,
             };
+            if candidate == "owned_io_experiment" {
+                let write = write(&pipe, b"positive");
+                write.record(evidence, "control_pipe")?;
+                if !matches!(write.progress?, Progress::Bytes(8)) {
+                    return Err(failure("named pipe peer write"));
+                }
+                if !super::owned::probe(&pipe, evidence, true)? {
+                    return Err(failure("production named pipe rejected"));
+                }
+                return Ok(true);
+            }
             pipe.qualify(evidence)?;
             pipe.nowait(evidence)?;
             let write = write(&pipe, b"positive");
@@ -323,11 +314,87 @@ pub(super) fn control(case: &str, _candidate: &str, evidence: &mut Evidence) -> 
         _ => None,
     };
     if let Some(endpoint) = endpoint {
-        if endpoint.qualify(evidence).is_ok() {
+        let accepted = if candidate == "owned_io_experiment" {
+            super::owned::probe(&endpoint, evidence, false)?
+        } else {
+            endpoint.qualify(evidence).is_ok()
+        };
+        if accepted {
             return Err(failure("unsupported endpoint was accepted"));
         }
         evidence.mark("rejected", json!({"case":case,"actual_endpoint":true}))?;
         return Ok(true);
     }
     Ok(false)
+}
+
+pub(super) fn restore_fault(evidence: &mut Evidence) -> io::Result<()> {
+    let status = unsafe { libc::fcntl(-1, libc::F_SETFL, 0) };
+    let error = io::Error::last_os_error();
+    evidence.event(
+        "restore_fault",
+        "control",
+        "fcntl(invalid descriptor)",
+        false,
+        (Some(status as i64), None),
+        json!({"errno":error.raw_os_error(),"injected":true}),
+    )
+}
+
+pub(super) struct InputOverride {
+    saved: OwnedFd,
+    index: i32,
+}
+impl Drop for InputOverride {
+    fn drop(&mut self) {
+        if unsafe { libc::dup2(self.saved.as_raw_fd(), self.index) } < 0 {
+            std::process::exit(2);
+        }
+    }
+}
+impl Endpoint {
+    pub(super) fn install_input(&self) -> io::Result<InputOverride> {
+        let raw = unsafe { libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3) };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let saved = unsafe { OwnedFd::from_raw_fd(raw) };
+        if unsafe { libc::dup2(self.fd.as_raw_fd(), 0) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(InputOverride { saved, index: 0 })
+    }
+}
+
+pub(super) fn self_loop(evidence: &mut Evidence) -> io::Result<()> {
+    let mut pair = [-1; 2];
+    if unsafe { libc::pipe(pair.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let input = Endpoint {
+        fd: unsafe { OwnedFd::from_raw_fd(pair[0]) },
+        label: "stdin",
+        saved: None,
+    };
+    let output = unsafe { OwnedFd::from_raw_fd(pair[1]) };
+    let saved = unsafe { libc::fcntl(1, libc::F_DUPFD_CLOEXEC, 3) };
+    if saved < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let restore = InputOverride {
+        saved: unsafe { OwnedFd::from_raw_fd(saved) },
+        index: 1,
+    };
+    if unsafe { libc::dup2(output.as_raw_fd(), 1) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let accepted = super::owned::probe(&input, evidence, false)?;
+    drop(restore);
+    if accepted {
+        return Err(failure("production accepted one pipe self-loop"));
+    }
+    evidence.mark(
+        "rejected",
+        json!({"actual_self_loop":true,"production_transport":true}),
+    )
 }
