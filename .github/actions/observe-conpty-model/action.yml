@@ -1,0 +1,5 @@
+name: Observe the fixed ConPTY close MODEL
+description: Retain the fixed MODEL owner and publish bounded in-flight checkpoints
+runs:
+  using: node24
+  main: index.cjs
