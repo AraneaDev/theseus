@@ -195,7 +195,7 @@ impl Native {
                 ok: true,
                 status: None,
                 error: None,
-                observed: json!({"input_name_bytes":input_name.length,"output_name_bytes":output_name.length,"input_configuration":input_configuration,"output_configuration":output_configuration,"opposite_one_way_configurations":disjoint}),
+                observed: json!({"input_name_bytes":input_name.length,"output_name_bytes":output_name.length,"input_configuration":input_configuration,"output_configuration":output_configuration,"distinct_known_configurations":disjoint}),
             });
             if !disjoint {
                 return Err(invalid("unnamed stdio pipe identity is ambiguous"));
@@ -446,8 +446,9 @@ impl Native {
         else {
             unreachable!()
         };
-        let ok =
-            pipe.NamedPipeType == 0 && pipe_mode.ReadMode == 0 && pipe_mode.CompletionMode == 0;
+        let ok = profile::byte_stream_type(pipe.NamedPipeType)
+            && pipe_mode.ReadMode == 0
+            && pipe_mode.CompletionMode == 0;
         #[cfg(feature = "test-support")]
         self.trace.push(Event {phase:"qualified",endpoint:label(reading),api:"native pipe profile",ok,status:None,error:None,observed:json!({"access":access.AccessFlags,"mode":mode.Mode,"pipe_type":pipe.NamedPipeType,"remote":remote.IsRemote,"pipe_end":pipe.NamedPipeEnd,"pipe_configuration":pipe.NamedPipeConfiguration,"read_mode":pipe_mode.ReadMode,"completion_mode":pipe_mode.CompletionMode})});
         if !ok {

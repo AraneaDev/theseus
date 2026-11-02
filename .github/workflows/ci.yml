@@ -202,6 +202,7 @@ jobs:
           if-no-files-found: error
 
   docker:
+    needs: host-package
     name: docker (all eight required suites)
     runs-on: ubuntu-24.04
     timeout-minutes: 75

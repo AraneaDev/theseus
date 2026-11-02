@@ -197,12 +197,32 @@ fn exact_one_mebibyte_source_remains_valid() {
         format!("{:x}", Sha256::digest(&bytes))
     );
 }
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn non_utf8_native_root_retains_identity_without_display_conversion() {
     use std::os::unix::ffi::OsStringExt;
+    assert_native_root_identity(std::ffi::OsString::from_vec(b"project-\xff".to_vec()));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_root_names_qualify_invalid_bytes_and_preserve_native_identity() {
+    use std::os::unix::ffi::OsStringExt;
     let temp = tempfile::tempdir().unwrap();
-    let native = std::ffi::OsString::from_vec(b"project-\xff".to_vec());
+    let invalid = temp
+        .path()
+        .join(std::ffi::OsString::from_vec(b"project-\xff".to_vec()));
+    assert_eq!(
+        fs::create_dir(&invalid).unwrap_err().raw_os_error(),
+        Some(rustix::io::Errno::ILSEQ.raw_os_error())
+    );
+    assert!(!invalid.exists());
+    assert_native_root_identity(std::ffi::OsString::from("project-λ"));
+}
+
+#[cfg(unix)]
+fn assert_native_root_identity(native: std::ffi::OsString) {
+    let temp = tempfile::tempdir().unwrap();
     let path = temp.path().canonicalize().unwrap().join(native);
     fs::create_dir_all(path.join("target")).unwrap();
     fs::write(path.join("recipe.toml"), SOURCE).unwrap();

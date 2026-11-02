@@ -5,8 +5,8 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr::{null, null_mut};
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_ACCESS_INFORMATION, FILE_MODE_INFORMATION, FILE_PIPE_LOCAL_INFORMATION,
-    FileAccessInformation, FileIsRemoteDeviceInformation, FileModeInformation,
-    FilePipeLocalInformation, NtQueryInformationFile,
+    FILE_PIPE_REJECT_REMOTE_CLIENTS, FileAccessInformation, FileIsRemoteDeviceInformation,
+    FileModeInformation, FilePipeLocalInformation, NtQueryInformationFile,
 };
 use windows_sys::Wdk::System::SystemServices::FILE_IS_REMOTE_DEVICE_INFORMATION;
 use windows_sys::Win32::Foundation::*;
@@ -107,7 +107,7 @@ fn qualify(handle: HANDLE, label: &str, evidence: &mut Evidence) -> io::Result<(
     // FILE_SYNCHRONOUS_IO_ALERT/NONALERT are native create options 0x10/0x20.
     let ok = access.AccessFlags & required != 0
         && mode.Mode & 0x30 != 0
-        && local.NamedPipeType == 0
+        && matches!(local.NamedPipeType, 0 | FILE_PIPE_REJECT_REMOTE_CLIENTS)
         && !remote.IsRemote;
     evidence.event("qualified", label, "native pipe profile", ok, (None, None), json!({"access":access.AccessFlags,"mode":mode.Mode,"pipe_type":local.NamedPipeType,"remote":remote.IsRemote,"pipe_end":local.NamedPipeEnd}))?;
     if !ok {

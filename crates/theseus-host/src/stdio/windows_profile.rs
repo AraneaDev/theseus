@@ -1,4 +1,4 @@
-//! Checked native name lengths and conservative unnamed-pipe disjointness.
+//! Checked native byte-pipe profiles, name lengths and pipe disjointness.
 
 pub(super) fn valid_name_reply(
     status: i32,
@@ -18,6 +18,14 @@ pub(super) fn valid_name_reply(
         && returned == 4 + name_bytes as usize
 }
 
+pub(super) fn byte_stream_type(native_type: u32) -> bool {
+    // Native FILE_PIPE_MESSAGE_TYPE is 1; FILE_PIPE_REJECT_REMOTE_CLIENTS is 2.
+    // Accept byte streams with either remote-client policy, never message or
+    // unknown type bits. Locality is independently checked by the caller.
+    // https://github.com/microsoft/windows-rs/blob/32c3144490c016fe496a0aed769bce60987a2e9d/crates/libs/sys/src/Windows/Wdk/Storage/FileSystem/mod.rs
+    matches!(native_type, 0 | 2)
+}
+
 pub(super) fn disjoint_unnamed(
     input_name_bytes: u32,
     output_name_bytes: u32,
@@ -26,11 +34,13 @@ pub(super) fn disjoint_unnamed(
 ) -> bool {
     // NamedPipeConfiguration describes the entire pipe's direction relative
     // to its server, unlike NamedPipeEnd or the access rights of one handle.
-    // One pipe cannot be both FILE_PIPE_INBOUND (0) and FILE_PIPE_OUTBOUND (1).
+    // One pipe cannot have two distinct configurations: FILE_PIPE_INBOUND (0),
+    // FILE_PIPE_OUTBOUND (1), or FILE_PIPE_FULL_DUPLEX (2).
     // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_pipe_local_information
-    input_name_bytes == 0
-        && output_name_bytes == 0
-        && matches!((input_configuration, output_configuration), (0, 1) | (1, 0))
+    (input_name_bytes == 0 || output_name_bytes == 0)
+        && input_configuration <= 2
+        && output_configuration <= 2
+        && input_configuration != output_configuration
 }
 
 #[cfg(test)]
@@ -59,10 +69,6 @@ mod tests {
             (0, 0),
             (1, 1),
             (2, 2),
-            (0, 2),
-            (2, 1),
-            (1, 2),
-            (2, 0),
             (0, 3),
             (3, 1),
             (u32::MAX, 0),
@@ -70,9 +76,32 @@ mod tests {
         ] {
             assert!(!disjoint_unnamed(0, 0, input, output));
         }
-        for (input, output) in [(2, 0), (0, 2), (2, 2)] {
+        for (input, output) in [(2, 2), (4, 6)] {
             assert!(!disjoint_unnamed(input, output, 0, 1));
             assert!(!disjoint_unnamed(input, output, 1, 0));
+        }
+    }
+
+    #[test]
+    fn byte_stream_accepts_only_known_type_and_remote_rejection_flag() {
+        assert!(byte_stream_type(0));
+        assert!(byte_stream_type(2));
+        for native_type in [1, 3, 4, 6, 8, u32::MAX] {
+            assert!(!byte_stream_type(native_type));
+        }
+    }
+
+    #[test]
+    fn differing_known_configurations_prove_mixed_name_pipes_disjoint() {
+        for (input, output) in [(0, 1), (1, 0), (0, 2), (2, 0), (1, 2), (2, 1)] {
+            for (input_name, output_name) in [(0, 0), (64, 0), (0, 64)] {
+                assert!(disjoint_unnamed(input_name, output_name, input, output));
+            }
+        }
+        for (input, output) in [(0, 0), (1, 1), (2, 2), (0, 3), (3, 2), (u32::MAX, 0)] {
+            for (input_name, output_name) in [(0, 0), (64, 0), (0, 64)] {
+                assert!(!disjoint_unnamed(input_name, output_name, input, output));
+            }
         }
     }
 

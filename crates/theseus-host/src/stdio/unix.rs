@@ -1,3 +1,6 @@
+#[cfg(any(target_os = "macos", test))]
+#[path = "macos_pipe.rs"]
+mod macos_pipe;
 #[cfg(feature = "test-support")]
 use super::test_support::{Control, Event, Trace};
 use super::{
@@ -42,12 +45,49 @@ impl Native {
         self.output = Some(self.duplicate(1)?);
         let input_identity = self.qualify(true)?;
         let output_identity = self.qualify(false)?;
-        if input_identity == output_identity {
+        #[cfg(not(target_os = "macos"))]
+        let aliased = input_identity == output_identity;
+        #[cfg(target_os = "macos")]
+        let aliased = {
+            let input = macos_pipe::identity(
+                self.endpoint(true).fd.as_raw_fd(),
+                input_identity,
+                #[cfg(feature = "test-support")]
+                &mut self.trace,
+                #[cfg(feature = "test-support")]
+                "stdin",
+            )?;
+            let output = macos_pipe::identity(
+                self.endpoint(false).fd.as_raw_fd(),
+                output_identity,
+                #[cfg(feature = "test-support")]
+                &mut self.trace,
+                #[cfg(feature = "test-support")]
+                "stdout",
+            )?;
+            let disjoint = macos_pipe::disjoint(input, output);
+            #[cfg(feature = "test-support")]
+            self.trace.push(Event {
+                phase: "pipe_identity",
+                endpoint: "control",
+                api: "proc_pidfdinfo",
+                ok: disjoint,
+                status: None,
+                error: None,
+                observed: json!({"input":input,"output":output,"disjoint":disjoint}),
+            });
+            !disjoint
+        };
+        if aliased {
             #[cfg(feature = "test-support")]
             self.trace.push(Event {
                 phase: "alias_rejected",
                 endpoint: "control",
-                api: "fstat device/inode identity",
+                api: if cfg!(target_os = "macos") {
+                    "proc_pidfdinfo pipe identity"
+                } else {
+                    "fstat device/inode identity"
+                },
                 ok: true,
                 status: None,
                 error: None,
