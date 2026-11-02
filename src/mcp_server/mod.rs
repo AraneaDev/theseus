@@ -2,6 +2,7 @@
 pub(crate) mod budget;
 pub(crate) mod cursor;
 pub(crate) mod framing;
+pub(crate) mod owned_error;
 pub(crate) mod range_writer;
 pub(crate) mod schema;
 pub(crate) mod types;

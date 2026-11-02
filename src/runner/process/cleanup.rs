@@ -117,7 +117,38 @@ pub(crate) struct CleanupFailures {
     owners: Vec<AcquisitionFailure>,
     panics: Vec<PanicFailure>,
 }
+/// Facts sampled only while the caller owns the error on its worker.
+#[derive(Debug, Default)]
+pub(crate) struct WorkerCleanupSnapshot {
+    pub(crate) launch: Option<LaunchPhase>,
+    pub(crate) pending: bool,
+    pub(crate) publication_unknown: bool,
+}
 impl CleanupFailures {
+    /// Capture before formatting or transfer; unlike `retain`, history includes
+    /// completed acquisitions. Never call this from a coordinator polling views.
+    pub(crate) fn capture_on_worker(error: &anyhow::Error) -> (Self, WorkerCleanupSnapshot) {
+        let mut capture = WorkerCapture::default();
+        // Typed anyhow contexts are not individual Error::source entries.
+        if let Some(failures) = error.downcast_ref::<Self>() {
+            capture.aggregate(failures);
+        }
+        if let Some(failure) = error.downcast_ref::<AcquisitionFailure>() {
+            capture.acquisition(failure);
+        }
+        if let Some(panic) = error.downcast_ref::<PanicFailure>() {
+            capture.panic(panic);
+        }
+        if let Some(publication) = error.downcast_ref::<theseus_host::fs::PublicationError>() {
+            capture.publication(publication);
+        }
+        if let Some(io) = error.downcast_ref::<io::Error>() {
+            capture.source(io);
+        }
+        capture.source(error.as_ref());
+        capture.facts.pending = capture.retained.pending();
+        (capture.retained, capture.facts)
+    }
     pub(crate) fn retain(&mut self, error: &anyhow::Error) {
         // anyhow exposes typed context through downcast_ref, not as a separate
         // Error::source entry. Keep that aggregate as well as source-chain owners.
@@ -203,6 +234,78 @@ impl CleanupFailures {
         std::panic::resume_unwind(original)
     }
 }
+/// Worker-local traversal, separate from diagnostic rendering and pending filtering.
+#[derive(Default)]
+struct WorkerCapture {
+    retained: CleanupFailures,
+    facts: WorkerCleanupSnapshot,
+}
+impl WorkerCapture {
+    fn acquisition(&mut self, failure: &AcquisitionFailure) {
+        let rank = |phase| match phase {
+            LaunchPhase::NeverCreated => 0,
+            LaunchPhase::CreatedSuspended => 1,
+            LaunchPhase::MayRun => 2,
+        };
+        let launch = failure.launch();
+        if self
+            .facts
+            .launch
+            .is_none_or(|prior| rank(launch) > rank(prior))
+        {
+            self.facts.launch = Some(launch);
+        }
+        // Record history first: push intentionally filters settled acquisitions.
+        self.retained.push(failure);
+    }
+    fn aggregate(&mut self, failures: &CleanupFailures) {
+        for failure in &failures.owners {
+            self.acquisition(failure);
+        }
+        for panic in &failures.panics {
+            self.panic(panic);
+        }
+    }
+    fn panic(&mut self, panic: &PanicFailure) {
+        self.aggregate(&panic.0.cleanup);
+        self.retained.push_panic(panic);
+    }
+    fn publication(&mut self, publication: &theseus_host::fs::PublicationError) {
+        self.facts.publication_unknown |=
+            publication.state() == theseus_host::fs::PublicationState::Unknown;
+        if let Some(cleanup) = publication.cleanup_error() {
+            self.source(cleanup);
+        }
+    }
+    fn source(&mut self, mut source: &(dyn std::error::Error + 'static)) {
+        loop {
+            if let Some(failure) = source.downcast_ref::<AcquisitionFailure>() {
+                self.acquisition(failure);
+            }
+            if let Some(failures) = source.downcast_ref::<CleanupFailures>() {
+                self.aggregate(failures);
+            }
+            if let Some(panic) = source.downcast_ref::<PanicFailure>() {
+                self.panic(panic);
+            }
+            if let Some(publication) = source.downcast_ref::<theseus_host::fs::PublicationError>() {
+                self.publication(publication);
+            }
+            // io::Error::source skips its payload. Visit get_ref instead, then
+            // follow that payload's own source; this also avoids duplicate walks.
+            if let Some(io) = source.downcast_ref::<io::Error>()
+                && let Some(payload) = io.get_ref()
+            {
+                source = payload;
+            } else if let Some(next) = source.source() {
+                source = next;
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 impl fmt::Display for CleanupFailures {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "native host cleanup remains unresolved")?;
@@ -673,5 +776,42 @@ pub(crate) mod io_error_boundary_tests {
             dropped.load(Ordering::SeqCst),
             "payload must be released after its final owner is discharged"
         );
+    }
+}
+
+#[cfg(test)]
+mod worker_snapshot_tests {
+    use super::*;
+
+    fn completed(launch: LaunchPhase) -> AcquisitionFailure {
+        AcquisitionFailure::from_spawn(
+            SpawnFailure {
+                launch,
+                cleanup: HostCleanup::Complete,
+                error: io::Error::other("historical acquisition failure"),
+                cleanup_errors: vec![],
+            },
+            Instant::now(),
+        )
+    }
+
+    #[test]
+    fn strongest_historical_phase_survives_complete_records_and_io_payloads() {
+        let original = anyhow::Error::new(io::Error::other(completed(LaunchPhase::MayRun)))
+            .context(completed(LaunchPhase::CreatedSuspended));
+        let (retained, facts) = CleanupFailures::capture_on_worker(&original);
+        assert_eq!(facts.launch, Some(LaunchPhase::MayRun));
+        assert!(!facts.pending);
+        assert!(!retained.pending());
+    }
+
+    #[test]
+    fn explicit_never_created_is_distinct_from_no_record() {
+        let (_, facts) =
+            CleanupFailures::capture_on_worker(&completed(LaunchPhase::NeverCreated).into());
+        assert_eq!(facts.launch, Some(LaunchPhase::NeverCreated));
+        let (_, absent) =
+            CleanupFailures::capture_on_worker(&anyhow::anyhow!("ordinary recipe error"));
+        assert_eq!(absent.launch, None);
     }
 }

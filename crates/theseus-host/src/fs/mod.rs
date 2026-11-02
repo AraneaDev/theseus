@@ -314,6 +314,17 @@ fn publication_error(
         },
     )
 }
+/// Synthetic typed publication classification fixture; starts no native operation.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn publication_unknown_fixture_error() -> io::Error {
+    publication_error(
+        PublishStage::Replace,
+        io::Error::other(UnresolvedReplacement),
+        None,
+    )
+}
+
 fn publication_step<T>(
     stage: PublishStage,
     operation: impl FnOnce() -> io::Result<T>,
