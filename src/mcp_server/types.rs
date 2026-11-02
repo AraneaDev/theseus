@@ -27,6 +27,7 @@ macro_rules! text_type {
             pub fn parse(value: &str) -> Result<Self, ArgumentError> {
                 if valid_text(stringify!($name), value) { Ok(Self(value.into())) } else { Err(ArgumentError) }
             }
+            #[allow(dead_code, reason = "Validated text tokens share a uniform borrowing accessor.")]
             pub fn as_str(&self) -> &str { &self.0 }
         }
         impl TryFrom<String> for $name {

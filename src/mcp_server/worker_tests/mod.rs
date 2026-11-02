@@ -464,6 +464,10 @@ fn worker_saved_hints_coalesce_without_overwriting_started_and_never_wrap() {
     );
 }
 
+#[allow(
+    clippy::duplicate_mod,
+    reason = "Lexical wrappers reuse exact integration fixtures and private builders, including tests/support/plugin.rs."
+)]
 mod fixtures;
 
 // Compare every retained field, normalizing only actual per-run identity/time.

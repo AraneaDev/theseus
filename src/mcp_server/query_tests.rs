@@ -47,6 +47,10 @@ fn complete(worker: &mut QueryWorker) -> QueryCompletion {
         std::thread::yield_now();
     }
 }
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the worker's ownership-bearing error at the test join boundary."
+)]
 fn join(worker: &mut QueryWorker) -> Result<(), OwnedError> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
