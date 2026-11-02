@@ -58,14 +58,23 @@ unchanged, including the legacy negative control.
 
 `src/event/source/windows.rs` retains ReadConsoleInput, native resize/mouse/key
 handlers, and the existing poll deadline. Raw key-down records with virtual key
-zero enter `source/windows_vt.rs`; raw key-up records are ignored. UTF-16 pairs
-are decoded before UTF-8 parsing. Repeat counts are consumed one unit at a time
-with at most one retained input record, preserving order and timeout checks.
-A lone Escape resolves on actual queue exhaustion or before a native record,
-without a delay threshold. ConPTY queues a complete parsed sequence under its
-console lock; the required native fragmented-write control tests that assumption.
-Incomplete CSI and paste survive poll timeouts. A native key interleaved into an
-unfinished VT sequence errors rather than dispatching paste content as commands.
+zero enter `source/windows_vt.rs`; raw key-up records are ignored. Actual ConHost
+also leaves native modifier and Alt-numpad records in the queue. During pending
+VT input, zero-unit Shift/Control/Alt and Alt-only numeric keypad scaffolding are
+inert, following the native decoder's key categories. A nonzero Alt key release
+carries Alt-code Unicode (including surrogate halves) into that same VT buffer.
+Other native records retain their native handling. UTF-16 pairs are decoded
+before UTF-8 parsing. Repeat counts use at most one retained input record.
+
+A temporarily empty queue does not prove a complete Escape: ConPTY writes may
+split immediately after ESC. Positive finite polling waits until its caller's
+existing deadline; zero-timeout draining leaves ambiguous ESC buffered. Blocking
+read has no deadline and preserves its previous immediate queue-empty behavior.
+This explicitly retains a blocking-read fragmentation limitation. A subsequent
+native press/resize/mouse event remains an ordering boundary; native releases and
+inert scaffolding do not resolve ESC. No new timer is introduced. Partial CSI and
+paste survive poll deadlines. Any other native key-down during an unfinished
+sequence still fails closed, including ambiguous native NUL/Ctrl-Space records.
 
 `src/event/sys/windows.rs` includes the existing VT grammar via a path alias.
 A private parsed-event enum consumes complete query reports without changing
@@ -84,7 +93,10 @@ paste, standalone Escape/arrows/Ctrl-C, invalid UTF-16 and the size bound. Nativ
 controls live in `crates/theseus-host/src/process/windows/terminal/events.rs`:
 fixed raw records in legacy/VT modes, every delimiter split through ConPTY,
 actual paste/arrow/control/Escape events, raw repeats/surrogate key-ups/native
-fallback ordering, and exact mode restoration. The existing public preview
+fallback ordering, a full-field replay of 38 observed ConHost records, and exact
+mode restoration. The raw oracle verifies exact UTF-16 text from raw key-downs
+plus Alt-release Unicode and accounts for every remaining native record's fields;
+it does not assume all key-down records are raw VT text. The existing public preview
 acceptance still proves paste outside the editor inert and saved Unicode bytes
 exact. The added fragmented transport cases are Windows-specific; they do not
 change Unix's existing lone-Escape/chunk boundary contract.

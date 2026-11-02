@@ -1,12 +1,12 @@
 use std::time::Duration;
 
-use super::windows_vt::VtInput;
+use super::windows_vt::{VtInput, VtKey};
 
 use crossterm_winapi::{Console, Handle, InputRecord};
 
 use crate::event::{
     sys::windows::{parse::MouseButtonsPressed, poll::WinApiPoll},
-    Event,
+    Event, KeyModifiers,
 };
 
 #[cfg(feature = "event-stream")]
@@ -52,12 +52,12 @@ impl EventSource for WindowsEventSource {
         let poll_timeout = PollTimeout::new(timeout);
 
         loop {
-            // ReadConsoleInput preserves native resize/mouse records in VT mode.
-            // A complete ConPTY escape sequence is enqueued under the console
-            // lock. Queue availability, not a delay, distinguishes lone Escape.
+            // A split ConPTY write may temporarily exhaust this queue after
+            // ESC. Only the caller's positive deadline may resolve it; a
+            // zero-timeout drain must leave it buffered for the next poll.
             if self.pending_record.is_none() && self.console.number_of_console_input_events()? == 0
             {
-                if let Some(event) = self.vt.finish_escape()? {
+                if let Some(event) = self.vt.finish_poll(timeout, poll_timeout.elapsed())? {
                     return Ok(Some(event));
                 }
             }
@@ -73,19 +73,27 @@ impl EventSource for WindowsEventSource {
                         Some(record) => record,
                         None => self.console.read_single_input_event()?,
                     };
-                    // Raw releases are inert even with a buffered Esc: they
-                    // must not split an already queued paste opener into keys.
-                    // Actual native events must not overtake a preceding Esc.
-                    if !matches!(&record, InputRecord::KeyEvent(key) if key.virtual_key_code == 0) {
+                    let key_kind = match &record {
+                        InputRecord::KeyEvent(key) => Some(self.vt.key_kind(
+                            key.key_down,
+                            key.virtual_key_code,
+                            key.u_char,
+                            KeyModifiers::from(&key.control_key_state),
+                        )),
+                        _ => None,
+                    };
+                    // Inert scaffolding and releases cannot split a VT opener.
+                    // A real native press/resize/mouse event retains its order.
+                    if !matches!(key_kind, Some(VtKey::Text | VtKey::Ignore))
+                        && !matches!(&record, InputRecord::KeyEvent(key) if !key.key_down)
+                    {
                         if let Some(event) = self.vt.finish_escape()? {
                             self.pending_record = Some(record);
                             return Ok(Some(event));
                         }
                     }
                     let event = match record {
-                        InputRecord::KeyEvent(mut record)
-                            if record.key_down && record.virtual_key_code == 0 =>
-                        {
+                        InputRecord::KeyEvent(mut record) if key_kind == Some(VtKey::Text) => {
                             let unit = record.u_char;
                             if record.repeat_count > 1 {
                                 record.repeat_count -= 1;
@@ -98,7 +106,7 @@ impl EventSource for WindowsEventSource {
                             }
                             None
                         }
-                        InputRecord::KeyEvent(record) if record.virtual_key_code == 0 => None,
+                        InputRecord::KeyEvent(_) if key_kind == Some(VtKey::Ignore) => None,
                         InputRecord::KeyEvent(record) => {
                             // Preserve the legacy native decoder, but never let
                             // a non-VT key escape an unfinished paste/sequence.
@@ -143,7 +151,13 @@ impl EventSource for WindowsEventSource {
             }
 
             if poll_timeout.elapsed() {
-                return Ok(None);
+                return if self.pending_record.is_none()
+                    && self.console.number_of_console_input_events()? == 0
+                {
+                    self.vt.finish_poll(timeout, true)
+                } else {
+                    Ok(None)
+                };
             }
         }
     }

@@ -1,6 +1,6 @@
 {
   "added_files": {
-    "src/event/source/windows_vt.rs": "23832fa2feabaf63e3c6252d5f4de94bc85084c539de9743742f3688c509fbd6"
+    "src/event/source/windows_vt.rs": "d38e387358237bc80a8ecb15a6d11f469ac51e35173336f3e23d0607ae925621"
   },
   "archive_sha256": "829d955a0bb380ef178a640b91779e3987da38c9aea133b20614cfed8cdea9c6",
   "crate": "crossterm",
@@ -8,7 +8,7 @@
   "modified_files": {
     "src/event/source.rs": "e37b074a5c50d1fa152d43659706751b56dfe6cb5aa3aab5af01d82a816fa607",
     "src/event/source/unix/mio.rs": "05edccec7de3a08a44e77733d1cac54ff759637d69ababc96472d82579b109b1",
-    "src/event/source/windows.rs": "1068f5095285683c615dbe3af2dc8db120bedbf02adac832a5990ef199260875",
+    "src/event/source/windows.rs": "16ac70b4b09c022feaff0f4fa2936f7d08dcd281598555ee2f329d778f5e0895",
     "src/event/sys/unix/parse.rs": "70967544e4777b01f6f6a649a14ee14d1b426c13e0861d992e1e7e344da8f492",
     "src/event/sys/windows.rs": "e6e998c3afeb88e177124093fcc005099ebb044187c9abe5cdba9079b0decc05"
   },
