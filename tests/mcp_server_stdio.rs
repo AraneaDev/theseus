@@ -88,6 +88,48 @@ mod native_supervisor {
         process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio},
         time::{Duration, Instant},
     };
+    #[cfg(any(windows, test))]
+    fn cleanup_ready(
+        leader_done: bool,
+        job_empty: bool,
+        required_descendant: bool,
+        original_signaled: Option<bool>,
+    ) -> bool {
+        leader_done && job_empty && (!required_descendant || original_signaled == Some(true))
+    }
+
+    #[test]
+    fn empty_job_does_not_settle_an_unbound_or_unsignaled_original_descendant() {
+        assert!(!cleanup_ready(true, true, true, Some(false)));
+        assert!(!cleanup_ready(true, true, true, None));
+        assert!(!cleanup_ready(false, true, true, Some(true)));
+        assert!(!cleanup_ready(true, false, true, Some(true)));
+        assert!(cleanup_ready(true, true, true, Some(true)));
+        assert!(cleanup_ready(true, true, false, None));
+    }
+    #[cfg(any(windows, test))]
+    fn published_descendant_pid(root: &std::path::Path) -> io::Result<Option<u32>> {
+        // The helper publishes this only after the PID writer exits and both
+        // descendant pipe bytes arrive. Never parse a concurrently written PID.
+        if !root.join("leader-exited").try_exists()? {
+            return Ok(None);
+        }
+        let text = std::fs::read_to_string(root.join("descendant.pid"))?;
+        let pid = text
+            .parse()
+            .map_err(|_| io::Error::other("invalid descendant PID receipt"))?;
+        Ok(Some(pid))
+    }
+
+    #[test]
+    fn publication_marker_fences_partial_pid_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("descendant.pid"), b"8").unwrap();
+        assert_eq!(published_descendant_pid(root.path()).unwrap(), None);
+        std::fs::write(root.path().join("descendant.pid"), b"824").unwrap();
+        std::fs::write(root.path().join("leader-exited"), b"0").unwrap();
+        assert_eq!(published_descendant_pid(root.path()).unwrap(), Some(824));
+    }
     #[cfg(unix)]
     unsafe extern "C" {
         fn kill(pid: i32, signal: i32) -> i32;
@@ -173,6 +215,7 @@ mod native_supervisor {
             fn OpenThread(access: u32, inherit: i32, tid: u32) -> Handle;
             fn ResumeThread(thread: Handle) -> u32;
             fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+            fn IsProcessInJob(process: Handle, job: Handle, result: *mut i32) -> i32;
             fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
 
         }
@@ -190,17 +233,52 @@ mod native_supervisor {
                 Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
             }
         }
-        pub fn gone(pid: u32) -> bool {
-            let handle = unsafe { OpenProcess(0x100000, 0, pid) };
-            if handle.is_null() {
-                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(87));
-                return true;
+        pub struct Descendant {
+            pub pid: u32,
+            handle: OwnedHandle,
+            pub in_owned_job: bool,
+        }
+        impl Descendant {
+            pub fn signaled(&self) -> io::Result<bool> {
+                match unsafe { WaitForSingleObject(self.handle.as_raw_handle(), 0) } {
+                    0 => Ok(true),
+                    258 => Ok(false),
+                    u32::MAX => Err(io::Error::last_os_error()),
+                    _ => Err(io::Error::other("unexpected original process wait status")),
+                }
             }
-            let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
-            unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) == 0 }
         }
         pub struct Job(OwnedHandle);
         impl Job {
+            pub fn bind_descendant(&self, pid: u32) -> io::Result<Descendant> {
+                // Pin the live original before termination, with enough rights
+                // for both membership and synchronization; never reopen its PID.
+                let handle = unsafe { owned(OpenProcess(0x101000, 0, pid))? };
+                let mut member = 0;
+                unsafe {
+                    check(IsProcessInJob(
+                        handle.as_raw_handle(),
+                        self.0.as_raw_handle(),
+                        &mut member,
+                    ))?;
+                }
+                if member == 0 {
+                    return Err(io::Error::other(
+                        "published descendant is not in the owned Job",
+                    ));
+                }
+                let descendant = Descendant {
+                    pid,
+                    handle,
+                    in_owned_job: member != 0,
+                };
+                if descendant.signaled()? {
+                    return Err(io::Error::other(
+                        "descendant exited before identity was bound",
+                    ));
+                }
+                Ok(descendant)
+            }
             pub fn assign_and_resume(child: &Child) -> io::Result<Self> {
                 let job = Self(unsafe { owned(CreateJobObjectW(null(), null()))? });
                 let mut limits = Limits::default();
@@ -266,6 +344,12 @@ mod native_supervisor {
         cleaned: bool,
         #[cfg(windows)]
         job: windows::Job,
+        #[cfg(windows)]
+        descendant: Option<windows::Descendant>,
+        #[cfg(windows)]
+        required_descendant: bool,
+        #[cfg(windows)]
+        descendant_signaled: Option<bool>,
     }
     impl Tree {
         fn spawn(command: &mut Command) -> io::Result<Self> {
@@ -299,7 +383,23 @@ mod native_supervisor {
                 cleaned: false,
                 #[cfg(windows)]
                 job,
+                #[cfg(windows)]
+                descendant: None,
+                #[cfg(windows)]
+                required_descendant: false,
+                #[cfg(windows)]
+                descendant_signaled: None,
             })
+        }
+        #[cfg(windows)]
+        fn pin_descendant(&mut self, root: &std::path::Path) -> io::Result<()> {
+            if !self.required_descendant || self.descendant.is_some() {
+                return Ok(());
+            }
+            if let Some(pid) = published_descendant_pid(root)? {
+                self.descendant = Some(self.job.bind_descendant(pid)?);
+            }
+            Ok(())
         }
         fn cleanup(&mut self) -> io::Result<()> {
             if self.cleaned {
@@ -327,7 +427,23 @@ mod native_supervisor {
                 };
                 #[cfg(windows)]
                 let empty = self.job.empty()?;
-                if leader_done && empty {
+                #[cfg(windows)]
+                let ready = {
+                    self.descendant_signaled = self
+                        .descendant
+                        .as_ref()
+                        .map(windows::Descendant::signaled)
+                        .transpose()?;
+                    cleanup_ready(
+                        leader_done,
+                        empty,
+                        self.required_descendant,
+                        self.descendant_signaled,
+                    )
+                };
+                #[cfg(unix)]
+                let ready = leader_done && empty;
+                if ready {
                     self.cleaned = true;
                     return Ok(());
                 }
@@ -361,10 +477,18 @@ mod native_supervisor {
             "descendant {pid} survived exited-leader cleanup"
         );
         #[cfg(windows)]
-        assert!(
-            windows::gone(pid),
-            "descendant {pid} survived exited-leader cleanup"
-        );
+        {
+            let receipt: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(root.join("supervisor.json")).unwrap())
+                    .unwrap();
+            assert!(
+                receipt["tree_empty"] == true
+                    && receipt["original_descendant"]["pid"] == pid
+                    && receipt["original_descendant"]["in_owned_job"] == true
+                    && receipt["original_descendant"]["process_signaled"] == true,
+                "original descendant {pid} did not settle: {receipt}"
+            );
+        }
     }
     pub fn helper(
         test: &str,
@@ -393,8 +517,14 @@ mod native_supervisor {
             .stdout(std::fs::File::create(temp.as_path().join("helper.stdout")).unwrap())
             .stderr(std::fs::File::create(temp.as_path().join("helper.stderr")).unwrap());
         let mut tree = Tree::spawn(&mut command).unwrap();
+        #[cfg(windows)]
+        {
+            tree.required_descendant = matches!(mode, "exited-leader" | "blocked-reader");
+        }
         let deadline = Instant::now() + timeout;
         let status = loop {
+            #[cfg(windows)]
+            tree.pin_descendant(&temp).unwrap();
             if let Some(status) = tree.child.try_wait().unwrap() {
                 break Some(status);
             }
@@ -404,6 +534,8 @@ mod native_supervisor {
             std::thread::sleep(Duration::from_millis(2));
         };
         // Always clean descendants, including when the leader has exited normally.
+        #[cfg(windows)]
+        tree.pin_descendant(&temp).unwrap();
         tree.cleanup().unwrap();
         assert_eq!(
             status.is_none(),
@@ -419,7 +551,20 @@ mod native_supervisor {
                 std::fs::read_to_string(temp.as_path().join("helper.stderr")).unwrap()
             );
         }
-        std::fs::write(temp.join("supervisor.json"), serde_json::to_vec_pretty(&serde_json::json!({"mode":mode,"timed_out":status.is_none(),"tree_empty":tree.cleaned,"exit":status.and_then(|value| value.code())})).unwrap()).unwrap();
+        let receipt = serde_json::json!({"mode":mode,"timed_out":status.is_none(),"tree_empty":tree.cleaned,"exit":status.and_then(|value| value.code())});
+        #[cfg(windows)]
+        let receipt = {
+            let mut receipt = receipt;
+            receipt["original_descendant"] = tree.descendant.as_ref().map(|descendant|
+                serde_json::json!({"pid":descendant.pid,"in_owned_job":descendant.in_owned_job,"process_signaled":tree.descendant_signaled})
+            ).unwrap_or(serde_json::Value::Null);
+            receipt
+        };
+        std::fs::write(
+            temp.join("supervisor.json"),
+            serde_json::to_vec_pretty(&receipt).unwrap(),
+        )
+        .unwrap();
         temp
     }
 
