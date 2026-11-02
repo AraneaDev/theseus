@@ -518,7 +518,7 @@ mod tests {
             std::env::var_os("THESEUS_HOST_TEST_FIXTURE")
                 .expect("required Cargo-built native fixture"),
         );
-        command.args(["flood", "1048576", "0"]);
+        command.args(["console-flood", "1048576"]);
         trace("native-launch-begin");
         let child = match launch::spawn_terminal(&command, hpc) {
             Ok(child) => child,

@@ -9,6 +9,8 @@
 //! - `flood COUNT [STDERR_COUNT]`: write COUNT `O` bytes to stdout, then
 //!   STDERR_COUNT `E` bytes to stderr (defaults to COUNT).
 //! - `flood-duplex COUNT`: concurrently write COUNT `O` / `E` bytes on stdout/stderr.
+//! - Windows/test-support `console-flood COUNT`: write COUNT `O` bytes through
+//!   an explicitly opened and validated CONOUT$ handle.
 //! - `delayed-read-until-eof MAX_BYTES MILLIS`: delay reading, then echo input at
 //!   EOF and report `stdin EOF received` on stderr.
 //! - `descendant MILLIS`: spawn this fixture's `hold-pipes MILLIS` with inherited
@@ -406,6 +408,22 @@ fn run(args: &[OsString]) -> FixtureResult {
                     .map_err(|_| io::Error::other("flood worker panicked"))?;
                 output.and(errors)
             })
+        }
+        #[cfg(all(windows, feature = "test-support"))]
+        (Some("console-flood"), [count]) => {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::System::Console::GetConsoleMode;
+            let count = number(count, MAX_BYTES)?;
+            let mut output = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("CONOUT$")?;
+            let mut mode = 0;
+            // SAFETY: output owns the console handle and mode is writable storage.
+            if unsafe { GetConsoleMode(output.as_raw_handle(), &mut mode) } == 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            flood(&mut output, b'O', count)
         }
         (Some("flood"), [count]) => {
             let count = number(count, MAX_BYTES)?;
