@@ -14,3 +14,4 @@ pub(crate) mod schema;
 pub(crate) mod status_projection;
 pub(crate) mod types;
 pub(crate) mod wire;
+pub(crate) mod worker;

@@ -1,4 +1,6 @@
 //! Evidence foundation for the Theseus installation lifecycle workbench.
+#[cfg(test)]
+extern crate self as theseus;
 pub mod checks;
 pub mod cli;
 pub mod comparison;

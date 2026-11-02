@@ -355,6 +355,24 @@ impl Environment for SyntheticEnvironment {
         Ok(())
     }
 }
+/// Reuse this exact environment in facade parity tests; constructed on its worker.
+pub fn environment(fault: &str) -> impl Environment {
+    synthetic_environment(fault)
+}
+fn synthetic_environment(fault: &str) -> SyntheticEnvironment {
+    SyntheticEnvironment {
+        fault: fault
+            .strip_prefix("plugin:")
+            .or_else(|| fault.strip_prefix("upgrade:"))
+            .unwrap_or(fault)
+            .into(),
+        plugin: fault.starts_with("plugin:"),
+        upgrade: fault.starts_with("upgrade:"),
+        phase: String::new(),
+        calls: vec![],
+        unavailable: false,
+    }
+}
 pub fn run(fault: &str) -> (RunResult, Vec<String>) {
     let f = Fixture::new();
     let mut value = if fault.starts_with("plugin:") {
@@ -384,18 +402,7 @@ pub fn run(fault: &str) -> (RunResult, Vec<String>) {
     if fault == "client-file-missing" {
         std::fs::remove_file(f.root.path().join("target/client/claude")).unwrap();
     }
-    let mut env = SyntheticEnvironment {
-        fault: fault
-            .strip_prefix("plugin:")
-            .or_else(|| fault.strip_prefix("upgrade:"))
-            .unwrap_or(fault)
-            .into(),
-        plugin: fault.starts_with("plugin:"),
-        upgrade: fault.starts_with("upgrade:"),
-        phase: String::new(),
-        calls: vec![],
-        unavailable: false,
-    };
+    let mut env = synthetic_environment(fault);
     let options = RunOptions {
         output_root: f.root.path().join("runs"),
         ..RunOptions::all(&recipe)
