@@ -7,6 +7,7 @@ pub(crate) mod framing;
 pub(crate) mod inspection;
 pub(crate) mod inspection_records;
 pub(crate) mod owned_error;
+pub(crate) mod query;
 pub(crate) mod range_writer;
 pub(crate) mod registry;
 pub(crate) mod roots;
