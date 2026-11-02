@@ -32,6 +32,10 @@ pub(crate) struct ReadyRun {
     pub token: CancellationToken,
 }
 #[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "The bounded ownership-transfer API returns recipes and original error owners directly"
+)]
 pub(crate) enum RegistryUpdate {
     ValidationStarted {
         generation: u64,
