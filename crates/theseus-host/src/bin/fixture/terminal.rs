@@ -84,7 +84,9 @@ pub(super) fn run() -> super::FixtureResult {
         startup.columns,
         startup.console_profile,
     )?;
+    theseus_host::process::terminal::trace("ready-flush-begin");
     reply(serde_json::json!({"ready":true}))?;
+    theseus_host::process::terminal::trace("ready-flush-returned");
     let mut total = 0;
     for _ in 0..100_000 {
         let Some(bytes) = record(&mut input)? else {
@@ -105,7 +107,10 @@ pub(super) fn run() -> super::FixtureResult {
             Operation::Finish {} => terminal.finish(true)?,
             Operation::Poll {} => (),
         }
-        reply(terminal.poll()?)?;
+        let observed = terminal.poll()?;
+        theseus_host::process::terminal::trace("reply-flush-begin");
+        reply(observed)?;
+        theseus_host::process::terminal::trace("reply-flush-returned");
     }
     Err(io::Error::other("terminal operation count exceeded").into())
 }

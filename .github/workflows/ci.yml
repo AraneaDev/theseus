@@ -93,31 +93,155 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $theseusTestHost = @(Get-Content $theseusTestMetadata | ConvertFrom-Json | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'theseus_host' -and $_.features -contains 'test-support' })
           if ($theseusTestHost.Count -lt 1) { throw 'Application test graph lacks scoped native fault support' }
-      - name: Early native CLI and terminal diagnostics (required)
-        timeout-minutes: 5
+      - name: Precompile native diagnostic executables (required)
         shell: pwsh
+        run: |
+          cargo test --locked -p theseus-host --features test-support --lib --no-run 2>&1 |
+            Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'native-host-precompile.log')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --test host_cli --test host_terminal --no-run 2>&1 |
+            Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'native-integration-precompile.log')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload native diagnostic bootstrap
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: host-package-bootstrap-${{ matrix.os }}
+          path: ${{ env.THESEUS_HOST_EVIDENCE }}
+          retention-days: 7
+          if-no-files-found: error
+      - name: Early Windows legacy controls (required)
+        if: ${{ runner.os == 'Windows' }}
+        timeout-minutes: 1
+        shell: cmd
         env:
           THESEUS_TERMINAL_TRACE: '1'
         run: |
-          if ($IsWindows) {
-            cargo test --locked -p theseus-host --features test-support --lib conpty_legacy_crossterm -- --nocapture --test-threads=1 2>&1 |
-              Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'early-native-legacy-crossterm.log')
-          } else {
-            cargo test --locked -p theseus-host --features test-support --lib pty_resize_and_single_q -- --nocapture --test-threads=1 2>&1 |
-              Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'early-native-resize-key-control.log')
-          }
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked --test host_cli --test host_terminal -- --nocapture --test-threads=1 2>&1 |
-            Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'early-native-cli-terminal.log')
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if ($IsWindows) {
-            cargo test --locked -p theseus-host --features test-support --lib conpty_backpressure_close_model -- --nocapture --test-threads=1 2>&1 |
-              Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'early-native-conpty-close-model.log')
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
+          echo THESEUS diagnostic=legacy phase=start
+          cargo test --locked -p theseus-host --features test-support --lib conpty_legacy_crossterm -- --nocapture --test-threads=1 > "%THESEUS_HOST_EVIDENCE%\early-native-legacy-crossterm.log" 2>&1
+          set "theseusDiagnosticExit=%ERRORLEVEL%"
+          if not exist "%THESEUS_HOST_EVIDENCE%\early-native-legacy-crossterm.log" exit /b 1
+          type "%THESEUS_HOST_EVIDENCE%\early-native-legacy-crossterm.log"
+          if errorlevel 1 exit /b 1
+          echo THESEUS diagnostic=legacy phase=returned exit=%theseusDiagnosticExit%
+          exit /b %theseusDiagnosticExit%
+      - name: Early Unix resize and key controls (required)
+        if: ${{ runner.os != 'Windows' }}
+        timeout-minutes: 1
+        shell: bash
+        env:
+          THESEUS_TERMINAL_TRACE: '1'
+        run: |
+          printf 'THESEUS diagnostic=resize-key phase=start\n'
+          if cargo test --locked -p theseus-host --features test-support --lib pty_resize_and_single_q -- --nocapture --test-threads=1 > "$THESEUS_HOST_EVIDENCE/early-native-resize-key-control.log" 2>&1; then
+            theseus_diagnostic_exit=0
+          else
+            theseus_diagnostic_exit=$?
+          fi
+          cat "$THESEUS_HOST_EVIDENCE/early-native-resize-key-control.log"
+          printf 'THESEUS diagnostic=resize-key phase=returned exit=%s\n' "$theseus_diagnostic_exit"
+          exit "$theseus_diagnostic_exit"
+      - name: Upload native control diagnostic evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: host-package-controls-${{ matrix.os }}
+          path: ${{ env.THESEUS_HOST_EVIDENCE }}
+          retention-days: 7
+          if-no-files-found: error
+      - name: Early Windows CLI and terminal diagnostics (required)
+        if: ${{ runner.os == 'Windows' }}
+        timeout-minutes: 3
+        shell: cmd
+        env:
+          THESEUS_TERMINAL_TRACE: '1'
+        run: |
+          echo THESEUS diagnostic=cli-terminal phase=start
+          cargo test --locked --test host_cli --test host_terminal -- --nocapture --test-threads=1 > "%THESEUS_HOST_EVIDENCE%\early-native-cli-terminal.log" 2>&1
+          set "theseusDiagnosticExit=%ERRORLEVEL%"
+          if not exist "%THESEUS_HOST_EVIDENCE%\early-native-cli-terminal.log" exit /b 1
+          type "%THESEUS_HOST_EVIDENCE%\early-native-cli-terminal.log"
+          if errorlevel 1 exit /b 1
+          echo THESEUS diagnostic=cli-terminal phase=returned exit=%theseusDiagnosticExit%
+          exit /b %theseusDiagnosticExit%
+      - name: Early Unix CLI and terminal diagnostics (required)
+        if: ${{ runner.os != 'Windows' }}
+        timeout-minutes: 3
+        shell: bash
+        env:
+          THESEUS_TERMINAL_TRACE: '1'
+        run: |
+          printf 'THESEUS diagnostic=cli-terminal phase=start\n'
+          if cargo test --locked --test host_cli --test host_terminal -- --nocapture --test-threads=1 > "$THESEUS_HOST_EVIDENCE/early-native-cli-terminal.log" 2>&1; then
+            theseus_diagnostic_exit=0
+          else
+            theseus_diagnostic_exit=$?
+          fi
+          cat "$THESEUS_HOST_EVIDENCE/early-native-cli-terminal.log"
+          printf 'THESEUS diagnostic=cli-terminal phase=returned exit=%s\n' "$theseus_diagnostic_exit"
+          exit "$theseus_diagnostic_exit"
+      - name: Upload native CLI and terminal diagnostic evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: host-package-cli-terminal-${{ matrix.os }}
+          path: ${{ env.THESEUS_HOST_EVIDENCE }}
+          retention-days: 7
+          if-no-files-found: error
+      - name: Early Windows close MODEL (required)
+        if: ${{ runner.os == 'Windows' }}
+        timeout-minutes: 1
+        shell: cmd
+        env:
+          THESEUS_TERMINAL_TRACE: '1'
+        run: |
+          echo THESEUS diagnostic=close-model phase=start
+          cargo test --locked -p theseus-host --features test-support --lib conpty_backpressure_close_model -- --nocapture --test-threads=1 > "%THESEUS_HOST_EVIDENCE%\early-native-conpty-close-model.log" 2>&1
+          set "theseusDiagnosticExit=%ERRORLEVEL%"
+          if not exist "%THESEUS_HOST_EVIDENCE%\early-native-conpty-close-model.log" exit /b 1
+          type "%THESEUS_HOST_EVIDENCE%\early-native-conpty-close-model.log"
+          if errorlevel 1 exit /b 1
+          echo THESEUS diagnostic=close-model phase=returned exit=%theseusDiagnosticExit%
+          exit /b %theseusDiagnosticExit%
+      - name: Upload native close MODEL diagnostic evidence
+        if: ${{ always() && runner.os == 'Windows' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: host-package-close-model-${{ matrix.os }}
+          path: ${{ env.THESEUS_HOST_EVIDENCE }}
+          retention-days: 7
+          if-no-files-found: error
       - name: Full native application and explicit terminal acceptance
         shell: pwsh
         run: |
+          function Invoke-TheseusRuntimeGate {
+            param([ValidateSet('workspace', 'cli-terminal', 'windows-model', 'unix-master')][string]$Gate)
+            # Only these repository-owned literal commands can reach an OS shell.
+            switch ($Gate) {
+              'workspace' { $theseusGateCommand = 'cargo test --locked --workspace --all-targets --no-fail-fast'; $theseusGateLog = 'workspace-tests.log' }
+              'cli-terminal' { $theseusGateCommand = 'cargo test --locked --test host_cli --test host_terminal -- --nocapture'; $theseusGateLog = 'native-cli-terminal.log' }
+              'windows-model' { $theseusGateCommand = 'cargo test --locked -p theseus-host --features test-support --lib conpty_backpressure_close_model -- --nocapture'; $theseusGateLog = 'native-conpty-close-model.log' }
+              'unix-master' { $theseusGateCommand = 'cargo test --locked -p theseus-host --features test-support --lib pty_master_ -- --nocapture'; $theseusGateLog = 'native-pty-mode-controls.log' }
+            }
+            $env:THESEUS_RUNTIME_LOG = Join-Path $env:THESEUS_HOST_EVIDENCE $theseusGateLog
+            Write-Output "THESEUS runtime=$Gate phase=start"
+            if ($IsWindows) {
+              $theseusGateScript = Join-Path $env:RUNNER_TEMP "theseus-runtime-$Gate.cmd"
+              $theseusGateRedirect = ' > "%THESEUS_RUNTIME_LOG%" 2>&1'
+              @("$theseusGateCommand$theseusGateRedirect", 'exit /b %ERRORLEVEL%') | Set-Content -Encoding ascii $theseusGateScript
+              & $env:ComSpec /d /c $theseusGateScript
+            } else {
+              $theseusGateScript = Join-Path $env:RUNNER_TEMP "theseus-runtime-$Gate.sh"
+              $theseusGateRedirect = ' > "$THESEUS_RUNTIME_LOG" 2>&1'
+              @("$theseusGateCommand$theseusGateRedirect", 'exit $?') | Set-Content -Encoding ascii $theseusGateScript
+              & bash --noprofile --norc $theseusGateScript
+            }
+            $theseusGateExit = $LASTEXITCODE
+            if (-not (Test-Path -LiteralPath $env:THESEUS_RUNTIME_LOG -PathType Leaf)) { throw "Missing required native runtime log for $Gate" }
+            Get-Content -LiteralPath $env:THESEUS_RUNTIME_LOG
+            Write-Output "THESEUS runtime=$Gate phase=returned exit=$theseusGateExit"
+            if ($theseusGateExit -ne 0) { exit $theseusGateExit }
+          }
           $theseusTask7Template = Join-Path $env:GITHUB_WORKSPACE 'tests/fixtures/recipes/v4_downgrade.toml'
           $theseusTask7TemplateBytes = [System.IO.File]::ReadAllBytes($theseusTask7Template)
           [System.IO.File]::WriteAllBytes((Join-Path $env:THESEUS_HOST_EVIDENCE 'engine-downgrade-template.raw'), $theseusTask7TemplateBytes)
@@ -138,20 +262,12 @@ jobs:
             @{ source_sha = $env:GITHUB_SHA; canonical_temp_root = $theseusTask7TempRoot; fixture_policy = 'canonical native temp ancestry; strict production roots unchanged' } |
               ConvertTo-Json | Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'app-process-fixture-policy.json')
           }
-          cargo test --locked --workspace --all-targets --no-fail-fast 2>&1 |
-            Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'workspace-tests.log')
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked --test host_cli --test host_terminal -- --nocapture 2>&1 |
-            Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'native-cli-terminal.log')
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Invoke-TheseusRuntimeGate workspace
+          Invoke-TheseusRuntimeGate cli-terminal
           if ($IsWindows) {
-            cargo test --locked -p theseus-host --features test-support --lib conpty_backpressure_close_model -- --nocapture 2>&1 |
-              Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'native-conpty-close-model.log')
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Invoke-TheseusRuntimeGate windows-model
           } else {
-            cargo test --locked -p theseus-host --features test-support --lib pty_master_ -- --nocapture 2>&1 |
-              Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'native-pty-mode-controls.log')
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Invoke-TheseusRuntimeGate unix-master
           }
           $theseusPinnedArtifacts = Get-Content (Join-Path $env:THESEUS_HOST_EVIDENCE 'native-artifacts.json') | ConvertFrom-Json
           foreach ($theseusPinnedArtifact in @($theseusPinnedArtifacts.fixture, $theseusPinnedArtifacts.application)) {

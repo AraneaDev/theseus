@@ -266,6 +266,7 @@ impl Terminal {
         self.input.try_write(bytes)
     }
     pub(crate) fn resize(&mut self, rows: u16, columns: u16) -> io::Result<()> {
+        trace("resize-native-begin");
         let result = unsafe {
             ResizePseudoConsole(
                 self.console
@@ -278,6 +279,7 @@ impl Terminal {
                 },
             )
         };
+        trace("resize-native-returned");
         if result < 0 {
             return Err(invalid(&format!("ResizePseudoConsole HRESULT {result:#x}")));
         }
@@ -287,7 +289,10 @@ impl Terminal {
         if !matches!(event, "interrupt" | "terminate") {
             return Err(invalid("invalid terminal event"));
         }
-        self.request("signal").map(|_| ())
+        trace("signal-native-begin");
+        let result = self.request("signal").map(|_| ());
+        trace("signal-native-returned");
+        result
     }
     pub(crate) fn exited(&mut self) -> io::Result<bool> {
         self.child
@@ -301,6 +306,7 @@ impl Terminal {
         if let Ok(modes) = &observation {
             trace_modes("close-modes", modes);
         }
+        trace("input-close-begin");
         let input = self.input.close();
         trace("input-close-returned");
         let mut child = self
@@ -575,6 +581,7 @@ mod tests {
             }
         });
         trace("close-begin");
+        trace("input-close-begin");
         let closed_input = input.close();
         trace("input-close-returned");
         let closer = close_worker(console, Some(model.clone()));

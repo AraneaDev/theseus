@@ -47,6 +47,16 @@ const TRACE_PHASES: &[&str] = &[
     "failed-launch-cleanup-complete",
     "input-write-complete",
     "reserved-exit-observed",
+    "input-write-begin",
+    "input-close-begin",
+    "resize-native-begin",
+    "resize-native-returned",
+    "signal-native-begin",
+    "signal-native-returned",
+    "ready-flush-begin",
+    "ready-flush-returned",
+    "reply-flush-begin",
+    "reply-flush-returned",
 ];
 fn trace_phase(phase: &str) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -62,7 +72,8 @@ fn trace_phase(phase: &str) -> bool {
     let bit = 1_u64 << index;
     SEEN.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0
 }
-pub(crate) fn trace(phase: &str) {
+#[doc(hidden)]
+pub fn trace(phase: &str) {
     use std::io::Write;
     if trace_phase(phase) {
         let _ = writeln!(
@@ -204,6 +215,7 @@ impl Session {
         }
     }
     pub fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        trace("input-write-begin");
         if bytes.len() > 65536 {
             return Err(io::Error::other("terminal input exceeded 64 KiB"));
         }

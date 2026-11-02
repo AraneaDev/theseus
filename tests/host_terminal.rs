@@ -56,3 +56,18 @@ fn terminal_screen_literal_wrap_and_control_sequences_match_cells() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn terminal_diagnostics_release_pipe_producers_and_preserve_bounded_progress() {
+    let output = std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
+        .arg("tests/support/terminal_diagnostics_test.py")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("required native Python");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

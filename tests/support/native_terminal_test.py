@@ -5,7 +5,7 @@ import pathlib
 import sys
 import tempfile
 import time
-from terminal_session import NativeSession
+from terminal_session import NativeSession, SessionDiagnostics
 
 
 def resized_frame(terminal):
@@ -24,8 +24,9 @@ for profile in profiles:
         case = action if profile == 'default' else profile + '-' + action
         if os.environ.get('THESEUS_TERMINAL_TRACE') == '1':
             print('native terminal case=' + case + ' phase=start', file=sys.stderr, flush=True)
+        diagnostics = SessionDiagnostics(case, profile, evidence)
         terminal = NativeSession(binary, ['--no-animation'], 'examples/standalone', os.environ,
-                                 console_profile=profile)
+                                 console_profile=profile, diagnostics=diagnostics)
         outcome = 'failed'
         try:
             deadline = time.monotonic() + 8

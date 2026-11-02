@@ -5,20 +5,13 @@ import os
 import pathlib
 import subprocess
 import unittest
-from terminal_session import native_fixture
+from terminal_session import native_fixture, owned_bridge_stderr
 
 
 @contextmanager
 def diagnostic_stderr(case):
-    if os.environ.get('THESEUS_TERMINAL_TRACE') == '1':
-        # Fixed case names, a CI-owned evidence directory, and no tee worker.
-        # The native child writes directly to this file, preserving partial
-        # diagnostics even when communicate/wait cannot complete.
-        root = pathlib.Path(os.environ['THESEUS_HOST_EVIDENCE'])
-        with (root / ('terminal-protocol-' + case + '.stderr.log')).open('w+b') as output:
-            yield output
-    else:
-        yield subprocess.PIPE
+    with owned_bridge_stderr('protocol-' + case) as output:
+        yield output
 
 
 def captured_stderr(target, data):
