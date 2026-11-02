@@ -39,6 +39,10 @@
 //! Counts are decimal, at most 64 MiB; durations are at most 60,000 ms.
 //! Hex output is at most 64 MiB. No mode reads unrelated environment variables.
 
+#[cfg(feature = "test-support")]
+#[path = "fixture/stdio_preflight.rs"]
+mod stdio_preflight;
+
 #[path = "fixture/docker.rs"]
 mod docker;
 #[path = "fixture/duplex.rs"]
@@ -471,6 +475,10 @@ fn run(args: &[OsString]) -> FixtureResult {
 }
 
 fn main() {
+    #[cfg(feature = "test-support")]
+    if env::args_os().nth(1).as_deref() == Some(OsStr::new("stdio-preflight")) {
+        stdio_preflight::main();
+    }
     #[cfg(all(windows, feature = "test-support"))]
     if env::args_os().nth(1).as_deref() == Some(OsStr::new("terminal-vt-events")) {
         let arguments = env::args_os().skip(2).collect::<Vec<_>>();

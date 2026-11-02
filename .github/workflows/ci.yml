@@ -50,6 +50,38 @@ jobs:
             native_os_version = [Environment]::OSVersion.Version.ToString()
             native_os_build = [Environment]::OSVersion.Version.Build
           } | ConvertTo-Json | Tee-Object -FilePath (Join-Path $theseusHostEvidence 'runner.json')
+      - name: Build trusted native application fixture
+        shell: pwsh
+        run: |
+          $theseusTask7Python = if ($IsWindows) { 'python' } else { 'python3' }
+          $theseusTask7Fixture = & $theseusTask7Python tests/support/build_host_fixture.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "THESEUS_HOST_TEST_FIXTURE=$theseusTask7Fixture" >> $env:GITHUB_ENV
+          Copy-Item (Join-Path (Split-Path $theseusTask7Fixture) 'artifacts.json') (Join-Path $env:THESEUS_HOST_EVIDENCE 'native-artifacts.json')
+          @{ source_sha = $env:GITHUB_SHA; executable = $theseusTask7Fixture; sha256 = (Get-FileHash -Algorithm SHA256 $theseusTask7Fixture).Hash } |
+            ConvertTo-Json | Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'app-fixture.json')
+      - name: Ordinary inherited stdio qualification (required)
+        timeout-minutes: 8
+        shell: pwsh
+        run: |
+          $theseusStdioPython = if ($IsWindows) { 'python' } else { 'python3' }
+          & $theseusStdioPython tests/support/mcp_stdio_preflight.py --self-test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p theseus-host --features test-support --test stdio_preflight -- --nocapture 2>&1 |
+            Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'stdio-rust.log')
+          $theseusStdioRustExit = $LASTEXITCODE
+          & $theseusStdioPython tests/support/mcp_stdio_preflight.py --fixture $env:THESEUS_HOST_TEST_FIXTURE --evidence $env:THESEUS_HOST_EVIDENCE 2>&1 |
+            Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'stdio-python-createpipe.log')
+          $theseusStdioPythonExit = $LASTEXITCODE
+          if ($theseusStdioRustExit -ne 0 -or $theseusStdioPythonExit -ne 0) { exit 1 }
+      - name: Upload ordinary stdio qualification evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: host-stdio-preflight-${{ matrix.os }}
+          path: ${{ env.THESEUS_HOST_EVIDENCE }}
+          retention-days: 7
+          if-no-files-found: error
       - name: Workspace formatting
         if: ${{ matrix.os == 'ubuntu-24.04' }}
         run: cargo fmt --all --check
@@ -68,16 +100,6 @@ jobs:
           & $theseusTask6Python tests/support/portable_guest_bytes.py 2>&1 |
             Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'portable-guest-bytes.log')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Build trusted native application fixture
-        shell: pwsh
-        run: |
-          $theseusTask7Python = if ($IsWindows) { 'python' } else { 'python3' }
-          $theseusTask7Fixture = & $theseusTask7Python tests/support/build_host_fixture.py
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          "THESEUS_HOST_TEST_FIXTURE=$theseusTask7Fixture" >> $env:GITHUB_ENV
-          Copy-Item (Join-Path (Split-Path $theseusTask7Fixture) 'artifacts.json') (Join-Path $env:THESEUS_HOST_EVIDENCE 'native-artifacts.json')
-          @{ source_sha = $env:GITHUB_SHA; executable = $theseusTask7Fixture; sha256 = (Get-FileHash -Algorithm SHA256 $theseusTask7Fixture).Hash } |
-            ConvertTo-Json | Tee-Object -FilePath (Join-Path $env:THESEUS_HOST_EVIDENCE 'app-fixture.json')
       - name: Verify production and test native feature boundaries
         shell: pwsh
         run: |
@@ -284,52 +306,111 @@ jobs:
           if-no-files-found: error
 
   docker:
+    name: docker (all seven required suites)
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - docker_lifecycle
-          - interruption_lifecycle
-          - downgrade_lifecycle
-          - rollback_lifecycle
-          - interrupted_rollback_lifecycle
-          - comparison_docker
-          - mcp_docker
+    timeout-minutes: 75
     steps:
+      - name: Initialize total budget and all seven failure receipts
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          theseus_acceptance_started=$(date +%s)
+          theseus_evidence_dir="$RUNNER_TEMP/theseus-acceptance-evidence"
+          mkdir -p "$theseus_evidence_dir"
+          printf 'THESEUS_ACCEPTANCE_JOB_STARTED=%s\n' "$theseus_acceptance_started" >> "$GITHUB_ENV"
+          printf 'THESEUS_ACCEPTANCE_EVIDENCE=%s\n' "$theseus_evidence_dir" >> "$GITHUB_ENV"
+          printf 'All seven required suites have independent directories and result.json; absent, failed preparation and not-run results are failures.\n' > "$theseus_evidence_dir/README.txt"
+          printf '%s\n' "$GITHUB_SHA" > "$theseus_evidence_dir/source-sha.txt"
+          for theseus_target in docker_lifecycle interruption_lifecycle downgrade_lifecycle rollback_lifecycle interrupted_rollback_lifecycle comparison_docker mcp_docker; do
+            mkdir -p "$theseus_evidence_dir/$theseus_target"
+            printf '{"suite":"%s","status":"not_run_preparation","pass":false}\n' "$theseus_target" > "$theseus_evidence_dir/$theseus_target/result.json"
+          done
+          cat > "$RUNNER_TEMP/theseus-acceptance-budget.sh" <<'BUDGET'
+          theseus_budget() {
+            local theseus_maximum=$(( $1 - 15 ))
+            shift
+            local theseus_remaining=$(( 4200 - $(date +%s) + THESEUS_ACCEPTANCE_JOB_STARTED - 15 ))
+            if [ "$theseus_remaining" -le 0 ]; then
+              printf '{"command":"%s","status":"budget_exhausted","exit_code":124}\n' "$1" >> "$THESEUS_ACCEPTANCE_EVIDENCE/budget.jsonl"
+              return 124
+            fi
+            if [ "$theseus_maximum" -gt "$theseus_remaining" ]; then theseus_maximum="$theseus_remaining"; fi
+            local theseus_command_exit=0
+            if timeout --signal=TERM --kill-after=15s "${theseus_maximum}s" "$@"; then
+              theseus_command_exit=0
+            else
+              theseus_command_exit=$?
+            fi
+            printf '{"command":"%s","exit_code":%s,"term_after_seconds":%s,"kill_grace_seconds":15}\n' "$1" "$theseus_command_exit" "$theseus_maximum" >> "$THESEUS_ACCEPTANCE_EVIDENCE/budget.jsonl"
+            return "$theseus_command_exit"
+          }
+          BUDGET
+          printf 'BASH_ENV=%s\n' "$RUNNER_TEMP/theseus-acceptance-budget.sh" >> "$GITHUB_ENV"
+      # These fixed setup caps total at most 16 minutes from the first step;
+      # all following commands share that same 70-minute clock (including grace).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      - name: Set acceptance evidence paths
-        env:
-          THESEUS_ACCEPTANCE_TARGET: ${{ matrix.target }}
+        timeout-minutes: 10
+      - name: Prepare image and trusted native targets within total budget
+        id: prepare
+        shell: bash
         run: |
-          theseus_evidence_dir="$RUNNER_TEMP/theseus-acceptance-evidence-$THESEUS_ACCEPTANCE_TARGET"
-          mkdir -p "$theseus_evidence_dir"
-          printf 'THESEUS_ACCEPTANCE_EVIDENCE=%s\n' "$theseus_evidence_dir" >> "$GITHUB_ENV"
-          printf 'THESEUS_MCP_TEST_EVIDENCE=%s/mcp-transport\n' "$theseus_evidence_dir" >> "$GITHUB_ENV"
-      - name: Prepare Docker acceptance image
-        run: |
-          docker info
-          docker pull ubuntu:24.04
-          theseus_image_id="$(docker image inspect --format '{{.Id}}' ubuntu:24.04)"
+          theseus_budget 4200 docker info
+          theseus_budget 4200 docker pull ubuntu:24.04
+          theseus_image_id="$(theseus_budget 4200 docker image inspect --format '{{.Id}}' ubuntu:24.04)"
           printf 'THESEUS_MCP_TEST_IMAGE=%s\n' "$theseus_image_id" >> "$GITHUB_ENV"
-          printf '%s\n' "$theseus_image_id" | tee "$THESEUS_ACCEPTANCE_EVIDENCE/docker-image-id.txt"
-      - name: Build trusted native application fixture
-        run: |
-          theseus_fixture="$(python3 tests/support/build_host_fixture.py)"
+          printf '%s\n' "$theseus_image_id" > "$THESEUS_ACCEPTANCE_EVIDENCE/docker-image-id.txt"
+          theseus_fixture="$(theseus_budget 4200 python3 tests/support/build_host_fixture.py)"
           printf 'THESEUS_HOST_TEST_FIXTURE=%s\n' "$theseus_fixture" >> "$GITHUB_ENV"
-      - name: Real Docker acceptance (required)
-        env:
-          THESEUS_ACCEPTANCE_TARGET: ${{ matrix.target }}
-        run: cargo test --locked --test "$THESEUS_ACCEPTANCE_TARGET" -- --ignored --test-threads=1
-      - name: Upload acceptance evidence
+          theseus_budget 4200 cp "$(dirname "$theseus_fixture")/artifacts.json" "$THESEUS_ACCEPTANCE_EVIDENCE/native-artifacts.json"
+          theseus_budget 4200 cargo test --locked --no-run --test docker_lifecycle --test interruption_lifecycle --test downgrade_lifecycle --test rollback_lifecycle --test interrupted_rollback_lifecycle --test comparison_docker --test mcp_docker
+      - name: Real Docker acceptance (all seven required)
+        shell: bash
+        run: |
+          theseus_acceptance_root="$THESEUS_ACCEPTANCE_EVIDENCE"
+          theseus_any_failure=0
+          theseus_watchdog_expired=0
+          for theseus_target in docker_lifecycle interruption_lifecycle downgrade_lifecycle rollback_lifecycle interrupted_rollback_lifecycle comparison_docker mcp_docker; do
+            theseus_suite_dir="$theseus_acceptance_root/$theseus_target"
+            if [ "$theseus_watchdog_expired" -ne 0 ]; then
+              printf '{"suite":"%s","status":"not_run_after_watchdog","pass":false}\n' "$theseus_target" > "$theseus_suite_dir/result.json"
+              continue
+            fi
+            export THESEUS_ACCEPTANCE_TARGET="$theseus_target"
+            export THESEUS_ACCEPTANCE_EVIDENCE="$theseus_suite_dir"
+            export THESEUS_MCP_TEST_EVIDENCE="$theseus_suite_dir/mcp-transport"
+            theseus_suite_started=$(date +%s)
+            if theseus_budget 2700 cargo test --locked --test "$theseus_target" -- --ignored --test-threads=1 > "$theseus_suite_dir/tests.log" 2>&1; then
+              theseus_suite_exit=0
+            else
+              theseus_suite_exit=$?
+              theseus_any_failure=1
+            fi
+            cat "$theseus_suite_dir/tests.log"
+            theseus_suite_seconds=$(( $(date +%s) - theseus_suite_started ))
+            printf '{"suite":"%s","exit_code":%s,"elapsed_seconds":%s}\n' "$theseus_target" "$theseus_suite_exit" "$theseus_suite_seconds" > "$theseus_suite_dir/result.json"
+            if [ "$theseus_suite_exit" -eq 124 ] || [ "$theseus_suite_exit" -eq 137 ]; then
+              theseus_watchdog_expired=1
+            fi
+          done
+          exit "$theseus_any_failure"
+      - name: Finalize preparation failure evidence
         if: ${{ always() }}
+        timeout-minutes: 1
+        shell: bash
+        env:
+          THESEUS_PREPARATION_RESULT: ${{ steps.prepare.outcome }}
+        run: |
+          printf '{"preparation":"%s","all_seven_receipts_initialized_before_setup":true}\n' "$THESEUS_PREPARATION_RESULT" > "$THESEUS_ACCEPTANCE_EVIDENCE/preparation.json"
+      - name: Upload all seven acceptance suites and results
+        if: ${{ always() }}
+        timeout-minutes: 4
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: linux-acceptance-evidence-${{ matrix.target }}
+          name: linux-acceptance-evidence-all-seven
           path: ${{ env.THESEUS_ACCEPTANCE_EVIDENCE }}
           retention-days: 7
-          if-no-files-found: warn
+          if-no-files-found: error
