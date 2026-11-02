@@ -9,7 +9,7 @@ import time
 import unittest
 
 sys.dont_write_bytecode = True
-from terminal_session import SessionDiagnostics, owned_bridge_stderr
+from terminal_session import NativeSession, SessionDiagnostics, native_fixture, owned_bridge_stderr
 
 
 def line_from_pipe(stream, seconds=5):
@@ -182,6 +182,53 @@ class ProgressRecordTests(unittest.TestCase):
                 one.write(b'partial phase')
                 path = Path(one.name)
             self.assertEqual(path.read_bytes(), b'partial phase')
+
+
+class NativeFinishTests(unittest.TestCase):
+    def test_existing_kill_finishes_live_native_session_and_settles_owned_bridge(self):
+        _, metadata = native_fixture()
+        diagnostic = SessionDiagnostics('forced-finish')
+        session = NativeSession(metadata['application']['path'], ['--no-animation'],
+            str(Path(__file__).resolve().parents[2] / 'examples/standalone'), os.environ,
+            diagnostics=diagnostic)
+        observation = {}
+        try:
+            until = time.monotonic() + 8
+            while not session.output.has(b'Preview') and time.monotonic() < until:
+                session.pump()
+            self.assertTrue(session.output.has(b'Preview'), session.output.screen.text())
+            live = session.request('poll')
+            self.assertIsNone(live['status'])
+            self.assertFalse(live['eof'])
+            self.assertIsNone(session.bridge.poll())
+            observation['live_before_finish'] = True
+            try:
+                session.kill()  # Existing forced cleanup API, not a synthetic record.
+                observation['finish_error'] = None
+            except BaseException as error:
+                observation['finish_error'] = repr(error)
+            observation['status_after_finish'] = session.returncode
+            observation['eof_after_finish'] = session.eof
+            observation['finish_record'] = json.loads(diagnostic.progress_path.read_text())
+            if observation['finish_error'] is None:
+                observation['wait_status'] = session.wait()
+        finally:
+            # RED's rejected request must still rescue the live native owner.
+            session.close()
+            observation['bridge_exit'] = session.bridge.returncode
+            observation['bridge_stdout_closed'] = session.bridge.stdout.closed
+            (diagnostic.directory / 'forced-finish-observation.json').write_text(json.dumps(observation))
+        print(json.dumps(observation), flush=True)
+        self.assertIsNone(observation['finish_error'], observation)
+        self.assertTrue(observation['live_before_finish'])
+        self.assertIsInstance(observation['status_after_finish'], int)
+        self.assertTrue(observation['eof_after_finish'])
+        self.assertEqual(observation['wait_status'], observation['status_after_finish'])
+        self.assertEqual(observation['finish_record']['phase'], 'response-complete')
+        self.assertEqual(observation['finish_record']['operation'], 'finish')
+        self.assertTrue(observation['finish_record']['last_complete']['eof'])
+        self.assertEqual(observation['bridge_exit'], 0)
+        self.assertTrue(observation['bridge_stdout_closed'])
 
 
 if __name__ == '__main__':

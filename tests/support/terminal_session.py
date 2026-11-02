@@ -32,7 +32,7 @@ def owned_bridge_stderr(case, root=None):
 
 
 class SessionDiagnostics:
-    operations = {'startup', 'poll', 'input', 'resize', 'signal', 'wait', 'close'}
+    operations = {'startup', 'poll', 'input', 'resize', 'signal', 'wait', 'finish', 'close'}
 
     def __init__(self, case='session', profile='default', root=None):
         assert case and len(case) <= 64 and all(c in 'abcdefghijklmnopqrstuvwxyz0123456789-' for c in case)
