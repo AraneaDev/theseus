@@ -245,7 +245,9 @@ def native(runner, stage):
     if stage == 'stdio':
         runner.run('validation-driver-controls', [py, 'tests/support/validation_test.py'])
         runner.run('stdio-driver-controls', [py, 'tests/support/mcp_stdio_preflight.py', '--self-test'])
+        runner.run('server-supervisor-controls', [py, 'tests/support/mcp_server_stdio.py', '--self-test'])
         runner.cargo('stdio-rust', 'test', '--locked', '-p', 'theseus-host', '--features', 'test-support', '--test', 'stdio_preflight', '--', '--nocapture', timeout=180, required_cases=CASE_INVENTORY['native']['stdio-rust'])
+        runner.cargo('stdio-native-identity', 'test', '--locked', '-p', 'theseus-host', '--features', 'test-support', '--test', 'stdio', 'pipe', '--', '--nocapture', timeout=180, required_cases=CASE_INVENTORY['native']['stdio-identity-common'] + (CASE_INVENTORY['native']['stdio-identity-windows'] if windows else []))
         runner.run('stdio-python-createpipe', [py, 'tests/support/mcp_stdio_preflight.py', '--fixture', runner.env['THESEUS_HOST_TEST_FIXTURE'], '--evidence', str(runner.evidence)], timeout=180)
         runner.cargo('mcp-server-stdio', 'test', '--locked', '--features', 'mcp-test-support', '--test', 'mcp_server_stdio', '--', '--nocapture', timeout=300, required_cases=CASE_INVENTORY['native']['server-common'] + ([] if windows else CASE_INVENTORY['native']['server-unix']))
     elif stage == 'fmt':

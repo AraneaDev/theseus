@@ -143,13 +143,20 @@ def reap(child):
             receipt = child._job.terminate_and_wait()
             child.wait(timeout=5)
         else:
+            kill_permission_error = None
             try:
                 os.killpg(child.pid, signal.SIGKILL)
                 killed_group = True
             except ProcessLookupError:
                 killed_group = False
+            except PermissionError as error:
+                # Darwin can reject a zombie-only group. This does not prove
+                # completion: retain the error and still require disappearance.
+                killed_group = False
+                kill_permission_error = error.errno
             child.wait(timeout=5)
             reaped = []
+            probe_permission_errors = 0
             deadline = time.monotonic() + 5
             while True:
                 try:
@@ -163,9 +170,17 @@ def reap(child):
                     os.killpg(child.pid, 0)
                 except ProcessLookupError:
                     break
-                assert time.monotonic() < deadline, "process group did not disappear after SIGKILL"
+                except PermissionError:
+                    # Unknown is not empty; only ESRCH above can settle the tree.
+                    probe_permission_errors += 1
+                assert time.monotonic() < deadline, ("process group did not disappear after SIGKILL",
+                                                     {"kill_permission_error": kill_permission_error,
+                                                      "probe_permission_errors": probe_permission_errors})
                 time.sleep(.01)
-            receipt = {"containment": "posix_process_group", "kill_requested": killed_group, "descendants_reaped": reaped, "tree_empty": True}
+            receipt = {"containment": "posix_process_group", "kill_requested": killed_group,
+                       "kill_permission_error": kill_permission_error,
+                       "probe_permission_errors": probe_permission_errors,
+                       "descendants_reaped": reaped, "tree_empty": True}
         receipt["leader_exited_before_cleanup"] = leader_exited
         child._tree_receipt = receipt
         return receipt
@@ -541,13 +556,72 @@ def supervisor_regression(root):
         reap(child)
 
 
+def self_test():
+    import errno
+    import unittest
+    from types import SimpleNamespace
+    from unittest.mock import Mock, call, patch
+
+    class PermissionCleanup(unittest.TestCase):
+        def child(self):
+            return SimpleNamespace(pid=12345, _tree_lock=threading.Lock(), _tree_receipt=None,
+                                   poll=Mock(return_value=0), wait=Mock(return_value=0))
+
+        def fake_os(self, kill):
+            return SimpleNamespace(name="posix", killpg=kill, WNOHANG=1,
+                                   waitpid=Mock(side_effect=ChildProcessError))
+
+        def test_signal_and_probe_permission_errors_wait_for_actual_group_disappearance(self):
+            child = self.child()
+            kill = Mock(side_effect=[PermissionError(errno.EPERM, "signal denied"),
+                                     PermissionError(errno.EPERM, "unknown group"),
+                                     PermissionError(errno.EPERM, "unknown group"),
+                                     ProcessLookupError(errno.ESRCH, "group gone")])
+            clock = SimpleNamespace(monotonic=Mock(side_effect=[0, .1, .2]), sleep=Mock())
+            with patch(__name__ + ".os", self.fake_os(kill)), patch(__name__ + ".time", clock):
+                receipt = reap(child)
+                self.assertIs(reap(child), receipt)
+            self.assertEqual(kill.call_args_list, [call(child.pid, signal.SIGKILL),
+                                                   call(child.pid, 0), call(child.pid, 0), call(child.pid, 0)])
+            child.wait.assert_called_once_with(timeout=5)
+            self.assertFalse(receipt["kill_requested"])
+            self.assertEqual(receipt["kill_permission_error"], errno.EPERM)
+            self.assertEqual(receipt["probe_permission_errors"], 2)
+            self.assertTrue(receipt["tree_empty"])
+
+        def test_persistent_permission_error_never_establishes_tree_empty(self):
+            for denied_signal in (False, True):
+                with self.subTest(denied_signal=denied_signal):
+                    child = self.child()
+                    def kill(group, sig):
+                        if sig == signal.SIGKILL and not denied_signal:
+                            return
+                        raise PermissionError(errno.EPERM, "unknown group")
+                    clock = SimpleNamespace(monotonic=Mock(side_effect=[0, .1, 5.1]), sleep=Mock())
+                    with patch(__name__ + ".os", self.fake_os(Mock(side_effect=kill))), patch(__name__ + ".time", clock):
+                        with self.assertRaisesRegex(AssertionError, "process group did not disappear"):
+                            reap(child)
+                    self.assertIsNone(child._tree_receipt)
+                    child.wait.assert_called_once_with(timeout=5)
+
+    # These controls exercise POSIX cleanup even on a Windows CI host.
+    with patch(__name__ + ".signal", SimpleNamespace(SIGKILL=9)):
+        result = unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(PermissionCleanup))
+    return 0 if result.wasSuccessful() else 1
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary")
     parser.add_argument("--supervisor-regression", action="store_true")
+    parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--fixture")
-    parser.add_argument("--evidence", required=True)
+    parser.add_argument("--evidence")
     args = parser.parse_args()
+    if args.self_test:
+        raise SystemExit(self_test())
+    if not args.evidence:
+        parser.error("--evidence is required")
     root = Path(args.evidence)
     root.mkdir(parents=True, exist_ok=True)
     if args.supervisor_regression:

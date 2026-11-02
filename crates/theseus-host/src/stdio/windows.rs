@@ -8,12 +8,15 @@ use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::Arc;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_ACCESS_INFORMATION, FILE_MODE_INFORMATION, FILE_PIPE_INFORMATION,
-    FILE_PIPE_LOCAL_INFORMATION, FileAccessInformation, FileIsRemoteDeviceInformation,
-    FileModeInformation, FileNameInformation, FilePipeInformation, FilePipeLocalInformation,
-    NtQueryInformationFile,
+    FILE_ACCESS_INFORMATION, FILE_INTERNAL_INFORMATION, FILE_MODE_INFORMATION,
+    FILE_PIPE_INFORMATION, FILE_PIPE_LOCAL_INFORMATION, FileAccessInformation,
+    FileFsAttributeInformation, FileFsDeviceInformation, FileInternalInformation,
+    FileIsRemoteDeviceInformation, FileModeInformation, FileNameInformation, FilePipeInformation,
+    FilePipeLocalInformation, NtQueryInformationFile, NtQueryVolumeInformationFile,
 };
-use windows_sys::Wdk::System::SystemServices::FILE_IS_REMOTE_DEVICE_INFORMATION;
+use windows_sys::Wdk::System::SystemServices::{
+    FILE_FS_DEVICE_INFORMATION, FILE_IS_REMOTE_DEVICE_INFORMATION,
+};
 use windows_sys::Win32::{
     Foundation::*,
     Globalization::{CSTR_EQUAL, CompareStringOrdinal},
@@ -39,6 +42,16 @@ impl Default for PipeName {
         }
     }
 }
+// FILE_FS_ATTRIBUTE_INFORMATION header plus exactly the four-unit NPFS name.
+// Other providers and oversized replies are rejected without allocation/retry.
+#[repr(C)]
+#[derive(Default)]
+struct PipeProvider {
+    attributes: u32,
+    maximum_component_length: i32,
+    name_bytes: u32,
+    name: [u16; 4],
+}
 enum QueryOutput {
     Name(Box<PipeName>),
     Remote(Box<FILE_IS_REMOTE_DEVICE_INFORMATION>),
@@ -46,10 +59,28 @@ enum QueryOutput {
     Mode(Box<FILE_MODE_INFORMATION>),
     Pipe(Box<FILE_PIPE_LOCAL_INFORMATION>),
     PipeMode(Box<FILE_PIPE_INFORMATION>),
+    Internal(Box<FILE_INTERNAL_INFORMATION>),
+    Device(Box<FILE_FS_DEVICE_INFORMATION>),
+    Provider(Box<PipeProvider>),
 }
 impl QueryOutput {
     fn parts(&mut self) -> (*mut std::ffi::c_void, u32, i32) {
         match self {
+            Self::Internal(value) => (
+                (&mut **value as *mut FILE_INTERNAL_INFORMATION).cast(),
+                8,
+                FileInternalInformation,
+            ),
+            Self::Device(value) => (
+                (&mut **value as *mut FILE_FS_DEVICE_INFORMATION).cast(),
+                8,
+                FileFsDeviceInformation,
+            ),
+            Self::Provider(value) => (
+                (&mut **value as *mut PipeProvider).cast(),
+                20,
+                FileFsAttributeInformation,
+            ),
             Self::Name(value) => (
                 (&mut **value as *mut PipeName).cast(),
                 std::mem::size_of::<PipeName>() as u32,
@@ -178,9 +209,8 @@ impl Native {
             unreachable!()
         };
         if input_name.length == 0 || output_name.length == 0 {
-            // Ordinary Rust child pipes may have no name. Empty names provide
-            // no identity: require the already checked whole-pipe configurations
-            // to prove that these cannot be opposite ends of the same pipe.
+            // Empty names provide no identity. Distinct known configurations
+            // remain the fast path; otherwise require checked local NPFS IDs.
             let disjoint = profile::disjoint_unnamed(
                 input_name.length,
                 output_name.length,
@@ -189,7 +219,7 @@ impl Native {
             );
             #[cfg(feature = "test-support")]
             self.trace.push(Event {
-                phase: if disjoint { "pipe_identity" } else { "alias_rejected" },
+                phase: if disjoint { "pipe_identity" } else { "pipe_identity_pending" },
                 endpoint: "control",
                 api: "FilePipeLocalInformation",
                 ok: true,
@@ -198,7 +228,22 @@ impl Native {
                 observed: json!({"input_name_bytes":input_name.length,"output_name_bytes":output_name.length,"input_configuration":input_configuration,"output_configuration":output_configuration,"distinct_known_configurations":disjoint}),
             });
             if !disjoint {
-                return Err(invalid("unnamed stdio pipe identity is ambiguous"));
+                if input_configuration > 2 || output_configuration > 2 {
+                    return Err(invalid("unknown unnamed stdio pipe configuration"));
+                }
+                let input_id = self.npfs_identity(true)?;
+                let output_id = self.npfs_identity(false)?;
+                let disjoint = profile::disjoint_internal_ids(
+                    input_configuration,
+                    output_configuration,
+                    input_id,
+                    output_id,
+                );
+                #[cfg(feature = "test-support")]
+                self.trace.push(Event {phase:if disjoint {"pipe_identity"} else {"alias_rejected"},endpoint:"control",api:"FileInternalInformation",ok:disjoint,status:None,error:None,observed:json!({"input_id":input_id,"output_id":output_id,"distinct_local_npfs_ids":disjoint})});
+                if !disjoint {
+                    return Err(invalid("unnamed stdio pipe identity is ambiguous"));
+                }
             }
         } else {
             let compared = unsafe {
@@ -347,16 +392,31 @@ impl Native {
         });
         let handle = self.handle(reading);
         let query = self.query.as_mut().unwrap();
+        let volume = matches!(
+            &query.output,
+            QueryOutput::Device(_) | QueryOutput::Provider(_)
+        );
+        #[cfg(feature = "test-support")]
+        let api = if volume {
+            "NtQueryVolumeInformationFile"
+        } else {
+            "NtQueryInformationFile"
+        };
         let (buffer, size, class) = query.output.parts();
-        let status =
-            unsafe { NtQueryInformationFile(handle, &mut *query.iosb, buffer, size, class) };
+        let status = unsafe {
+            if volume {
+                NtQueryVolumeInformationFile(handle, &mut *query.iosb, buffer, size, class)
+            } else {
+                NtQueryInformationFile(handle, &mut *query.iosb, buffer, size, class)
+            }
+        };
         if status == STATUS_PENDING {
             self.query_pending = true;
             #[cfg(feature = "test-support")]
             self.trace.push(Event {
                 phase: "query_pending",
                 endpoint: label(reading),
-                api: "NtQueryInformationFile",
+                api,
                 ok: false,
                 status: Some(status as i64),
                 error: None,
@@ -367,6 +427,12 @@ impl Native {
             return Err(io::Error::other("native stdio query unexpectedly pending"));
         }
         let completion = unsafe { query.iosb.Anonymous.Status };
+        if completion == STATUS_PENDING {
+            self.query_pending = true;
+            return Err(io::Error::other(
+                "native stdio query completion still pending",
+            ));
+        }
         let returned = query.iosb.Information;
         let expected = match &query.output {
             QueryOutput::Name(name)
@@ -383,9 +449,17 @@ impl Native {
             QueryOutput::Name(_) => None,
             _ => Some(size as usize),
         };
-        let ok = status >= 0 && completion >= 0 && expected == Some(returned);
+        let identity_query = matches!(
+            &query.output,
+            QueryOutput::Internal(_) | QueryOutput::Device(_) | QueryOutput::Provider(_)
+        );
+        let ok = if identity_query {
+            profile::complete_identity_reply(status, completion, returned, size as usize)
+        } else {
+            status >= 0 && completion >= 0 && expected == Some(returned)
+        };
         #[cfg(feature = "test-support")]
-        self.trace.push(Event {phase:"query",endpoint:label(reading),api:"NtQueryInformationFile",ok,status:Some(status as i64),error:None,observed:json!({"class":class,"completion_status":completion,"returned_bytes":returned,"expected_bytes":expected})});
+        self.trace.push(Event {phase:"query",endpoint:label(reading),api,ok,status:Some(status as i64),error:None,observed:json!({"class":class,"completion_status":completion,"returned_bytes":returned,"expected_bytes":expected})});
         let query = self.query.take().unwrap();
         if !ok {
             return Err(io::Error::other(
@@ -393,6 +467,55 @@ impl Native {
             ));
         }
         Ok(query.output)
+    }
+
+    fn npfs_identity(&mut self, reading: bool) -> io::Result<u64> {
+        let QueryOutput::Device(device) =
+            self.query(reading, QueryOutput::Device(Box::default()))?
+        else {
+            unreachable!()
+        };
+        let QueryOutput::Provider(provider) =
+            self.query(reading, QueryOutput::Provider(Box::default()))?
+        else {
+            unreachable!()
+        };
+        let local_npfs = profile::local_npfs(
+            device.DeviceType,
+            device.Characteristics,
+            provider.name_bytes,
+            &provider.name,
+        );
+        #[cfg(feature = "test-support")]
+        self.trace.push(Event {phase:"identity_provider",endpoint:label(reading),api:"NtQueryVolumeInformationFile",ok:local_npfs,status:None,error:None,observed:json!({"device_type":device.DeviceType,"characteristics":device.Characteristics,"filesystem_attributes":provider.attributes,"maximum_component_length":provider.maximum_component_length,"filesystem_name_bytes":provider.name_bytes,"filesystem_name_utf16":provider.name,"local_npfs":local_npfs})});
+        if !local_npfs {
+            return Err(invalid("unnamed pipe identity requires local NPFS"));
+        }
+        // Microsoft identifies the local pipe volume as \Device\NamedPipe and
+        // FileInternalInformation as its filesystem-specific reference number.
+        // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fltkernel/nf-fltkernel-fltcreatenamedpipefile
+        // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_internal_information
+        // Actual Windows 26100 controls show shared IDs across the two ends of
+        // CreatePipe, distinct IDs across pairs, and stable live re-queries.
+        // Keep both endpoint owners live; do not use these IDs across lifetimes.
+        let QueryOutput::Internal(first) =
+            self.query(reading, QueryOutput::Internal(Box::default()))?
+        else {
+            unreachable!()
+        };
+        let QueryOutput::Internal(second) =
+            self.query(reading, QueryOutput::Internal(Box::default()))?
+        else {
+            unreachable!()
+        };
+        let id = first.IndexNumber as u64;
+        let stable = id == second.IndexNumber as u64;
+        #[cfg(feature = "test-support")]
+        self.trace.push(Event {phase:"identity_query",endpoint:label(reading),api:"FileInternalInformation",ok:stable && id != 0 && id != u64::MAX,status:None,error:None,observed:json!({"file_id":id,"requery_file_id":second.IndexNumber as u64,"stable":stable,"local_npfs":true})});
+        if !stable || id == 0 || id == u64::MAX {
+            return Err(invalid("unsupported or unstable local pipe identity"));
+        }
+        Ok(id)
     }
     fn qualify(&mut self, reading: bool) -> io::Result<u32> {
         let kind = unsafe { GetFileType(self.handle(reading)) };

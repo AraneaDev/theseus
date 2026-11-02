@@ -264,6 +264,100 @@ fn opposite_ends_of_one_pipe_are_rejected_as_stdio_self_loop() {
             .any(|e| e["phase"] == "rejected" && e["observed"]["actual_self_loop"] == true),
         "{text}"
     );
+    #[cfg(windows)]
+    assert!(
+        events.iter().any(|event| event["phase"] == "alias_rejected"
+            && event["api"] == "FileInternalInformation"
+            && event["observed"]["input_id"]
+                .as_u64()
+                .is_some_and(|id| id != 0)
+            && event["observed"]["input_id"] == event["observed"]["output_id"]),
+        "same CreatePipe endpoints must reach the shared-ID rejection: {text}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn separate_createpipe_pairs_use_distinct_npfs_ids_and_production_transport() {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    fn pair() -> (OwnedHandle, OwnedHandle) {
+        let (mut read, mut write) = (std::ptr::null_mut(), std::ptr::null_mut());
+        assert_ne!(
+            unsafe {
+                windows_sys::Win32::System::Pipes::CreatePipe(
+                    &mut read,
+                    &mut write,
+                    std::ptr::null(),
+                    4096,
+                )
+            },
+            0
+        );
+        unsafe {
+            (
+                OwnedHandle::from_raw_handle(read),
+                OwnedHandle::from_raw_handle(write),
+            )
+        }
+    }
+    let (input, writer) = pair();
+    let (_output_peer, output) = pair();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("createpipe-identity.jsonl");
+    let mut child = Command::new(fixture())
+        .args(["stdio-preflight", "owned_io_experiment/partial-input-eof"])
+        .arg(&path)
+        .stdin(Stdio::from(input))
+        .stdout(Stdio::from(output))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut writer = Some(std::fs::File::from(writer));
+    let started = Instant::now();
+    let status = loop {
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        if text.contains("\"phase\":\"ready_idle\"")
+            && let Some(mut writer) = writer.take()
+        {
+            writer.write_all(b"abc").unwrap();
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() >= Duration::from_secs(15) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("explicit CreatePipe production transport timed out");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let text = std::fs::read_to_string(path).unwrap();
+    assert!(status.success(), "{status}: {text}");
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        events.iter().any(|e| e["phase"] == "pipe_identity"
+            && e["api"] == "FileInternalInformation"
+            && e["observed"]["distinct_local_npfs_ids"] == true),
+        "{text}"
+    );
+    assert!(
+        events
+            .iter()
+            .filter(|e| e["phase"] == "identity_provider" && e["observed"]["local_npfs"] == true)
+            .count()
+            == 2,
+        "{text}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e["phase"] == "eof" && e["observed"]["read_bytes"] == 3),
+        "{text}"
+    );
+    assert!(events.iter().any(|e| e["phase"] == "restored"), "{text}");
 }
 
 #[cfg(windows)]

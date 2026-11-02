@@ -125,6 +125,13 @@
     ],
     "server-unix": [
       "serve_roots_preserve_non_unicode_native_paths"
+    ],
+    "stdio-identity-common": [
+      "ordinary_pipes_exercise_production_pending_bytes_eof_and_shutdown",
+      "opposite_ends_of_one_pipe_are_rejected_as_stdio_self_loop"
+    ],
+    "stdio-identity-windows": [
+      "separate_createpipe_pairs_use_distinct_npfs_ids_and_production_transport"
     ]
   }
 }

@@ -43,9 +43,89 @@ pub(super) fn disjoint_unnamed(
         && input_configuration != output_configuration
 }
 
+pub(super) fn disjoint_internal_ids(
+    input_configuration: u32,
+    output_configuration: u32,
+    input: u64,
+    output: u64,
+) -> bool {
+    input_configuration <= 2
+        && output_configuration <= 2
+        && input != 0
+        && output != 0
+        && input != u64::MAX
+        && output != u64::MAX
+        && input != output
+}
+
+pub(super) fn local_npfs(
+    device: u32,
+    characteristics: u32,
+    name_bytes: u32,
+    name: &[u16; 4],
+) -> bool {
+    device == 17 // FILE_DEVICE_NAMED_PIPE
+        && characteristics & (0x10 | 0x80000) == 0 // FILE_REMOTE_DEVICE / VSMB
+        && name_bytes == 8
+        && name == &[b'N' as u16, b'P' as u16, b'F' as u16, b'S' as u16]
+}
+
+pub(super) fn complete_identity_reply(
+    status: i32,
+    completion: i32,
+    returned: usize,
+    expected: usize,
+) -> bool {
+    status == 0 && completion == 0 && returned == expected
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn internal_ids_require_known_profiles_and_distinct_supported_identity() {
+        assert!(disjoint_internal_ids(2, 2, 0x388, 0x389));
+        for (input, output) in [(0x3a7, 0x3a7), (0, 2), (2, 0), (u64::MAX, 2), (2, u64::MAX)] {
+            assert!(!disjoint_internal_ids(2, 2, input, output));
+        }
+        assert!(!disjoint_internal_ids(3, 2, 1, 2));
+        assert!(!disjoint_internal_ids(2, u32::MAX, 1, 2));
+    }
+
+    #[test]
+    fn internal_identity_domain_requires_exact_local_npfs_provider() {
+        let name = [78, 80, 70, 83];
+        assert!(local_npfs(17, 0x20000, 8, &name));
+        for (device, flags, bytes, name) in [
+            (7, 0, 8, name),
+            (17, 0x10, 8, name),
+            (17, 0x80000, 8, name),
+            (17, 0, 6, name),
+            (17, 0, 10, name),
+            (17, 0, 8, [78, 84, 70, 83]),
+        ] {
+            assert!(!local_npfs(device, flags, bytes, &name));
+        }
+    }
+
+    #[test]
+    fn identity_requires_exact_successful_completion_not_pending_or_short() {
+        for size in [8, 20] {
+            assert!(complete_identity_reply(0, 0, size, size));
+            for (status, completion, returned) in [
+                (-1, 0, size),
+                (0, -1, size),
+                (259, 0, size),
+                (0, 259, size),
+                (1, 0, size),
+                (0, 0, size - 1),
+                (0, 0, size + 1),
+            ] {
+                assert!(!complete_identity_reply(status, completion, returned, size));
+            }
+        }
+    }
 
     // Break caught: a successful zero-name FILE_NAME_INFORMATION reply is
     // structurally rejected before the separate native identity proof.
