@@ -5,6 +5,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.dont_write_bytecode = True
 
@@ -14,7 +15,53 @@ validation = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(validation)
 
 
+class StageRunner:
+    def __init__(self, evidence, env, failure=None):
+        self.evidence = evidence
+        self.env = dict(env)
+        self.failure = failure
+        self.calls = []
+
+    def cargo(self, name, *arguments, **kwargs):
+        self.calls.append((name, dict(self.env)))
+        if name.startswith('early-') and self.failure is not None:
+            raise self.failure
+
+
 class ValidationTests(unittest.TestCase):
+    def test_early_trace_is_scoped_before_later_runtime(self):
+        key = 'THESEUS_TERMINAL_TRACE'
+        for stage in ('early-controls', 'early-cli'):
+            for original in ({}, {key: 'caller-value'}, {key: ''}):
+                with self.subTest(stage=stage, original=original), tempfile.TemporaryDirectory() as temp:
+                    runner = StageRunner(pathlib.Path(temp), original)
+                    with patch.object(validation, 'load_pinned', return_value={}):
+                        validation.native(runner, stage)
+                        self.assertEqual(runner.calls[0][1][key], '1')
+                        self.assertEqual(key in runner.env, key in original)
+                        self.assertEqual(runner.env.get(key), original.get(key))
+                        validation.native(runner, 'runtime')
+                    self.assertEqual([name for name, _ in runner.calls[1:]],
+                                     ['workspace-tests', 'native-cli-terminal', 'native-explicit-terminal-controls'])
+                    for _, env in runner.calls[1:]:
+                        self.assertEqual(key in env, key in original)
+                        self.assertEqual(env.get(key), original.get(key))
+
+    def test_early_trace_restores_caller_environment_when_stage_fails(self):
+        key = 'THESEUS_TERMINAL_TRACE'
+        for stage in ('early-controls', 'early-cli'):
+            for original in ({}, {key: 'caller-value'}, {key: ''}):
+                with self.subTest(stage=stage, original=original), tempfile.TemporaryDirectory() as temp:
+                    failure = validation.GateFailure('deliberate early-stage failure')
+                    runner = StageRunner(pathlib.Path(temp), original, failure)
+                    with patch.object(validation, 'load_pinned', return_value={}):
+                        with self.assertRaises(validation.GateFailure) as caught:
+                            validation.native(runner, stage)
+                    self.assertIs(caught.exception, failure)
+                    self.assertEqual(runner.calls[0][1][key], '1')
+                    self.assertEqual(key in runner.env, key in original)
+                    self.assertEqual(runner.env.get(key), original.get(key))
+
     def test_zero_tests_cannot_pass_required_cargo_gate(self):
         self.assert_required_cases_rejected([], ['required_case'])
 

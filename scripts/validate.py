@@ -268,12 +268,26 @@ def native(runner, stage):
         if windows:
             runner.run('model-observer-controls', ['pwsh', '-NoProfile', '-File', 'tests/support/observe_conpty_model_test.ps1'])
     elif stage == 'early-controls':
+        original_trace = runner.env.get('THESEUS_TERMINAL_TRACE')
         runner.env['THESEUS_TERMINAL_TRACE'] = '1'
-        test = 'conpty_legacy_crossterm' if windows else 'pty_resize_and_single_q'
-        runner.cargo('early-native-controls', 'test', '--locked', '-p', 'theseus-host', '--features', 'test-support', '--lib', test, '--', '--nocapture', '--test-threads=1', timeout=45, required_cases=CASE_INVENTORY['native']['early-windows' if windows else 'early-unix'])
+        try:
+            test = 'conpty_legacy_crossterm' if windows else 'pty_resize_and_single_q'
+            runner.cargo('early-native-controls', 'test', '--locked', '-p', 'theseus-host', '--features', 'test-support', '--lib', test, '--', '--nocapture', '--test-threads=1', timeout=45, required_cases=CASE_INVENTORY['native']['early-windows' if windows else 'early-unix'])
+        finally:
+            if original_trace is None:
+                runner.env.pop('THESEUS_TERMINAL_TRACE', None)
+            else:
+                runner.env['THESEUS_TERMINAL_TRACE'] = original_trace
     elif stage == 'early-cli':
+        original_trace = runner.env.get('THESEUS_TERMINAL_TRACE')
         runner.env['THESEUS_TERMINAL_TRACE'] = '1'
-        runner.cargo('early-native-cli-terminal', 'test', '--locked', '--test', 'host_cli', '--test', 'host_terminal', '--', '--nocapture', '--test-threads=1', timeout=165, required_cases=CASE_INVENTORY['native']['cli-terminal'])
+        try:
+            runner.cargo('early-native-cli-terminal', 'test', '--locked', '--test', 'host_cli', '--test', 'host_terminal', '--', '--nocapture', '--test-threads=1', timeout=165, required_cases=CASE_INVENTORY['native']['cli-terminal'])
+        finally:
+            if original_trace is None:
+                runner.env.pop('THESEUS_TERMINAL_TRACE', None)
+            else:
+                runner.env['THESEUS_TERMINAL_TRACE'] = original_trace
     elif stage == 'runtime':
         runner.cargo('workspace-tests', 'test', '--locked', '--workspace', '--all-targets', '--no-fail-fast')
         runner.cargo('native-cli-terminal', 'test', '--locked', '--test', 'host_cli', '--test', 'host_terminal', '--', '--nocapture', required_cases=CASE_INVENTORY['native']['cli-terminal'])
