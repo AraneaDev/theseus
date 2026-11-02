@@ -514,13 +514,6 @@ mod tests {
         assert!(result >= 0, "CreatePseudoConsole HRESULT {result:#x}");
         trace("native-created");
         let console = PseudoConsole(hpc);
-        // CreatePseudoConsole owns its duplicates before the flood child starts.
-        trace("input-peer-drop-begin");
-        drop(input_peer);
-        trace("input-peer-drop-returned");
-        trace("output-peer-drop-begin");
-        drop(output_peer);
-        trace("output-peer-drop-returned");
         let mut command = NativeCommand::new(
             std::env::var_os("THESEUS_HOST_TEST_FIXTURE")
                 .expect("required Cargo-built native fixture"),
@@ -531,12 +524,20 @@ mod tests {
             Ok(child) => child,
             Err(mut error) => {
                 drop(output);
+                drop(output_peer);
+                drop(input_peer);
                 settle_failed_launch(&mut error);
                 drop(console);
                 panic!("{error}");
             }
         };
         trace("native-launched");
+        trace("input-peer-drop-begin");
+        drop(input_peer);
+        trace("input-peer-drop-returned");
+        trace("output-peer-drop-begin");
+        drop(output_peer);
+        trace("output-peer-drop-returned");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
         let pressure = loop {
             trace("pressure-peek-begin");
@@ -589,10 +590,10 @@ mod tests {
             }
         });
         trace("close-begin");
+        let closer = close_worker(console, Some(model.clone()));
         trace("input-close-begin");
         let closed_input = input.close();
         trace("input-close-returned");
-        let closer = close_worker(console, Some(model.clone()));
         trace("job-cleanup-begin");
         let cleanup = child.reap_and_release();
         trace("job-cleanup-returned");
