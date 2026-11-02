@@ -9,6 +9,9 @@ $theseusModelScript = Join-Path $env:RUNNER_TEMP 'theseus-close-model-observed.c
 ) | Set-Content -Encoding ascii $theseusModelScript
 $theseusModelPhases = @(
     'native-create-begin', 'native-created', 'native-launch-begin', 'native-launched',
+    'input-peer-drop-begin', 'input-peer-drop-returned',
+    'output-peer-drop-begin', 'output-peer-drop-returned',
+    'pressure-peek-begin', 'pressure-peek-returned', 'pressure-loop-complete', 'reader-spawn-begin',
     'reader-started', 'reader-eof', 'reader-error', 'close-begin',
     'input-close-begin', 'input-close-returned', 'close-worker-start',
     'close-native-begin', 'close-native-complete', 'job-cleanup-begin',
@@ -51,7 +54,7 @@ function New-TheseusModelSnapshot {
         $RunAttempt -cnotmatch '\A[1-9][0-9]{0,9}\z' -or $Ordinal -notin @(1, 2) -or $ElapsedMs -lt 0) {
         throw 'Invalid fixed MODEL checkpoint metadata'
     }
-    if ($Phases.Count -gt 21) { throw 'MODEL checkpoint phase bound exceeded' }
+    if ($Phases.Count -gt 29) { throw 'MODEL checkpoint phase bound exceeded' }
     $theseusSnapshotSeen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($theseusSnapshotPhase in $Phases) {
         if ($theseusModelPhases -cnotcontains $theseusSnapshotPhase -or -not $theseusSnapshotSeen.Add($theseusSnapshotPhase)) {
@@ -72,8 +75,8 @@ function Get-TheseusModelCheckpoint {
     param([long]$ElapsedMs, [bool]$Returned, [int]$Attempted)
     if ($ElapsedMs -lt 0 -or $Attempted -lt 0 -or $Attempted -gt 2) { throw 'Invalid MODEL checkpoint schedule' }
     if ($Returned -or $Attempted -eq 2) { return 0 }
-    if ($Attempted -eq 0 -and $ElapsedMs -ge 2000) { return 1 }
-    if ($Attempted -eq 1 -and $ElapsedMs -ge 15000) { return 2 }
+    if ($Attempted -eq 0 -and $ElapsedMs -ge 15000) { return 1 }
+    if ($Attempted -eq 1 -and $ElapsedMs -ge 30000) { return 2 }
     return 0
 }
 function Write-TheseusModelSnapshot {

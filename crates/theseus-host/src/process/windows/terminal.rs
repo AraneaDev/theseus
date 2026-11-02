@@ -532,11 +532,18 @@ mod tests {
             }
         };
         trace("native-launched");
+        trace("input-peer-drop-begin");
         drop(input_peer);
+        trace("input-peer-drop-returned");
+        trace("output-peer-drop-begin");
         drop(output_peer);
+        trace("output-peer-drop-returned");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
         let pressure = loop {
-            match output.terminal_buffered_bytes() {
+            trace("pressure-peek-begin");
+            let buffered = output.terminal_buffered_bytes();
+            trace("pressure-peek-returned");
+            match buffered {
                 Ok(bytes) if bytes >= 16384 => break Ok(bytes),
                 Ok(_) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(std::time::Duration::from_millis(2))
@@ -549,11 +556,13 @@ mod tests {
                 Err(error) => break Err(error.to_string()),
             }
         };
+        trace("pressure-loop-complete");
         // Even a failed pressure observation goes through the same real drain,
         // close and child cleanup before any assertion can unwind.
         let model = Arc::new(CloseModel::default());
         model.paused.store(true, Ordering::SeqCst);
         let observer = model.clone();
+        trace("reader-spawn-begin");
         let reader = std::thread::spawn(move || -> io::Result<usize> {
             trace("reader-started");
             let mut bytes = [0; 16384];

@@ -57,6 +57,14 @@ const TRACE_PHASES: &[&str] = &[
     "ready-flush-returned",
     "reply-flush-begin",
     "reply-flush-returned",
+    "input-peer-drop-begin",
+    "input-peer-drop-returned",
+    "output-peer-drop-begin",
+    "output-peer-drop-returned",
+    "pressure-peek-begin",
+    "pressure-peek-returned",
+    "pressure-loop-complete",
+    "reader-spawn-begin",
 ];
 fn trace_phase(phase: &str) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

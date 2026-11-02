@@ -49,7 +49,7 @@ try {
     # Pure scheduling/serialization and actual immutable files; no native owner start.
     $theseusSnapshotArguments = @{
         SourceSha = ('a' * 40); RunId = '12345'; RunAttempt = '2'; Ordinal = 1
-        ElapsedMs = 2000; LogPresent = $true; Phases = @('native-created', 'native-launched')
+        ElapsedMs = 15000; LogPresent = $true; Phases = @('native-created', 'native-launched')
     }
     $theseusSnapshot = New-TheseusModelSnapshot @theseusSnapshotArguments
     $theseusSnapshotValue = $theseusSnapshot | ConvertFrom-Json
@@ -60,6 +60,23 @@ try {
     }
     if (($theseusModelObserved -join ',') -cne 'native-created,reader-eof') {
         throw 'Actual parser lost first-observed ordering'
+    }
+    $theseusProbePhases = @('input-peer-drop-begin', 'input-peer-drop-returned',
+        'output-peer-drop-begin', 'output-peer-drop-returned', 'pressure-peek-begin',
+        'pressure-peek-returned', 'pressure-loop-complete', 'reader-spawn-begin')
+    [System.IO.File]::WriteAllText($theseusModelLog, (($theseusProbePhases | ForEach-Object {
+        "theseus-terminal pid=12 phase=$_`n"
+    }) -join ''))
+    $theseusProbeNotices = @(Publish-TheseusModelPhases)
+    if ($theseusProbeNotices.Count -ne 8 -or
+        ($theseusModelObserved.GetRange(2, 8) -join ',') -cne ($theseusProbePhases -join ',')) {
+        throw 'Actual parser lost a fixed native boundary probe'
+    }
+    $theseusAllPhaseArguments = $theseusSnapshotArguments.Clone()
+    $theseusAllPhaseArguments.Phases = $theseusModelPhases
+    $theseusAllPhases = New-TheseusModelSnapshot @theseusAllPhaseArguments | ConvertFrom-Json
+    if (($theseusAllPhases.phases -join ',') -cne ($theseusModelPhases -join ',')) {
+        throw 'Snapshot lost a fixed native boundary probe'
     }
     $theseusEmptyArguments = $theseusSnapshotArguments.Clone()
     $theseusEmptyArguments.Phases = @()
@@ -81,7 +98,7 @@ try {
     }
     foreach ($theseusInvalidPhases in @(
         @{ CasePhases = @('unknown-phase') }, @{ CasePhases = @('native-created', 'native-created') },
-        @{ CasePhases = @('reader-eof ::error::injected') }, @{ CasePhases = (@('reader-eof') * 22) }
+        @{ CasePhases = @('reader-eof ::error::injected') }, @{ CasePhases = (@('reader-eof') * 30) }
     )) {
         $theseusInvalidArguments = $theseusSnapshotArguments.Clone()
         $theseusInvalidArguments.Phases = $theseusInvalidPhases.CasePhases
@@ -90,8 +107,8 @@ try {
         if (-not $theseusRejected) { throw 'Unbounded or untrusted phases were accepted' }
     }
     foreach ($theseusScheduleCase in @(
-        @(1999, $false, 0, 0), @(2000, $false, 0, 1), @(14999, $false, 1, 0),
-        @(15000, $false, 1, 2), @(30000, $false, 2, 0), @(30000, $true, 0, 0),
+        @(2000, $false, 0, 0), @(14999, $false, 0, 0), @(15000, $false, 0, 1),
+        @(29999, $false, 1, 0), @(30000, $false, 1, 2), @(30000, $false, 2, 0), @(30000, $true, 0, 0),
         @(30000, $false, 0, 1), @(30000, $false, 1, 2)
     )) {
         if ((Get-TheseusModelCheckpoint $theseusScheduleCase[0] $theseusScheduleCase[1] $theseusScheduleCase[2]) -ne $theseusScheduleCase[3]) {
