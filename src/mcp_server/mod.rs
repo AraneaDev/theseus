@@ -16,3 +16,6 @@ pub(crate) mod status_projection;
 pub(crate) mod types;
 pub(crate) mod wire;
 pub(crate) mod worker;
+pub(crate) mod coordinator;
+pub(crate) mod shutdown;
+pub(crate) mod diagnostics;

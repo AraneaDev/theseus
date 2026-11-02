@@ -30,9 +30,10 @@ pub(crate) struct OwnedError {
     has_worker_panic: bool,
 }
 impl OwnedError {
-    /// Only the owning worker (or the caller after its actual join) may capture.
-    pub(crate) fn capture(error: QueryError) -> Self {
-        let mut owner = Self {
+    /// Retain a coordinator-origin error without formatting, source traversal,
+    /// cleanup locks or native queries. Only the finalizer may refresh it.
+    pub(crate) fn deferred(error: QueryError) -> Self {
+        Self {
             view: ErrorView {
                 code: error.code,
                 message: TextPreview::new("error diagnostic unavailable", false),
@@ -44,7 +45,11 @@ impl OwnedError {
             cleanup: CleanupFailures::default(),
             panics: Vec::new(),
             has_worker_panic: false,
-        };
+        }
+    }
+    /// Only the owning worker (or the caller after its actual join) may capture.
+    pub(crate) fn capture(error: QueryError) -> Self {
+        let mut owner = Self::deferred(error);
         owner.refresh();
         owner
     }
@@ -52,6 +57,7 @@ impl OwnedError {
     pub(crate) fn view(&self) -> &ErrorView {
         &self.view
     }
+    #[cfg(test)]
     pub(crate) fn primary(&self) -> &anyhow::Error {
         &self.error.source
     }
