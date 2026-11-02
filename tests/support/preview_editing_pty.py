@@ -192,6 +192,12 @@ def choose_name(s, source, new):
     name_in_prompt(s, source.stem + '.edited.toml', new)
 
 
+def paste_payload_boundaries(paste):
+    opening, closing = b'\x1b[200~', b'\x1b[201~'
+    assert paste.startswith(opening) and paste.endswith(closing)
+    return range(len(opening), len(paste) - len(closing) + 1)
+
+
 def preview(kind):
     root, source = fixture(kind, kind + '-preview')
     collision = root / 'occupied.toml'
@@ -207,10 +213,11 @@ def preview(kind):
         s.key(b'\x1b[200~r\nq\x1b[201~')
         s.pump()
         assert not (root / ('.theseus-runs' if kind == 'recipe' else '.theseus-comparisons')).exists()
-        # Exercise every delimiter boundary through the real terminal transport.
-        # The terminal reader must keep payload commands inert between writes.
+        # Keep delimiters whole across ConPTY writes; every payload boundary
+        # must keep commands inert. All ten delimiter splits are independently
+        # required through real native console-record batches in the host suite.
         hostile = b'\x1b[200~r\nq\x1b[201~'
-        for split in ([*range(1, 6), *range(len(hostile) - 5, len(hostile))] if os.name == 'nt' else []):
+        for split in (paste_payload_boundaries(hostile) if os.name == 'nt' else []):
             s.key(hostile[:split])
             s.pump()
             assert s.proc.poll() is None, 'partial paste quit preview'
@@ -219,6 +226,7 @@ def preview(kind):
             s.pump()
             assert s.proc.poll() is None, 'paste payload quit preview'
             assert not (root / ('.theseus-runs' if kind == 'recipe' else '.theseus-comparisons')).exists()
+            print(f'PTY preview {kind} payload split {split}: passed', flush=True)
         s.key(b'e')
         s.until('EDIT unchanged')
         s.key(b'\x1b[1;5H')  # Ctrl-Home

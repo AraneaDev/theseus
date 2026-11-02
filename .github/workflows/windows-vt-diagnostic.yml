@@ -1,6 +1,11 @@
 name: Windows VT diagnostic (not release acceptance)
 on:
   workflow_dispatch:
+    inputs:
+      collect_workspace:
+        description: Also collect the full Windows workspace and release build
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
@@ -20,7 +25,7 @@ jobs:
           "THESEUS_HOST_EVIDENCE=$theseusEvidence" >> $env:GITHUB_ENV
           python scripts/validate.py native --stage fixture --evidence $theseusEvidence --expected-host x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Repeat the unchanged fragmented-paste assertion with bounded tracing
+      - name: Required Windows input, public TUI and repeated-fragment checks
         timeout-minutes: 6
         shell: python
         run: |
@@ -38,6 +43,8 @@ jobs:
               runner = validation.Runner(evidence, deadline=time.time() + 300)
               validation.load_pinned(runner)
               runner.cargo('all-required-conpty-input-and-close', 'test', '--locked', '-p', 'theseus-host', '--features', 'test-support', '--lib', 'conpty_', '--', '--nocapture', '--test-threads=1', timeout=300, required_cases=validation.CASE_INVENTORY['native']['runtime-windows'])
+              for target, public_case in [('preview_editing_acceptance', 'public_preview_editing_pty'), ('tui', 'actual_pty_default_animation_controls_signals_and_restoration')]:
+                  runner.cargo(f'public-{target}', 'test', '--locked', '--test', target, public_case, '--', '--exact', '--nocapture', '--test-threads=1', timeout=300, required_cases=[public_case])
               case = 'process::windows::terminal::events::tests::conpty_fragmented_paste_controls_and_standalone_escape_reach_actual_reader'
               for repetition in range(1, 17):
                   runner.cargo(f'fragmented-paste-{repetition:02}', 'test', '--locked', '-p', 'theseus-host', '--features', 'test-support', '--lib', case, '--', '--exact', '--nocapture', '--test-threads=1', timeout=300, required_cases=[case])
@@ -56,14 +63,14 @@ jobs:
           retention-days: 7
           if-no-files-found: error
       - name: Collect full Windows workspace and native-control results
-        if: ${{ !cancelled() && steps.fixture.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.fixture.outcome == 'success' && inputs.collect_workspace }}
         timeout-minutes: 20
         shell: pwsh
         run: |
           python scripts/validate.py native --stage runtime --evidence $env:THESEUS_HOST_EVIDENCE --expected-host x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Collect optimized Windows build result
-        if: ${{ !cancelled() && steps.fixture.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.fixture.outcome == 'success' && inputs.collect_workspace }}
         timeout-minutes: 5
         shell: pwsh
         run: |

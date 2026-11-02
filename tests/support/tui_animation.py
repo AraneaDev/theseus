@@ -291,6 +291,21 @@ def cached_worker_error(s):
     s.key(b'q')
     s.finish(code=2)
     restored = bytes(s.data).rsplit(b'\x1b[?1049l', 1)[1]
+    if os.name == 'nt':
+        # ReportStore prints its canonical path; tempfile may retain an 8.3 alias.
+        reported_line = next((line for line in restored.splitlines()
+                              if line.startswith(b'Saved report: ')), None)
+        assert reported_line is not None, (s.name, 'missing saved report path', restored)
+        reported = pathlib.Path(reported_line.removeprefix(b'Saved report: ').split(b'\x1b', 1)[0].decode())
+        assert reported.is_absolute() and reported.name == saved.name == 'report.json', reported
+        # The original report was renamed: bind its intended replacement location,
+        # not cached-report.json, and retain the exact printed cleanup-root check.
+        assert reported.samefile(saved) and reported.parent.samefile(saved.parent), (reported, saved)
+        recovery_line = next((line.split(b'\x1b', 1)[0] for line in restored.splitlines()
+                              if line.startswith(b'Recovery: theseus cleanup ')), None)
+        expected_recovery = "Recovery: theseus cleanup '" + str(reported.parent).replace("'", "''") + "'"
+        assert recovery_line == expected_recovery.encode(), (recovery_line, expected_recovery)
+        saved = reported
     for expected in [b'Engine error:', b'Saved report:', str(saved).encode(),
                      b'Recovery: theseus cleanup', str(saved.parent).encode()]:
         assert expected in restored, (s.name, 'missing restored-terminal diagnostic', expected, restored)

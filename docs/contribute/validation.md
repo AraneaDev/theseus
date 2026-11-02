@@ -29,6 +29,8 @@ Windows VT acceptance tests preserve all ten paste-delimiter splits as separate
 batch was consumed without an event before submitting the second. A separate
 required test sends the complete paste through the ConPTY pipe and checks the
 literal Unicode/newline paste, controls, standalone Escape and mode restoration.
+The public preview test also splits every payload boundary between complete paste
+delimiters into two real pipe writes and checks that neither starts a run or quits.
 On the Windows 26100 runner, the retained diagnostic showed that splitting the
 raw pipe write after `ESC[2` lost that prefix before any native input record
 reached the reader. These tests therefore make no claim that this ConHost
