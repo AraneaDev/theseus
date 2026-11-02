@@ -74,14 +74,14 @@ pub(crate) fn run(root: &Path, mode: &str) -> io::Result<()> {
             let expected = if mode == "records" {
                 // A queued opener ESC release must be inert before escape
                 // resolution: require one literal Paste before any other keys.
-                let mut input = vec![(27, 0, 1, true), (27, 0, 1, false)];
-                input.extend(
+                let mut queued_records = vec![(27, 0, 1, true), (27, 0, 1, false)];
+                queued_records.extend(
                     "[200~r\nq\x1b[201~"
                         .encode_utf16()
                         .map(|unit| (unit, 0, 1, true)),
                 );
                 // Preserve the existing repeat/surrogate/native fallback controls.
-                input.extend([
+                queued_records.extend([
                     (120, 0, 3, true),
                     (0xd83d, 0, 1, true),
                     (0xd83d, 0, 1, false),
@@ -92,7 +92,7 @@ pub(crate) fn run(root: &Path, mode: &str) -> io::Result<()> {
                     (113, 0, 1, true),
                 ]);
                 let mut records: Vec<INPUT_RECORD> = Vec::new();
-                for (unit, vkey, repeat, down) in input {
+                for (unit, vkey, repeat, down) in queued_records {
                     let mut record: INPUT_RECORD = unsafe { std::mem::zeroed() };
                     record.EventType = KEY_EVENT as u16;
                     record.Event.KeyEvent = KEY_EVENT_RECORD {
