@@ -46,8 +46,9 @@ pulls `ubuntu:24.04` and records the exact image ID used for the MCP fixtures.
 The server suite uses the real production `serve` binary over ordinary pipes. No
 client, public MCP service, model or credentials are needed.
 
-In CI, Docker starts only after all three native host jobs pass. Its budget
-starts in the Docker job itself.
+Full CI runs the three native host jobs and the Docker job in parallel. All four
+jobs must pass on the same source. The shared Docker budget starts in the Docker
+job itself.
 
 ## Receipts and required execution
 

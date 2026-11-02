@@ -19,7 +19,8 @@ from docker_absence import require_container_absent
 binary = str(pathlib.Path(sys.argv[1]).resolve())
 case = sys.argv[2]
 repo = pathlib.Path(__file__).resolve().parents[2]
-evidence = pathlib.Path(tempfile.mkdtemp(prefix='theseus-preview-editing-task4-'))
+evidence = pathlib.Path(tempfile.mkdtemp(prefix='theseus-preview-editing-task4-',
+                                      dir=os.environ.get('THESEUS_HOST_EVIDENCE')))
 print('Evidence:', evidence, flush=True)
 
 
@@ -46,10 +47,20 @@ def assert_private_file(path):
     script = r"""
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-$acl = Get-Acl -LiteralPath $env:THESEUS_PRIVATE_FILE
+# A pwsh -> Python -> powershell.exe launch inherits PowerShell 7 module paths.
+# Pin each non-Core cmdlet to this Windows PowerShell installation instead.
+$securityModule = Import-Module -Name "$PSHOME\Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1" -PassThru -ErrorAction Stop
+$utilityModule = Import-Module -Name "$PSHOME\Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1" -PassThru -ErrorAction Stop
+$acl = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $env:THESEUS_PRIVATE_FILE
 $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
 if ($rules.Count -gt 32) { throw 'private file ACE bound exceeded' }
 $value = @{
+    observer = @{
+        edition = [string]$PSVersionTable.PSEdition
+        version = $PSVersionTable.PSVersion.ToString()
+        security_module = $securityModule.Path
+        utility_module = $utilityModule.Path
+    }
     user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     protected = $acl.AreAccessRulesProtected
     rules = @($rules | ForEach-Object { @{
@@ -59,7 +70,7 @@ $value = @{
         inherited = $_.IsInherited
     } })
 }
-$json = ConvertTo-Json -InputObject $value -Depth 4 -Compress
+$json = Microsoft.PowerShell.Utility\ConvertTo-Json -InputObject $value -Depth 4 -Compress
 if ($json.Length -gt 16384) { throw 'private file ACL receipt bound exceeded' }
 [Console]::WriteLine($json)
 """
