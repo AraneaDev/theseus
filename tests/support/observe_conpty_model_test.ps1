@@ -49,7 +49,7 @@ try {
     # Pure scheduling/serialization and actual immutable files; no native owner start.
     $theseusSnapshotArguments = @{
         SourceSha = ('a' * 40); RunId = '12345'; RunAttempt = '2'; Ordinal = 1
-        ElapsedMs = 15000; LogPresent = $true; Phases = @('native-created', 'native-launched')
+        ElapsedMs = 2000; LogPresent = $true; Phases = @('native-created', 'native-launched')
     }
     $theseusSnapshot = New-TheseusModelSnapshot @theseusSnapshotArguments
     $theseusSnapshotValue = $theseusSnapshot | ConvertFrom-Json
@@ -107,8 +107,8 @@ try {
         if (-not $theseusRejected) { throw 'Unbounded or untrusted phases were accepted' }
     }
     foreach ($theseusScheduleCase in @(
-        @(2000, $false, 0, 0), @(14999, $false, 0, 0), @(15000, $false, 0, 1),
-        @(29999, $false, 1, 0), @(30000, $false, 1, 2), @(30000, $false, 2, 0), @(30000, $true, 0, 0),
+        @(1999, $false, 0, 0), @(2000, $false, 0, 1), @(14999, $false, 1, 0),
+        @(15000, $false, 1, 2), @(30000, $false, 2, 0), @(30000, $true, 0, 0),
         @(30000, $false, 0, 1), @(30000, $false, 1, 2)
     )) {
         if ((Get-TheseusModelCheckpoint $theseusScheduleCase[0] $theseusScheduleCase[1] $theseusScheduleCase[2]) -ne $theseusScheduleCase[3]) {

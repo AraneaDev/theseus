@@ -590,10 +590,10 @@ mod tests {
             }
         });
         trace("close-begin");
-        let closer = close_worker(console, Some(model.clone()));
         trace("input-close-begin");
         let closed_input = input.close();
         trace("input-close-returned");
+        let closer = close_worker(console, Some(model.clone()));
         trace("job-cleanup-begin");
         let cleanup = child.reap_and_release();
         trace("job-cleanup-returned");

@@ -75,8 +75,8 @@ function Get-TheseusModelCheckpoint {
     param([long]$ElapsedMs, [bool]$Returned, [int]$Attempted)
     if ($ElapsedMs -lt 0 -or $Attempted -lt 0 -or $Attempted -gt 2) { throw 'Invalid MODEL checkpoint schedule' }
     if ($Returned -or $Attempted -eq 2) { return 0 }
-    if ($Attempted -eq 0 -and $ElapsedMs -ge 15000) { return 1 }
-    if ($Attempted -eq 1 -and $ElapsedMs -ge 30000) { return 2 }
+    if ($Attempted -eq 0 -and $ElapsedMs -ge 2000) { return 1 }
+    if ($Attempted -eq 1 -and $ElapsedMs -ge 15000) { return 2 }
     return 0
 }
 function Write-TheseusModelSnapshot {
