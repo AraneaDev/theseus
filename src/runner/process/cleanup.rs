@@ -653,7 +653,12 @@ pub(crate) mod io_error_boundary_tests {
             command.arg(&ready).arg(&heartbeat).arg("30000");
             let mut child = super::super::HostProcess::spawn(&command).unwrap();
             let deadline = Instant::now() + Duration::from_secs(3);
-            while !ready.exists() || !heartbeat.exists() {
+            // ready-hold publishes both paths before flushing stdout. Its first
+            // heartbeat is written only afterwards; wait for that live-loop proof
+            // before transferring the child and dropping the unused pipe readers.
+            while !ready.exists()
+                || std::fs::metadata(&heartbeat).map_or(true, |metadata| metadata.len() == 0)
+            {
                 assert!(Instant::now() < deadline);
                 std::thread::sleep(Duration::from_millis(1));
             }

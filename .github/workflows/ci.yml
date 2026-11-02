@@ -50,6 +50,23 @@ jobs:
             native_os_version = [Environment]::OSVersion.Version.ToString()
             native_os_build = [Environment]::OSVersion.Version.Build
           } | ConvertTo-Json | Tee-Object -FilePath (Join-Path $theseusHostEvidence 'runner.json')
+      - name: Diagnose Windows pipe identities
+        if: ${{ runner.os == 'Windows' }}
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          $theseusPipeEvidence = Join-Path $env:THESEUS_HOST_EVIDENCE 'windows-pipe-identity'
+          python tests/support/windows_pipe_identity_probe.py --output $theseusPipeEvidence
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload Windows pipe identity diagnostics
+        if: ${{ always() && runner.os == 'Windows' }}
+        timeout-minutes: 1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-pipe-identity-diagnostic
+          path: ${{ env.THESEUS_HOST_EVIDENCE }}/windows-pipe-identity
+          retention-days: 7
+          if-no-files-found: error
       - name: Build trusted native application fixture
         shell: pwsh
         run: |

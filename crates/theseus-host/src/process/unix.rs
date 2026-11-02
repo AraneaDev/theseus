@@ -105,19 +105,30 @@ impl OwnedChild {
 
     /// Signal the group before its leader is reaped. ECHILD permanently disarms it.
     pub fn terminate_owned(&mut self) -> io::Result<()> {
+        self.terminate_owned_after_observation(
+            #[cfg(test)]
+            |_, _| {},
+        )
+    }
+
+    fn terminate_owned_after_observation(
+        &mut self,
+        #[cfg(test)] after_observation: impl FnOnce(&mut Self, bool),
+    ) -> io::Result<()> {
         if self.group.is_none() || self.termination_requested {
             return Ok(());
         }
-        #[cfg(target_os = "macos")]
-        let exited = self.exited_reserved()?;
-        #[cfg(not(target_os = "macos"))]
-        self.exited_reserved()?;
+        let _exited = self.exited_reserved()?;
+        #[cfg(test)]
+        after_observation(self, _exited);
         let group = self.group.expect("reserved after observation");
         match kill_process_group(group, Signal::KILL) {
             Ok(()) | Err(rustix::io::Errno::SRCH) => {}
             #[cfg(target_os = "macos")]
             Err(rustix::io::Errno::PERM)
-                if exited && only_reserved_leader(group) && self.exited_reserved()? => {}
+                // The child may exit after the initial observation but before
+                // killpg. Prove its current waitable, leader-only state afresh.
+                if self.exited_reserved()? && only_reserved_leader(group) && self.exited_reserved()? => {}
             Err(error) => return Err(error.into()),
         }
         // Repeated cleanup polls must not reissue an accepted termination request.
@@ -226,6 +237,46 @@ mod tests {
             !only_reserved_leader(group),
             "zero/absent group must not count as a complete observation"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_exit_after_initial_observation_uses_fresh_reserved_group_proof() {
+        use std::time::{Duration, Instant};
+        let (input, release) = std::io::pipe().unwrap();
+        let command = NativeCommand {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "read token".into()],
+            cwd: None,
+            environment: ChildEnvironment::Inherit,
+        };
+        let mut child = OwnedChild::spawn_files(
+            &command,
+            Some(std::os::fd::OwnedFd::from(input).into()),
+            None,
+            None,
+        )
+        .unwrap();
+        child
+            .terminate_owned_after_observation(move |child, was_exited| {
+                assert!(
+                    !was_exited,
+                    "open stdin keeps the child alive at the first observation"
+                );
+                drop(release);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !child.exited_reserved().unwrap() {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert_eq!(
+                    kill_process_group(child.group.unwrap(), Signal::KILL),
+                    Err(rustix::io::Errno::PERM)
+                );
+            })
+            .unwrap();
+        assert!(child.termination_requested);
+        assert_eq!(child.reap_and_release().unwrap().code(), Some(1));
     }
 
     #[cfg(target_os = "macos")]
