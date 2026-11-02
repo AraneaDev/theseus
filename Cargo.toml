@@ -10,6 +10,14 @@ edition = "2024"
 license = "MIT"
 description = "Installation lifecycle workbench with Docker evidence and a terminal UI"
 
+[features]
+mcp-test-support = ["theseus-host/test-support"]
+
+[[bin]]
+name = "theseus-mcp-fixture"
+path = "src/bin/theseus-mcp-fixture.rs"
+required-features = ["mcp-test-support"]
+
 [dependencies]
 theseus-host = { path = "crates/theseus-host" }
 anyhow = "1.0.104"

@@ -245,7 +245,7 @@ impl QueryWorker {
             Ok(()) => Ok(()),
         })
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "mcp-test-support"))]
     pub(super) fn spawn_executor(
         executor: impl FnMut(QueryWork, &CancellationToken) -> Result<QueryValue, QueryError>
         + Send

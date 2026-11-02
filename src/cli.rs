@@ -24,6 +24,15 @@ pub struct Cli {
 }
 #[derive(Debug, Subcommand)]
 pub enum Action {
+    /// Serve the local six-tool MCP facade over ordinary stdio pipes.
+    Serve {
+        #[arg(long)]
+        project_root: PathBuf,
+        #[arg(long)]
+        output_root: PathBuf,
+        #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u64).range(1..=86400))]
+        max_run_seconds: u64,
+    },
     Init,
     Validate {
         #[arg(long, default_value = "theseus.toml")]
@@ -88,6 +97,11 @@ pub fn execute(cli: Cli) -> Result<i32> {
         enabled: !cli.no_animation,
     };
     match cli.command {
+        Some(Action::Serve {
+            project_root,
+            output_root,
+            max_run_seconds,
+        }) => Ok(serve(&project_root, &output_root, max_run_seconds)),
         None => {
             crate::tui::terminal::require_tty()?;
             let recipe = recipe::load(std::path::Path::new("theseus.toml"))?;
@@ -318,6 +332,47 @@ fn write_comparison_json(
     output.write_all(b"\n")?;
     Ok(())
 }
+/// Serve has its own quiet binary boundary: errors never enter the CLI printer.
+fn serve(project_root: &Path, output_root: &Path, max_run_seconds: u64) -> i32 {
+    use crate::mcp_server::{
+        coordinator::{IDLE_WAIT, ServerRuntime},
+        diagnostics,
+        roots::Roots,
+        shutdown::RuntimeAction,
+        types::Instance,
+    };
+    use std::{sync::Arc, time::Instant};
+    diagnostics::install_quiet_panic_hook();
+    let mut random = [0u8; 16];
+    if theseus_host::random_bytes(&mut random).is_err() {
+        return 2;
+    }
+    let instance = Instance::parse(&format!("{:032x}", u128::from_be_bytes(random)))
+        .expect("random instance encoding");
+    let stop = CancellationToken::default();
+    let Ok(_signals) = theseus_host::cancel::CancellationRegistration::install(stop.flag()) else {
+        return 2;
+    };
+    let roots = Roots::open(project_root, output_root).map(Arc::new);
+    let transport = theseus_host::stdio::Stdio::acquire();
+    let mut runtime = ServerRuntime::new(
+        transport,
+        roots,
+        instance,
+        max_run_seconds,
+        stop,
+        Instant::now(),
+    );
+    loop {
+        match runtime.poll(Instant::now()) {
+            RuntimeAction::Continue => std::thread::sleep(IDLE_WAIT),
+            RuntimeAction::OrderlyExit(code) => return code,
+            // Runtime and all unresolved native owners stay live until process death.
+            RuntimeAction::ForceProcessExit(code) => std::process::exit(code),
+        }
+    }
+}
+
 #[cfg(test)]
 mod bounded_comparison_json_tests {
     use super::*;

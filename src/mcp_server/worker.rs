@@ -184,6 +184,44 @@ impl EngineWorker {
         })
     }
 
+    /// Fixed supervised fixture: real retained thread, deliberately no engine execution.
+    #[cfg(feature = "mcp-test-support")]
+    pub(super) fn fixture_thread(stuck: bool, finalizer: bool) -> Result<Self, QueryError> {
+        let handle = Handle::parse("0123456789abcdef0123456789abcdef:1").expect("fixture handle");
+        let worker_handle = handle.clone();
+        let (entered, ready) = std::sync::mpsc::sync_channel(1);
+        let thread = thread::Builder::new()
+            .name("theseus-fixed-fixture".into())
+            .spawn(move || {
+                entered.send(()).expect("supervisor retains setup receiver");
+                if stuck {
+                    loop {
+                        thread::park();
+                    }
+                }
+                if finalizer {
+                    WorkerCompletion::Finalizer { owners: Vec::new() }
+                } else {
+                    WorkerCompletion::Engine(EngineCompletion {
+                        handle: worker_handle,
+                        result: Err(OwnedError::capture(failure(anyhow::anyhow!(
+                            "fixed fixture completed"
+                        )))),
+                    })
+                }
+            })
+            .map_err(|error| failure(error.into()))?;
+        ready.recv().expect("fixed worker entered");
+        Ok(Self {
+            owner: Some(Box::new(WorkerOwner {
+                thread: Some(thread),
+                bindings: Arc::new(Mutex::new(Bindings::default())),
+                handle: (!finalizer).then_some(handle),
+                finalizer_handoff: None,
+            })),
+        })
+    }
+
     #[cfg(test)]
     fn spawn_with_environment<E: Environment + 'static>(
         handle: Handle,
@@ -276,6 +314,7 @@ impl Observer {
     }
 }
 
+#[allow(clippy::result_large_err, reason = "original error authority transfers directly through the frozen worker handoff")]
 fn execute<E: Environment>(
     recipe: ValidatedRecipe,
     options: RunOptions,

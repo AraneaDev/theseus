@@ -16,6 +16,8 @@ pub mod tui;
 pub(crate) mod shell;
 
 pub mod mcp;
-#[allow(dead_code, reason = "MCP core is integrated by subsequent roadmap tasks")]
 mod mcp_server;
 mod strict_json;
+
+#[cfg(feature = "mcp-test-support")]
+pub use mcp_server::coordinator::fixture::main as mcp_fixture_main;
