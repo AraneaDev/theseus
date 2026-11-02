@@ -314,7 +314,10 @@ impl Observer {
     }
 }
 
-#[allow(clippy::result_large_err, reason = "original error authority transfers directly through the frozen worker handoff")]
+#[allow(
+    clippy::result_large_err,
+    reason = "original error authority transfers directly through the frozen worker handoff"
+)]
 fn execute<E: Environment>(
     recipe: ValidatedRecipe,
     options: RunOptions,
