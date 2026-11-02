@@ -15,11 +15,11 @@ const RECIPE: &str = include_str!("fixtures/recipes/v2_clean.toml");
 fn relative_recipes_resolve_at_manifest_parent_and_validate_before_running() {
     let (d, p) = fixture(SUITE, RECIPE);
     let suite = load(&p).unwrap();
-    assert_eq!(suite.project_root, d.path());
+    assert_eq!(suite.project_root, d.path().canonicalize().unwrap());
     assert_eq!(suite.variants.len(), 2);
     assert_eq!(
         suite.variants[0].recipe.path,
-        d.path().join("recipes/a.toml")
+        d.path().join("recipes/a.toml").canonicalize().unwrap()
     );
 }
 #[test]

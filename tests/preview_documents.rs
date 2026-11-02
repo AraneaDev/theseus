@@ -228,6 +228,10 @@ fn save_rejects_bad_names_collisions_and_invalid_drafts_without_creation() {
     fs::write(&existing, "sentinel").unwrap();
     let link = dir.path().canonicalize().unwrap().join("link.toml");
     symlink(&existing, &link).unwrap();
+    // Windows may return the link's print-name without the canonical verbatim prefix.
+    // Preserve its exact stored spelling and independently check full target identity.
+    let original_link_target = fs::read_link(&link).unwrap();
+    assert_eq!(link.canonicalize().unwrap(), existing);
     for name in [
         "",
         ".",
@@ -250,7 +254,8 @@ fn save_rejects_bad_names_collisions_and_invalid_drafts_without_creation() {
             .is_err()
     );
     assert_eq!(fs::read_to_string(&existing).unwrap(), "sentinel");
-    assert_eq!(fs::read_link(&link).unwrap(), existing);
+    assert_eq!(fs::read_link(&link).unwrap(), original_link_target);
+    assert_eq!(link.canonicalize().unwrap(), existing);
     draft.text = "not = [toml".into();
     assert!(draft.validate().is_err());
     assert!(draft.save_copy("invalid.toml").is_err());

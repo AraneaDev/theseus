@@ -471,6 +471,24 @@ fn run(args: &[OsString]) -> FixtureResult {
 }
 
 fn main() {
+    #[cfg(all(windows, feature = "test-support"))]
+    if env::args_os().nth(1).as_deref() == Some(OsStr::new("terminal-vt-events")) {
+        let arguments = env::args_os().skip(2).collect::<Vec<_>>();
+        let result = match arguments.as_slice() {
+            [root, mode] => theseus_host::process::terminal::run_vt_event_fixture(
+                std::path::Path::new(root),
+                mode.to_str().unwrap_or(""),
+            ),
+            _ => Err(invalid(
+                "fixed VT fixture requires owned directory and mode",
+            )),
+        };
+        if let Err(error) = result {
+            eprintln!("terminal VT fixture: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
     #[cfg(all(unix, feature = "test-support"))]
     if env::args_os().nth(1).as_deref() == Some(OsStr::new("terminal-events")) {
         let arguments = env::args_os().skip(2).collect::<Vec<_>>();

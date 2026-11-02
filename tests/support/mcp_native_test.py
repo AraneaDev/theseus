@@ -89,7 +89,10 @@ class WireOracle(unittest.TestCase):
             self.assertEqual(ready['stderr_path'], str(log))
             self.assertEqual(ready['request']['id'], 'theseus-discover-1')
             self.assertEqual(ready['stdout_bytes_at_ready'], 0)
-            log.rename(root / 'c019-stdout.log')
+            # Poison the wrong stream even when its empty capture already exists.
+            log.replace(root / 'c019-stdout.log')
+            self.assertFalse(log.exists())
+            self.assertEqual((root / 'c019-stdout.log').read_bytes(), marker)
             self.assertIsNone(native.direct_ready(root, 'unique', '2026-07-28'))
 
 class CurrentDetailOracle(unittest.TestCase):

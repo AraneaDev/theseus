@@ -259,7 +259,7 @@ fn observed_text(value: &serde_json::Value, limit: usize) -> String {
         .map(|s| Record::Text(s).summary(limit))
         .unwrap_or_else(|| "<non-string>".into())
 }
-// Stream POSIX quoting before projection; source paths can be large stored fields.
+// Stream host-shell quoting before projection; source paths can be large stored fields.
 fn shell_path(out: &mut dyn Write, root: &Path, relative: Option<&str>) -> fmt::Result {
     let root = root.to_string_lossy();
     let chars = || {
@@ -276,7 +276,11 @@ fn shell_path(out: &mut dyn Write, root: &Path, relative: Option<&str>) -> fmt::
     }
     for c in chars() {
         if c == '\'' {
+            #[cfg(unix)]
             out.write_str("'\"'\"'")?;
+            // Windows recovery commands target PowerShell single-quoted arguments.
+            #[cfg(windows)]
+            out.write_str("''")?;
         } else {
             out.write_char(c)?;
         }

@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use super::windows_vt::VtInput;
+
 use crossterm_winapi::{Console, Handle, InputRecord};
 
 use crate::event::{
@@ -21,6 +23,8 @@ pub(crate) struct WindowsEventSource {
     poll: WinApiPoll,
     surrogate_buffer: Option<u16>,
     mouse_buttons_pressed: MouseButtonsPressed,
+    vt: VtInput,
+    pending_record: Option<InputRecord>,
 }
 
 impl WindowsEventSource {
@@ -36,20 +40,71 @@ impl WindowsEventSource {
 
             surrogate_buffer: None,
             mouse_buttons_pressed: MouseButtonsPressed::default(),
+            vt: VtInput::default(),
+            pending_record: None,
         })
     }
 }
 
 impl EventSource for WindowsEventSource {
     fn try_read(&mut self, timeout: Option<Duration>) -> std::io::Result<Option<InternalEvent>> {
+        self.vt.check()?;
         let poll_timeout = PollTimeout::new(timeout);
 
         loop {
-            if let Some(event_ready) = self.poll.poll(poll_timeout.leftover())? {
+            // ReadConsoleInput preserves native resize/mouse records in VT mode.
+            // A complete ConPTY escape sequence is enqueued under the console
+            // lock. Queue availability, not a delay, distinguishes lone Escape.
+            if self.pending_record.is_none() && self.console.number_of_console_input_events()? == 0
+            {
+                if let Some(event) = self.vt.finish_escape()? {
+                    return Ok(Some(event));
+                }
+            }
+            let ready = if self.pending_record.is_some() {
+                Some(true)
+            } else {
+                self.poll.poll(poll_timeout.leftover())?
+            };
+            if let Some(event_ready) = ready {
                 let number = self.console.number_of_console_input_events()?;
-                if event_ready && number != 0 {
-                    let event = match self.console.read_single_input_event()? {
+                if event_ready && (number != 0 || self.pending_record.is_some()) {
+                    let record = match self.pending_record.take() {
+                        Some(record) => record,
+                        None => self.console.read_single_input_event()?,
+                    };
+                    // Raw releases are inert even with a buffered Esc: they
+                    // must not split an already queued paste opener into keys.
+                    // Actual native events must not overtake a preceding Esc.
+                    if !matches!(&record, InputRecord::KeyEvent(key) if key.virtual_key_code == 0) {
+                        if let Some(event) = self.vt.finish_escape()? {
+                            self.pending_record = Some(record);
+                            return Ok(Some(event));
+                        }
+                    }
+                    let event = match record {
+                        InputRecord::KeyEvent(mut record)
+                            if record.key_down && record.virtual_key_code == 0 =>
+                        {
+                            let unit = record.u_char;
+                            if record.repeat_count > 1 {
+                                record.repeat_count -= 1;
+                                self.pending_record = Some(InputRecord::KeyEvent(record));
+                            }
+                            let more = self.pending_record.is_some()
+                                || self.console.number_of_console_input_events()? != 0;
+                            if let Some(event) = self.vt.push(unit, more)? {
+                                return Ok(Some(event));
+                            }
+                            None
+                        }
+                        InputRecord::KeyEvent(record) if record.virtual_key_code == 0 => None,
                         InputRecord::KeyEvent(record) => {
+                            // Preserve the legacy native decoder, but never let
+                            // a non-VT key escape an unfinished paste/sequence.
+                            if record.key_down && self.vt.pending() {
+                                return Err(self.vt.reject());
+                            }
                             handle_key_event(record, &mut self.surrogate_buffer)
                         }
                         InputRecord::MouseEvent(record) => {

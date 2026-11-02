@@ -22,16 +22,41 @@ fn screen(app: &App, width: u16, height: u16) -> String {
         .map(|c| c.symbol())
         .collect()
 }
+// Independent expected host-shell quoting; command execution below also checks
+// that apostrophes, spaces and metacharacters survive as a single native argument.
+fn shell_path(path: &std::path::Path) -> String {
+    let text = path.to_string_lossy();
+    if !text.is_empty()
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/_-.".contains(&b))
+    {
+        return text.into_owned();
+    }
+    #[cfg(unix)]
+    let escaped = text.replace('\'', "'\"'\"'");
+    #[cfg(windows)]
+    let escaped = text.replace('\'', "''");
+    format!("'{escaped}'")
+}
+
+fn source_report_path(root: &std::path::Path, variant: &str) -> std::path::PathBuf {
+    // SourceReference paths are portable recorded keys, appended unchanged by the display.
+    std::path::PathBuf::from(format!(
+        "{}/sources/{variant}/run-{variant}/report.json",
+        root.display()
+    ))
+}
+
 // These two overview assertions require complete native commands in the 60%
 // records pane. Narrow/detail reachability tests keep their fixed dimensions.
 fn overview_width(root: &std::path::Path) -> u16 {
-    let quoted_root = root.to_string_lossy().replace('\'', "'\"'\"'");
+    let quoted_root = shell_path(root);
+    let quoted_report = shell_path(&source_report_path(root, "archive"));
     let records = [
-        format!(
-            "Source logs/commands: theseus report '{quoted_root}/sources/archive/run-archive/report.json'"
-        ),
-        format!("Recovery: theseus cleanup '{quoted_root}'"),
-        format!("Complete evidence: theseus comparison '{quoted_root}' --json"),
+        format!("Source logs/commands: theseus report {quoted_report}"),
+        format!("Recovery: theseus cleanup {quoted_root}"),
+        format!("Complete evidence: theseus comparison {quoted_root} --json"),
     ];
     let cells = records
         .iter()
@@ -207,11 +232,14 @@ fn large_difference_display_keeps_all_differences_and_full_source_fields_reachab
     let mut app = App::comparison_offline(document, root.clone());
     let text = screen(&app, overview_width(&root), 70);
     for expected in [
-        "sources/copy/run-copy/report.json",
-        "theseus cleanup",
-        &format!("theseus comparison {} --json", root.display()),
+        format!(
+            "theseus report {}",
+            shell_path(&source_report_path(&root, "copy"))
+        ),
+        format!("theseus cleanup {}", shell_path(&root)),
+        format!("theseus comparison {} --json", shell_path(&root)),
     ] {
-        assert!(text.contains(expected), "missing {expected}");
+        assert!(text.contains(&expected), "missing {expected}");
     }
     assert!(!text.contains("tail-that-must-be-elided"));
     key(&mut app, KeyCode::Tab);
@@ -246,7 +274,7 @@ fn displayed_commands_preserve_spaced_quoted_shell_paths() {
     let parent = t.path().join("space ' $(touch INJECTED) ;");
     fs::create_dir(&parent).unwrap();
     let root = support::saved(&parent);
-    let app = App::comparison_offline(comparison::load_document(&root).unwrap(), root);
+    let app = App::comparison_offline(comparison::load_document(&root).unwrap(), root.clone());
     let text = screen(&app, 600, 70);
     let bin = t.path().join("bin");
     fs::create_dir(&bin).unwrap();
@@ -255,10 +283,25 @@ fn displayed_commands_preserve_spaced_quoted_shell_paths() {
         bin.join(format!("theseus{}", std::env::consts::EXE_SUFFIX)),
     )
     .unwrap();
-    for (prefix, suffix) in [
-        ("Source logs/commands: ", " --json"),
-        ("Recovery: ", ""),
-        ("Complete evidence: ", ""),
+    for (prefix, suffix, expected) in [
+        (
+            "Source logs/commands: ",
+            " --json",
+            format!(
+                "theseus report {}",
+                shell_path(&source_report_path(&root, "copy"))
+            ),
+        ),
+        (
+            "Recovery: ",
+            "",
+            format!("theseus cleanup {}", shell_path(&root)),
+        ),
+        (
+            "Complete evidence: ",
+            "",
+            format!("theseus comparison {} --json", shell_path(&root)),
+        ),
     ] {
         let command = text
             .split(prefix)
@@ -268,6 +311,10 @@ fn displayed_commands_preserve_spaced_quoted_shell_paths() {
             .next()
             .unwrap()
             .trim();
+        assert_eq!(
+            command, expected,
+            "complete native command must be reachable"
+        );
         let out = native::shell(&format!("{command}{suffix}"))
             .env(
                 "PATH",

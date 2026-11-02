@@ -76,6 +76,12 @@ class Screen:
                     for column in range(self.columns):
                         if first == 2 or first == 0 and column >= self.column or first == 1 and column <= self.column:
                             self.cells.pop((self.row, column), None)
+                elif command == 'X':
+                    # ConPTY emits ECH for blank runs in frame differences.
+                    # Erase from the cursor, bounded by this row, without motion.
+                    self.wrap_pending = False
+                    for column in range(self.column, min(self.columns, self.column + (first or 1))):
+                        self.cells.pop((self.row, column), None)
                 elif command in ['A', 'B', 'C', 'D']:
                     self.wrap_pending = False
                     amount = first or 1

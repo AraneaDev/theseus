@@ -150,6 +150,8 @@ impl Guard {
         let snapshot = Arc::new(theseus_host::console::ConsoleModeSnapshot::capture()?);
         #[cfg(windows)]
         let preparation = snapshot.clone();
+        #[cfg(windows)]
+        let input_mode = snapshot.clone();
         let guard = Self {
             state: Arc::new(Restoration {
                 step: Box::new(restore_step),
@@ -176,6 +178,8 @@ impl Guard {
         // mutation, including a partially successful initialization error.
         let terminal = guard.initialize(|| {
             enable_raw_mode()?;
+            #[cfg(windows)]
+            input_mode.enable_vt_input()?;
             execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
             Ok(ratatui::Terminal::new(
                 ratatui::backend::CrosstermBackend::new(io::stdout()),

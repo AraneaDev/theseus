@@ -3,7 +3,8 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::windows::io::AsRawHandle;
 use windows_sys::Win32::System::Console::{
-    ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, SetConsoleMode,
+    ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode,
+    SetConsoleMode,
 };
 
 pub struct ConsoleModeSnapshot {
@@ -45,6 +46,16 @@ impl ConsoleModeSnapshot {
             input_mode,
             output_mode,
         })
+    }
+    /// Preserve VT input boundaries for the application's record-aware reader.
+    /// The captured original mode is restored even after partial initialization.
+    pub fn enable_vt_input(&self) -> io::Result<()> {
+        let current = mode(&self.input, "read console VT input mode")?;
+        set(
+            &self.input,
+            current | ENABLE_VIRTUAL_TERMINAL_INPUT,
+            "enable console VT input",
+        )
     }
     /// Prepare only unfinished escape cleanup on this retained output handle.
     /// The caller must restore the exact snapshot last, including on failure.

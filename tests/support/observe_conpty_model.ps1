@@ -4,7 +4,7 @@ $theseusModelLog = Join-Path $env:THESEUS_HOST_EVIDENCE 'early-native-conpty-clo
 $theseusModelScript = Join-Path $env:RUNNER_TEMP 'theseus-close-model-observed.cmd'
 @(
     '@echo off'
-    'cargo test --locked -p theseus-host --features test-support --lib conpty_backpressure_close_model -- --nocapture --test-threads=1 > "%THESEUS_HOST_EVIDENCE%\early-native-conpty-close-model.log" 2>&1'
+    'cargo test --locked -p theseus-host --features test-support --lib conpty_ -- --nocapture --test-threads=1 > "%THESEUS_HOST_EVIDENCE%\early-native-conpty-close-model.log" 2>&1'
     'exit /b %ERRORLEVEL%'
 ) | Set-Content -Encoding ascii $theseusModelScript
 $theseusModelPhases = @(

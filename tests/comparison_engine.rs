@@ -348,6 +348,7 @@ fn source_reference_save_failure_at_started_prevents_even_prepare_and_exposes_re
     let (_t, suite, options) = fixture();
     let mut fake = Fake::default();
     let mut path = None;
+    let mut source_recovery = None;
     let result = comparison::run_with(
         &suite,
         options,
@@ -360,6 +361,25 @@ fn source_reference_save_failure_at_started_prevents_even_prepare_and_exposes_re
                 .is_some_and(|e| e.kind == EventKind::Started)
             {
                 path = Some(event.report_path.clone());
+                let run_id = event
+                    .source
+                    .as_ref()
+                    .unwrap()
+                    .report_path
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap();
+                // Persisted source references have portable forward slashes.
+                source_recovery = Some(
+                    event
+                        .report_path
+                        .parent()
+                        .unwrap()
+                        .join(format!("sources/copy/{run_id}")),
+                );
                 fs::remove_file(&event.report_path).unwrap();
                 fs::create_dir(&event.report_path).unwrap();
             }
@@ -372,11 +392,7 @@ fn source_reference_save_failure_at_started_prevents_even_prepare_and_exposes_re
     assert_eq!(fake.creates, 0);
     assert_eq!(fake.prepares, 0);
     assert!(error.contains(path.unwrap().to_str().unwrap()));
-    assert!(error.contains(&format!(
-        "sources{}copy{}",
-        std::path::MAIN_SEPARATOR,
-        std::path::MAIN_SEPARATOR
-    )));
+    assert!(error.contains(&source_recovery.unwrap().display().to_string()));
 }
 #[test]
 fn output_symlink_parent_is_rejected_before_mutation() {

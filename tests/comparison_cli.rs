@@ -106,7 +106,7 @@ fn headless_compare_records_single_source_failure_and_suite_recovery_without_doc
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(roots.len(), 1);
-    let root = roots[0].path();
+    let root = roots[0].path().canonicalize().unwrap();
     let r = theseus::comparison::load_report(&root).unwrap();
     assert_eq!(r.outcome, theseus::model::RunOutcome::Incomplete);
     assert!(r.sources[0].report_path.is_some());
@@ -114,11 +114,8 @@ fn headless_compare_records_single_source_failure_and_suite_recovery_without_doc
     assert!(r.sources[1].report_path.is_none());
     let error = String::from_utf8_lossy(&out.stderr);
     assert!(error.contains(&root.display().to_string()));
-    assert!(error.contains(&format!(
-        "sources{}copy{}",
-        std::path::MAIN_SEPARATOR,
-        std::path::MAIN_SEPARATOR
-    )));
+    let source_report = root.join(r.sources[0].report_path.as_ref().unwrap());
+    assert!(error.contains(&source_report.display().to_string()));
     assert!(!out.stderr.contains(&0x1b));
     assert!(!t.path().join(".theseus-runs").exists());
 }

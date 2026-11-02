@@ -7,6 +7,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crossterm_winapi::{ConsoleMode, Handle};
 
 pub(crate) mod parse;
+// Reuse the VT grammar without changing Windows' native event/query API.
+#[path = "unix/parse.rs"]
+pub(crate) mod vt;
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum VtEvent {
+    Event(crate::event::Event),
+    CursorPosition(u16, u16),
+    KeyboardEnhancementFlags(crate::event::KeyboardEnhancementFlags),
+    PrimaryDeviceAttributes,
+}
 pub(crate) mod poll;
 #[cfg(feature = "event-stream")]
 pub(crate) mod waker;

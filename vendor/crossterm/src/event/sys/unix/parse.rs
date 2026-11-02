@@ -5,7 +5,10 @@ use crate::event::{
     MediaKeyCode, ModifierKeyCode, MouseButton, MouseEvent, MouseEventKind,
 };
 
+#[cfg(unix)]
 use super::super::super::InternalEvent;
+#[cfg(windows)]
+use crate::event::sys::windows::VtEvent as InternalEvent;
 
 // Event parsing
 //
@@ -96,7 +99,7 @@ pub(crate) fn parse_event(
         // newlines as input is because the terminal converts \r into \n for us. When we
         // enter raw mode, we disable that, so \n no longer has any meaning - it's better to
         // use Ctrl+J. Waiting to handle it here means it gets picked up later
-        b'\n' if !crate::terminal::sys::is_raw_mode_enabled() => Ok(Some(InternalEvent::Event(
+        b'\n' if !crate::terminal::is_raw_mode_enabled()? => Ok(Some(InternalEvent::Event(
             Event::Key(KeyCode::Enter.into()),
         ))),
         b'\t' => Ok(Some(InternalEvent::Event(Event::Key(KeyCode::Tab.into())))),
@@ -250,8 +253,12 @@ pub(crate) fn parse_csi_cursor_position(buffer: &[u8]) -> io::Result<Option<Inte
 
     let mut split = s.split(';');
 
-    let y = next_parsed::<u16>(&mut split)? - 1;
-    let x = next_parsed::<u16>(&mut split)? - 1;
+    let y = next_parsed::<u16>(&mut split)?
+        .checked_sub(1)
+        .ok_or_else(could_not_parse_event_error)?;
+    let x = next_parsed::<u16>(&mut split)?
+        .checked_sub(1)
+        .ok_or_else(could_not_parse_event_error)?;
 
     Ok(Some(InternalEvent::CursorPosition(x, y)))
 }
@@ -549,7 +556,7 @@ pub(crate) fn parse_csi_u_encoded_key_code(buffer: &[u8]) -> io::Result<Option<I
                     // newlines as input is because the terminal converts \r into \n for us. When we
                     // enter raw mode, we disable that, so \n no longer has any meaning - it's better to
                     // use Ctrl+J. Waiting to handle it here means it gets picked up later
-                    '\n' if !crate::terminal::sys::is_raw_mode_enabled() => KeyCode::Enter,
+                    '\n' if !crate::terminal::is_raw_mode_enabled()? => KeyCode::Enter,
                     '\t' => {
                         if modifiers.contains(KeyModifiers::SHIFT) {
                             KeyCode::BackTab
@@ -676,8 +683,12 @@ pub(crate) fn parse_csi_rxvt_mouse(buffer: &[u8]) -> io::Result<Option<InternalE
         .ok_or_else(could_not_parse_event_error)?;
     let (kind, modifiers) = parse_cb(cb)?;
 
-    let cx = next_parsed::<u16>(&mut split)? - 1;
-    let cy = next_parsed::<u16>(&mut split)? - 1;
+    let cx = next_parsed::<u16>(&mut split)?
+        .checked_sub(1)
+        .ok_or_else(could_not_parse_event_error)?;
+    let cy = next_parsed::<u16>(&mut split)?
+        .checked_sub(1)
+        .ok_or_else(could_not_parse_event_error)?;
 
     Ok(Some(InternalEvent::Event(Event::Mouse(MouseEvent {
         kind,
@@ -704,8 +715,16 @@ pub(crate) fn parse_csi_normal_mouse(buffer: &[u8]) -> io::Result<Option<Interna
     // See http://www.xfree86.org/current/ctlseqs.html#Mouse%20Tracking
     // The upper left character position on the terminal is denoted as 1,1.
     // Subtract 1 to keep it synced with cursor
-    let cx = u16::from(buffer[4].saturating_sub(32)) - 1;
-    let cy = u16::from(buffer[5].saturating_sub(32)) - 1;
+    let cx = u16::from(
+        buffer[4]
+            .checked_sub(33)
+            .ok_or_else(could_not_parse_event_error)?,
+    );
+    let cy = u16::from(
+        buffer[5]
+            .checked_sub(33)
+            .ok_or_else(could_not_parse_event_error)?,
+    );
 
     Ok(Some(InternalEvent::Event(Event::Mouse(MouseEvent {
         kind,
@@ -734,8 +753,12 @@ pub(crate) fn parse_csi_sgr_mouse(buffer: &[u8]) -> io::Result<Option<InternalEv
     // See http://www.xfree86.org/current/ctlseqs.html#Mouse%20Tracking
     // The upper left character position on the terminal is denoted as 1,1.
     // Subtract 1 to keep it synced with cursor
-    let cx = next_parsed::<u16>(&mut split)? - 1;
-    let cy = next_parsed::<u16>(&mut split)? - 1;
+    let cx = next_parsed::<u16>(&mut split)?
+        .checked_sub(1)
+        .ok_or_else(could_not_parse_event_error)?;
+    let cy = next_parsed::<u16>(&mut split)?
+        .checked_sub(1)
+        .ok_or_else(could_not_parse_event_error)?;
 
     // When button 3 in Cb is used to represent mouse release, you can't tell which button was
     // released. SGR mode solves this by having the sequence end with a lowercase m if it's a

@@ -27,8 +27,55 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def assert_private_acl(value):
+    assert value['protected'] is True, value
+    user = value['user']
+    assert isinstance(user, str) and user.startswith('S-1-'), value
+    expected = [{'sid': sid, 'type': 'Allow', 'rights': 0x1f01ff, 'inherited': False}
+                for sid in (user, 'S-1-5-18')]
+    assert sorted(value['rules'], key=lambda rule: rule['sid']) == sorted(
+        expected, key=lambda rule: rule['sid']), value
+
+
+def assert_private_file(path):
+    if os.name != 'nt':
+        assert path.stat().st_mode & 0o777 == 0o600
+        return
+    # Query this saved object's actual protected DACL, independently of the
+    # writer. SIDs avoid localized account names; no path is interpolated as code.
+    script = r"""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$acl = Get-Acl -LiteralPath $env:THESEUS_PRIVATE_FILE
+$rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+if ($rules.Count -gt 32) { throw 'private file ACE bound exceeded' }
+$value = @{
+    user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    protected = $acl.AreAccessRulesProtected
+    rules = @($rules | ForEach-Object { @{
+        sid = $_.IdentityReference.Value
+        type = $_.AccessControlType.ToString()
+        rights = [long]$_.FileSystemRights
+        inherited = $_.IsInherited
+    } })
+}
+$json = ConvertTo-Json -InputObject $value -Depth 4 -Compress
+if ($json.Length -gt 16384) { throw 'private file ACL receipt bound exceeded' }
+[Console]::WriteLine($json)
+"""
+    result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', script],
+                            env={**os.environ, 'THESEUS_PRIVATE_FILE': str(path)},
+                            capture_output=True, timeout=15)
+    receipt = evidence / f'{path.parent.name}-{path.name}.acl'
+    receipt.with_suffix('.acl.stdout').write_bytes(result.stdout)
+    receipt.with_suffix('.acl.stderr').write_bytes(result.stderr)
+    assert len(result.stdout) <= 16384 and len(result.stderr) <= 16384, 'ACL query output exceeded bound'
+    assert result.returncode == 0, result.stderr
+    assert_private_acl(json.loads(result.stdout))
+
+
 def manifest(root):
-    return {str(p.relative_to(root)): digest(p) for p in root.rglob('*') if p.is_file()}
+    return {p.relative_to(root).as_posix(): digest(p) for p in root.rglob('*') if p.is_file()}
 
 
 def expected_suite_manifest(saved):
@@ -69,8 +116,8 @@ def assert_suite_provenance(value, saved, artifact_path):
         actual = json.loads(source_path.read_text())
         assert actual['outcome'] == 'passed', actual
         assert actual['recipe_digest'] == declared[variant], actual
-        assert pathlib.Path(actual['recipe_path']) == (saved.parent / next(
-            v['recipe'] for v in expected['variants'] if v['id'] == variant)).resolve(), actual
+        assert pathlib.Path(actual['recipe_path']).samefile(saved.parent / next(
+            v['recipe'] for v in expected['variants'] if v['id'] == variant)), actual
 
 
 def fixture(kind, name):
@@ -156,9 +203,22 @@ def preview(kind):
     s = Session(root, kind + '-preview', args(kind, source))
     try:
         s.until('Preview')
+        assert not (root / ('.theseus-runs' if kind == 'recipe' else '.theseus-comparisons')).exists()
         s.key(b'\x1b[200~r\nq\x1b[201~')
         s.pump()
         assert not (root / ('.theseus-runs' if kind == 'recipe' else '.theseus-comparisons')).exists()
+        # Exercise every delimiter boundary through the real terminal transport.
+        # The terminal reader must keep payload commands inert between writes.
+        hostile = b'\x1b[200~r\nq\x1b[201~'
+        for split in ([*range(1, 6), *range(len(hostile) - 5, len(hostile))] if os.name == 'nt' else []):
+            s.key(hostile[:split])
+            s.pump()
+            assert s.proc.poll() is None, 'partial paste quit preview'
+            assert not (root / ('.theseus-runs' if kind == 'recipe' else '.theseus-comparisons')).exists()
+            s.key(hostile[split:])
+            s.pump()
+            assert s.proc.poll() is None, 'paste payload quit preview'
+            assert not (root / ('.theseus-runs' if kind == 'recipe' else '.theseus-comparisons')).exists()
         s.key(b'e')
         s.until('EDIT unchanged')
         s.key(b'\x1b[1;5H')  # Ctrl-Home
@@ -188,7 +248,7 @@ def preview(kind):
         s.key(b'e')
         s.until('EDIT unchanged')
         s.key(b'\x1b[1;5H')
-        comment = '# q r ñ\n'.encode()
+        comment = '# q r ñ 😀\n'.encode()
         s.key(b'\x1b[200~' + comment + b'\x1b[201~')
         s.until('EDIT UNSAVED')
         s.snap('valid-draft')
@@ -209,7 +269,7 @@ def preview(kind):
         s.until('Preview')
         saved = root / chosen
         assert saved.read_bytes() == comment + source.read_bytes()
-        assert saved.stat().st_mode & 0o777 == 0o600
+        assert_private_file(saved)
         assert saved.resolve().parent == source.resolve().parent
         assert not (root / ('.theseus-runs' if kind == 'recipe' else '.theseus-comparisons')).exists()
         s.snap('saved-preview')
@@ -221,7 +281,7 @@ def preview(kind):
     (evidence / (kind + '-after.json')).write_text(json.dumps(after, indent=2))
     assert all(after.get(k) == v for k, v in before.items()), 'original fixture changed'
     assert set(after) - set(before) == {
-        'verified-copy.toml', f'{s.name}-bin/docker'
+        'verified-copy.toml', f'{s.name}-bin/' + ('docker.exe' if os.name == 'nt' else 'docker')
     }, 'unexpected file created during preview editing'
     assert after['verified-copy.toml'] == digest(root / 'verified-copy.toml')
 
@@ -335,7 +395,7 @@ def docker():
             (evidence / (kind + '-actual-report.json')).write_text(json.dumps(value, indent=2))
             if kind == 'recipe':
                 assert value['outcome'] == 'passed', value
-                assert pathlib.Path(value['recipe_path']) == saved.resolve()
+                assert pathlib.Path(value['recipe_path']).samefile(saved)
                 assert value['recipe_digest'] == digest(saved)
             else:
                 assert value['finished'] and value['report']['outcome'] == 'passed', value

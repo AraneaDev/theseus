@@ -8,6 +8,8 @@ use super::InternalEvent;
 pub(crate) mod unix;
 #[cfg(windows)]
 pub(crate) mod windows;
+#[cfg(any(windows, test))]
+mod windows_vt;
 
 /// An interface for trying to read an `InternalEvent` within an optional `Duration`.
 pub(crate) trait EventSource: Sync + Send {

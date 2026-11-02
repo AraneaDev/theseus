@@ -68,6 +68,30 @@ class ScreenProjectionTests(unittest.TestCase):
                 screen.feed(b'abcd' + erase + b'X')
                 self.assertEqual(screen.text().splitlines(), [expected, b'    '])
 
+    def test_erase_characters_defaults_bounds_and_preserves_cursor(self):
+        for erase, expected in [(b'\x1b[X', b'ab def'), (b'\x1b[0X', b'ab def'),
+                                (b'\x1b[2X', b'ab  ef'), (b'\x1b[99X', b'ab    ')]:
+            with self.subTest(erase=erase):
+                screen = Screen(2, 6)
+                screen.feed(b'abcdef\x1b[1;3H' + erase)
+                self.assertEqual(screen.text().splitlines(), [expected, b' ' * 6])
+                self.assertEqual((screen.row, screen.column), (0, 2))
+                screen.feed(b'Q')
+                self.assertEqual(screen.text().splitlines()[0], b'abQ' + expected[3:])
+        screen = Screen(2, 4)
+        screen.feed(b'abcd\x1b[XQ')
+        self.assertEqual(screen.text().splitlines(), [b'abcQ', b'    '])
+
+    def test_conpty_outro_erase_removes_previous_hero_without_losing_new_one(self):
+        screen = Screen(24, 80)
+        screen.feed(b'\x1b[9;49H@')
+        # Literal actual Windows frame diff: new hero at 9;32, erase the old
+        # hero in the 17 following cells; ECH itself must not move the cursor.
+        screen.feed(b'\x1b[9;32H@\x1b[38;5;6m\x1b[22m\x1b[17X\x1b[17C')
+        self.assertEqual([(x - 20, y - 3) for (y, x), c in screen.cells.items() if c == '@'],
+                         [(11, 5)])
+        self.assertEqual((screen.row, screen.column), (8, 49))
+
     def test_split_wide_character_uses_two_columns_and_wraps_as_one_glyph(self):
         for raw, expected in [('ab界c'.encode(), ['ab界', 'c   ']),
                               ('abc界'.encode(), ['abc ', '界  '])]:

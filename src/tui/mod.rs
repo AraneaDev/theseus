@@ -542,11 +542,13 @@ mod tests {
         let mut app = App::offline(RunReport::new("old-root-evidence"), PathBuf::from("/old"));
         app.active = true;
         let mut last = None;
+        let root = PathBuf::from("/missing-new-root");
+        let report_path = root.join("report.json");
         apply_event(
             &mut app,
             WorkEvent::Run(engine::EngineEvent {
                 kind: engine::EventKind::StageStarted,
-                report_path: PathBuf::from("/missing-new-root/report.json"),
+                report_path: report_path.clone(),
                 scenario_id: Some("user-clean".into()),
                 stage: Some("install".into()),
             }),
@@ -556,8 +558,8 @@ mod tests {
             app.status.contains("StageStarted"),
             "event status must not wait for a successful read"
         );
-        assert_eq!(last, Some(PathBuf::from("/missing-new-root/report.json")));
-        assert_eq!(app.root, PathBuf::from("/missing-new-root"));
+        assert_eq!(last, Some(report_path.clone()));
+        assert_eq!(app.root, root);
         assert!(
             app.report.is_none(),
             "old document must not acquire a different root"
@@ -567,7 +569,7 @@ mod tests {
             app.terminal_error
                 .as_ref()
                 .unwrap()
-                .contains("/missing-new-root/report.json")
+                .contains(&report_path.display().to_string())
         );
     }
 
@@ -576,7 +578,8 @@ mod tests {
         for mode in ["disabled", "dumb", "small"] {
             let mut report = RunReport::new("cached-before-error");
             report.outcome = RunOutcome::Passed;
-            let mut app = App::offline(report, PathBuf::from("/tmp/cached-worker-error"));
+            let root = PathBuf::from("/tmp/cached-worker-error");
+            let mut app = App::offline(report, root.clone());
             app.active = true;
             complete_run(&mut app, Err(anyhow!("final persistence failed"))).unwrap();
             let mut presentation = Presentation::new(mode == "small", Duration::ZERO);
@@ -596,11 +599,14 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             for expected in [
-                "Engine error: final persistence failed",
-                "Saved report: /tmp/cached-worker-error/report.json",
-                "Recovery: theseus cleanup /tmp/cached-worker-error",
+                "Engine error: final persistence failed".to_string(),
+                format!("Saved report: {}", root.join("report.json").display()),
+                format!(
+                    "Recovery: theseus cleanup {}",
+                    crate::shell::path_argument(&root)
+                ),
             ] {
-                assert!(error.contains(expected), "{mode}: {error}");
+                assert!(error.contains(&expected), "{mode}: {error}");
             }
         }
     }
@@ -687,7 +693,8 @@ mod tests {
             };
             scenario.stages.push(stage);
             report.scenarios.push(scenario);
-            let mut app = App::offline(report, PathBuf::from("/tmp/recovery-run"));
+            let root = PathBuf::from("/tmp/recovery-run");
+            let mut app = App::offline(report, root.clone());
             app.active = true;
             app.filter = "unrelated old filter".into();
             complete_run(&mut app, Err(anyhow!("final persistence failed"))).unwrap();
@@ -719,12 +726,12 @@ mod tests {
                     .map(|cell| cell.symbol())
                     .collect();
                 for expected in [
-                    "cached-before-final-save | incomplete |",
-                    "final persistence failed",
-                    "/tmp/recovery-run/report.json",
-                    "theseus cleanup /tmp/recovery-run",
+                    "cached-before-final-save | incomplete |".to_string(),
+                    "final persistence failed".to_string(),
+                    root.join("report.json").display().to_string(),
+                    format!("theseus cleanup {}", crate::shell::path_argument(&root)),
                 ] {
-                    assert!(text.contains(expected), "missing {expected}");
+                    assert!(text.contains(&expected), "missing {expected}");
                 }
             }
         }
@@ -874,7 +881,7 @@ mod comparison_tests {
             KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
         );
         input(&mut app, KeyCode::Enter.into());
-        let saved = t.path().join("copy.edited.toml");
+        let saved = t.path().join("copy.edited.toml").canonicalize().unwrap();
         assert_eq!(
             std::fs::read(&saved).unwrap(),
             [old.clone(), b"\n# caf\xc3\xa9\n".to_vec()].concat()
@@ -935,7 +942,11 @@ mod comparison_tests {
             KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
         );
         input(&mut app, KeyCode::Enter.into());
-        let saved = t.path().join("comparison.edited.toml");
+        let saved = t
+            .path()
+            .join("comparison.edited.toml")
+            .canonicalize()
+            .unwrap();
         assert!(saved.exists());
         assert_eq!(
             app.comparison

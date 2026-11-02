@@ -1,8 +1,10 @@
 //! ConPTY-only acceptance plumbing. All handles keep their existing native owners.
 use super::{OwnedChild, launch, pipe};
 use crate::process::terminal::{ConsoleProfile, trace, trace_modes};
+mod events;
 mod modes;
 use crate::process::{NativeCommand, PipeReader, PipeWriter};
+pub(crate) use events::run as run_vt_event_fixture;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::windows::io::AsRawHandle;

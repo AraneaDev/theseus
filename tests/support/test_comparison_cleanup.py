@@ -18,7 +18,7 @@ finally:
 ''')
             fake = root/'fake.py'
             for status, original in [(0,False),(7,False),(7,True)]:
-                fake.write_text(f"import sys\nassert sys.argv[1] == 'cleanup'\nassert sys.argv[2].endswith('/fixture/.theseus-comparisons/owned/comparison.json')\nassert len(sys.argv) == 3\nprint('saved stdout')\nprint('saved stderr',file=sys.stderr)\nsys.exit({status})\n")
+                fake.write_text(f"import pathlib,sys\nassert sys.argv[1] == 'cleanup'\nassert pathlib.Path(sys.argv[2]) == pathlib.Path(sys.argv[0]).parent/'fixture/.theseus-comparisons/owned/comparison.json'\nassert len(sys.argv) == 3\nprint('saved stdout')\nprint('saved stderr',file=sys.stderr)\nsys.exit({status})\n")
                 out = subprocess.run([sys.executable,str(runner),str(pathlib.Path(__file__).parent.resolve()),str(root),'original' if original else 'normal'],capture_output=True,text=True)
                 if status==0: self.assertEqual(out.returncode,0,out.stderr)
                 else:

@@ -325,6 +325,12 @@ pub fn run_event_fixture(root: &std::path::Path, mode: &str) -> io::Result<()> {
 
 #[cfg(windows)]
 #[doc(hidden)]
+pub fn run_vt_event_fixture(root: &std::path::Path, mode: &str) -> io::Result<()> {
+    platform::run_vt_event_fixture(root, mode)
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
 pub fn run_legacy_client(
     arguments: &[std::ffi::OsString],
 ) -> Result<i32, Box<dyn std::error::Error>> {
