@@ -163,7 +163,7 @@ VMs, services, desktop applications or arbitrary installer safety. Recipes
 declare observed expectations; application authors own quiescence, database
 consistency and application-specific restoration.
 
-See [ROADMAP.md](ROADMAP.md) for future capabilities and the
+See [ROADMAP.md](ROADMAP.md) for completed milestones, current progress and remaining work, and the
 [validation guide](docs/contribute/validation.md) for required versus opt-in
 acceptance. Existing example walkthroughs remain next to their fixtures.
 

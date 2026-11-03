@@ -65,4 +65,4 @@ repository root unless they explicitly change directory.
 | Rehearse Claude Code plugins | [Plugin walkthrough](../examples/plugins/README.md) |
 | Rehearse MCP registration and discovery | [MCP fixture walkthrough](../examples/mcp/README.md) |
 
-Future capabilities are recorded in the [roadmap](../ROADMAP.md).
+Completed milestones, current progress and remaining work are tracked in the [roadmap](../ROADMAP.md).
