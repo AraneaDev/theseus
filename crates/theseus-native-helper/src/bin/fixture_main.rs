@@ -118,6 +118,9 @@ fn fixture_serve(args: &[String]) -> i32 {
         "hold-init" => FixtureMode::HoldInit,
         "hold-before-spawn" => FixtureMode::HoldBeforeSpawn,
         "panic-after-owned-spawn" => FixtureMode::PanicAfterOwnedSpawn,
+        "hold-before-file-effect" => FixtureMode::HoldBeforeFileEffect,
+        "hold-after-file-finished" => FixtureMode::HoldAfterFileFinished,
+        "fail-file-write" => FixtureMode::FailFileWrite,
         _ => return 2,
     };
     let invocation = load_config(config).unwrap();
@@ -201,7 +204,7 @@ fn fixture_serve(args: &[String]) -> i32 {
         }
         let snapshot = control.snapshot();
         if last != Some(snapshot) {
-            let observation = serde_json::json!({"nonce":nonce,"config_sha256":config_sha256,"executable_sha256":executable_sha256,"fixture_mode":args[2],"profile":profile,"init_reached":snapshot.init_reached,"before_spawn_reached":snapshot.before_spawn_reached,"acquire_committed":snapshot.acquire_committed,"accepted_committed":snapshot.accepted_committed,"terminal_committed":snapshot.terminal_committed,"spawn_attempted":snapshot.spawn_attempted,"spawn_owned":snapshot.spawn_owned,"write_pending":snapshot.write_pending,"cancel_requested":snapshot.cancel_requested,"panic_injected":snapshot.panic_injected,"capture_saturated":snapshot.capture_saturated,"control_write_acks":snapshot.control_write_acks,"saturation_wire_bytes":snapshot.saturation_wire_bytes,"saturation_published_frames":snapshot.saturation_published_frames});
+            let observation = serde_json::json!({"nonce":nonce,"config_sha256":config_sha256,"executable_sha256":executable_sha256,"fixture_mode":args[2],"profile":profile,"file_before_effect":snapshot.file_before_effect,"file_effect_attempted":snapshot.file_effect_attempted,"file_finished_committed":snapshot.file_finished_committed,"file_write_failed":snapshot.file_write_failed,"file_quarantine_committed":snapshot.file_quarantine_committed,"init_reached":snapshot.init_reached,"before_spawn_reached":snapshot.before_spawn_reached,"acquire_committed":snapshot.acquire_committed,"accepted_committed":snapshot.accepted_committed,"terminal_committed":snapshot.terminal_committed,"spawn_attempted":snapshot.spawn_attempted,"spawn_owned":snapshot.spawn_owned,"write_pending":snapshot.write_pending,"cancel_requested":snapshot.cancel_requested,"panic_injected":snapshot.panic_injected,"capture_saturated":snapshot.capture_saturated,"control_write_acks":snapshot.control_write_acks,"saturation_wire_bytes":snapshot.saturation_wire_bytes,"saturation_published_frames":snapshot.saturation_published_frames});
             if let Err(error) = publish(witness, &serde_json::to_vec(&observation).unwrap()) {
                 if witness_error.is_none() {
                     witness_error = Some(error);

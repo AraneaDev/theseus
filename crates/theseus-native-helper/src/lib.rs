@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 mod contract;
 mod error;
+mod files;
 mod invocation;
 pub use error::{InvocationError, RuntimeError};
 pub use invocation::{CatalogEntry, Invocation};

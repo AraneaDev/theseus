@@ -297,7 +297,9 @@ impl Peer {
             std::fs::write(stderr_path, &data).unwrap();
             data
         });
-        let session = SessionId::parse("77777777777777777777777777777777").unwrap();
+        let mut session_bytes = [0; 16];
+        theseus_host::random_bytes(&mut session_bytes).unwrap();
+        let session = SessionId::parse(&hex(&session_bytes)).unwrap();
         let join_receipt = log_root.join(format!("helper-join-{}.json", child.id()));
         let mut peer = Self {
             child,

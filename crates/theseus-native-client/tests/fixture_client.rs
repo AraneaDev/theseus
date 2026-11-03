@@ -467,3 +467,186 @@ fn native_client_windows_unsigned_status_is_preserved() {
         |e| matches!(e,ledger::Entry::OperationFinished {outcome:found,..} if *found==outcome)
     ));
 }
+
+#[test]
+fn native_client_file_roundtrip_empty_bounded_ranges_and_run() {
+    use sha2::{Digest as _, Sha256};
+    // Opt-in is fixture-local and binds the explicitly pinned new normal helper.
+    // Description's program list is not a file capability advertisement.
+    let fixture = Fixture::new("success");
+    let mut client = fixture.start(None);
+    let lease = client.acquire(&fixture);
+    for (index, bytes) in [Vec::new(), vec![b'x'; MAX_FILE_BYTES]]
+        .into_iter()
+        .enumerate()
+    {
+        let operation = OperationId::from_bytes([20 + index as u8; 16]);
+        let path = LeafName::new(&format!("file-{index}")).unwrap();
+        assert!(matches!(
+            client.request(Action::CreateFile {
+                lease,
+                operation,
+                path: path.clone(),
+                bytes: FileBytes::new(&bytes).unwrap()
+            }),
+            Reply::Operation {
+                state: OperationView::Accepted {
+                    operation_kind: OperationKind::CreateFile
+                },
+                ..
+            }
+        ));
+        let digest = Digest::from_bytes(Sha256::digest(&bytes).into());
+        assert_eq!(
+            client.terminal(lease, operation),
+            Outcome::FileCreated {
+                length: bytes.len() as u16,
+                digest
+            }
+        );
+        assert!(client.output.is_empty(), "CreateFile has no Run stream");
+        assert_eq!(
+            client.request(Action::InspectFile {
+                lease,
+                path: path.clone()
+            }),
+            Reply::FileInfo {
+                lease,
+                path: path.clone(),
+                length: bytes.len() as u16,
+                digest
+            }
+        );
+        for (offset, length) in [(0, 1), (4095, 2), (u64::MAX - 1, 1)] {
+            let begin = offset.min(bytes.len() as u64) as usize;
+            let end = (begin + usize::from(length)).min(bytes.len());
+            assert_eq!(
+                client.request(Action::ReadFile {
+                    lease,
+                    path: path.clone(),
+                    offset,
+                    length
+                }),
+                Reply::FileBytes {
+                    lease,
+                    path: path.clone(),
+                    offset,
+                    bytes: FileBytes::new(&bytes[begin..end]).unwrap(),
+                    eof: end == bytes.len()
+                }
+            );
+        }
+        assert_eq!(
+            std::fs::read(
+                fixture
+                    .root
+                    .path()
+                    .join("workspace")
+                    .join(format!("file-{index}"))
+            )
+            .unwrap(),
+            bytes
+        );
+    }
+    let operation = OperationId::from_bytes([25; 16]);
+    client.run(lease, operation);
+    assert!(matches!(
+        client.terminal(lease, operation),
+        Outcome::RunCompleted { .. }
+    ));
+    client.settle();
+    assert_eq!(
+        fixture
+            .records()
+            .iter()
+            .filter(|e| matches!(
+                e,
+                ledger::Entry::OperationAccepted {
+                    operation_kind: OperationKind::CreateFile,
+                    ..
+                }
+            ))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn native_client_file_connection_loss_queries_original_without_second_create() {
+    let fixture = Fixture::new("success");
+    let mut client = fixture.start(None);
+    let lease = client.acquire(&fixture);
+    let operation = OperationId::from_bytes([30; 16]);
+    let path = LeafName::new("recover-file").unwrap();
+    // Recovery here retains this live Client. A controller-crash caller must
+    // durably persist this FULL typed request plus request_digest before submit.
+    let full = Request::CreateFile {
+        lease,
+        operation,
+        path: path.clone(),
+        bytes: FileBytes::new(b"retained").unwrap(),
+    };
+    let _identity_digest = request_digest(&full).unwrap();
+    assert!(matches!(
+        client.request(Action::CreateFile {
+            lease,
+            operation,
+            path: path.clone(),
+            bytes: FileBytes::new(b"retained").unwrap()
+        }),
+        Reply::Operation {
+            state: OperationView::Accepted {
+                operation_kind: OperationKind::CreateFile
+            },
+            ..
+        }
+    ));
+    // Lose the application terminal reply; no automatic mutation follows join.
+    client.settle();
+    client.reconnect(fixture.command(None));
+    assert_eq!(
+        client.client.submit(Action::CreateFile {
+            lease,
+            operation,
+            path,
+            bytes: FileBytes::new(b"retained").unwrap()
+        }),
+        Err(ClientError::RecoveryRequired)
+    );
+    let reply = client.request(Action::Query { lease, operation });
+    assert!(matches!(
+        reply,
+        Reply::Operation {
+            state: OperationView::Finished {
+                outcome: Outcome::FileCreated { .. }
+            } | OperationView::Unknown { .. },
+            ..
+        }
+    ));
+    if matches!(
+        reply,
+        Reply::Operation {
+            state: OperationView::Unknown { .. },
+            ..
+        }
+    ) {
+        assert_eq!(
+            client.client.submit(Action::CreateFile {
+                lease,
+                operation: OperationId::from_bytes([31; 16]),
+                path: LeafName::new("other").unwrap(),
+                bytes: FileBytes::new(&[]).unwrap()
+            }),
+            Err(ClientError::RecoveryRequired)
+        );
+    }
+    client.settle();
+    assert_eq!(
+        fixture
+            .records()
+            .iter()
+            .filter(|e| matches!(e, ledger::Entry::OperationAccepted { .. }))
+            .count(),
+        1
+    );
+}

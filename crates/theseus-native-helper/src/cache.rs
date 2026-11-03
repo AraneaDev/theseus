@@ -13,6 +13,7 @@ pub(crate) struct Cache {
     wire_terminals: Vec<(v2::LeaseId, v2::OperationId)>,
     pub(crate) live: Option<Live>,
     pub(crate) poisoned: bool,
+    pub(crate) stopped: bool,
     pub(crate) native_settled: bool,
 }
 pub(crate) struct Live {
@@ -32,10 +33,19 @@ impl Cache {
             wire_terminals: Vec::new(),
             live: None,
             poisoned: false,
+            stopped: false,
             native_settled: false,
         }
     }
+    #[cfg(test)]
     pub(crate) fn begin(&mut self, key: RunKey) -> Result<(), RuntimeError> {
+        self.begin_kind(key, v2::OperationKind::Run)
+    }
+    pub(crate) fn begin_kind(
+        &mut self,
+        key: RunKey,
+        kind: v2::OperationKind,
+    ) -> Result<(), RuntimeError> {
         let recorded = |lease, operation| {
             self.operations
                 .iter()
@@ -74,7 +84,7 @@ impl Cache {
         }
         self.live = Some(Live {
             key,
-            kind: v2::OperationKind::Run,
+            kind,
             phase: LivePhase::AdmissionPending,
             deadline: None,
             terminal: None,
@@ -169,6 +179,7 @@ impl Cache {
                 store_poisoned,
                 native_settled,
             } => {
+                self.stopped = true;
                 self.poisoned = store_poisoned;
                 self.native_settled = native_settled;
             }
@@ -189,11 +200,14 @@ impl Cache {
         Ok(())
     }
     pub(crate) fn replay_refusal(&self, request: &v2::Request) -> Option<v2::RefusalCode> {
-        let v2::Request::Run {
-            lease, operation, ..
-        } = request
-        else {
-            return None;
+        let (lease, operation, kind) = match request {
+            v2::Request::Run {
+                lease, operation, ..
+            } => (lease, operation, v2::OperationKind::Run),
+            v2::Request::CreateFile {
+                lease, operation, ..
+            } => (lease, operation, v2::OperationKind::CreateFile),
+            _ => return None,
         };
         if self.wire_terminals.contains(&(*lease, *operation))
             || self
@@ -210,8 +224,7 @@ impl Cache {
             .operations
             .iter()
             .find(|o| o.lease == *lease && o.operation == *operation)
-            && (old.kind != v2::OperationKind::Run
-                || v2::request_digest(request).ok() != Some(old.request_digest))
+            && (old.kind != kind || v2::request_digest(request).ok() != Some(old.request_digest))
         {
             return Some(v2::RefusalCode::ReplayConflict);
         }
@@ -319,9 +332,6 @@ impl Cache {
                     refused(RefusalCode::WrongLease)
                 }
             }
-            Request::CreateFile { .. } | Request::ReadFile { .. } | Request::InspectFile { .. } => {
-                refused(RefusalCode::Unsupported)
-            }
             _ => return None,
         })
     }
@@ -357,6 +367,20 @@ mod tests {
             },
         })
         .unwrap();
+    }
+    #[test]
+    fn file_requests_reach_serialized_worker() {
+        let mut c = Cache::new();
+        c.description = Some(v2::Reply::Refused {
+            code: v2::RefusalCode::Unsupported,
+        });
+        assert_eq!(
+            c.query(&v2::Request::InspectFile {
+                lease: key(1).lease,
+                path: v2::LeafName::new("leaf").unwrap(),
+            }),
+            None
+        );
     }
     #[test]
     fn cached_queries_require_exact_reserved_lease() {

@@ -1,4 +1,5 @@
 use crate::{Action, ClientError};
+use sha2::{Digest as _, Sha256};
 use theseus_host::fs::CommitScope;
 use theseus_native_helper_store::IntentRecord;
 use theseus_native_protocol::v2;
@@ -8,7 +9,62 @@ pub(crate) struct Recovery {
     intents: Vec<(IntentRecord, CommitScope, Option<v2::LeaseId>)>,
     operations: Vec<(v2::LeaseId, v2::OperationId, Option<v2::OperationView>)>,
     quarantined: Vec<v2::LeaseId>,
+    identities: Vec<MutationIdentity>,
     captures: Vec<StreamEvidence>,
+}
+// Owned before encoding; retained across transport epochs in this live process.
+struct MutationIdentity {
+    request: v2::Request,
+    digest: v2::Digest,
+}
+impl MutationIdentity {
+    fn ids(&self) -> (v2::LeaseId, v2::OperationId) {
+        match &self.request {
+            v2::Request::Run {
+                lease, operation, ..
+            }
+            | v2::Request::CreateFile {
+                lease, operation, ..
+            } => (*lease, *operation),
+            _ => unreachable!("mutation identity"),
+        }
+    }
+    fn validate(&self, state: &v2::OperationView) -> Result<(), ClientError> {
+        let create = matches!(self.request, v2::Request::CreateFile { .. });
+        let valid = match state {
+            v2::OperationView::Accepted { operation_kind } => {
+                *operation_kind
+                    == if create {
+                        v2::OperationKind::CreateFile
+                    } else {
+                        v2::OperationKind::Run
+                    }
+            }
+            v2::OperationView::Running => !create,
+            v2::OperationView::Finished { outcome } => match outcome {
+                v2::Outcome::FileCreated { length, digest } => match &self.request {
+                    v2::Request::CreateFile { bytes, .. } => {
+                        usize::from(*length) == bytes.as_slice().len()
+                            && *digest
+                                == v2::Digest::from_bytes(Sha256::digest(bytes.as_slice()).into())
+                    }
+                    _ => false,
+                },
+                v2::Outcome::FileCreateFailed { .. } => create,
+                v2::Outcome::RunCompleted { .. } | v2::Outcome::LaunchFailed { .. } => !create,
+                v2::Outcome::NotStarted { .. } => true,
+            },
+            _ => true,
+        };
+        // Keep the canonical digest alongside the full request, not a derived
+        // replacement identity that could authorize a second mutation.
+        debug_assert_eq!(v2::request_digest(&self.request).ok(), Some(self.digest));
+        if valid {
+            Ok(())
+        } else {
+            Err(ClientError::Protocol)
+        }
+    }
 }
 struct StreamEvidence {
     lease: v2::LeaseId,
@@ -156,31 +212,72 @@ impl Recovery {
                 if !expected.programs.as_slice().contains(&program) {
                     return Err(ClientError::Preflight);
                 }
-                if self.quarantined.contains(&lease)
-                    || self.operations.iter().any(|(l, o, state)| {
-                        *l == lease
-                            && (*o == operation
-                                || !matches!(state, Some(v2::OperationView::Finished { .. })))
-                    })
-                {
-                    return Err(ClientError::RecoveryRequired);
-                }
-                if self.operations.len() == v2::MAX_OPERATIONS {
-                    return Err(ClientError::Capacity);
-                }
-                self.stream(lease, operation, true)?;
-                self.operations.push((lease, operation, None));
-                v2::Request::Run {
+                let request = v2::Request::Run {
                     lease,
                     operation,
                     program,
-                }
+                };
+                self.mutation(request, true)?
             }
+            Action::CreateFile {
+                lease,
+                operation,
+                path,
+                bytes,
+            } => self.mutation(
+                v2::Request::CreateFile {
+                    lease,
+                    operation,
+                    path,
+                    bytes,
+                },
+                false,
+            )?,
+            Action::ReadFile {
+                lease,
+                path,
+                offset,
+                length,
+            } => v2::Request::ReadFile {
+                lease,
+                path,
+                offset,
+                length,
+            },
+            Action::InspectFile { lease, path } => v2::Request::InspectFile { lease, path },
             Action::Query { lease, operation } => v2::Request::QueryOperation { lease, operation },
             Action::Cancel { lease, operation } => v2::Request::Cancel { lease, operation },
             Action::QueryLease(lease) => v2::Request::QueryLease { lease },
             Action::Release(lease) => v2::Request::Release { lease },
         })
+    }
+    fn mutation(&mut self, request: v2::Request, run: bool) -> Result<v2::Request, ClientError> {
+        let digest = v2::request_digest(&request).map_err(|_| ClientError::Protocol)?;
+        let identity = MutationIdentity {
+            request: request.clone(),
+            digest,
+        };
+        let (lease, operation) = identity.ids();
+        if self.quarantined.contains(&lease)
+            || self.operations.iter().any(|(l, o, state)| {
+                *l == lease
+                    && (*o == operation
+                        || !matches!(state, Some(v2::OperationView::Finished { .. })))
+            })
+        {
+            return Err(ClientError::RecoveryRequired);
+        }
+        if self.operations.len() == v2::MAX_OPERATIONS
+            || self.identities.len() == v2::MAX_OPERATIONS
+        {
+            return Err(ClientError::Capacity);
+        }
+        if run {
+            self.stream(lease, operation, true)?;
+        }
+        self.identities.push(identity);
+        self.operations.push((lease, operation, None));
+        Ok(request)
     }
     pub(crate) fn observe(&mut self, reply: &v2::Reply) -> Result<(), ClientError> {
         match reply {
@@ -189,6 +286,13 @@ impl Recovery {
                 operation,
                 state,
             } => {
+                if let Some(identity) = self
+                    .identities
+                    .iter()
+                    .find(|i| i.ids() == (*lease, *operation))
+                {
+                    identity.validate(state)?;
+                }
                 if let v2::OperationView::Finished { outcome } = state
                     && let Some(stream) = self
                         .captures
@@ -641,5 +745,109 @@ mod review_regressions {
         }))
         .unwrap();
         assert!(r.quarantined.contains(&lease));
+    }
+}
+
+#[cfg(test)]
+mod file_tests {
+    use super::*;
+
+    fn create(lease: v2::LeaseId, operation: v2::OperationId) -> Action<'static> {
+        Action::CreateFile {
+            lease,
+            operation,
+            path: v2::LeafName::new("note").unwrap(),
+            bytes: v2::FileBytes::new(b"hello").unwrap(),
+        }
+    }
+    #[test]
+    fn create_retains_original_identity_without_run_stream_and_requires_query_after_loss() {
+        let mut r = Recovery::default();
+        let e = crate::pump::tests::expected();
+        let lease = v2::LeaseId::from_bytes([1; 16]);
+        let operation = v2::OperationId::from_bytes([2; 16]);
+        let request = r.request(create(lease, operation), &e).unwrap();
+        assert!(matches!(request, v2::Request::CreateFile { .. }));
+        assert!(r.captures.is_empty());
+        assert_eq!(
+            r.request(create(lease, operation), &e),
+            Err(ClientError::RecoveryRequired)
+        );
+        assert_eq!(
+            r.request(create(lease, v2::OperationId::from_bytes([3; 16])), &e),
+            Err(ClientError::RecoveryRequired)
+        );
+        assert_eq!(
+            r.request(
+                Action::Run {
+                    lease,
+                    operation,
+                    program: v2::ProgramId::new("probe").unwrap()
+                },
+                &e
+            ),
+            Err(ClientError::RecoveryRequired)
+        );
+        assert_eq!(
+            r.request(Action::Query { lease, operation }, &e).unwrap(),
+            v2::Request::QueryOperation { lease, operation }
+        );
+        for outcome in [
+            v2::Outcome::FileCreated {
+                length: 4,
+                digest: v2::Digest::from_bytes(Sha256::digest(b"hello").into()),
+            },
+            v2::Outcome::FileCreated {
+                length: 5,
+                digest: v2::Digest::from_bytes([0; 32]),
+            },
+            v2::Outcome::LaunchFailed {
+                phase: v2::LaunchPhase::NeverCreated,
+                code: v2::FailureCode::Io,
+                cleanup: v2::SpawnCleanup::NoChildCreated,
+            },
+        ] {
+            assert_eq!(
+                r.observe(&v2::Reply::Operation {
+                    lease,
+                    operation,
+                    state: v2::OperationView::Finished { outcome }
+                }),
+                Err(ClientError::Protocol)
+            );
+        }
+        assert_eq!(
+            r.observe(&v2::Reply::Operation {
+                lease,
+                operation,
+                state: v2::OperationView::Accepted {
+                    operation_kind: v2::OperationKind::Run
+                }
+            }),
+            Err(ClientError::Protocol)
+        );
+        let reply = v2::Reply::Operation {
+            lease,
+            operation,
+            state: v2::OperationView::Finished {
+                outcome: v2::Outcome::FileCreated {
+                    length: 5,
+                    digest: v2::Digest::from_bytes(Sha256::digest(b"hello").into()),
+                },
+            },
+        };
+        r.observe(&reply).unwrap();
+        r.observe(&reply).unwrap();
+        assert_eq!(
+            r.observe(&v2::Reply::Operation {
+                lease,
+                operation,
+                state: v2::OperationView::Unknown {
+                    reason: v2::UnknownReason::FileEffectUncertain
+                }
+            }),
+            Err(ClientError::Protocol)
+        );
+        assert!(r.captures.is_empty());
     }
 }

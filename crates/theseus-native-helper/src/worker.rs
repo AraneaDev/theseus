@@ -32,8 +32,16 @@ pub(crate) fn spawn(
             // Native owners and panic storage live outside the unwind closure.
             let mut owner = Box::new(Worker::new(ports, tokens));
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.run()));
-            if let Err(payload) = result {
-                owner.fail(WorkerPrimary::Panic(payload));
+            if let Err(payload) = result
+                && let Err(recovery_payload) =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        owner.file_panic(payload)
+                    }))
+            {
+                loop {
+                    std::hint::black_box((&owner, &recovery_payload));
+                    thread::park();
+                }
             }
             if let Err(cleanup_payload) =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.settle_native()))
@@ -74,6 +82,29 @@ struct Active {
     returned: u32,
     abandoned: bool,
 }
+struct PendingFileRequest {
+    request: v2::Request,
+    ticket: Option<ResponseTicket>,
+    owner: Box<crate::files::FileOwner>,
+    key: Option<RunKey>,
+    create: Option<FileCreate>,
+}
+struct FileCreate {
+    cancel: CancelToken,
+    start: StartWatch,
+    deadline: Instant,
+    terminal: Option<v2::OperationView>,
+    published: bool,
+}
+fn file_boundary(key: RunKey) -> FinalBoundary {
+    FinalBoundary {
+        key,
+        final_ordinal: 0,
+        stdout_bytes: 0,
+        stderr_bytes: 0,
+        truncated: false,
+    }
+}
 struct Worker {
     ports: WorkerPorts,
     tokens: Vec<DataPermit>,
@@ -81,6 +112,8 @@ struct Worker {
     program: Option<v2::ProgramId>,
     invocation: Option<Invocation>,
     store: Option<LedgerStore>,
+    workspace: Option<HostDir>,
+    file: Option<PendingFileRequest>,
     lease: Option<(v2::IntentId, v2::LeaseId, v2::LeaseView)>,
     last_spawn: Option<theseus_host::process::SpawnFailure>,
     active: Option<Active>,
@@ -97,6 +130,8 @@ impl Worker {
             program: None,
             invocation: None,
             store: None,
+            workspace: None,
+            file: None,
             lease: None,
             last_spawn: None,
             active: None,
@@ -119,11 +154,13 @@ impl Worker {
             } else {
                 self.failure = Some(OwnedWorkerFailure {
                     primary: WorkerPrimary::Spawn(spawn),
+                    retained_file: None,
                     retained_spawn: None,
                     cleanup_errors: std::array::from_fn(|_| None),
                 });
             }
         }
+        self.retire_file();
         match self.failure.take() {
             Some(failure) => WorkerCompletion::Failed(failure),
             None => WorkerCompletion::Clean {
@@ -146,6 +183,7 @@ impl Worker {
         if self.failure.is_none() {
             self.failure = Some(OwnedWorkerFailure {
                 primary,
+                retained_file: None,
                 retained_spawn: None,
                 cleanup_errors: std::array::from_fn(|_| None),
             });
@@ -207,10 +245,24 @@ impl Worker {
             {
                 self.fail(primary);
             }
+            if self.file.as_ref().is_some_and(|p| p.create.is_some())
+                && let Err(primary) = self.advance_file()
+            {
+                self.fail(primary);
+            }
             if self.failure.is_some() {
                 break;
             }
-            if self.stopping && self.active.as_ref().is_none_or(|a| a.committed) {
+            if self.stopping
+                && self.active.as_ref().is_none_or(|a| a.committed)
+                && self.file.as_ref().is_none_or(|f| {
+                    f.create
+                        .as_ref()
+                        .is_none_or(|c| c.terminal.is_some() && c.published)
+                })
+                && self.pending.is_none()
+                && self.response.is_none()
+            {
                 break;
             }
             if self.pending.is_none()
@@ -242,6 +294,16 @@ impl Worker {
                 cancel,
                 start,
             } => self.begin(request, ticket, cancel, start)?,
+            WorkerCommand::CreateFile {
+                request,
+                ticket,
+                cancel,
+                start,
+            } => self.begin_file(request, ticket, cancel, start)?,
+            WorkerCommand::ReadFile { request, ticket }
+            | WorkerCommand::InspectFile { request, ticket } => {
+                self.observe_file(request, ticket)?
+            }
             WorkerCommand::Release { lease, ticket } => self.release(lease, ticket)?,
             WorkerCommand::Stop => self.stopping = true,
         }
@@ -330,6 +392,7 @@ impl Worker {
                 .map_err(|_| WorkerPrimary::Io(io::Error::other("invalid catalog")))?,
         };
         self.store = Some(store);
+        self.workspace = Some(workspace);
         self.invocation = Some(inv);
         self.publish(WorkerEvent::CacheUpdate(CachePatch::Initialized {
             description,
@@ -424,7 +487,7 @@ impl Worker {
         cancel: CancelToken,
         start: StartWatch,
     ) -> Result<(), WorkerPrimary> {
-        if self.active.is_some() {
+        if self.active.is_some() || self.file.is_some() {
             self.refuse(ticket, v2::RefusalCode::Busy);
             return Ok(());
         }
@@ -583,8 +646,426 @@ impl Worker {
         }));
         Ok(())
     }
+    fn held_refusal(&self, lease: v2::LeaseId) -> Option<v2::RefusalCode> {
+        match &self.lease {
+            Some((_, actual, _)) if *actual != lease => Some(v2::RefusalCode::WrongLease),
+            Some((_, _, v2::LeaseView::Held { .. })) => None,
+            Some((_, _, v2::LeaseView::Quarantined { .. })) => {
+                Some(v2::RefusalCode::LeaseQuarantined)
+            }
+            Some(_) => Some(v2::RefusalCode::AwaitingExternalReset),
+            None => Some(v2::RefusalCode::WrongLease),
+        }
+    }
+    fn begin_file(
+        &mut self,
+        request: v2::Request,
+        ticket: ResponseTicket,
+        cancel: CancelToken,
+        start: StartWatch,
+    ) -> Result<(), WorkerPrimary> {
+        if self.active.is_some() || self.file.is_some() {
+            self.refuse(ticket, v2::RefusalCode::Busy);
+            return Ok(());
+        }
+        let v2::Request::CreateFile {
+            lease, operation, ..
+        } = &request
+        else {
+            self.refuse(ticket, v2::RefusalCode::InvalidRequest);
+            return Ok(());
+        };
+        let (lease, operation) = (*lease, *operation);
+        if !self.lease.as_ref().is_some_and(|(_, l, _)| *l == lease) {
+            self.refuse(ticket, v2::RefusalCode::WrongLease);
+            return Ok(());
+        }
+        let key = cancel.key;
+        if key.lease != lease || key.operation != operation || start.key() != key {
+            self.refuse(ticket, v2::RefusalCode::InvalidRequest);
+            return Ok(());
+        }
+        let replay = self
+            .store
+            .as_ref()
+            .unwrap()
+            .restart_view()
+            .replay_operation(&request);
+        let now = Instant::now();
+        match replay {
+            Ok(v2::ledger::ReplayDecision::Recorded(view)) => {
+                self.file = Some(PendingFileRequest {
+                    request,
+                    ticket: None,
+                    owner: Box::new(crate::files::FileOwner::new()),
+                    key: Some(key),
+                    create: Some(FileCreate {
+                        cancel,
+                        start,
+                        deadline: now,
+                        terminal: Some(view.clone()),
+                        published: true,
+                    }),
+                });
+                self.response = Some((
+                    ticket,
+                    v2::Reply::Operation {
+                        lease,
+                        operation,
+                        state: view.clone(),
+                    },
+                    None,
+                ));
+                self.publish(WorkerEvent::CacheUpdate(CachePatch::Terminal {
+                    key,
+                    view,
+                    boundary: file_boundary(key),
+                }));
+                return Ok(());
+            }
+            Err(code) => {
+                self.refuse(ticket, code);
+                return Ok(());
+            }
+            Ok(v2::ledger::ReplayDecision::NotRecorded) => {}
+        }
+        if let Some(code) = self.held_refusal(lease) {
+            self.refuse(ticket, code);
+            return Ok(());
+        }
+        let digest = v2::request_digest(&request)
+            .map_err(|_| WorkerPrimary::Io(io::Error::other("invalid file request")))?;
+        self.append(Entry::OperationAccepted {
+            lease,
+            operation,
+            request_digest: digest,
+            operation_kind: v2::OperationKind::CreateFile,
+        })?;
+        #[cfg(feature = "test-support")]
+        if let Some(control) = self
+            .invocation
+            .as_ref()
+            .and_then(|inv| inv.fixture.as_ref())
+        {
+            control.mark_accepted_committed();
+        }
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(30);
+        self.file = Some(PendingFileRequest {
+            request,
+            ticket: None,
+            owner: Box::new(crate::files::FileOwner::new()),
+            key: Some(key),
+            create: Some(FileCreate {
+                cancel,
+                start,
+                deadline,
+                terminal: None,
+                published: false,
+            }),
+        });
+        self.response = Some((
+            ticket,
+            v2::Reply::Operation {
+                lease,
+                operation,
+                state: v2::OperationView::Accepted {
+                    operation_kind: v2::OperationKind::CreateFile,
+                },
+            },
+            Some(key),
+        ));
+        self.publish(WorkerEvent::CacheUpdate(CachePatch::Phase {
+            key,
+            kind: v2::OperationKind::CreateFile,
+            phase: LivePhase::Accepted,
+            accepted_at: Some(now),
+            deadline: Some(deadline),
+        }));
+        Ok(())
+    }
+    fn observe_file(
+        &mut self,
+        request: v2::Request,
+        ticket: ResponseTicket,
+    ) -> Result<(), WorkerPrimary> {
+        let (lease, path) = match &request {
+            v2::Request::ReadFile { lease, path, .. }
+            | v2::Request::InspectFile { lease, path } => (*lease, path.clone()),
+            _ => {
+                self.refuse(ticket, v2::RefusalCode::InvalidRequest);
+                return Ok(());
+            }
+        };
+        if let Some(code) = self.held_refusal(lease) {
+            self.refuse(ticket, code);
+            return Ok(());
+        }
+        if self.active.is_some() || self.file.is_some() {
+            self.refuse(ticket, v2::RefusalCode::Busy);
+            return Ok(());
+        }
+        if let v2::Request::ReadFile { offset, length, .. } = &request
+            && (*length == 0 || *length > 4096 || offset.checked_add(u64::from(*length)).is_none())
+        {
+            self.refuse(ticket, v2::RefusalCode::InvalidRequest);
+            return Ok(());
+        }
+        self.file = Some(PendingFileRequest {
+            request,
+            ticket: Some(ticket),
+            owner: Box::new(crate::files::FileOwner::new()),
+            key: None,
+            create: None,
+        });
+        let result = {
+            let pending = self.file.as_mut().unwrap();
+            crate::files::observe(&mut pending.owner, self.workspace.as_ref().unwrap(), &path)
+        };
+        let reply = match result {
+            Ok(observed) => match &self.file.as_ref().unwrap().request {
+                v2::Request::InspectFile { .. } => v2::Reply::FileInfo {
+                    lease,
+                    path,
+                    length: observed.bytes.as_slice().len() as u16,
+                    digest: observed.digest,
+                },
+                v2::Request::ReadFile { offset, length, .. } => {
+                    let all = observed.bytes.as_slice();
+                    let begin = if *offset >= all.len() as u64 {
+                        all.len()
+                    } else {
+                        *offset as usize
+                    };
+                    let end = begin.saturating_add(usize::from(*length)).min(all.len());
+                    v2::Reply::FileBytes {
+                        lease,
+                        path,
+                        offset: *offset,
+                        bytes: v2::FileBytes::new(&all[begin..end]).expect("bounded observation"),
+                        eof: end == all.len(),
+                    }
+                }
+                _ => unreachable!(),
+            },
+            Err(kind) => v2::Reply::Refused {
+                code: if kind == crate::files::FileFailureKind::Changed {
+                    v2::RefusalCode::Busy
+                } else {
+                    v2::RefusalCode::Unsupported
+                },
+            },
+        };
+        let pending = self.file.as_mut().unwrap();
+        let ticket = pending.ticket.take().unwrap();
+        let sticky = pending.owner.sticky_open;
+        self.respond(ticket, reply, None);
+        if sticky {
+            self.stopping = true;
+        } else {
+            // Synchronous observation completed; the request may retire its known
+            // handle and source after handing back its reserved response.
+            self.file.take();
+        }
+        Ok(())
+    }
+    fn advance_file(&mut self) -> Result<(), WorkerPrimary> {
+        let Some(pending) = &mut self.file else {
+            return Ok(());
+        };
+        let Some(create) = &mut pending.create else {
+            return Ok(());
+        };
+        let key = pending.key.unwrap();
+        if let Some(view) = &create.terminal {
+            if !create.published && self.pending.is_none() {
+                let view = view.clone();
+                create.published = true;
+                self.publish(WorkerEvent::CacheUpdate(CachePatch::Terminal {
+                    key,
+                    view,
+                    boundary: file_boundary(key),
+                }));
+            }
+            return Ok(());
+        }
+        let expired = Instant::now() >= create.deadline;
+        let cancelled = self.stopping
+            || self.ports.stop.load(Ordering::Acquire)
+            || create.cancel.flag.load(Ordering::Acquire)
+            || matches!(create.start.poll(), StartState::Aborted);
+        if expired || cancelled {
+            return self.finish_file(v2::Outcome::NotStarted {
+                reason: if expired {
+                    v2::NotStartedReason::Deadline
+                } else {
+                    v2::NotStartedReason::CancelRequested
+                },
+            });
+        }
+        if !matches!(create.start.poll(), StartState::Granted) {
+            return Ok(());
+        }
+        #[cfg(feature = "test-support")]
+        if let Some(control) = self
+            .invocation
+            .as_ref()
+            .and_then(|inv| inv.fixture.as_ref())
+        {
+            control.before_file_effect();
+            let expired = Instant::now() >= create.deadline;
+            let cancelled = self.stopping
+                || self.ports.stop.load(Ordering::Acquire)
+                || create.cancel.flag.load(Ordering::Acquire)
+                || matches!(create.start.poll(), StartState::Aborted);
+            if expired || cancelled {
+                return self.finish_file(v2::Outcome::NotStarted {
+                    reason: if expired {
+                        v2::NotStartedReason::Deadline
+                    } else {
+                        v2::NotStartedReason::CancelRequested
+                    },
+                });
+            }
+            pending.owner.fixture = Some(control.clone());
+        }
+        let v2::Request::CreateFile { path, bytes, .. } = &pending.request else {
+            unreachable!()
+        };
+        let result = crate::files::create(
+            &mut pending.owner,
+            self.workspace.as_ref().unwrap(),
+            path,
+            bytes,
+        );
+        match result {
+            Ok(created) => self.finish_file(v2::Outcome::FileCreated {
+                length: created.length,
+                digest: created.digest,
+            }),
+            Err(_) => self.quarantine_file(),
+        }
+    }
+    fn finish_file(&mut self, outcome: v2::Outcome) -> Result<(), WorkerPrimary> {
+        let key = self.file.as_ref().unwrap().key.unwrap();
+        self.append(Entry::OperationFinished {
+            lease: key.lease,
+            operation: key.operation,
+            outcome: outcome.clone(),
+        })?;
+        self.file
+            .as_mut()
+            .unwrap()
+            .create
+            .as_mut()
+            .unwrap()
+            .terminal = Some(v2::OperationView::Finished { outcome });
+        #[cfg(feature = "test-support")]
+        if let Some(control) = self
+            .invocation
+            .as_ref()
+            .and_then(|inv| inv.fixture.as_ref())
+        {
+            control.after_file_finished();
+        }
+        self.advance_file()
+    }
+    fn quarantine_file(&mut self) -> Result<(), WorkerPrimary> {
+        let key = self.file.as_ref().unwrap().key.unwrap();
+        let reason = v2::UnknownReason::FileEffectUncertain;
+        if let Err(error) = self.append(Entry::LeaseClosed {
+            lease: key.lease,
+            disposition: Disposition::Quarantined { reason },
+        }) {
+            if let WorkerPrimary::Store(error) = error {
+                self.file.as_mut().unwrap().owner.ledger_error = Some(error);
+            } else {
+                self.fail(error);
+            }
+            self.stopping = true;
+            self.transfer_file_failure();
+            return Ok(());
+        }
+        #[cfg(feature = "test-support")]
+        if let Some(control) = self
+            .invocation
+            .as_ref()
+            .and_then(|inv| inv.fixture.as_ref())
+        {
+            control.mark_file_quarantine_committed();
+        }
+        let intent = self.lease.as_ref().unwrap().0;
+        let view = v2::LeaseView::Quarantined { intent, reason };
+        self.lease = Some((intent, key.lease, view.clone()));
+        self.file
+            .as_mut()
+            .unwrap()
+            .create
+            .as_mut()
+            .unwrap()
+            .terminal = Some(v2::OperationView::Unknown { reason });
+        self.publish(WorkerEvent::CacheUpdate(CachePatch::Lease {
+            intent,
+            lease: key.lease,
+            view,
+        }));
+        if self.file.as_ref().unwrap().owner.sticky_open {
+            self.stopping = true;
+        }
+        Ok(())
+    }
+    fn transfer_file_failure(&mut self) {
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
+        if self.failure.is_none() {
+            let primary = file
+                .owner
+                .primary
+                .take()
+                .map(WorkerPrimary::File)
+                .or_else(|| file.owner.panic.take().map(WorkerPrimary::Panic))
+                .or_else(|| file.owner.ledger_error.take().map(WorkerPrimary::Store));
+            if let Some(primary) = primary {
+                self.failure = Some(OwnedWorkerFailure {
+                    primary,
+                    retained_file: None,
+                    retained_spawn: None,
+                    cleanup_errors: std::array::from_fn(|_| None),
+                });
+            }
+        }
+    }
+    fn retire_file(&mut self) {
+        self.transfer_file_failure();
+        if let Some(pending) = self.file.take()
+            && let Some(failure) = &mut self.failure
+        {
+            failure.retained_file = Some(pending.owner);
+        }
+    }
+    fn file_panic(&mut self, payload: Box<dyn std::any::Any + Send>) {
+        if let Some(pending) = &mut self.file {
+            pending.owner.panic = Some(payload);
+            if pending.owner.opening {
+                pending.owner.sticky_open = true;
+            }
+            let uncertain = pending.owner.attempted
+                && pending
+                    .create
+                    .as_ref()
+                    .is_some_and(|c| c.terminal.is_none());
+            if uncertain {
+                let _ = self.quarantine_file();
+            }
+            self.transfer_file_failure();
+            self.stopping = true;
+        } else {
+            self.fail(WorkerPrimary::Panic(payload));
+        }
+    }
     fn release(&mut self, lease: v2::LeaseId, ticket: ResponseTicket) -> Result<(), WorkerPrimary> {
-        if self.active.is_some() {
+        if self.active.is_some() || self.file.is_some() {
             self.refuse(ticket, v2::RefusalCode::Busy);
             return Ok(());
         }
@@ -648,6 +1129,14 @@ impl Worker {
                     self.tokens.push(permit);
                 }
                 Ok(DataReturn::ProducerDrained { key, final_ordinal }) => {
+                    if self.file.as_ref().is_some_and(|p| {
+                        p.key == Some(key)
+                            && final_ordinal == 0
+                            && p.create.as_ref().is_some_and(|c| c.published)
+                    }) {
+                        self.retire_file();
+                        continue;
+                    }
                     if self.active.as_ref().is_some_and(|a| {
                         a.key == key
                             && a.terminal
@@ -952,6 +1441,29 @@ impl Worker {
         Ok(())
     }
     fn settle_native(&mut self) {
+        if self
+            .file
+            .as_ref()
+            .is_some_and(|f| f.owner.sticky_open || f.owner.opening)
+        {
+            while !self.flush() {
+                thread::sleep(Duration::from_millis(1));
+            }
+            self.publish(WorkerEvent::CacheUpdate(CachePatch::Stopped {
+                store_poisoned: self.poisoned(),
+                native_settled: false,
+            }));
+            while !self.flush() {
+                thread::sleep(Duration::from_millis(1));
+            }
+            // HostDir may retain lower-level pending native authority. Keep the
+            // whole worker alive until the existing process shutdown budget fires.
+            loop {
+                std::hint::black_box(&self.file);
+                thread::park();
+            }
+        }
+
         // Retain every authority on errors and retry; completion never means detached.
         loop {
             let mut complete = true;
@@ -1505,6 +2017,489 @@ mod private_barrier_tests {
         let (ports, wp, controls, tokens) = channels();
         (tmp, Worker::new(wp, tokens), ports, controls, invocation)
     }
+    fn accepted_file(
+        cancelled: bool,
+    ) -> (
+        tempfile::TempDir,
+        Worker,
+        DispatcherPorts,
+        StartGrant,
+        ResponseTicket,
+    ) {
+        let (tmp, mut worker, ports, [p0, p1], inv) = fixture();
+        let request = v2::Request::Acquire {
+            intent: v2::IntentId::from_bytes([3; 16]),
+            binding: inv.expected.binding,
+            manifest_digest: inv.expected.manifest_digest,
+        };
+        worker
+            .initialize(inv)
+            .unwrap_or_else(|_| panic!("initialize"));
+        ports.events.try_recv().unwrap();
+        worker
+            .acquire(
+                request,
+                ResponseTicket {
+                    reply_to: 1,
+                    permit: p0,
+                },
+            )
+            .unwrap_or_else(|_| panic!("acquire"));
+        ports.events.try_recv().unwrap();
+        let (spare, _, _) = worker.response.take().unwrap();
+        let key = RunKey {
+            lease: worker.lease.as_ref().unwrap().1,
+            operation: v2::OperationId::from_bytes([4; 16]),
+            generation: 1,
+        };
+        let (grant, start) = start_pair(key, 2);
+        worker
+            .begin_file(
+                v2::Request::CreateFile {
+                    lease: key.lease,
+                    operation: key.operation,
+                    path: v2::LeafName::new("leaf").unwrap(),
+                    bytes: v2::FileBytes::new(b"actual").unwrap(),
+                },
+                ResponseTicket {
+                    reply_to: 2,
+                    permit: p1,
+                },
+                CancelToken {
+                    key,
+                    flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(cancelled)),
+                },
+                start,
+            )
+            .unwrap_or_else(|_| panic!("file admission"));
+        ports.events.try_recv().unwrap();
+        (tmp, worker, ports, grant, spare)
+    }
+    #[test]
+    fn file_acceptance_grant_actual_finish_and_zero_boundary_retirement() {
+        let (_tmp, mut worker, ports, mut grant, ticket) = accepted_file(false);
+        let path = worker
+            .invocation
+            .as_ref()
+            .unwrap()
+            .workspace_root
+            .join("leaf");
+        assert!(!path.exists());
+        assert!(matches!(
+            worker
+                .store
+                .as_ref()
+                .unwrap()
+                .records()
+                .last()
+                .unwrap()
+                .entry(),
+            Entry::OperationAccepted {
+                operation_kind: v2::OperationKind::CreateFile,
+                ..
+            }
+        ));
+        worker.advance_file().unwrap_or_else(|_| panic!("waiting"));
+        assert!(
+            !path.exists(),
+            "physical create must wait original Accepted admission"
+        );
+        let key = worker.file.as_ref().unwrap().key.unwrap();
+        grant
+            .grant(AcceptedAdmission {
+                key,
+                reply_to: 2,
+                outbound_sequence: 3,
+            })
+            .unwrap();
+        worker.advance_file().unwrap_or_else(|_| panic!("create"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"actual");
+        assert!(matches!(
+            worker
+                .store
+                .as_ref()
+                .unwrap()
+                .records()
+                .last()
+                .unwrap()
+                .entry(),
+            Entry::OperationFinished {
+                outcome: v2::Outcome::FileCreated { length: 6, .. },
+                ..
+            }
+        ));
+        let WorkerEvent::CacheUpdate(CachePatch::Terminal { boundary, view, .. }) =
+            ports.events.try_recv().unwrap()
+        else {
+            panic!("terminal")
+        };
+        assert_eq!(boundary, file_boundary(key));
+        assert!(matches!(
+            view,
+            v2::OperationView::Finished {
+                outcome: v2::Outcome::FileCreated { .. }
+            }
+        ));
+        assert!(
+            worker.active.is_none(),
+            "file never owns process output state"
+        );
+        ports
+            .returned
+            .try_send(DataReturn::ProducerDrained {
+                key,
+                final_ordinal: 0,
+            })
+            .unwrap_or_else(|_| panic!("drain"));
+        worker.returns();
+        assert!(worker.file.is_none());
+        worker
+            .observe_file(
+                v2::Request::ReadFile {
+                    lease: key.lease,
+                    path: v2::LeafName::new("leaf").unwrap(),
+                    offset: u64::MAX - 4096,
+                    length: 4096,
+                },
+                ticket,
+            )
+            .unwrap_or_else(|_| panic!("read EOF"));
+        let WorkerEvent::ResponseReady {
+            reply: v2::Reply::FileBytes { bytes, eof, .. },
+            ..
+        } = ports.events.try_recv().unwrap()
+        else {
+            panic!("read")
+        };
+        assert!(bytes.as_slice().is_empty() && eof);
+    }
+    #[test]
+    fn file_cancel_before_attempt_commits_not_started_without_native_open() {
+        let (_tmp, mut worker, ports, _grant, _ticket) = accepted_file(true);
+        worker.advance_file().unwrap_or_else(|_| panic!("cancel"));
+        let pending = worker.file.as_ref().unwrap();
+        assert!(!pending.owner.attempted && pending.owner.handle.is_none());
+        assert!(matches!(
+            worker
+                .store
+                .as_ref()
+                .unwrap()
+                .records()
+                .last()
+                .unwrap()
+                .entry(),
+            Entry::OperationFinished {
+                outcome: v2::Outcome::NotStarted {
+                    reason: v2::NotStartedReason::CancelRequested
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            ports.events.try_recv().unwrap(),
+            WorkerEvent::CacheUpdate(CachePatch::Terminal {
+                boundary: FinalBoundary {
+                    final_ordinal: 0,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+    #[test]
+    fn file_uncertainty_is_exact_synced_close_and_never_finished() {
+        let (_tmp, mut worker, ports, mut grant, _ticket) = accepted_file(false);
+        let path = worker
+            .invocation
+            .as_ref()
+            .unwrap()
+            .workspace_root
+            .join("leaf");
+        std::fs::write(&path, b"untouched").unwrap();
+        let key = worker.file.as_ref().unwrap().key.unwrap();
+        grant
+            .grant(AcceptedAdmission {
+                key,
+                reply_to: 2,
+                outbound_sequence: 3,
+            })
+            .unwrap();
+        worker
+            .advance_file()
+            .unwrap_or_else(|_| panic!("uncertain"));
+        assert_eq!(std::fs::read(path).unwrap(), b"untouched");
+        assert!(matches!(
+            worker
+                .store
+                .as_ref()
+                .unwrap()
+                .records()
+                .last()
+                .unwrap()
+                .entry(),
+            Entry::LeaseClosed {
+                disposition: Disposition::Quarantined {
+                    reason: v2::UnknownReason::FileEffectUncertain
+                },
+                ..
+            }
+        ));
+        assert!(
+            !worker
+                .store
+                .as_ref()
+                .unwrap()
+                .records()
+                .iter()
+                .any(|r| matches!(r.entry(), Entry::OperationFinished { .. }))
+        );
+        assert!(worker.stopping && worker.file.as_ref().unwrap().owner.sticky_open);
+        ports.events.try_recv().unwrap(); // exact lease close is already committed
+        worker.advance_file().unwrap_or_else(|_| panic!("publish"));
+        assert!(matches!(
+            ports.events.try_recv().unwrap(),
+            WorkerEvent::CacheUpdate(CachePatch::Terminal {
+                view: v2::OperationView::Unknown {
+                    reason: v2::UnknownReason::FileEffectUncertain
+                },
+                ..
+            })
+        ));
+        worker.retire_file();
+        let failure = worker.failure.as_ref().unwrap();
+        assert!(matches!(
+            failure.primary,
+            WorkerPrimary::File(crate::files::FileFailure::OpenUnclassified(_))
+        ));
+        assert!(failure.retained_file.as_ref().unwrap().sticky_open);
+    }
+    #[test]
+    fn observation_requires_exact_held_lease_and_busy_never_opens() {
+        for state in 0..5 {
+            let (_tmp, mut worker, ports, [p0, p1], inv) = fixture();
+            let binding = inv.expected.binding;
+            let manifest_digest = inv.expected.manifest_digest;
+            worker.initialize(inv).unwrap_or_else(|_| panic!("init"));
+            ports.events.try_recv().unwrap();
+            worker
+                .acquire(
+                    v2::Request::Acquire {
+                        intent: v2::IntentId::from_bytes([3; 16]),
+                        binding,
+                        manifest_digest,
+                    },
+                    ResponseTicket {
+                        reply_to: 1,
+                        permit: p0,
+                    },
+                )
+                .unwrap_or_else(|_| panic!("acquire"));
+            ports.events.try_recv().unwrap();
+            worker.response.take();
+            let (intent, actual, _) = worker.lease.clone().unwrap();
+            let lease = if state == 0 {
+                v2::LeaseId::from_bytes([9; 16])
+            } else {
+                actual
+            };
+            let expected = match state {
+                0 | 1 => v2::RefusalCode::WrongLease,
+                2 => v2::RefusalCode::AwaitingExternalReset,
+                3 => v2::RefusalCode::LeaseQuarantined,
+                _ => v2::RefusalCode::Busy,
+            };
+            match state {
+                1 => worker.lease = None,
+                2 => {
+                    worker.lease = Some((
+                        intent,
+                        actual,
+                        v2::LeaseView::AwaitingExternalReset { intent },
+                    ))
+                }
+                3 => {
+                    worker.lease = Some((
+                        intent,
+                        actual,
+                        v2::LeaseView::Quarantined {
+                            intent,
+                            reason: v2::UnknownReason::FileEffectUncertain,
+                        },
+                    ))
+                }
+                4 => {
+                    worker.file = Some(PendingFileRequest {
+                        request: v2::Request::Describe,
+                        ticket: None,
+                        owner: Box::new(crate::files::FileOwner::new()),
+                        key: None,
+                        create: None,
+                    })
+                }
+                _ => {}
+            }
+            worker
+                .observe_file(
+                    v2::Request::InspectFile {
+                        lease,
+                        path: v2::LeafName::new("absent").unwrap(),
+                    },
+                    ResponseTicket {
+                        reply_to: 2,
+                        permit: p1,
+                    },
+                )
+                .unwrap_or_else(|_| panic!("authorization"));
+            assert!(
+                matches!(ports.events.try_recv().unwrap(),WorkerEvent::ResponseReady { reply:v2::Reply::Refused { code },.. } if code==expected)
+            );
+            assert!(
+                !worker.stopping,
+                "absent open would latch sticky uncertainty"
+            );
+            assert!(worker.file.as_ref().is_none_or(|p| !p.owner.attempted));
+        }
+    }
+    #[test]
+    fn file_observation_open_uncertainty_stops_but_known_oversize_retires() {
+        for missing in [false, true] {
+            let (_tmp, mut worker, ports, _grant, ticket) = accepted_file(true);
+            worker
+                .advance_file()
+                .unwrap_or_else(|_| panic!("cancel create"));
+            ports.events.try_recv().unwrap();
+            let key = worker.file.as_ref().unwrap().key.unwrap();
+            ports
+                .returned
+                .try_send(DataReturn::ProducerDrained {
+                    key,
+                    final_ordinal: 0,
+                })
+                .unwrap_or_else(|_| panic!("drain"));
+            worker.returns();
+            worker.response.take();
+            let lease = worker.lease.as_ref().unwrap().1;
+            if !missing {
+                std::fs::write(
+                    worker
+                        .invocation
+                        .as_ref()
+                        .unwrap()
+                        .workspace_root
+                        .join("leaf"),
+                    vec![1u8; 4097],
+                )
+                .unwrap();
+            }
+            let records = worker.store.as_ref().unwrap().records().len();
+            worker
+                .observe_file(
+                    v2::Request::InspectFile {
+                        lease,
+                        path: v2::LeafName::new("leaf").unwrap(),
+                    },
+                    ticket,
+                )
+                .unwrap_or_else(|_| panic!("observe"));
+            assert!(matches!(
+                ports.events.try_recv().unwrap(),
+                WorkerEvent::ResponseReady {
+                    reply: v2::Reply::Refused {
+                        code: v2::RefusalCode::Unsupported
+                    },
+                    ..
+                }
+            ));
+            assert_eq!(worker.store.as_ref().unwrap().records().len(), records);
+            assert_eq!(worker.stopping, missing);
+            if missing {
+                let pending = worker.file.as_ref().unwrap();
+                assert!(pending.owner.sticky_open && pending.owner.handle.is_none());
+                worker.retire_file();
+                assert!(matches!(
+                    worker.failure.as_ref().unwrap().primary,
+                    WorkerPrimary::File(crate::files::FileFailure::OpenUnclassified(_))
+                ));
+            } else {
+                assert!(worker.file.is_none() && worker.failure.is_none());
+            }
+        }
+    }
+    #[test]
+    fn file_panic_preserves_exact_payload_primary_and_committed_finish() {
+        for finished in [false, true] {
+            let (_tmp, mut worker, ports, mut grant, _ticket) = accepted_file(false);
+            let key = worker.file.as_ref().unwrap().key.unwrap();
+            if finished {
+                grant
+                    .grant(AcceptedAdmission {
+                        key,
+                        reply_to: 2,
+                        outbound_sequence: 3,
+                    })
+                    .unwrap();
+                worker.advance_file().unwrap_or_else(|_| panic!("create"));
+                ports.events.try_recv().unwrap();
+            } else {
+                worker.file.as_mut().unwrap().owner.attempted = true;
+                worker.file.as_mut().unwrap().owner.opening = true;
+            }
+            let payload = Box::new([91u8; 32]);
+            let address = payload.as_ptr();
+            worker.file_panic(payload);
+            let last = worker
+                .store
+                .as_ref()
+                .unwrap()
+                .records()
+                .last()
+                .unwrap()
+                .entry();
+            if finished {
+                assert!(matches!(
+                    last,
+                    Entry::OperationFinished {
+                        outcome: v2::Outcome::FileCreated { .. },
+                        ..
+                    }
+                ));
+            } else {
+                assert!(matches!(
+                    last,
+                    Entry::LeaseClosed {
+                        disposition: Disposition::Quarantined {
+                            reason: v2::UnknownReason::FileEffectUncertain
+                        },
+                        ..
+                    }
+                ));
+            }
+            worker.retire_file();
+            assert_eq!(
+                worker
+                    .failure
+                    .as_ref()
+                    .unwrap()
+                    .panic_payload()
+                    .unwrap()
+                    .downcast_ref::<[u8; 32]>()
+                    .unwrap()
+                    .as_ptr(),
+                address
+            );
+            assert_eq!(
+                worker
+                    .failure
+                    .as_ref()
+                    .unwrap()
+                    .retained_file
+                    .as_ref()
+                    .unwrap()
+                    .sticky_open,
+                !finished
+            );
+        }
+    }
     fn dispatch_input(d: &mut crate::dispatcher::Dispatcher, sequence: u64, message: v2::Message) {
         let bytes = v2::encode(
             &v2::Envelope::new(v2::SessionId::from_bytes([7; 16]), sequence, message).unwrap(),
@@ -1683,7 +2678,9 @@ mod private_barrier_tests {
             .collect();
         assert_eq!(values, vec![71, 72]);
     }
-    fn integrated_accepted() -> (
+    fn integrated_admitted(
+        file: bool,
+    ) -> (
         tempfile::TempDir,
         Worker,
         crate::dispatcher::Dispatcher,
@@ -1730,10 +2727,19 @@ mod private_barrier_tests {
         request(
             &mut d,
             3,
-            v2::Request::Run {
-                lease,
-                operation,
-                program: v2::ProgramId::new("probe").unwrap(),
+            if file {
+                v2::Request::CreateFile {
+                    lease,
+                    operation,
+                    path: v2::LeafName::new("leaf").unwrap(),
+                    bytes: v2::FileBytes::new(b"bytes").unwrap(),
+                }
+            } else {
+                v2::Request::Run {
+                    lease,
+                    operation,
+                    program: v2::ProgramId::new("probe").unwrap(),
+                }
             },
         );
         worker
@@ -1741,6 +2747,205 @@ mod private_barrier_tests {
             .unwrap_or_else(|_| panic!("run"));
         d.event_quantum().unwrap(); // Accepted cache, original ResponseReady deliberately retained.
         (tmp, worker, d, lease, operation)
+    }
+    fn integrated_accepted() -> (
+        tempfile::TempDir,
+        Worker,
+        crate::dispatcher::Dispatcher,
+        v2::LeaseId,
+        v2::OperationId,
+    ) {
+        integrated_admitted(false)
+    }
+    #[test]
+    fn file_terminal_waits_for_original_accepted_and_matching_zero_drain() {
+        let (_tmp, mut worker, mut d, lease, operation) = integrated_admitted(true);
+        request(&mut d, 4, v2::Request::Cancel { lease, operation });
+        d.response_quantum().unwrap();
+        dispatch_flush(&mut d);
+        worker
+            .advance_file()
+            .unwrap_or_else(|_| panic!("cancel physical"));
+        d.event_quantum().unwrap();
+        request(&mut d, 5, v2::Request::QueryOperation { lease, operation });
+        assert!(
+            !d.response_quantum().unwrap(),
+            "terminal cannot precede original Accepted"
+        );
+        let (ticket, reply, key) = worker.response.take().unwrap();
+        worker.respond(ticket, reply, key);
+        d.event_quantum().unwrap();
+        assert!(d.response_quantum().unwrap()); // original Accepted
+        assert!(d.response_quantum().unwrap()); // terminal
+        dispatch_flush(&mut d);
+        d.return_quantum().unwrap();
+        worker.returns();
+        assert!(worker.file.is_none() && worker.active.is_none());
+        request(
+            &mut d,
+            6,
+            v2::Request::Run {
+                lease,
+                operation: v2::OperationId::from_bytes([8; 16]),
+                program: v2::ProgramId::new("probe").unwrap(),
+            },
+        );
+        worker
+            .command(worker.ports.commands.try_recv().unwrap())
+            .unwrap_or_else(|_| panic!("run after file"));
+        assert!(worker.active.is_some() && worker.file.is_none());
+        assert_eq!(worker.active.as_ref().unwrap().key.generation, 2);
+    }
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn file_fixture_native_write_error_retains_both_handles_and_exact_quarantine() {
+        use crate::test_support::{FixtureControl, FixtureMode};
+        let (_tmp, mut worker, ports, mut grant, _ticket) = accepted_file(false);
+        let control = FixtureControl::new(FixtureMode::FailFileWrite);
+        worker.invocation.as_mut().unwrap().fixture = Some(control.clone());
+        let key = worker.file.as_ref().unwrap().key.unwrap();
+        grant
+            .grant(AcceptedAdmission {
+                key,
+                reply_to: 2,
+                outbound_sequence: 3,
+            })
+            .unwrap();
+        worker
+            .advance_file()
+            .unwrap_or_else(|_| panic!("native failure"));
+        let owner = &worker.file.as_ref().unwrap().owner;
+        let Some(crate::files::FileFailure::IoAfterOpen {
+            stage: crate::files::FileStage::Write,
+            error,
+        }) = &owner.primary
+        else {
+            panic!("actual write source")
+        };
+        assert!(
+            error.raw_os_error().is_some(),
+            "write_all on actual read-only native file supplies OS source"
+        );
+        assert!(owner.handle.is_some() && owner.fixture_reopened.is_some());
+        assert!(!owner.sticky_open && !owner.opening);
+        assert_eq!(
+            std::fs::read(
+                worker
+                    .invocation
+                    .as_ref()
+                    .unwrap()
+                    .workspace_root
+                    .join("leaf")
+            )
+            .unwrap(),
+            b""
+        );
+        let snapshot = control.snapshot();
+        assert!(
+            snapshot.file_before_effect
+                && snapshot.file_effect_attempted
+                && snapshot.file_write_failed
+                && snapshot.file_quarantine_committed
+        );
+        assert!(!snapshot.file_finished_committed);
+        assert!(matches!(
+            worker
+                .store
+                .as_ref()
+                .unwrap()
+                .records()
+                .last()
+                .unwrap()
+                .entry(),
+            Entry::LeaseClosed {
+                disposition: Disposition::Quarantined {
+                    reason: v2::UnknownReason::FileEffectUncertain
+                },
+                ..
+            }
+        ));
+        assert!(
+            !worker
+                .store
+                .as_ref()
+                .unwrap()
+                .records()
+                .iter()
+                .any(|r| matches!(r.entry(), Entry::OperationFinished { .. }))
+        );
+        ports.events.try_recv().unwrap();
+        worker
+            .advance_file()
+            .unwrap_or_else(|_| panic!("publish unknown"));
+        assert!(matches!(
+            ports.events.try_recv().unwrap(),
+            WorkerEvent::CacheUpdate(CachePatch::Terminal {
+                view: v2::OperationView::Unknown {
+                    reason: v2::UnknownReason::FileEffectUncertain
+                },
+                ..
+            })
+        ));
+        worker.retire_file();
+        let retained = worker
+            .failure
+            .as_ref()
+            .unwrap()
+            .retained_file
+            .as_ref()
+            .unwrap();
+        assert!(retained.handle.is_some() && retained.fixture_reopened.is_some());
+    }
+    #[test]
+    fn file_close_error_preserves_original_file_source_and_secondary_store_error() {
+        let (_tmp, mut worker, _ports, _grant, _ticket) = accepted_file(false);
+        let key = worker.file.as_ref().unwrap().key.unwrap();
+        worker.file.as_mut().unwrap().owner.primary =
+            Some(crate::files::FileFailure::IoAfterOpen {
+                stage: crate::files::FileStage::Write,
+                error: io::Error::other(Original(73)),
+            });
+        // An actual ledger rejection provides a typed secondary StoreError; this
+        // is an ownership model, not a claim of an injected native sync failure.
+        worker
+            .append(Entry::LeaseClosed {
+                lease: key.lease,
+                disposition: Disposition::Quarantined {
+                    reason: v2::UnknownReason::HelperRestartedWithUnfinishedOperation,
+                },
+            })
+            .unwrap_or_else(|_| panic!("close"));
+        let records = worker.store.as_ref().unwrap().records().len();
+        worker
+            .quarantine_file()
+            .unwrap_or_else(|_| panic!("retained failure"));
+        assert_eq!(worker.store.as_ref().unwrap().records().len(), records);
+        assert!(worker.file.as_ref().unwrap().owner.ledger_error.is_some());
+        worker.retire_file();
+        let failure = worker.failure.as_ref().unwrap();
+        let WorkerPrimary::File(crate::files::FileFailure::IoAfterOpen { error, .. }) =
+            &failure.primary
+        else {
+            panic!("original file error")
+        };
+        assert_eq!(
+            error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<Original>()
+                .unwrap()
+                .0,
+            73
+        );
+        assert!(
+            failure
+                .retained_file
+                .as_ref()
+                .unwrap()
+                .ledger_error
+                .is_some()
+        );
+        assert!(worker.stopping);
     }
     #[test]
     fn cancelled_terminal_waits_for_original_accepted_fifo() {

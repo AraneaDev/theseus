@@ -228,7 +228,7 @@ pub(crate) mod tests {
             programs: v2::ProgramList::new(vec![v2::ProgramId::new("probe").unwrap()]).unwrap(),
         }
     }
-    fn inbound(
+    pub(super) fn inbound(
         pump: &mut Pump,
         seq: u64,
         message: v2::Message,
@@ -521,5 +521,70 @@ mod write_tests {
                 request: v2::Request::Cancel { .. }
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod file_wire_tests {
+    use super::*;
+    #[test]
+    fn literal_old_helper_unsupported_is_preserved_for_valid_lease_file_requests() {
+        // Independently authored legacy-compatible bytes; no historical binary claim.
+        for request in [
+            v2::Request::CreateFile {
+                lease: v2::LeaseId::from_bytes([1; 16]),
+                operation: v2::OperationId::from_bytes([2; 16]),
+                path: v2::LeafName::new("note").unwrap(),
+                bytes: v2::FileBytes::new(&[1]).unwrap(),
+            },
+            v2::Request::ReadFile {
+                lease: v2::LeaseId::from_bytes([1; 16]),
+                path: v2::LeafName::new("note").unwrap(),
+                offset: 0,
+                length: 1,
+            },
+            v2::Request::InspectFile {
+                lease: v2::LeaseId::from_bytes([1; 16]),
+                path: v2::LeafName::new("note").unwrap(),
+            },
+        ] {
+            let mut pump = tests::ready();
+            pump.submit(
+                RequestId(41),
+                v2::Request::QueryLease {
+                    lease: v2::LeaseId::from_bytes([1; 16]),
+                },
+            )
+            .unwrap();
+            pump.frames.clear();
+            tests::inbound(
+                &mut pump,
+                2,
+                v2::Message::Response {
+                    reply_to: 2,
+                    result: v2::Reply::Lease {
+                        lease: v2::LeaseId::from_bytes([1; 16]),
+                        state: v2::LeaseView::Held {
+                            intent: v2::IntentId::from_bytes([8; 16]),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+            pump.submit(RequestId(42), request).unwrap();
+            let body = br#"{"version":2,"session":"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a","sequence":3,"message":{"kind":"response","reply_to":3,"result":{"kind":"refused","code":"unsupported"}}}"#;
+            let mut literal = (body.len() as u32).to_be_bytes().to_vec();
+            literal.extend_from_slice(body);
+            let (_, event) = pump.decode(&literal, &tests::expected()).unwrap();
+            assert!(matches!(
+                event,
+                Some(Event::Reply {
+                    request: RequestId(42),
+                    reply: v2::Reply::Refused {
+                        code: v2::RefusalCode::Unsupported
+                    }
+                })
+            ));
+        }
     }
 }

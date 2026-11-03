@@ -23,7 +23,7 @@ fn native_child_status_and_probe_principal_are_observed_truthfully() {
 }
 
 #[test]
-fn explicit_config_and_unsupported_requests_never_create_authority() {
+fn explicit_config_and_wrong_lease_file_requests_never_create_authority() {
     prove_postjoin_ledger_rejects_corruption();
     let fixture = Fixture::new("success");
     let mut before = fixture.ledger_bytes();
@@ -43,28 +43,29 @@ fn explicit_config_and_unsupported_requests_never_create_authority() {
         .unwrap(),
     );
     let operation = OperationId::from_bytes([5; 16]);
+    let wrong = LeaseId::from_bytes([99; 16]);
     for request in [
         Request::CreateFile {
-            lease,
+            lease: wrong,
             operation,
             path: LeafName::new("denied").unwrap(),
             bytes: FileBytes::new(b"denied").unwrap(),
         },
         Request::ReadFile {
-            lease,
+            lease: wrong,
             path: LeafName::new("denied").unwrap(),
             offset: 0,
             length: 1,
         },
         Request::InspectFile {
-            lease,
+            lease: wrong,
             path: LeafName::new("denied").unwrap(),
         },
     ] {
         assert_eq!(
             peer.request(request),
             Reply::Refused {
-                code: RefusalCode::Unsupported
+                code: RefusalCode::WrongLease
             }
         );
     }
@@ -613,4 +614,572 @@ fn assert_pressure_facts(witness: &serde_json::Value) {
         (4..=128).contains(&published),
         "actual successful data publications at first no-free discard: {witness}"
     );
+}
+
+fn create_request(lease: LeaseId, id: u8, name: &str, bytes: &[u8]) -> Request {
+    Request::CreateFile {
+        lease,
+        operation: OperationId::from_bytes([id; 16]),
+        path: LeafName::new(name).unwrap(),
+        bytes: FileBytes::new(bytes).unwrap(),
+    }
+}
+
+fn create_file(peer: &mut Peer, lease: LeaseId, id: u8, name: &str, bytes: &[u8]) -> Outcome {
+    assert_eq!(
+        peer.request(create_request(lease, id, name, bytes)),
+        Reply::Operation {
+            lease,
+            operation: OperationId::from_bytes([id; 16]),
+            state: OperationView::Accepted {
+                operation_kind: OperationKind::CreateFile
+            },
+        }
+    );
+    let outcome = peer.terminal(lease, OperationId::from_bytes([id; 16]));
+    assert_eq!(
+        outcome,
+        Outcome::FileCreated {
+            length: bytes.len() as u16,
+            digest: content_digest(bytes),
+        }
+    );
+    outcome
+}
+
+fn content_digest(bytes: &[u8]) -> Digest {
+    use sha2::{Digest as _, Sha256};
+    Digest::from_bytes(Sha256::digest(bytes).into())
+}
+
+fn assert_observed(peer: &mut Peer, lease: LeaseId, name: &str, bytes: &[u8]) {
+    let path = LeafName::new(name).unwrap();
+    assert_eq!(
+        peer.request(Request::InspectFile {
+            lease,
+            path: path.clone()
+        }),
+        Reply::FileInfo {
+            lease,
+            path: path.clone(),
+            length: bytes.len() as u16,
+            digest: content_digest(bytes)
+        }
+    );
+    for (offset, length) in [
+        (0, 4096),
+        (0, 1),
+        (1, 2),
+        (bytes.len() as u64, 1),
+        (u64::MAX - 4096, 4096),
+    ] {
+        let begin = offset.min(bytes.len() as u64) as usize;
+        let end = (begin + length as usize).min(bytes.len());
+        assert_eq!(
+            peer.request(Request::ReadFile {
+                lease,
+                path: path.clone(),
+                offset,
+                length
+            }),
+            Reply::FileBytes {
+                lease,
+                path: path.clone(),
+                offset,
+                bytes: FileBytes::new(&bytes[begin..end]).unwrap(),
+                eof: end == bytes.len()
+            }
+        );
+    }
+}
+
+#[test]
+fn native_leaf_files_observe_actual_content_empty_limit_and_ranges() {
+    let fixture = Fixture::new("success");
+    let mut peer = fixture.start();
+    let lease = peer.acquire(&fixture);
+    let full = (0..4096).map(|n| (n % 251) as u8).collect::<Vec<_>>();
+    let mut expected = vec![];
+    for (id, name, bytes) in [
+        (21, "empty", &b""[..]),
+        (22, "full", full.as_slice()),
+        (23, "small", &b"original"[..]),
+    ] {
+        let request = create_request(lease, id, name, bytes);
+        let outcome = create_file(&mut peer, lease, id, name, bytes);
+        assert_eq!(
+            std::fs::read(fixture.root.path().join("workspace").join(name)).unwrap(),
+            bytes
+        );
+        assert_observed(&mut peer, lease, name, bytes);
+        expected.push((
+            OperationId::from_bytes([id; 16]),
+            request_digest(&request).unwrap(),
+            outcome,
+        ));
+    }
+    // A later native observation must hash actual current bytes, not the Create request.
+    std::fs::write(fixture.root.path().join("workspace/small"), b"changed").unwrap();
+    assert_observed(&mut peer, lease, "small", b"changed");
+    assert!(
+        peer.output.is_empty(),
+        "file requests have no output stream"
+    );
+    peer.close();
+    let records = fixture.records();
+    for (operation, digest, outcome) in expected {
+        let accepted = records.iter().position(|entry| matches!(entry,
+            ledger::Entry::OperationAccepted { lease: found, operation: op, operation_kind: OperationKind::CreateFile, request_digest, .. }
+            if *found == lease && *op == operation && *request_digest == digest)).unwrap();
+        let finished = records
+            .iter()
+            .position(|entry| {
+                matches!(entry,
+            ledger::Entry::OperationFinished { lease: found, operation: op, outcome: stored }
+            if *found == lease && *op == operation && *stored == outcome)
+            })
+            .unwrap();
+        assert!(
+            accepted < finished,
+            "physical accepted precedes matching finished"
+        );
+    }
+    assert!(!fixture.receipt.exists());
+}
+
+#[test]
+fn native_leaf_files_exclusive_create_quarantines_and_restarts_exact_reason() {
+    let fixture = Fixture::new("success");
+    let existing = fixture.root.path().join("workspace/existing");
+    std::fs::write(&existing, b"preserved original").unwrap();
+    let mut peer = fixture.start();
+    let lease = peer.acquire(&fixture);
+    let operation = OperationId::from_bytes([24; 16]);
+    let request = create_request(lease, 24, "existing", b"must not overwrite");
+    assert!(matches!(
+        peer.request(request.clone()),
+        Reply::Operation {
+            state: OperationView::Accepted {
+                operation_kind: OperationKind::CreateFile
+            },
+            ..
+        }
+    ));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    loop {
+        match peer.request(Request::QueryOperation { lease, operation }) {
+            Reply::Operation {
+                state:
+                    OperationView::Unknown {
+                        reason: UnknownReason::FileEffectUncertain,
+                    },
+                ..
+            } => break,
+            Reply::Operation {
+                state: OperationView::Accepted { .. } | OperationView::Running,
+                ..
+            } => {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            other => panic!("uncertain create {other:?}"),
+        }
+    }
+    assert_eq!(
+        peer.request(Request::QueryLease { lease }),
+        Reply::Lease {
+            lease,
+            state: LeaseView::Quarantined {
+                intent: fixture.prepared.record().intent,
+                reason: UnknownReason::FileEffectUncertain
+            }
+        }
+    );
+    peer.close_expected(2, b"helper: cleanup incomplete\n");
+    assert_eq!(std::fs::read(&existing).unwrap(), b"preserved original");
+    let records = fixture.records();
+    assert_eq!(records.len(), 4);
+    assert!(
+        matches!(&records[2],ledger::Entry::OperationAccepted { operation: op, operation_kind: OperationKind::CreateFile, request_digest: digest, .. }
+        if *op == operation && *digest == request_digest(&request).unwrap())
+    );
+    assert_eq!(
+        records[3],
+        ledger::Entry::LeaseClosed {
+            lease,
+            disposition: ledger::Disposition::Quarantined {
+                reason: UnknownReason::FileEffectUncertain
+            }
+        }
+    );
+    let mut restarted = fixture.start();
+    assert_eq!(
+        restarted.request(Request::QueryOperation { lease, operation }),
+        Reply::Operation {
+            lease,
+            operation,
+            state: OperationView::Unknown {
+                reason: UnknownReason::FileEffectUncertain
+            }
+        }
+    );
+    assert_eq!(
+        restarted.request(Request::InspectFile {
+            lease,
+            path: LeafName::new("existing").unwrap()
+        }),
+        Reply::Refused {
+            code: RefusalCode::LeaseQuarantined
+        }
+    );
+    restarted.close();
+    assert_eq!(fixture.records(), records);
+    assert_eq!(std::fs::read(existing).unwrap(), b"preserved original");
+}
+
+#[test]
+fn native_leaf_files_wrong_closed_lease_and_run_busy_preserve_workspace() {
+    let fixture = Fixture::new("wait");
+    let mut peer = fixture.start();
+    let lease = peer.acquire(&fixture);
+    let wrong = LeaseId::from_bytes([99; 16]);
+    let requests = |lease| {
+        [
+            create_request(lease, 25, "absent", b"denied"),
+            Request::ReadFile {
+                lease,
+                path: LeafName::new("absent").unwrap(),
+                offset: 0,
+                length: 1,
+            },
+            Request::InspectFile {
+                lease,
+                path: LeafName::new("absent").unwrap(),
+            },
+        ]
+    };
+    for request in requests(wrong) {
+        assert_eq!(
+            peer.request(request),
+            Reply::Refused {
+                code: RefusalCode::WrongLease
+            }
+        );
+    }
+    let operation = OperationId::from_bytes([26; 16]);
+    peer.run(lease, operation);
+    fixture.wait_receipt();
+    for request in requests(lease) {
+        assert_eq!(
+            peer.request(request),
+            Reply::Refused {
+                code: RefusalCode::Busy
+            }
+        );
+    }
+    assert!(!fixture.root.path().join("workspace/absent").exists());
+    std::fs::write(&fixture.release, fixture.nonce.as_bytes()).unwrap();
+    peer.terminal(lease, operation);
+    assert!(matches!(
+        peer.request(Request::Release { lease }),
+        Reply::Lease {
+            state: LeaseView::AwaitingExternalReset { .. },
+            ..
+        }
+    ));
+    for request in requests(lease) {
+        assert_eq!(
+            peer.request(request),
+            Reply::Refused {
+                code: RefusalCode::AwaitingExternalReset
+            }
+        );
+    }
+    peer.close();
+    assert!(!fixture.root.path().join("workspace/absent").exists());
+    assert!(!fixture.records().iter().any(|entry| matches!(
+        entry,
+        ledger::Entry::OperationAccepted {
+            operation_kind: OperationKind::CreateFile,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn native_leaf_files_replay_conflict_and_run_generations_retire() {
+    let fixture = Fixture::new("success");
+    let mut peer = fixture.start();
+    let lease = peer.acquire(&fixture);
+    let request = create_request(lease, 27, "first", b"first content");
+    let outcome = create_file(&mut peer, lease, 27, "first", b"first content");
+    assert_observed(&mut peer, lease, "first", b"first content");
+    let replay = Reply::Operation {
+        lease,
+        operation: OperationId::from_bytes([27; 16]),
+        state: OperationView::Finished { outcome },
+    };
+    assert_eq!(
+        peer.request(request.clone()),
+        Reply::Refused {
+            code: RefusalCode::InvalidRequest
+        }
+    );
+    assert_eq!(
+        peer.request(create_request(lease, 27, "first", b"conflict")),
+        Reply::Refused {
+            code: RefusalCode::InvalidRequest
+        }
+    );
+    let run = OperationId::from_bytes([28; 16]);
+    peer.run(lease, run);
+    assert!(matches!(
+        peer.terminal(lease, run),
+        Outcome::RunCompleted {
+            reason: RunReason::Natural,
+            ..
+        }
+    ));
+    fixture.assert_probe_receipt();
+    create_file(&mut peer, lease, 29, "after-run", b"next generation");
+    peer.close();
+    let before = fixture.records();
+    let mut restarted = fixture.start();
+    assert_eq!(
+        restarted.request(create_request(lease, 27, "first", b"conflict")),
+        Reply::Refused {
+            code: RefusalCode::ReplayConflict
+        }
+    );
+    assert_eq!(restarted.request(request.clone()), replay);
+    assert_eq!(
+        restarted.request(request),
+        Reply::Refused {
+            code: RefusalCode::InvalidRequest
+        }
+    );
+    assert_observed(&mut restarted, lease, "after-run", b"next generation");
+    restarted.close();
+    assert_eq!(fixture.records(), before);
+    assert_eq!(
+        before
+            .iter()
+            .filter(|entry| matches!(
+                entry,
+                ledger::Entry::OperationAccepted {
+                    operation_kind: OperationKind::CreateFile,
+                    ..
+                }
+            ))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn native_leaf_files_commit_ordering_and_cached_control_at_worker_gates() {
+    // These deliberate worker-boundary gates surround real synced store/file
+    // facts; they do not claim to block a kernel file call.
+    let before = Fixture::new("success");
+    let mut peer = before.start_feature("hold-before-file-effect", true);
+    let lease = peer.acquire(&before);
+    let operation = OperationId::from_bytes([30; 16]);
+    let request = create_request(lease, 30, "cancelled", b"never written");
+    assert!(matches!(
+        peer.request(request.clone()),
+        Reply::Operation {
+            state: OperationView::Accepted {
+                operation_kind: OperationKind::CreateFile
+            },
+            ..
+        }
+    ));
+    let witness = before.wait_witness(&["accepted_committed", "file_before_effect"]);
+    assert_eq!(witness["file_effect_attempted"], false);
+    assert!(!before.root.path().join("workspace/cancelled").exists());
+    assert_eq!(
+        peer.request(Request::QueryOperation { lease, operation }),
+        Reply::Operation {
+            lease,
+            operation,
+            state: OperationView::Accepted {
+                operation_kind: OperationKind::CreateFile
+            }
+        }
+    );
+    assert!(matches!(
+        peer.request(Request::Cancel { lease, operation }),
+        Reply::Operation { .. }
+    ));
+    before.wait_witness(&["cancel_requested"]);
+    before.release_hook();
+    let cancelled = Outcome::NotStarted {
+        reason: NotStartedReason::CancelRequested,
+    };
+    assert_eq!(peer.terminal(lease, operation), cancelled);
+    assert!(!before.root.path().join("workspace/cancelled").exists());
+    assert_eq!(before.witness()["file_effect_attempted"], false);
+    peer.close();
+    let records = before.records();
+    assert_eq!(records.len(), 4);
+    assert_eq!(
+        records[2],
+        ledger::Entry::OperationAccepted {
+            lease,
+            operation,
+            operation_kind: OperationKind::CreateFile,
+            request_digest: request_digest(&request).unwrap()
+        }
+    );
+    assert_eq!(
+        records[3],
+        ledger::Entry::OperationFinished {
+            lease,
+            operation,
+            outcome: cancelled
+        }
+    );
+
+    let finished = Fixture::new("success");
+    let mut peer = finished.start_feature("hold-after-file-finished", true);
+    let lease = peer.acquire(&finished);
+    let operation = OperationId::from_bytes([31; 16]);
+    let bytes = b"physically committed before wire terminal";
+    let request = create_request(lease, 31, "finished", bytes);
+    assert!(matches!(
+        peer.request(request.clone()),
+        Reply::Operation {
+            state: OperationView::Accepted {
+                operation_kind: OperationKind::CreateFile
+            },
+            ..
+        }
+    ));
+    let witness = finished.wait_witness(&["file_effect_attempted", "file_finished_committed"]);
+    assert_eq!(witness["file_quarantine_committed"], false);
+    let actual = std::fs::read(finished.root.path().join("workspace/finished")).unwrap();
+    assert_eq!(actual, bytes);
+    assert_eq!(content_digest(&actual), content_digest(bytes));
+    // The nonce/hash-bound marker is emitted only after the physical sync;
+    // live ledger reads are deliberately avoided, including on Windows.
+    assert_eq!(
+        peer.request(Request::QueryOperation { lease, operation }),
+        Reply::Operation {
+            lease,
+            operation,
+            state: OperationView::Accepted {
+                operation_kind: OperationKind::CreateFile
+            }
+        }
+    );
+    finished.release_hook();
+    let outcome = Outcome::FileCreated {
+        length: bytes.len() as u16,
+        digest: content_digest(bytes),
+    };
+    assert_eq!(peer.terminal(lease, operation), outcome);
+    assert!(peer.output.is_empty());
+    peer.close();
+    let records = finished.records();
+    assert_eq!(records.len(), 4);
+    assert_eq!(
+        records[2],
+        ledger::Entry::OperationAccepted {
+            lease,
+            operation,
+            operation_kind: OperationKind::CreateFile,
+            request_digest: request_digest(&request).unwrap()
+        }
+    );
+    assert_eq!(
+        records[3],
+        ledger::Entry::OperationFinished {
+            lease,
+            operation,
+            outcome
+        }
+    );
+}
+
+#[test]
+fn native_leaf_files_real_write_failure_quarantines_and_restarts() {
+    // Fixture-induced read-only handle: the native write itself fails. This
+    // does not model ordinary permissions or inject a ledger sync failure.
+    let fixture = Fixture::new("success");
+    let mut peer = fixture.start_feature("fail-file-write", true);
+    let lease = peer.acquire(&fixture);
+    let operation = OperationId::from_bytes([32; 16]);
+    let request = create_request(lease, 32, "write-failed", b"native write must fail");
+    assert!(matches!(
+        peer.request(request.clone()),
+        Reply::Operation {
+            state: OperationView::Accepted {
+                operation_kind: OperationKind::CreateFile
+            },
+            ..
+        }
+    ));
+    let witness = fixture.wait_witness(&[
+        "file_effect_attempted",
+        "file_write_failed",
+        "file_quarantine_committed",
+    ]);
+    assert_eq!(witness["file_finished_committed"], false);
+    let unknown = Reply::Operation {
+        lease,
+        operation,
+        state: OperationView::Unknown {
+            reason: UnknownReason::FileEffectUncertain,
+        },
+    };
+    // The synced witness survives the worker's failure-driven shutdown;
+    // cached replies are not guaranteed to remain available in this window.
+    peer.close_expected(2, b"helper: runtime failed\n");
+    let path = fixture.root.path().join("workspace/write-failed");
+    assert_eq!(std::fs::read(&path).unwrap(), b"");
+    let records = fixture.records();
+    assert_eq!(records.len(), 4);
+    assert_eq!(
+        records[2],
+        ledger::Entry::OperationAccepted {
+            lease,
+            operation,
+            operation_kind: OperationKind::CreateFile,
+            request_digest: request_digest(&request).unwrap()
+        }
+    );
+    assert_eq!(
+        records[3],
+        ledger::Entry::LeaseClosed {
+            lease,
+            disposition: ledger::Disposition::Quarantined {
+                reason: UnknownReason::FileEffectUncertain
+            }
+        }
+    );
+    let mut restarted = fixture.start();
+    assert_eq!(
+        restarted.request(Request::QueryLease { lease }),
+        Reply::Lease {
+            lease,
+            state: LeaseView::Quarantined {
+                intent: fixture.prepared.record().intent,
+                reason: UnknownReason::FileEffectUncertain
+            }
+        }
+    );
+    assert_eq!(
+        restarted.request(Request::QueryOperation { lease, operation }),
+        unknown
+    );
+    assert_eq!(
+        restarted.request(create_request(lease, 33, "second-create", b"denied")),
+        Reply::Refused {
+            code: RefusalCode::LeaseQuarantined
+        }
+    );
+    restarted.close();
+    assert_eq!(fixture.records(), records);
+    assert_eq!(std::fs::read(path).unwrap(), b"");
+    assert!(!fixture.root.path().join("workspace/second-create").exists());
 }

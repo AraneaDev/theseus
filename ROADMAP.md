@@ -18,7 +18,7 @@ accepted on every operating system. Unchecked acceptance gates remain required.
 | README and documentation restructure | Complete and merged |
 | Native helper protocol, host primitives, durable store and runtime | Local complete; final cross-platform acceptance pending |
 | Typed native helper client | Local complete after review fixes; final cross-platform acceptance pending |
-| Native helper file operations | Next implementation step; design review in progress |
+| Native helper file operations | In progress: implementation reviewed; native ordering/fault coverage being completed |
 | Native machine/VM adapter integration | Planned; not available through CLI, TUI or MCP yet |
 | Native services and desktop application observations | Planned |
 
@@ -94,10 +94,13 @@ installation interface for the controller machine.
   native execution evidence.
 - [ ] **Integrate to main:** merge reviewed native work after the combined gates.
 
-## Next: bounded native helper file operations
+## In progress: bounded native helper file operations
 
-- [ ] Retain the validated workspace directory authority for all file requests.
-- [ ] Implement existing typed `CreateFile`, `ReadFile` and `InspectFile` requests
+Implementation checkmarks in this section describe reviewed local source. The
+final native ordering/fault tests and cross-platform acceptance remain unchecked.
+
+- [x] Retain the validated workspace directory authority for all file requests.
+- [x] Implement existing typed `CreateFile`, `ReadFile` and `InspectFile` requests
   for bounded regular leaf files; no implicit overwrite or recursive access.
 - [ ] Commit acceptance before mutation; publish completion only after actual
   file observations and durable ledger completion.
@@ -105,7 +108,7 @@ installation interface for the controller machine.
   or a safe retry from a transport/filesystem error.
 - [ ] Serialize file work with native Run/cleanup on the existing worker; keep
   cached Query/Cancel responsive and refuse conflicting work before filesystem I/O.
-- [ ] Extend the typed client and retain explicit Unsupported behavior from older
+- [x] Extend the typed client and retain explicit Unsupported behavior from older
   helpers; support selection must be explicit.
 - [ ] Add focused failure/order/ownership tests and required native cases on all
   three OS jobs; complete review and local qualification before the final batch.

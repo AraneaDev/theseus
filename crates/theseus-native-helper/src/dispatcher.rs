@@ -204,6 +204,9 @@ impl Dispatcher {
         if let Some(reply) = self.cache.query(&request) {
             return self.response(ticket, reply, None);
         }
+        if self.cache.stopped {
+            return self.response(ticket, refused(v2::RefusalCode::OwnershipPending), None);
+        }
         if self.cache.poisoned {
             return self.response(ticket, refused(v2::RefusalCode::LedgerUnavailable), None);
         }
@@ -224,6 +227,9 @@ impl Dispatcher {
             },
             v2::Request::Run {
                 lease, operation, ..
+            }
+            | v2::Request::CreateFile {
+                lease, operation, ..
             } => {
                 if self.cache.live.as_ref().is_some_and(|l| {
                     l.key.lease == *lease && l.key.operation == *operation && l.terminal.is_some()
@@ -241,7 +247,15 @@ impl Dispatcher {
                 };
                 let flag = Arc::new(AtomicBool::new(false));
                 let (grant, start) = start_pair(key, sequence);
-                self.cache.begin(key)?;
+                let is_file = matches!(request, v2::Request::CreateFile { .. });
+                self.cache.begin_kind(
+                    key,
+                    if is_file {
+                        v2::OperationKind::CreateFile
+                    } else {
+                        v2::OperationKind::Run
+                    },
+                )?;
                 self.barrier = Some(BoundaryTracker::new(key));
                 self.active = Some(Active {
                     key,
@@ -252,13 +266,24 @@ impl Dispatcher {
                     requires_accepted: false,
                     terminal_admitted: false,
                 });
-                WorkerCommand::Run {
-                    request,
-                    ticket,
-                    cancel: CancelToken { key, flag },
-                    start,
+                if is_file {
+                    WorkerCommand::CreateFile {
+                        request,
+                        ticket,
+                        cancel: CancelToken { key, flag },
+                        start,
+                    }
+                } else {
+                    WorkerCommand::Run {
+                        request,
+                        ticket,
+                        cancel: CancelToken { key, flag },
+                        start,
+                    }
                 }
             }
+            v2::Request::ReadFile { .. } => WorkerCommand::ReadFile { request, ticket },
+            v2::Request::InspectFile { .. } => WorkerCommand::InspectFile { request, ticket },
             _ => return self.response(ticket, refused(v2::RefusalCode::InvalidRequest), None),
         };
         match self.ports.commands.try_send(command) {
@@ -276,8 +301,11 @@ impl Dispatcher {
                 };
                 let ticket = match command {
                     WorkerCommand::Acquire { ticket, .. }
-                    | WorkerCommand::Release { ticket, .. } => ticket,
-                    WorkerCommand::Run { ticket, .. } => {
+                    | WorkerCommand::Release { ticket, .. }
+                    | WorkerCommand::ReadFile { ticket, .. }
+                    | WorkerCommand::InspectFile { ticket, .. } => ticket,
+                    WorkerCommand::Run { ticket, .. }
+                    | WorkerCommand::CreateFile { ticket, .. } => {
                         self.active = None;
                         self.barrier = None;
                         self.cache.live = None;
@@ -407,7 +435,7 @@ impl Dispatcher {
             &pending.reply,
             v2::Reply::Operation {
                 state: v2::OperationView::Accepted {
-                    operation_kind: v2::OperationKind::Run
+                    operation_kind: v2::OperationKind::Run | v2::OperationKind::CreateFile
                 },
                 ..
             }

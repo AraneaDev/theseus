@@ -128,6 +128,7 @@ pub(crate) enum CachePatch {
     },
 }
 pub(crate) enum WorkerPrimary {
+    File(crate::files::FileFailure),
     Io(io::Error),
     Store(StoreError),
     Spawn(theseus_host::process::SpawnFailure),
@@ -135,6 +136,7 @@ pub(crate) enum WorkerPrimary {
 }
 pub struct OwnedWorkerFailure {
     pub(crate) primary: WorkerPrimary,
+    pub(crate) retained_file: Option<Box<crate::files::FileOwner>>,
     pub(crate) retained_spawn: Option<Box<theseus_host::process::SpawnFailure>>,
     pub(crate) cleanup_errors: [Option<io::Error>; 8],
 }
@@ -164,6 +166,20 @@ pub(crate) enum WorkerCommand {
         ticket: ResponseTicket,
         cancel: CancelToken,
         start: StartWatch,
+    },
+    CreateFile {
+        request: v2::Request,
+        ticket: ResponseTicket,
+        cancel: CancelToken,
+        start: StartWatch,
+    },
+    ReadFile {
+        request: v2::Request,
+        ticket: ResponseTicket,
+    },
+    InspectFile {
+        request: v2::Request,
+        ticket: ResponseTicket,
     },
     Release {
         lease: v2::LeaseId,
@@ -278,6 +294,7 @@ impl OwnedWorkerFailure {
     }
     pub fn classification(&self) -> &'static str {
         match &self.primary {
+            WorkerPrimary::File(_) => "file",
             WorkerPrimary::Io(_) => "io",
             WorkerPrimary::Store(_) => "store",
             WorkerPrimary::Spawn(_) => "spawn",
@@ -286,11 +303,16 @@ impl OwnedWorkerFailure {
     }
     pub fn cleanup_error_count(&self) -> usize {
         self.cleanup_errors.iter().filter(|e| e.is_some()).count()
+            + usize::from(
+                self.retained_file
+                    .as_ref()
+                    .is_some_and(|o| o.cleanup_error.is_some()),
+            )
     }
     pub fn panic_payload(&self) -> Option<&(dyn std::any::Any + Send + 'static)> {
         match &self.primary {
             WorkerPrimary::Panic(p) => Some(p.as_ref()),
-            _ => None,
+            _ => self.retained_file.as_ref().and_then(|o| o.panic.as_deref()),
         }
     }
 }
@@ -307,6 +329,7 @@ impl std::fmt::Debug for OwnedWorkerFailure {
 impl std::error::Error for OwnedWorkerFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.primary {
+            WorkerPrimary::File(e) => Some(e),
             WorkerPrimary::Io(e) => Some(e),
             WorkerPrimary::Store(e) => Some(e),
             WorkerPrimary::Spawn(e) => Some(e),
@@ -372,6 +395,7 @@ mod failure_tests {
     fn bounded_failure_formatting_never_formats_retained_sources() {
         let failure = OwnedWorkerFailure {
             primary: WorkerPrimary::Io(io::Error::other(Hostile)),
+            retained_file: None,
             retained_spawn: None,
             cleanup_errors: std::array::from_fn(|_| None),
         };
@@ -393,6 +417,7 @@ mod failure_tests {
         let original = payload.as_ptr();
         let failure = OwnedWorkerFailure {
             primary: WorkerPrimary::Panic(payload),
+            retained_file: None,
             retained_spawn: None,
             cleanup_errors: std::array::from_fn(|_| None),
         };

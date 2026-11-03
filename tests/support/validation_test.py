@@ -333,14 +333,20 @@ class ValidationTests(unittest.TestCase):
                 inner.calls.append((name, args, kwargs))
             def run(inner, *args, **kwargs):
                 pass
-        common = ['explicit_config_and_unsupported_requests_never_create_authority',
+        common = ['explicit_config_and_wrong_lease_file_requests_never_create_authority',
                   'ordinary_pipes_prove_commit_before_ack_spawn_and_finished',
                   'lost_acquire_reply_reuses_committed_intent_and_lease',
                   'cached_cancel_remains_responsive_under_saturated_output',
                   'finished_is_durable_before_optional_output_drain',
                   'native_child_status_and_probe_principal_are_observed_truthfully',
                   'eof_and_unresolved_cleanup_keep_owners_until_join_or_exit_two',
-                  'fixture_faults_are_absent_from_normal_helper_graph']
+                  'fixture_faults_are_absent_from_normal_helper_graph',
+                  'native_leaf_files_observe_actual_content_empty_limit_and_ranges',
+                  'native_leaf_files_exclusive_create_quarantines_and_restarts_exact_reason',
+                  'native_leaf_files_wrong_closed_lease_and_run_busy_preserve_workspace',
+                  'native_leaf_files_replay_conflict_and_run_generations_retire',
+                  'native_leaf_files_commit_ordering_and_cached_control_at_worker_gates',
+                  'native_leaf_files_real_write_failure_quarantines_and_restarts']
         for system in ('Linux', 'Darwin', 'Windows'):
             with tempfile.TemporaryDirectory() as temp:
                 runner = RecordingRunner(pathlib.Path(temp), {})
@@ -502,7 +508,9 @@ class ValidationTests(unittest.TestCase):
                   'native_client_cancel_remains_responsive_under_output_pressure',
                   'native_client_connection_loss_never_reexecutes_run',
                   'native_client_reconnect_ids_and_partial_failure_owners_are_safe',
-                  'native_client_transport_join_does_not_claim_remote_cleanup']
+                  'native_client_transport_join_does_not_claim_remote_cleanup',
+                  'native_client_file_roundtrip_empty_bounded_ranges_and_run',
+                  'native_client_file_connection_loss_queries_original_without_second_create']
         for system in ('Linux', 'Darwin', 'Windows'):
             with self.subTest(system=system), tempfile.TemporaryDirectory() as temp:
                 runner = RecordingRunner(pathlib.Path(temp), {})

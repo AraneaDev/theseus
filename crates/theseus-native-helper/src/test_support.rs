@@ -11,11 +11,15 @@ pub enum FixtureMode {
     HoldInit,
     HoldBeforeSpawn,
     PanicAfterOwnedSpawn,
+    HoldBeforeFileEffect,
+    HoldAfterFileFinished,
+    FailFileWrite,
 }
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FixtureControl {
     state: Arc<State>,
 }
+#[derive(Debug)]
 struct State {
     mode: FixtureMode,
     events: AtomicU64,
@@ -26,6 +30,11 @@ struct State {
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FixtureSnapshot {
+    pub file_before_effect: bool,
+    pub file_effect_attempted: bool,
+    pub file_finished_committed: bool,
+    pub file_write_failed: bool,
+    pub file_quarantine_committed: bool,
     pub init_reached: bool,
     pub before_spawn_reached: bool,
     pub acquire_committed: bool,
@@ -41,6 +50,11 @@ pub struct FixtureSnapshot {
     pub saturation_wire_bytes: u64,
     pub saturation_published_frames: u64,
 }
+const FILE_BEFORE_EFFECT: u64 = 1 << 11;
+const FILE_EFFECT_ATTEMPTED: u64 = 1 << 12;
+const FILE_FINISHED_COMMITTED: u64 = 1 << 13;
+const FILE_WRITE_FAILED: u64 = 1 << 14;
+const FILE_QUARANTINE_COMMITTED: u64 = 1 << 15;
 const INIT_REACHED: u64 = 1 << 0;
 const BEFORE_SPAWN_REACHED: u64 = 1 << 1;
 const ACQUIRE_COMMITTED: u64 = 1 << 2;
@@ -77,6 +91,11 @@ impl FixtureControl {
     pub fn snapshot(&self) -> FixtureSnapshot {
         let events = self.state.events.load(Ordering::Acquire);
         FixtureSnapshot {
+            file_before_effect: events & FILE_BEFORE_EFFECT != 0,
+            file_effect_attempted: events & FILE_EFFECT_ATTEMPTED != 0,
+            file_finished_committed: events & FILE_FINISHED_COMMITTED != 0,
+            file_write_failed: events & FILE_WRITE_FAILED != 0,
+            file_quarantine_committed: events & FILE_QUARANTINE_COMMITTED != 0,
             init_reached: events & INIT_REACHED != 0,
             before_spawn_reached: events & BEFORE_SPAWN_REACHED != 0,
             acquire_committed: events & ACQUIRE_COMMITTED != 0,
@@ -102,6 +121,34 @@ impl FixtureControl {
                 0
             },
         }
+    }
+
+    /// Fixture gate model after Accepted sync and original wire admission,
+    /// before the first native file open. Worker must recheck cancellation.
+    pub(crate) fn before_file_effect(&self) {
+        self.mark(FILE_BEFORE_EFFECT);
+        if self.state.mode == FixtureMode::HoldBeforeFileEffect {
+            self.wait_for_release();
+        }
+    }
+    /// Actual Finished append/sync has returned before this gate is reached.
+    pub(crate) fn after_file_finished(&self) {
+        self.mark(FILE_FINISHED_COMMITTED);
+        if self.state.mode == FixtureMode::HoldAfterFileFinished {
+            self.wait_for_release();
+        }
+    }
+    pub(crate) fn fail_file_write(&self) -> bool {
+        self.state.mode == FixtureMode::FailFileWrite
+    }
+    pub(crate) fn mark_file_effect_attempted(&self) {
+        self.mark(FILE_EFFECT_ATTEMPTED);
+    }
+    pub(crate) fn mark_file_write_failed(&self) {
+        self.mark(FILE_WRITE_FAILED);
+    }
+    pub(crate) fn mark_file_quarantine_committed(&self) {
+        self.mark(FILE_QUARANTINE_COMMITTED);
     }
 
     pub(crate) fn is_output_pressure(&self) -> bool {
@@ -242,6 +289,7 @@ mod tests {
                 control_write_acks: 0,
                 saturation_wire_bytes: 0,
                 saturation_published_frames: 0,
+                ..FixtureSnapshot::default()
             }
         );
         assert_eq!(independent.snapshot(), FixtureSnapshot::default());
@@ -340,6 +388,46 @@ mod tests {
         assert!(!snapshot.terminal_committed);
     }
 
+    #[test]
+    fn file_gates_hold_only_their_named_boundary_and_preserve_latched_facts() {
+        for before in [false, true] {
+            let control = FixtureControl::new(if before {
+                FixtureMode::HoldBeforeFileEffect
+            } else {
+                FixtureMode::HoldAfterFileFinished
+            });
+            let independent = FixtureControl::new(FixtureMode::Observe);
+            let worker = control.clone();
+            let (sent, received) = mpsc::channel();
+            let join = thread::spawn(move || {
+                if before {
+                    worker.before_file_effect();
+                } else {
+                    worker.after_file_finished();
+                }
+                sent.send(()).unwrap();
+            });
+            wait_until(|| {
+                if before {
+                    control.snapshot().file_before_effect
+                } else {
+                    control.snapshot().file_finished_committed
+                }
+            });
+            let blocked = received.try_recv().is_err();
+            control.release();
+            received.recv_timeout(Duration::from_secs(5)).unwrap();
+            join.join().unwrap();
+            assert!(blocked);
+            let snapshot = control.snapshot();
+            assert!(
+                !snapshot.file_effect_attempted
+                    && !snapshot.file_write_failed
+                    && !snapshot.file_quarantine_committed
+            );
+            assert_eq!(independent.snapshot(), FixtureSnapshot::default());
+        }
+    }
     #[test]
     fn concurrent_marks_are_never_lost() {
         let control = FixtureControl::new(FixtureMode::Observe);

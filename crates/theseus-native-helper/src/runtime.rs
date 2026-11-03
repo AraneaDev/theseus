@@ -215,6 +215,7 @@ impl RuntimeOwner {
                 }
                 Err(payload) => WorkerCompletion::Failed(crate::contract::OwnedWorkerFailure {
                     primary: crate::contract::WorkerPrimary::Panic(payload),
+                    retained_file: None,
                     retained_spawn: None,
                     cleanup_errors: std::array::from_fn(|_| None),
                 }),

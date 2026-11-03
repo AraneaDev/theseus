@@ -18,6 +18,24 @@ pub enum Action<'a> {
         operation: v2::OperationId,
         program: v2::ProgramId,
     },
+    /// Explicit opt-in for a known file-capable helper. Persist the complete
+    /// typed request and canonical digest before submit for process-crash recovery.
+    CreateFile {
+        lease: v2::LeaseId,
+        operation: v2::OperationId,
+        path: v2::LeafName,
+        bytes: v2::FileBytes,
+    },
+    ReadFile {
+        lease: v2::LeaseId,
+        path: v2::LeafName,
+        offset: u64,
+        length: u16,
+    },
+    InspectFile {
+        lease: v2::LeaseId,
+        path: v2::LeafName,
+    },
     Query {
         lease: v2::LeaseId,
         operation: v2::OperationId,
@@ -1069,6 +1087,95 @@ mod wire_review_tests {
                 .unwrap(),
                 Some(Event::Reply { .. })
             ));
+            settle(&mut c);
+        }
+    }
+    #[test]
+    fn create_reconnect_preserves_identity_checks_receipt_and_never_automatically_reexecutes() {
+        use sha2::{Digest as _, Sha256};
+        for bad in 0..4 {
+            let mut c = client();
+            let old = ready(&mut c);
+            let lease = v2::LeaseId::from_bytes([1; 16]);
+            let operation = v2::OperationId::from_bytes([2; 16]);
+            c.submit(Action::CreateFile {
+                lease,
+                operation,
+                path: v2::LeafName::new("note").unwrap(),
+                bytes: v2::FileBytes::new(b"hello").unwrap(),
+            })
+            .unwrap();
+            let frames = sent(&mut c);
+            assert!(matches!(
+                frames[0].message(),
+                v2::Message::Request {
+                    request: v2::Request::CreateFile { .. }
+                }
+            ));
+            let session = reconnect(&mut c, &old);
+            assert!(sent(&mut c).is_empty());
+            let query = c.submit(Action::Query { lease, operation }).unwrap();
+            let frames = sent(&mut c);
+            assert!(matches!(
+                frames[0].message(),
+                v2::Message::Request {
+                    request: v2::Request::QueryOperation { .. }
+                }
+            ));
+            let digest = v2::Digest::from_bytes(Sha256::digest(b"hello").into());
+            let state = match bad {
+                0 => v2::OperationView::Finished {
+                    outcome: v2::Outcome::FileCreated { length: 4, digest },
+                },
+                1 => v2::OperationView::Finished {
+                    outcome: v2::Outcome::FileCreated {
+                        length: 5,
+                        digest: v2::Digest::from_bytes([0; 32]),
+                    },
+                },
+                2 => v2::OperationView::Accepted {
+                    operation_kind: v2::OperationKind::Run,
+                },
+                _ => v2::OperationView::Finished {
+                    outcome: v2::Outcome::LaunchFailed {
+                        phase: v2::LaunchPhase::NeverCreated,
+                        code: v2::FailureCode::Io,
+                        cleanup: v2::SpawnCleanup::NoChildCreated,
+                    },
+                },
+            };
+            assert!(matches!(
+                feed(
+                    &mut c,
+                    &session,
+                    2,
+                    v2::Message::Response {
+                        reply_to: 2,
+                        result: v2::Reply::Operation {
+                            lease,
+                            operation,
+                            state
+                        }
+                    }
+                ),
+                Err(ClientError::Protocol)
+            ));
+            assert_eq!(
+                c.submit(Action::CreateFile {
+                    lease,
+                    operation: v2::OperationId::from_bytes([3; 16]),
+                    path: v2::LeafName::new("other").unwrap(),
+                    bytes: v2::FileBytes::new(&[]).unwrap()
+                }),
+                Err(ClientError::RecoveryRequired)
+            );
+            let next = reconnect(&mut c, &session);
+            let next_query = c.submit(Action::Query { lease, operation }).unwrap();
+            assert_ne!(query, next_query);
+            sent(&mut c);
+            assert!(
+                matches!(feed(&mut c,&next,2,v2::Message::Response {reply_to:2,result:v2::Reply::Operation {lease,operation,state:v2::OperationView::Finished {outcome:v2::Outcome::FileCreated {length:5,digest}}}}).unwrap(),Some(Event::Reply {request,..}) if request == next_query)
+            );
             settle(&mut c);
         }
     }
