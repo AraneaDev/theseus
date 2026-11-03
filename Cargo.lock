@@ -797,6 +797,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "theseus-native-helper-store"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "theseus-host",
+ "theseus-native-protocol",
+]
+
+[[package]]
 name = "theseus-native-protocol"
 version = "0.1.0"
 dependencies = [
