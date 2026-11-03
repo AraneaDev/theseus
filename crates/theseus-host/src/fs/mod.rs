@@ -1,4 +1,6 @@
 //! Pinned directory authority. Paths retained here are diagnostic only.
+mod ledger;
+pub use ledger::LockedLedgerFile;
 mod path;
 pub use path::RelativePath;
 #[cfg(unix)]

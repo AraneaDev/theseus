@@ -69,6 +69,18 @@ pub(super) fn open_file(parent: &File, name: &OsStr, create: bool) -> io::Result
     }
     Ok(file)
 }
+pub(super) fn open_ledger(parent: &File, name: &OsStr) -> io::Result<File> {
+    let file = File::from(openat(
+        parent,
+        name,
+        OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+    if !file.metadata()?.is_file() {
+        return Err(super::invalid("expected a regular file"));
+    }
+    Ok(file)
+}
 pub(super) fn entries(directory: &File) -> io::Result<Vec<OsString>> {
     let mut names = Vec::new();
     for entry in Dir::read_from(directory)? {

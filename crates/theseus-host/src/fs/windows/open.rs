@@ -170,9 +170,15 @@ struct OpenCall {
 }
 fn relative(parent: &File, name: &OsStr, directory: bool, create: bool) -> io::Result<File> {
     crate::fs::validate_name(name)?;
-    relative_open(parent, name, directory, create)
+    relative_open(parent, name, directory, create, false)
 }
-fn relative_open(parent: &File, name: &OsStr, directory: bool, create: bool) -> io::Result<File> {
+fn relative_open(
+    parent: &File,
+    name: &OsStr,
+    directory: bool,
+    create: bool,
+    ledger: bool,
+) -> io::Result<File> {
     let name = wide(name)?;
     let length = u16::try_from(
         (name.len() - 1)
@@ -224,6 +230,7 @@ fn relative_open(parent: &File, name: &OsStr, directory: bool, create: bool) -> 
             }
     } else {
         FILE_GENERIC_READ
+            | if ledger { FILE_GENERIC_WRITE } else { 0 }
             | if create {
                 FILE_GENERIC_WRITE | DELETE
             } else {
@@ -294,6 +301,11 @@ pub(in crate::fs) fn create_dir(parent: &File, name: &OsStr) -> io::Result<File>
 }
 pub(in crate::fs) fn open_file(parent: &File, name: &OsStr, create: bool) -> io::Result<File> {
     relative(parent, name, false, create)
+}
+pub(in crate::fs) fn open_ledger(parent: &File, name: &OsStr) -> io::Result<File> {
+    crate::fs::validate_name(name)?;
+    // OBJ_INHERIT is deliberately absent from the shared relative-open attributes.
+    relative_open(parent, name, false, false, true)
 }
 pub(in crate::fs) fn validate(file: &File, directory: bool) -> io::Result<()> {
     let info: FILE_ATTRIBUTE_TAG_INFO = query(file, FileAttributeTagInfo)?;

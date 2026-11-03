@@ -3,6 +3,7 @@ pub mod cancel;
 #[cfg(windows)]
 pub mod console;
 pub mod fs;
+pub mod principal;
 pub mod process;
 mod random;
 pub mod stdio;
