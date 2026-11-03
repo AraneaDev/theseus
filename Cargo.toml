@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/theseus-host"]
+members = ["crates/theseus-host", "crates/theseus-native-protocol"]
 exclude = ["vendor/crossterm"]
 resolver = "3"
 
