@@ -63,11 +63,19 @@ def main():
         raise RuntimeError('Production graph contains fault support or required artifact is absent')
     metadata['production'] = pin(owned, production, 'theseus', 'production')
     metadata['production_graph'] = production
+    helper = build(['-p', 'theseus-native-helper', '--bin', 'theseus-native-helper'])
+    VALIDATION.check_helper_graph(helper)
+    metadata['helper_production'] = pin(owned, helper, 'theseus-native-helper', 'helper-production')
+    metadata['helper_production_graph'] = helper
     native = build(['--workspace', '--bins', '--features', 'theseus-host/test-support'])
     metadata['fixture'] = pin(owned, native, 'theseus-host-fixture', 'fixture')
     metadata['application'] = pin(owned, native, 'theseus', 'application')
     mcp = build(['--features', 'mcp-test-support', '--bin', 'theseus-mcp-fixture'])
     metadata['mcp_fixture'] = pin(owned, mcp, 'theseus-mcp-fixture', 'mcp-fixture')
+    helper_fixture = build(['-p', 'theseus-native-helper', '--features', 'test-support', '--bin', 'theseus-native-helper-fixture'])
+    VALIDATION.check_helper_graph(helper_fixture, fixture=True)
+    metadata['helper_fixture'] = pin(owned, helper_fixture, 'theseus-native-helper-fixture', 'helper-fixture')
+    metadata['helper_fixture_graph'] = helper_fixture
     if VALIDATION.source_identity(ROOT) != identity:
         raise RuntimeError('Source changed while building pinned artifacts; no source binding established')
     # Preserve the original fixture-parent metadata convention for Rust tests.

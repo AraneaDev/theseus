@@ -137,6 +137,19 @@
     ],
     "stdio-identity-windows": [
       "separate_createpipe_pairs_use_distinct_npfs_ids_and_production_transport"
+    ],
+    "helper-runtime-common": [
+      "explicit_config_and_unsupported_requests_never_create_authority",
+      "ordinary_pipes_prove_commit_before_ack_spawn_and_finished",
+      "lost_acquire_reply_reuses_committed_intent_and_lease",
+      "cached_cancel_remains_responsive_under_saturated_output",
+      "finished_is_durable_before_optional_output_drain",
+      "native_child_status_and_probe_principal_are_observed_truthfully",
+      "eof_and_unresolved_cleanup_keep_owners_until_join_or_exit_two",
+      "fixture_faults_are_absent_from_normal_helper_graph"
+    ],
+    "helper-runtime-windows": [
+      "windows_unsigned_high_bit_exit_status_is_preserved"
     ]
   }
 }

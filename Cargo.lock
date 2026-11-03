@@ -797,6 +797,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "theseus-native-helper"
+version = "0.1.0"
+dependencies = [
+ "rustix 1.1.5",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "theseus-host",
+ "theseus-native-helper-store",
+ "theseus-native-protocol",
+]
+
+[[package]]
 name = "theseus-native-helper-store"
 version = "0.1.0"
 dependencies = [

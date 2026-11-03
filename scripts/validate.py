@@ -93,11 +93,28 @@ def check_native_host(rustc, system, expected):
 
 
 def verify_artifacts(metadata):
-    for key in ('fixture', 'application', 'production', 'mcp_fixture'):
+    for key in ('fixture', 'application', 'production', 'mcp_fixture', 'helper_production', 'helper_fixture'):
         item = metadata.get(key, {})
         path = pathlib.Path(item.get('path', ''))
-        if not path.is_file() or path.is_symlink() or sha256(path) != item.get('sha256'):
+        if not path.is_file() or path.is_symlink() or (os.name != 'nt' and not os.access(path, os.X_OK)) or sha256(path) != item.get('sha256'):
             raise GateFailure(f'Missing or changed pinned native artifact: {key}')
+
+    if pathlib.Path(metadata['helper_production']['path']).samefile(metadata['helper_fixture']['path']):
+        raise GateFailure('Normal helper and helper fixture must be separate pinned artifacts')
+
+
+def check_helper_graph(artifacts, *, fixture=False):
+    """Require the explicit helper graph; helper test-support never enables host faults."""
+    binary = 'theseus-native-helper-fixture' if fixture else 'theseus-native-helper'
+    for target in ('theseus_host', 'theseus_native_helper', binary):
+        matches = [item for item in artifacts if item.get('reason') == 'compiler-artifact'
+                   and item.get('target', {}).get('name') == target]
+        enabled = fixture and target != 'theseus_host'
+        if not matches or any(('test-support' in item['features']) != enabled for item in matches):
+            raise GateFailure(f'{target}: helper feature boundary violated or artifact absent')
+    if not fixture and any(item.get('target', {}).get('name') == 'theseus-native-helper-fixture'
+                           for item in artifacts):
+        raise GateFailure('Normal helper graph contains the fixture binary')
 
 
 def test_execution(text, required_cases):
@@ -202,6 +219,8 @@ def load_pinned(runner):
     runner.env['THESEUS_HOST_TEST_FIXTURE'] = metadata['fixture']['path']
     runner.env['THESEUS_MCP_BINARY'] = metadata['production']['path']
     runner.env['THESEUS_MCP_FIXTURE'] = metadata['mcp_fixture']['path']
+    runner.env['THESEUS_NATIVE_HELPER_BINARY'] = metadata['helper_production']['path']
+    runner.env['THESEUS_NATIVE_HELPER_FIXTURE'] = metadata['helper_fixture']['path']
     return metadata
 
 
@@ -217,6 +236,8 @@ def fixture(runner):
             output.write(f'THESEUS_HOST_TEST_FIXTURE={metadata["fixture"]["path"]}\n')
             output.write(f'THESEUS_MCP_BINARY={metadata["production"]["path"]}\n')
             output.write(f'THESEUS_MCP_FIXTURE={metadata["mcp_fixture"]["path"]}\n')
+            output.write(f'THESEUS_NATIVE_HELPER_BINARY={metadata["helper_production"]["path"]}\n')
+            output.write(f'THESEUS_NATIVE_HELPER_FIXTURE={metadata["helper_fixture"]["path"]}\n')
 
 
 def feature_boundaries(runner):
@@ -240,6 +261,21 @@ def feature_boundaries(runner):
             raise GateFailure('Production application unexpectedly enables MCP fixture support')
         if not artifacts or any(('test-support' in artifact['features']) != enabled for artifact in artifacts):
             raise GateFailure(f'{name}: native test-support feature boundary violated or artifact absent')
+
+    for name, arguments, fixture_graph in (
+        ('helper-release-artifacts', ['check', '--locked', '--release', '-p', 'theseus-native-helper', '--bin', 'theseus-native-helper', '--message-format=json'], False),
+        ('helper-fixture-artifacts', ['check', '--locked', '-p', 'theseus-native-helper', '--features', 'test-support', '--bin', 'theseus-native-helper-fixture', '--message-format=json'], True),
+    ):
+        text = runner.cargo(name, *arguments)
+        artifacts = []
+        for line in text.splitlines():
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if value.get('reason') == 'compiler-artifact':
+                artifacts.append(value)
+        check_helper_graph(artifacts, fixture=fixture_graph)
 
 
 def native(runner, stage):
@@ -275,6 +311,7 @@ def native(runner, stage):
     elif stage == 'precompile':
         runner.cargo('native-host-precompile', 'test', '--locked', '-p', 'theseus-host', '--features', 'test-support', '--lib', '--no-run')
         runner.cargo('native-integration-precompile', 'test', '--locked', '--test', 'host_cli', '--test', 'host_terminal', '--no-run')
+        runner.cargo('native-helper-precompile', 'test', '--locked', '-p', 'theseus-native-helper', '--features', 'test-support', '--test', 'fixture_runtime', '--no-run', timeout=180)
         runner.run('model-action-controls', ['node', 'tests/support/observe_conpty_model_action_test.cjs'])
         if windows:
             runner.run('model-observer-controls', ['pwsh', '-NoProfile', '-File', 'tests/support/observe_conpty_model_test.ps1'])
@@ -304,6 +341,7 @@ def native(runner, stage):
         runner.cargo('native-cli-terminal', 'test', '--locked', '--test', 'host_cli', '--test', 'host_terminal', '--', '--nocapture', required_cases=CASE_INVENTORY['native']['cli-terminal'])
         test = 'conpty_' if windows else 'pty_master_'
         runner.cargo('native-explicit-terminal-controls', 'test', '--locked', '-p', 'theseus-host', '--features', 'test-support', '--lib', test, '--', '--nocapture', '--test-threads=1', timeout=120, required_cases=CASE_INVENTORY['native']['runtime-windows' if windows else 'runtime-unix'])
+        runner.cargo('native-helper-runtime', 'test', '--locked', '-p', 'theseus-native-helper', '--features', 'test-support', '--test', 'fixture_runtime', '--', '--nocapture', '--test-threads=1', timeout=240, required_cases=CASE_INVENTORY['native']['helper-runtime-common'] + (CASE_INVENTORY['native']['helper-runtime-windows'] if windows else []))
         metadata = load_pinned(runner)
         write_json(runner.evidence / 'native-artifacts-after.json', metadata)
     elif stage == 'release':
