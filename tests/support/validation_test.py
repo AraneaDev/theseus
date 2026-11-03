@@ -113,7 +113,7 @@ class ValidationTests(unittest.TestCase):
                         self.assertEqual(runner.env.get(key), original.get(key))
                         validation.native(runner, 'runtime')
                     self.assertEqual([name for name, _ in runner.calls[1:]],
-                                     ['workspace-tests', 'native-cli-terminal', 'native-explicit-terminal-controls', 'native-helper-runtime'])
+                                     ['workspace-tests', 'native-cli-terminal', 'native-explicit-terminal-controls', 'native-helper-runtime', 'native-client-runtime'])
                     for _, env in runner.calls[1:]:
                         self.assertEqual(key in env, key in original)
                         self.assertEqual(env.get(key), original.get(key))
@@ -406,7 +406,9 @@ class ValidationTests(unittest.TestCase):
                 inner.calls = []
             def cargo(inner, name, *args):
                 inner.calls.append((name, args))
-                if name == 'helper-release-artifacts':
+                if name.startswith('client-'):
+                    graph = self.client_graph(name == 'client-fixture-artifacts')
+                elif name == 'helper-release-artifacts':
                     graph = self.helper_graph()
                 elif name == 'helper-fixture-artifacts':
                     graph = self.helper_graph(True)
@@ -424,6 +426,99 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(calls.get('helper-fixture-artifacts'),
                          ('check', '--locked', '-p', 'theseus-native-helper', '--features', 'test-support',
                           '--bin', 'theseus-native-helper-fixture', '--message-format=json'))
+
+    def client_graph(self, fixture=False):
+        return [{'reason': 'compiler-artifact', 'target': {'name': name, 'kind': [kind]},
+                 'features': ['test-support'] if fixture and name != 'theseus_host' else []}
+                for name, kind in [('theseus_host', 'lib'), ('theseus_native_client', 'lib')] +
+                ([('fixture_client', 'test')] if fixture else [])]
+
+    def test_client_graph_rejects_missing_features_host_faults_and_release_fixture(self):
+        for fixture in (False, True):
+            good = self.client_graph(fixture)
+            validation.check_client_graph(good, fixture=fixture)
+            for index in range(len(good)):
+                with self.subTest(fixture=fixture, missing=index):
+                    with self.assertRaises(validation.GateFailure):
+                        validation.check_client_graph(good[:index] + good[index + 1:], fixture=fixture)
+                bad = json.loads(json.dumps(good))
+                bad[index]['features'] = [] if bad[index]['features'] else ['test-support']
+                with self.subTest(fixture=fixture, wrong_features=index):
+                    with self.assertRaises(validation.GateFailure):
+                        validation.check_client_graph(bad, fixture=fixture)
+                bad = json.loads(json.dumps(good))
+                bad[index]['target']['kind'] = ['bin']
+                with self.subTest(fixture=fixture, wrong_target_kind=index):
+                    with self.assertRaises(validation.GateFailure):
+                        validation.check_client_graph(bad, fixture=fixture)
+        with self.assertRaises(validation.GateFailure):
+            validation.check_client_graph(self.client_graph() + self.client_graph(True)[-1:])
+
+    def test_client_library_and_explicit_fixture_graph_checks_are_required(self):
+        calls = {}
+        corrupted = {}
+        def cargo(name, *args):
+            calls[name] = args
+            if name.startswith('client-'):
+                graph = corrupted.get(name, self.client_graph(name == 'client-fixture-artifacts'))
+            elif name.startswith('helper-'):
+                graph = self.helper_graph(name == 'helper-fixture-artifacts')
+            else:
+                graph = [{'reason': 'compiler-artifact', 'target': {'name': 'theseus'}, 'features': []},
+                         {'reason': 'compiler-artifact', 'target': {'name': 'theseus_host'},
+                          'features': ['test-support'] if name == 'app-test-artifacts' else []}]
+            return '\n'.join(map(json.dumps, graph))
+        with tempfile.TemporaryDirectory() as temp:
+            runner = validation.Runner(pathlib.Path(temp))
+            with patch.object(runner, 'cargo', side_effect=cargo):
+                validation.feature_boundaries(runner)
+            for name, graph in (
+                ('client-release-artifacts', self.client_graph()[0:1]),
+                ('client-release-artifacts', self.client_graph(True)),
+                ('client-fixture-artifacts', self.client_graph(True)[:-1]),
+                ('client-fixture-artifacts', [dict(self.client_graph(True)[0], features=['test-support'])] + self.client_graph(True)[1:]),
+            ):
+                corrupted.clear()
+                corrupted[name] = graph
+                with self.subTest(corrupted_graph=name, graph=graph), \
+                        patch.object(runner, 'cargo', side_effect=cargo), \
+                        self.assertRaises(validation.GateFailure):
+                    validation.feature_boundaries(runner)
+        self.assertEqual(calls.get('client-release-artifacts'),
+                         ('check', '--locked', '--release', '-p', 'theseus-native-client', '--lib', '--message-format=json'))
+        self.assertEqual(calls.get('client-fixture-artifacts'),
+                         ('test', '--locked', '-p', 'theseus-native-client', '--features', 'test-support',
+                          '--test', 'fixture_client', '--no-run', '--message-format=json'))
+
+    def test_native_client_gate_requires_actual_os_inventory_and_exact_target(self):
+        class RecordingRunner(StageRunner):
+            def cargo(inner, name, *args, **kwargs):
+                inner.calls.append((name, args, kwargs))
+            def run(inner, *args, **kwargs):
+                pass
+        common = ['native_client_preflight_is_exact_and_read_only',
+                  'native_client_requires_committed_intent_and_recovers_same_lease',
+                  'native_client_run_and_query_preserve_native_outcome',
+                  'native_client_cancel_remains_responsive_under_output_pressure',
+                  'native_client_connection_loss_never_reexecutes_run',
+                  'native_client_reconnect_ids_and_partial_failure_owners_are_safe',
+                  'native_client_transport_join_does_not_claim_remote_cleanup']
+        for system in ('Linux', 'Darwin', 'Windows'):
+            with self.subTest(system=system), tempfile.TemporaryDirectory() as temp:
+                runner = RecordingRunner(pathlib.Path(temp), {})
+                with patch.object(validation, 'load_pinned', return_value={}), \
+                        patch.object(validation.platform, 'system', return_value=system):
+                    validation.native(runner, 'precompile')
+                    validation.native(runner, 'runtime')
+                calls = {name: (args, kwargs) for name, args, kwargs in runner.calls}
+                prefix = ('test', '--locked', '-p', 'theseus-native-client', '--features', 'test-support', '--test', 'fixture_client')
+                self.assertEqual(calls.get('native-client-precompile'), (prefix + ('--no-run',), {'timeout': 240}))
+                expected = common + (['native_client_windows_unsigned_status_is_preserved'] if system == 'Windows' else [])
+                self.assertEqual(calls.get('native-client-runtime'), (prefix + ('--', '--nocapture', '--test-threads=1'),
+                                                                    {'timeout': 240, 'required_cases': expected}))
+                receipt = self.cargo_transcript(expected, expected)
+                self.assertTrue(receipt['test_execution_verified'])
+                self.assert_required_cases_rejected(expected[:-1], expected)
 
     def test_ignored_duplicate_and_nested_noisy_receipts_cannot_satisfy_required_cases(self):
         for text in (

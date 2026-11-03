@@ -117,6 +117,22 @@ def check_helper_graph(artifacts, *, fixture=False):
         raise GateFailure('Normal helper graph contains the fixture binary')
 
 
+def check_client_graph(artifacts, *, fixture=False):
+    """The client fixture enables only client support, never host fault injection."""
+    targets = [('theseus_host', 'lib'), ('theseus_native_client', 'lib')]
+    if fixture:
+        targets.append(('fixture_client', 'test'))
+    for target, kind in targets:
+        matches = [item for item in artifacts if item.get('reason') == 'compiler-artifact'
+                   and item.get('target', {}).get('name') == target]
+        enabled = fixture and target != 'theseus_host'
+        if not matches or any(('test-support' in item['features']) != enabled
+                              or item['target'].get('kind') != [kind] for item in matches):
+            raise GateFailure(f'{target}: client feature boundary violated or artifact absent')
+    if not fixture and any(item.get('target', {}).get('name') == 'fixture_client' for item in artifacts):
+        raise GateFailure('Normal client library graph contains the fixture test')
+
+
 def test_execution(text, required_cases):
     """Read stable libtest pretty output, including sequential --nocapture logs.
 
@@ -278,6 +294,22 @@ def feature_boundaries(runner):
         check_helper_graph(artifacts, fixture=fixture_graph)
 
 
+    for name, arguments, fixture_graph in (
+        ('client-release-artifacts', ['check', '--locked', '--release', '-p', 'theseus-native-client', '--lib', '--message-format=json'], False),
+        ('client-fixture-artifacts', ['test', '--locked', '-p', 'theseus-native-client', '--features', 'test-support', '--test', 'fixture_client', '--no-run', '--message-format=json'], True),
+    ):
+        text = runner.cargo(name, *arguments)
+        artifacts = []
+        for line in text.splitlines():
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if value.get('reason') == 'compiler-artifact':
+                artifacts.append(value)
+        check_client_graph(artifacts, fixture=fixture_graph)
+
+
 def native(runner, stage):
     if stage == 'fixture':
         fixture(runner)
@@ -312,6 +344,7 @@ def native(runner, stage):
         runner.cargo('native-host-precompile', 'test', '--locked', '-p', 'theseus-host', '--features', 'test-support', '--lib', '--no-run')
         runner.cargo('native-integration-precompile', 'test', '--locked', '--test', 'host_cli', '--test', 'host_terminal', '--no-run')
         runner.cargo('native-helper-precompile', 'test', '--locked', '-p', 'theseus-native-helper', '--features', 'test-support', '--test', 'fixture_runtime', '--no-run', timeout=180)
+        runner.cargo('native-client-precompile', 'test', '--locked', '-p', 'theseus-native-client', '--features', 'test-support', '--test', 'fixture_client', '--no-run', timeout=240)
         runner.run('model-action-controls', ['node', 'tests/support/observe_conpty_model_action_test.cjs'])
         if windows:
             runner.run('model-observer-controls', ['pwsh', '-NoProfile', '-File', 'tests/support/observe_conpty_model_test.ps1'])
@@ -342,6 +375,7 @@ def native(runner, stage):
         test = 'conpty_' if windows else 'pty_master_'
         runner.cargo('native-explicit-terminal-controls', 'test', '--locked', '-p', 'theseus-host', '--features', 'test-support', '--lib', test, '--', '--nocapture', '--test-threads=1', timeout=120, required_cases=CASE_INVENTORY['native']['runtime-windows' if windows else 'runtime-unix'])
         runner.cargo('native-helper-runtime', 'test', '--locked', '-p', 'theseus-native-helper', '--features', 'test-support', '--test', 'fixture_runtime', '--', '--nocapture', '--test-threads=1', timeout=240, required_cases=CASE_INVENTORY['native']['helper-runtime-common'] + (CASE_INVENTORY['native']['helper-runtime-windows'] if windows else []))
+        runner.cargo('native-client-runtime', 'test', '--locked', '-p', 'theseus-native-client', '--features', 'test-support', '--test', 'fixture_client', '--', '--nocapture', '--test-threads=1', timeout=240, required_cases=CASE_INVENTORY['native']['client-common'] + (CASE_INVENTORY['native']['client-windows'] if windows else []))
         metadata = load_pinned(runner)
         write_json(runner.evidence / 'native-artifacts-after.json', metadata)
     elif stage == 'release':

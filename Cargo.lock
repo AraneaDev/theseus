@@ -797,6 +797,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "theseus-native-client"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "theseus-host",
+ "theseus-native-helper-store",
+ "theseus-native-protocol",
+]
+
+[[package]]
 name = "theseus-native-helper"
 version = "0.1.0"
 dependencies = [

@@ -150,6 +150,18 @@
     ],
     "helper-runtime-windows": [
       "windows_unsigned_high_bit_exit_status_is_preserved"
+    ],
+    "client-common": [
+      "native_client_preflight_is_exact_and_read_only",
+      "native_client_requires_committed_intent_and_recovers_same_lease",
+      "native_client_run_and_query_preserve_native_outcome",
+      "native_client_cancel_remains_responsive_under_output_pressure",
+      "native_client_connection_loss_never_reexecutes_run",
+      "native_client_reconnect_ids_and_partial_failure_owners_are_safe",
+      "native_client_transport_join_does_not_claim_remote_cleanup"
+    ],
+    "client-windows": [
+      "native_client_windows_unsigned_status_is_preserved"
     ]
   }
 }
