@@ -170,6 +170,56 @@
     ],
     "client-windows": [
       "native_client_windows_unsigned_status_is_preserved"
+    ],
+    "profile-runtime-common": [
+      "actual_native_profile_stream_absence_and_sticky_prefix_revocation",
+      "actual_unproved_prefix_mapping_retains_owner_until_incomplete_exit"
+    ],
+    "catalog-common": [
+      "actual_native_helper_executes_installed_reader_and_hashes_settled_absence",
+      "actual_fake_provider_reserves_before_reply_and_queries_exact_identity",
+      "fake_ssh_argv_preparation_uses_only_synthetic_private_material",
+      "unchanged_catalog_manifest_cannot_authorize_different_recipe_artifacts"
+    ],
+    "selected-common": [
+      "selected_native_ordinary_scenarios_use_shared_sequence_and_original_authorities",
+      "failed_engine_publication_never_invokes_provider_or_acquires_guest",
+      "selected_lost_prepare_requires_matching_original_query_before_dispose"
+    ],
+    "consumers-common": [
+      "native_retained_store_has_only_namespaced_files_and_offline_reader",
+      "mixed_families_refuse_read_write_and_legacy_cleanup_without_docker",
+      "missing_journal_and_native_bytes_renamed_legacy_never_clean_successfully",
+      "overlapping_native_and_legacy_journal_never_authorizes_empty_cleanup",
+      "recursive_native_fields_and_duplicate_keys_refuse",
+      "native_pages_are_bounded_and_preserve_provenance",
+      "public_cli_native_preview_and_report_are_offline_and_profiles_refuse",
+      "public_native_tui_keeps_its_own_domain_and_surfaces_unknown_cleanup",
+      "native_comparison_refuses_before_creating_a_suite_directory",
+      "command_and_file_pages_preserve_native_status_partial_capture_and_absence_domain",
+      "native_recipe_rejects_impossible_posix_signal_status",
+      "native_intent_namespace_reopens_original_retained_directory_without_republishing",
+      "native_retained_reader_rejects_impossible_actual_signal_evidence",
+      "public_native_cleanup_requires_explicit_authority_without_effects"
+    ],
+    "consumers-unix": [
+      "unsafe_reserved_name_is_not_absent_family"
+    ],
+    "recovery-common": [
+      "recovery_queries_original_lease_and_run_without_replay_and_keeps_prior_local_unknown",
+      "recovery_not_found_never_acquires_or_runs_a_replacement",
+      "recovery_missing_or_changed_original_intent_refuses_before_any_event_or_effect",
+      "recovery_resolves_original_unknown_dispose_by_query_without_new_invocation_or_transport",
+      "recovery_rejects_changed_known_terminal_status_without_rewriting_original_evidence",
+      "retained_native_finalizer_joins_only_original_local_session_and_preserves_remote_unknown",
+      "recovery_rejects_changed_known_stdout_count_without_inventing_output"
+    ],
+    "catalog-library-common": [
+      "mcp_server::worker::native_execution_tests::native_admission_requires_server_ceiling_and_omits_docker_role",
+      "mcp_server::worker::native_execution_tests::native_validation_generation_and_narrowed_options_use_existing_admission",
+      "mcp_server::worker::native_execution_tests::native_worker_cancelled_before_prepare_binds_only_native_saved_family",
+      "mcp_server::worker::native_execution_tests::native_failed_preparation_keeps_original_owner_and_blocks_next_admission",
+      "mcp_server::coordinator::tests::native_admission_dispatches_through_existing_query_worker_and_retains_uncertain_owner"
     ]
   }
 }

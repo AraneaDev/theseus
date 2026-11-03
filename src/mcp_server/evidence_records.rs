@@ -131,6 +131,7 @@ impl<'a> Catalog<'a> {
                 let stage = get(&scenario.stages, ti)?;
                 let prefix = format!("s/{index}/stage/{ti}");
                 match s.collection {
+                    StageCollection::NativeFiles => return Err(error(ErrorCode::InvalidArguments)),
                     StageCollection::Commands => Self::Commands(prefix, &stage.commands),
                     StageCollection::Checks => Self::Checks(prefix, &stage.checks),
                     StageCollection::Snapshots => Self::Snapshots(prefix, &stage.snapshots),

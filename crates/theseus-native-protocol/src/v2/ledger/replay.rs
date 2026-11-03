@@ -19,6 +19,7 @@ pub struct LedgerView {
     manifest: Digest,
     lease: Option<(IntentId, LeaseId, LeaseView)>,
     operations: Vec<Operation>,
+    authority_failure: Option<PrefixAuthorityFailure>,
 }
 fn capacity(l: usize, n: usize, unfinished: bool, closed: bool) -> Result<usize, LedgerError> {
     let next = l.checked_add(n).ok_or(LedgerError::Capacity)?;
@@ -36,12 +37,18 @@ impl LedgerView {
         if records.len() > MAX_RECORDS {
             return Err(LedgerError::Capacity);
         }
-        let Entry::Header {
+        let (Entry::Header {
             binding,
             manifest_digest,
             os,
             ..
-        } = records[0].entry()
+        }
+        | Entry::NativeHeader {
+            binding,
+            manifest_digest,
+            os,
+            ..
+        }) = records[0].entry()
         else {
             return Err(LedgerError::InvalidTransition);
         };
@@ -50,6 +57,7 @@ impl LedgerView {
             manifest: *manifest_digest,
             lease: None,
             operations: Vec::new(),
+            authority_failure: None,
         };
         let mut active: Option<usize> = None;
         let mut closed = false;
@@ -60,10 +68,21 @@ impl LedgerView {
             }
             let n = super::encode(r)?.len();
             match r.entry() {
-                Entry::Header { .. } => {
+                Entry::Header { .. } | Entry::NativeHeader { .. } => {
                     if i != 0 {
                         return Err(LedgerError::InvalidTransition);
                     }
+                }
+                Entry::NativeAuthorityRevoked { lease, reason } => {
+                    if !matches!(records[0].entry(), Entry::NativeHeader { .. })
+                        || active.is_some()
+                        || v.authority_failure.is_some()
+                    {
+                        return Err(LedgerError::InvalidTransition);
+                    }
+                    v.check_lease(*lease)
+                        .map_err(|_| LedgerError::InvalidTransition)?;
+                    v.authority_failure = Some(*reason);
                 }
                 Entry::LeaseReserved { intent, lease } => {
                     if i != 1 || v.lease.is_some() {
@@ -79,7 +98,10 @@ impl LedgerView {
                 } => {
                     v.check_lease(*lease)
                         .map_err(|_| LedgerError::InvalidTransition)?;
-                    if active.is_some() || v.operations.iter().any(|o| o.operation == *operation) {
+                    if v.authority_failure.is_some()
+                        || active.is_some()
+                        || v.operations.iter().any(|o| o.operation == *operation)
+                    {
                         return Err(LedgerError::InvalidTransition);
                     }
                     if v.operations.len() >= MAX_OPERATIONS {
@@ -171,6 +193,9 @@ impl LedgerView {
         }
         Ok(v)
     }
+    pub fn native_authority_failure(&self) -> Option<PrefixAuthorityFailure> {
+        self.authority_failure
+    }
     fn check_lease(&self, lease: LeaseId) -> Result<(), RefusalCode> {
         if self.lease.as_ref().is_some_and(|(_, l, _)| *l == lease) {
             Ok(())
@@ -231,6 +256,9 @@ impl LedgerView {
             _ => return Err(RefusalCode::InvalidRequest),
         };
         self.check_lease(lease)?;
+        if self.authority_failure.is_some() {
+            return Err(RefusalCode::LeaseQuarantined);
+        }
         let digest = request_digest(request).map_err(|_| RefusalCode::InvalidRequest)?;
         if let Some(o) = self.operations.iter().find(|o| o.operation == operation) {
             return if o.kind == kind && o.digest == digest {

@@ -11,6 +11,7 @@ license = "MIT"
 description = "Installation lifecycle workbench with Docker evidence and a terminal UI"
 
 [features]
+native-catalog-test-support = []
 mcp-test-support = ["theseus-host/test-support"]
 
 [[bin]]
@@ -20,6 +21,9 @@ required-features = ["mcp-test-support"]
 
 [dependencies]
 theseus-host = { path = "crates/theseus-host" }
+theseus-native-protocol = { path = "crates/theseus-native-protocol" }
+theseus-native-helper-store = { path = "crates/theseus-native-helper-store" }
+theseus-native-client = { path = "crates/theseus-native-client" }
 anyhow = "1.0.104"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -37,7 +41,23 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync"] }
 rustix = { version = "1.1.5", features = ["fs", "process"] }
 
 [dev-dependencies]
+theseus-native-helper = { path = "crates/theseus-native-helper" }
 theseus-host = { path = "crates/theseus-host", features = ["test-support"] }
 
 [patch.crates-io]
 crossterm = { path = "vendor/crossterm" }
+
+[[bin]]
+name = "theseus-native-catalog-fixture"
+path = "src/bin/theseus-native-catalog-fixture.rs"
+required-features = ["native-catalog-test-support"]
+
+[[bin]]
+name = "theseus-native-base-reader"
+path = "src/bin/theseus-native-base-reader.rs"
+required-features = ["native-catalog-test-support"]
+
+[[bin]]
+name = "theseus-native-target-reader"
+path = "src/bin/theseus-native-target-reader.rs"
+required-features = ["native-catalog-test-support"]

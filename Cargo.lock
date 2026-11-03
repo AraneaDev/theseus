@@ -778,6 +778,10 @@ dependencies = [
  "sha2",
  "tempfile",
  "theseus-host",
+ "theseus-native-client",
+ "theseus-native-helper",
+ "theseus-native-helper-store",
+ "theseus-native-protocol",
  "tokio",
  "toml",
 ]

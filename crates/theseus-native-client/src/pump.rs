@@ -36,6 +36,7 @@ pub(crate) struct Pump {
     pending: [Option<(RequestId, u64)>; 2],
     describe: Option<u64>,
     pub(crate) ready: bool,
+    pub(crate) artifact_commitment: Option<v2::Digest>,
     started: Instant,
     pub(crate) residual: Vec<u8>,
 }
@@ -51,6 +52,7 @@ impl Pump {
             pending: [None; 2],
             describe: None,
             ready: false,
+            artifact_commitment: None,
             started: Instant::now(),
             residual: Vec::with_capacity(4096),
         };
@@ -135,7 +137,8 @@ impl Pump {
                         ..
                     } => {
                         let b = &expected.binding;
-                        if *binding != b.binding
+                        if expected.profile != v2::HelperProfile::Fixture
+                            || *binding != b.binding
                             || *manifest_digest != b.manifest_digest
                             || *workspace_marker != b.workspace_marker
                             || *os != b.os
@@ -143,6 +146,25 @@ impl Pump {
                         {
                             return Err(ClientError::Preflight);
                         }
+                        self.ready = true;
+                        Some(Event::Ready)
+                    }
+                    v2::Reply::NativeDescription { description: d } => {
+                        let b = &expected.binding;
+                        if expected.profile
+                            != (v2::HelperProfile::Native {
+                                provider_epoch: d.provider_epoch,
+                            })
+                            || d.binding != b.binding
+                            || d.manifest_digest != b.manifest_digest
+                            || d.workspace_marker != b.workspace_marker
+                            || d.os != b.os
+                            || d.programs != expected.programs
+                            || d.capabilities != v2::NativeCapabilities
+                        {
+                            return Err(ClientError::Preflight);
+                        }
+                        self.artifact_commitment = Some(d.artifact_commitment);
                         self.ready = true;
                         Some(Event::Ready)
                     }
@@ -206,6 +228,7 @@ pub(crate) mod tests {
     use theseus_native_helper_store::StoreBinding;
     pub(crate) fn expected() -> ExpectedHelper {
         ExpectedHelper {
+            profile: v2::HelperProfile::Fixture,
             binding: StoreBinding {
                 binding: v2::BindingId::from_bytes([1; 16]),
                 manifest_digest: v2::Digest::from_bytes([2; 32]),
@@ -267,6 +290,97 @@ pub(crate) mod tests {
             Some(Event::Ready)
         ));
         pump
+    }
+    #[test]
+    fn native_profile_and_epoch_are_required_before_ready() {
+        for (native_expected, native_reply, stale) in [
+            (true, true, false),
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+        ] {
+            let mut pump = Pump::new(v2::SessionId::from_bytes([10; 16])).unwrap();
+            pump.frames.clear();
+            inbound(
+                &mut pump,
+                0,
+                v2::Message::Hello {
+                    role: v2::Role::Helper,
+                },
+            )
+            .unwrap();
+            pump.frames.clear();
+            let mut expected = expected();
+            let programs = v2::ProgramList::new(
+                [
+                    "check_base",
+                    "check_data",
+                    "check_target",
+                    "configure",
+                    "exercise",
+                    "install_base",
+                    "install_target",
+                    "uninstall",
+                ]
+                .map(|id| v2::ProgramId::new(id).unwrap())
+                .to_vec(),
+            )
+            .unwrap();
+            expected.programs = programs.clone();
+            if native_expected {
+                expected.profile = v2::HelperProfile::Native {
+                    provider_epoch: v2::Digest::from_bytes([4; 32]),
+                };
+            }
+            let result = if native_reply {
+                v2::Reply::NativeDescription {
+                    description: Box::new(v2::NativeDescription {
+                        binding: expected.binding.binding,
+                        manifest_digest: expected.binding.manifest_digest,
+                        workspace_marker: expected.binding.workspace_marker,
+                        os: expected.binding.os,
+                        helper_principal: v2::Principal::Posix {
+                            effective_uid: 1000,
+                            effective_gid: 1000,
+                        },
+                        programs,
+                        capabilities: v2::NativeCapabilities,
+                        provider_epoch: v2::Digest::from_bytes([if stale { 5 } else { 4 }; 32]),
+                        artifact_commitment: v2::Digest::from_bytes([6; 32]),
+                        build: v2::Provenance::Unavailable {
+                            reason: "fixture".into(),
+                        },
+                        os_build: v2::Provenance::Unavailable {
+                            reason: "fixture".into(),
+                        },
+                    }),
+                }
+            } else {
+                let mut reply = description();
+                if let v2::Reply::Description { programs: p, .. } = &mut reply {
+                    *p = programs;
+                }
+                reply
+            };
+            let frame = v2::Envelope::new(
+                pump.session.clone(),
+                1,
+                v2::Message::Response {
+                    reply_to: 1,
+                    result,
+                },
+            )
+            .unwrap();
+            let bytes = v2::encode(&frame).unwrap();
+            let result = pump.decode(&bytes, &expected);
+            if native_expected && native_reply && !stale {
+                assert!(matches!(result, Ok((_, Some(Event::Ready)))));
+                assert!(pump.ready);
+            } else {
+                assert!(matches!(result, Err(ClientError::Preflight)));
+                assert!(!pump.ready);
+            }
+        }
     }
     #[test]
     fn every_description_field_is_bound_before_ready() {

@@ -21,6 +21,8 @@ directory they assume, and each contract keeps its limits beside its claims. The
   an explicit native client and check installation, update and removal?
 - [MCP lifecycle and client registration](guides/mcp-lifecycle.md): how do I
   rehearse another server's registration, health and typed stdio discovery?
+- [Supplied native targets](guides/native-targets.md): how do I preview native
+  catalog recipes, supply launch/provider authority and preserve recovery evidence?
 
 ## Agents
 
@@ -64,5 +66,6 @@ repository root unless they explicitly change directory.
 | Compare methods and image IDs | [Comparison walkthrough](../examples/comparisons/README.md) |
 | Rehearse Claude Code plugins | [Plugin walkthrough](../examples/plugins/README.md) |
 | Rehearse MCP registration and discovery | [MCP fixture walkthrough](../examples/mcp/README.md) |
+| Preview a supplied native target recipe | [Native catalog template](../examples/native/README.md) |
 
 Completed milestones, current progress and remaining work are tracked in the [roadmap](../ROADMAP.md).

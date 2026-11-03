@@ -4,7 +4,9 @@ type NativeSpawn = fn(&NativeCommand, InputMode) -> Result<AcquiredChild, SpawnF
 use theseus_native_helper_store::{PreparedAcquire, StoreBinding};
 use theseus_native_protocol::v2;
 
+pub use crate::recovery::{ClientMode, RecoveredOperation, RecoveryImage};
 pub struct ExpectedHelper {
+    pub profile: v2::HelperProfile,
     pub binding: StoreBinding,
     pub programs: v2::ProgramList,
 }
@@ -12,6 +14,7 @@ pub struct ExpectedHelper {
 pub struct RequestId(pub(crate) u64);
 pub enum Action<'a> {
     Acquire(&'a PreparedAcquire),
+    QueryOriginalAcquire(&'a theseus_native_helper_store::VerifiedOriginalIntent),
     RecoverAcquire(&'a PreparedAcquire),
     Run {
         lease: v2::LeaseId,
@@ -31,6 +34,10 @@ pub enum Action<'a> {
         path: v2::LeafName,
         offset: u64,
         length: u16,
+    },
+    InspectNativeFile {
+        lease: v2::LeaseId,
+        path: v2::LeafName,
     },
     InspectFile {
         lease: v2::LeaseId,
@@ -80,6 +87,7 @@ pub struct Client {
     expected: ExpectedHelper,
     settlement: crate::transport::Settlement,
     recovery: crate::recovery::Recovery,
+    query_only: bool,
     next_id: Option<u64>,
     error: Option<ClientError>,
     lost: bool,
@@ -89,15 +97,45 @@ pub struct StartFailure {
     error: ClientError,
 }
 impl Client {
+    /// Catalog artifact facts observed during the validated native handshake.
+    /// Unavailable before readiness, after transfer to settlement, or for fixtures.
+    pub fn artifact_commitment(&self) -> Option<v2::Digest> {
+        self.settlement
+            .owner
+            .as_ref()?
+            .pump
+            .as_ref()?
+            .artifact_commitment
+    }
     pub fn start(command: NativeCommand, expected: ExpectedHelper) -> Result<Self, StartFailure> {
+        Self::start_with(command, expected, ClientMode::Fresh)
+    }
+    pub fn start_with(
+        command: NativeCommand,
+        expected: ExpectedHelper,
+        mode: ClientMode,
+    ) -> Result<Self, StartFailure> {
+        let (recovery, query_only, mode_error) =
+            match crate::recovery::Recovery::from_mode(mode, &expected) {
+                Ok((r, q)) => (r, q, None),
+                Err(e) => (crate::recovery::Recovery::default(), true, Some(e)),
+            };
         let mut client = Self {
             expected,
             settlement: crate::transport::Settlement::new(crate::transport::TransportOwner::empty()),
-            recovery: crate::recovery::Recovery::default(),
+            recovery,
+            query_only,
             next_id: Some(0),
             error: None,
             lost: false,
         };
+        if let Some(error) = mode_error {
+            client.settlement.stopped = true;
+            return Err(StartFailure {
+                client: Box::new(client),
+                error,
+            });
+        }
         if let Err(error) = client.attempt(command, OwnedChild::spawn) {
             return Err(StartFailure {
                 client: Box::new(client),
@@ -169,7 +207,22 @@ impl Client {
             }
         }
     }
+    pub fn export_recovery(&self) -> Result<RecoveryImage, ClientError> {
+        self.recovery.export(&self.expected)
+    }
     pub fn submit(&mut self, action: Action<'_>) -> Result<RequestId, ClientError> {
+        if self.query_only
+            && !matches!(
+                &action,
+                Action::QueryOriginalAcquire(_)
+                    | Action::Query { .. }
+                    | Action::Cancel { .. }
+                    | Action::QueryLease(_)
+                    | Action::Release(_)
+            )
+        {
+            return Err(ClientError::RecoveryRequired);
+        }
         if self.settlement.stopped {
             return Err(ClientError::Stopping);
         }
@@ -424,6 +477,7 @@ mod tests {
             expected: crate::pump::tests::expected(),
             settlement: Settlement::new(owner),
             recovery: crate::recovery::Recovery::default(),
+            query_only: false,
             next_id: next,
             error: None,
             lost: false,
@@ -513,6 +567,7 @@ mod reconnect_tests {
             expected: crate::pump::tests::expected(),
             settlement: Settlement::new(TransportOwner::empty()),
             recovery: Recovery::default(),
+            query_only: false,
             next_id: Some(73),
             error: None,
             lost: false,
@@ -557,6 +612,7 @@ mod reconnect_tests {
             expected: crate::pump::tests::expected(),
             settlement: Settlement::new(owner),
             recovery: Recovery::default(),
+            query_only: false,
             next_id: Some(0),
             error: None,
             lost: false,

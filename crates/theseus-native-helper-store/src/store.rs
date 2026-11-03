@@ -42,6 +42,32 @@ impl LedgerStore {
         workspace_root: &HostDir,
         expected: StoreBinding,
     ) -> Result<Self, StoreError> {
+        Self::open_profile(
+            ledger_root,
+            workspace_root,
+            expected,
+            theseus_native_protocol::v2::HelperProfile::Fixture,
+        )
+    }
+    pub fn open_native(
+        ledger_root: &HostDir,
+        workspace_root: &HostDir,
+        expected: StoreBinding,
+        provider_epoch: Digest,
+    ) -> Result<Self, StoreError> {
+        Self::open_profile(
+            ledger_root,
+            workspace_root,
+            expected,
+            theseus_native_protocol::v2::HelperProfile::Native { provider_epoch },
+        )
+    }
+    fn open_profile(
+        ledger_root: &HostDir,
+        workspace_root: &HostDir,
+        expected: StoreBinding,
+        profile: theseus_native_protocol::v2::HelperProfile,
+    ) -> Result<Self, StoreError> {
         if ledger_root.same_object(workspace_root)? {
             return Err(StoreError::AliasedRoots);
         }
@@ -71,7 +97,23 @@ impl LedgerStore {
                 manifest_digest,
                 workspace_marker,
                 os,
-            } if *binding == expected.binding
+            } if profile == theseus_native_protocol::v2::HelperProfile::Fixture
+                && *binding == expected.binding
+                && *manifest_digest == expected.manifest_digest
+                && *workspace_marker == expected.workspace_marker
+                && *os == expected.os => {}
+            Entry::NativeHeader {
+                binding,
+                manifest_digest,
+                workspace_marker,
+                os,
+                provider_epoch,
+                ..
+            } if profile
+                == (theseus_native_protocol::v2::HelperProfile::Native {
+                    provider_epoch: *provider_epoch,
+                })
+                && *binding == expected.binding
                 && *manifest_digest == expected.manifest_digest
                 && *workspace_marker == expected.workspace_marker
                 && *os == expected.os => {}

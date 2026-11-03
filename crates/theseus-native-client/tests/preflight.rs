@@ -4,6 +4,7 @@ use theseus_native_helper_store::StoreBinding;
 use theseus_native_protocol::v2::*;
 fn expected() -> ExpectedHelper {
     ExpectedHelper {
+        profile: theseus_native_protocol::v2::HelperProfile::Fixture,
         binding: StoreBinding {
             binding: BindingId::from_bytes([1; 16]),
             manifest_digest: Digest::from_bytes([2; 32]),

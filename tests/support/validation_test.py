@@ -31,6 +31,23 @@ class StageRunner:
 
 
 class ValidationTests(unittest.TestCase):
+    def catalog_graph(self):
+        return [{'reason': 'compiler-artifact', 'target': {'name': name, 'kind': [kind]},
+                 'features': ['native-catalog-test-support'] if name == 'theseus' or kind == 'bin' else []}
+                for name, kind in [('theseus_host', 'lib'), ('theseus_native_helper_store', 'lib'),
+                                   ('theseus_native_client', 'lib'), ('theseus', 'lib')] +
+                                  [(target, 'bin') for target, _ in validation.CATALOG_ARTIFACTS.values()]]
+
+    def add_catalog_metadata(self, root, metadata):
+        graph = self.catalog_graph()
+        metadata['native_catalog_graph'] = graph
+        for key, (target, _) in validation.CATALOG_ARTIFACTS.items():
+            path = root / key
+            path.write_bytes(key.encode())
+            path.chmod(0o755)
+            artifact = next(item for item in graph if item['target']['name'] == target)
+            metadata[key] = {'path': str(path), 'sha256': validation.sha256(path), 'cargo_artifact': artifact}
+
     def test_cp1252_console_preserves_raw_utf8_and_required_case_receipt(self):
         raw = ('running 1 test\ntest required_case ... native \U0001f600\nok\n'
                'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n').encode('utf-8')
@@ -113,7 +130,7 @@ class ValidationTests(unittest.TestCase):
                         self.assertEqual(runner.env.get(key), original.get(key))
                         validation.native(runner, 'runtime')
                     self.assertEqual([name for name, _ in runner.calls[1:]],
-                                     ['workspace-tests', 'native-cli-terminal', 'native-explicit-terminal-controls', 'native-helper-runtime', 'native-client-runtime'])
+                                     ['workspace-tests', 'native-cli-terminal', 'native-explicit-terminal-controls', 'native-helper-runtime', 'native-client-runtime', 'native-profile-runtime', 'native-catalog-library', 'native-catalog-adapter', 'native-selected', 'native-recovery', 'native-consumers'])
                     for _, env in runner.calls[1:]:
                         self.assertEqual(key in env, key in original)
                         self.assertEqual(env.get(key), original.get(key))
@@ -241,6 +258,7 @@ class ValidationTests(unittest.TestCase):
                 path.write_bytes(key.encode())
                 path.chmod(0o755)
                 metadata[key] = {'path': str(path), 'sha256': validation.sha256(path)}
+            self.add_catalog_metadata(root, metadata)
             validation.verify_artifacts(metadata)
             artifact.write_bytes(b'replaced')
             with self.assertRaises(validation.GateFailure):
@@ -260,6 +278,7 @@ class ValidationTests(unittest.TestCase):
                 path.write_bytes(key.encode())
                 path.chmod(0o755)
                 metadata[key] = {'path': str(path), 'sha256': validation.sha256(path)}
+            self.add_catalog_metadata(root, metadata)
             validation.verify_artifacts(metadata)
             (root / 'helper_production').chmod(0o644)
             if sys.platform == 'win32':
@@ -279,16 +298,18 @@ class ValidationTests(unittest.TestCase):
             owned.mkdir()
             cargo = root / 'cargo'
             cargo.mkdir()
-            def graph(names, fixture=False, host_support=False):
+            def graph(names, fixture=False, host_support=False, catalog=False):
                 artifacts = []
                 for name in names:
                     path = cargo / name
                     path.write_bytes((name + ('-fixture' if fixture else '-default')).encode())
                     path.chmod(0o755)
-                    artifacts.append({'reason': 'compiler-artifact', 'target': {'name': name},
+                    kind = 'lib' if '_' in name or (catalog and name == 'theseus') else 'bin'
+                    artifacts.append({'reason': 'compiler-artifact', 'target': {'name': name, 'kind': [kind]},
                                       'features': ['test-support'] if (host_support and name == 'theseus_host') or
-                                      (fixture and name in ('theseus_native_helper', 'theseus-native-helper-fixture')) else [],
-                                      'executable': str(path) if '-' in name or name == 'theseus' else None})
+                                      (fixture and name in ('theseus_native_helper', 'theseus-native-helper-fixture')) else
+                                      ['native-catalog-test-support'] if catalog and (name == 'theseus' or kind == 'bin') else [],
+                                      'executable': str(path) if kind == 'bin' else None})
                 return artifacts
             def fake_build(args):
                 if args == ['--bin', 'theseus']:
@@ -302,6 +323,8 @@ class ValidationTests(unittest.TestCase):
                     return graph(('theseus-mcp-fixture',))
                 if args == ['-p', 'theseus-native-helper', '--features', 'test-support', '--bin', 'theseus-native-helper-fixture']:
                     return graph(('theseus_host', 'theseus_native_helper', 'theseus-native-helper-fixture'), fixture=True)
+                if args == ['--features', 'native-catalog-test-support', '--bin', 'theseus-native-catalog-fixture', '--bin', 'theseus-native-base-reader', '--bin', 'theseus-native-target-reader']:
+                    return graph(('theseus_host', 'theseus_native_helper_store', 'theseus_native_client', 'theseus', 'theseus-native-catalog-fixture', 'theseus-native-base-reader', 'theseus-native-target-reader'), catalog=True)
                 self.fail(f'unexpected build: {args}')
             output = io.StringIO()
             with patch.object(builder, 'build', side_effect=fake_build), \
@@ -322,7 +345,8 @@ class ValidationTests(unittest.TestCase):
                     patch.dict(validation.os.environ, {'GITHUB_ENV': str(env_file)}):
                 validation.fixture(runner)
             for key, variable in (('helper_production', 'THESEUS_NATIVE_HELPER_BINARY'),
-                                  ('helper_fixture', 'THESEUS_NATIVE_HELPER_FIXTURE')):
+                                  ('helper_fixture', 'THESEUS_NATIVE_HELPER_FIXTURE'),
+                                  *[(key, variable) for key, (_, variable) in validation.CATALOG_ARTIFACTS.items()]):
                 self.assertEqual(runner.env[variable], metadata[key]['path'])
                 self.assertIn(f'{variable}={metadata[key]["path"]}\n', env_file.read_text())
             self.assertEqual(json.loads((runner.evidence / 'native-artifacts.json').read_text()), metadata)
@@ -394,6 +418,7 @@ class ValidationTests(unittest.TestCase):
                 path.write_bytes(key.encode())
                 path.chmod(0o755)
                 metadata[key] = {'path': str(path), 'sha256': validation.sha256(path)}
+            self.add_catalog_metadata(root, metadata)
             validation.verify_artifacts(metadata)
             normal = metadata.pop('helper_production')
             with self.assertRaises(validation.GateFailure):
@@ -412,7 +437,9 @@ class ValidationTests(unittest.TestCase):
                 inner.calls = []
             def cargo(inner, name, *args):
                 inner.calls.append((name, args))
-                if name.startswith('client-'):
+                if name == 'catalog-fixture-artifacts':
+                    graph = self.catalog_graph()
+                elif name.startswith('client-'):
                     graph = self.client_graph(name == 'client-fixture-artifacts')
                 elif name == 'helper-release-artifacts':
                     graph = self.helper_graph()
@@ -438,6 +465,122 @@ class ValidationTests(unittest.TestCase):
                  'features': ['test-support'] if fixture and name != 'theseus_host' else []}
                 for name, kind in [('theseus_host', 'lib'), ('theseus_native_client', 'lib')] +
                 ([('fixture_client', 'test')] if fixture else [])]
+
+    def test_catalog_builder_parser_refuses_malformed_json_and_ambiguous_executable(self):
+        builder_spec = importlib.util.spec_from_file_location('fixture_builder', SCRIPT.parents[1] / 'tests/support/build_host_fixture.py')
+        builder = importlib.util.module_from_spec(builder_spec)
+        builder_spec.loader.exec_module(builder)
+        class Result:
+            stdout = 'not Cargo JSON\n'
+            def check_returncode(inner):
+                pass
+        with patch.object(builder.subprocess, 'run', return_value=Result()):
+            with self.assertRaises(json.JSONDecodeError):
+                builder.build(['--features', 'native-catalog-test-support'])
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            source = root / 'reader'
+            source.write_bytes(b'inert reader')
+            artifact = {'target': {'name': 'theseus-native-base-reader'}, 'executable': str(source)}
+            with self.assertRaises(RuntimeError):
+                builder.pin(root, [], 'theseus-native-base-reader', 'missing')
+            with self.assertRaises(RuntimeError):
+                builder.pin(root, [artifact, dict(artifact)], 'theseus-native-base-reader', 'ambiguous')
+            self.assertFalse((root / 'ambiguous').exists())
+
+    def test_catalog_graph_rejects_missing_duplicate_malformed_and_fault_features(self):
+        graph = self.catalog_graph()
+        validation.check_catalog_graph(graph)
+        for index in range(len(graph)):
+            with self.subTest(missing=index), self.assertRaises(validation.GateFailure):
+                validation.check_catalog_graph(graph[:index] + graph[index + 1:])
+        for target in ('theseus_host', 'theseus_native_client', 'theseus'):
+            bad = json.loads(json.dumps(graph))
+            next(item for item in bad if item['target']['name'] == target)['features'].append('test-support')
+            with self.subTest(fault=target), self.assertRaises(validation.GateFailure):
+                validation.check_catalog_graph(bad)
+        helper_fault = {'reason': 'compiler-artifact', 'target': {'name': 'theseus_native_helper', 'kind': ['lib']}, 'features': ['test-support']}
+        for malformed in (None, {}, [None], graph + [graph[-1]], graph + [helper_fault]):
+            with self.subTest(malformed=malformed), self.assertRaises(validation.GateFailure):
+                validation.check_catalog_graph(malformed)
+        bad = json.loads(json.dumps(graph))
+        bad[-1]['features'] = []
+        with self.assertRaises(validation.GateFailure):
+            validation.check_catalog_graph(bad)
+
+    def test_catalog_metadata_refuses_missing_tampered_substituted_and_aliased_reader(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            metadata = {}
+            for key in ('fixture', 'application', 'production', 'mcp_fixture', 'helper_production', 'helper_fixture'):
+                path = root / key
+                path.write_bytes(key.encode())
+                path.chmod(0o755)
+                metadata[key] = {'path': str(path), 'sha256': validation.sha256(path)}
+            self.add_catalog_metadata(root, metadata)
+            validation.verify_artifacts(metadata)
+            for key in validation.CATALOG_ARTIFACTS:
+                bad = json.loads(json.dumps(metadata))
+                del bad[key]
+                with self.subTest(missing=key), self.assertRaises(validation.GateFailure):
+                    validation.verify_artifacts(bad)
+            for malformed in (None, [], {'native_base_reader': []}):
+                with self.subTest(metadata=malformed), self.assertRaises(validation.GateFailure):
+                    validation.verify_artifacts(malformed)
+            for field, value in (('path', None), ('sha256', 'not-a-digest')):
+                bad = json.loads(json.dumps(metadata))
+                bad['native_base_reader'][field] = value
+                with self.subTest(field=field), self.assertRaises(validation.GateFailure):
+                    validation.verify_artifacts(bad)
+            bad = json.loads(json.dumps(metadata))
+            bad['native_base_reader']['cargo_artifact'] = bad['native_target_reader']['cargo_artifact']
+            with self.assertRaises(validation.GateFailure):
+                validation.verify_artifacts(bad)
+            bad = json.loads(json.dumps(metadata))
+            bad['native_base_reader'].update(path=bad['native_target_reader']['path'], sha256=bad['native_target_reader']['sha256'])
+            with self.assertRaises(validation.GateFailure):
+                validation.verify_artifacts(bad)
+            bad = json.loads(json.dumps(metadata))
+            del bad['native_catalog_graph']
+            with self.assertRaises(validation.GateFailure):
+                validation.verify_artifacts(bad)
+            pathlib.Path(metadata['native_target_reader']['path']).write_bytes(b'replaced reader')
+            with self.assertRaises(validation.GateFailure):
+                validation.verify_artifacts(metadata)
+
+    def test_catalog_runtime_inventory_and_commands_are_required_on_every_native_os(self):
+        class RecordingRunner(StageRunner):
+            def cargo(inner, name, *args, **kwargs):
+                inner.calls.append((name, args, kwargs))
+            def run(inner, *args, **kwargs):
+                pass
+        for system in ('Linux', 'Darwin', 'Windows'):
+            with self.subTest(system=system), tempfile.TemporaryDirectory() as temp:
+                runner = RecordingRunner(pathlib.Path(temp), {})
+                with patch.object(validation, 'load_pinned', return_value={}), patch.object(validation.platform, 'system', return_value=system):
+                    validation.native(runner, 'precompile')
+                    validation.native(runner, 'runtime')
+                calls = {name: (args, kwargs) for name, args, kwargs in runner.calls}
+                for stage in ('native-profile-precompile', 'native-catalog-precompile', 'native-consumers-precompile'):
+                    self.assertIn('--no-run', calls[stage][0])
+                for stage, target, cases in (
+                        ('native-profile-runtime', 'native_profile_runtime', 'profile-runtime-common'),
+                        ('native-catalog-adapter', 'native_catalog_adapter', 'catalog-common'),
+                        ('native-selected', 'native_selected', 'selected-common'),
+                        ('native-recovery', 'native_recovery', 'recovery-common'),
+                        ('native-consumers', 'native_consumers', 'consumers-common')):
+                    args, kwargs = calls[stage]
+                    self.assertEqual(args[args.index('--test') + 1], target)
+                    self.assertTrue(validation.CASE_INVENTORY['native'][cases])
+                    self.assertTrue(set(validation.CASE_INVENTORY['native'][cases]).issubset(kwargs['required_cases']))
+                    self.assertIn('--test-threads=1', args)
+                self.assertIn('fake_ssh_argv_preparation_uses_only_synthetic_private_material', calls['native-catalog-adapter'][1]['required_cases'])
+                args, kwargs = calls['native-catalog-library']
+                self.assertIn('--lib', args)
+                self.assertEqual(args[args.index('--features') + 1], 'native-catalog-test-support')
+                self.assertEqual(kwargs['required_cases'], validation.CASE_INVENTORY['native']['catalog-library-common'])
+                self.assertEqual(len(kwargs['required_cases']), 5)
+                self.assertEqual('unsafe_reserved_name_is_not_absent_family' in calls['native-consumers'][1]['required_cases'], system != 'Windows')
 
     def test_client_graph_rejects_missing_features_host_faults_and_release_fixture(self):
         for fixture in (False, True):
@@ -465,7 +608,9 @@ class ValidationTests(unittest.TestCase):
         corrupted = {}
         def cargo(name, *args):
             calls[name] = args
-            if name.startswith('client-'):
+            if name == 'catalog-fixture-artifacts':
+                graph = self.catalog_graph()
+            elif name.startswith('client-'):
                 graph = corrupted.get(name, self.client_graph(name == 'client-fixture-artifacts'))
             elif name.startswith('helper-'):
                 graph = self.helper_graph(name == 'helper-fixture-artifacts')

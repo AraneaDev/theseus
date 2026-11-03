@@ -283,7 +283,9 @@ impl Dispatcher {
                 }
             }
             v2::Request::ReadFile { .. } => WorkerCommand::ReadFile { request, ticket },
-            v2::Request::InspectFile { .. } => WorkerCommand::InspectFile { request, ticket },
+            v2::Request::InspectFile { .. } | v2::Request::InspectNativeFile { .. } => {
+                WorkerCommand::InspectFile { request, ticket }
+            }
             _ => return self.response(ticket, refused(v2::RefusalCode::InvalidRequest), None),
         };
         match self.ports.commands.try_send(command) {
@@ -378,11 +380,13 @@ impl Dispatcher {
                 reply,
                 start_key,
             } => {
-                if matches!(reply, v2::Reply::Refused { .. })
-                    && self
-                        .active
-                        .as_ref()
-                        .is_some_and(|a| a.request_sequence == ticket.reply_to && !a.accepted)
+                if matches!(
+                    reply,
+                    v2::Reply::Refused { .. } | v2::Reply::PrefixAuthorityRevoked { .. }
+                ) && self
+                    .active
+                    .as_ref()
+                    .is_some_and(|a| a.request_sequence == ticket.reply_to && !a.accepted)
                 {
                     self.active = None;
                     self.barrier = None;

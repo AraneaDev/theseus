@@ -19,7 +19,7 @@ mod operation;
 pub use contract::OwnedWorkerFailure as WorkerFailure;
 
 mod config;
-pub use config::{ConfigError, load_config};
+pub use config::{ConfigError, config_manifest_digest, load_config};
 
 #[cfg(feature = "test-support")]
 pub mod test_support;

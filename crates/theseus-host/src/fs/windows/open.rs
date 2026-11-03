@@ -293,6 +293,130 @@ fn relative_open(
     let _: FILE_ID_INFO = query(&file, FileIdInfo)?;
     Ok(file)
 }
+// This owner is never accessed after issuance is classified unresolved. Its
+// allocations, native pointers, handle, parent and security are retained together.
+// Moving the outer box changes no native pointee; no Rust thread may dereference
+// or mutate the inner records. Kernel completion may still write them.
+struct RetainedLeafOpen(#[allow(dead_code)] Box<OpenCall>);
+unsafe impl Send for RetainedLeafOpen {}
+unsafe impl Sync for RetainedLeafOpen {}
+
+pub(in crate::fs) fn open_leaf_classified(
+    parent: &File,
+    name: &OsStr,
+) -> crate::fs::LeafOpenResult {
+    use crate::fs::LeafOpenResult;
+    let result = (|| -> Result<File, LeafOpenResult> {
+        let name = wide(name).map_err(LeafOpenResult::FailedSettled)?;
+        let length = u16::try_from(
+            (name.len() - 1)
+                .checked_mul(2)
+                .ok_or_else(|| LeafOpenResult::FailedSettled(invalid("component too long")))?,
+        )
+        .map_err(|_| LeafOpenResult::FailedSettled(invalid("component too long")))?;
+        let maximum = length
+            .checked_add(2)
+            .ok_or_else(|| LeafOpenResult::FailedSettled(invalid("component too long")))?;
+        // SAFETY: these C records permit zero initialization; all required fields are
+        // initialized below before use. Box and Vec allocations keep pointees stable.
+        let mut call = Box::new(OpenCall {
+            handle: null_mut(),
+            status: unsafe { zeroed() },
+            name,
+            unicode: unsafe { zeroed() },
+            attributes: unsafe { zeroed() },
+            security: None,
+            parent: parent.try_clone().map_err(LeafOpenResult::FailedSettled)?,
+        });
+        call.unicode = UNICODE_STRING {
+            Length: length,
+            MaximumLength: maximum,
+            Buffer: call.name.as_mut_ptr(),
+        };
+        call.attributes = OBJECT_ATTRIBUTES {
+            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: call.parent.as_raw_handle(),
+            ObjectName: &call.unicode,
+            Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+            SecurityDescriptor: call.security.as_mut().map_or(null(), |s| s.as_ptr()),
+            SecurityQualityOfService: null_mut(),
+        };
+        let options = nt::FILE_OPEN_REPARSE_POINT
+            | nt::FILE_SYNCHRONOUS_IO_NONALERT
+            | nt::FILE_NON_DIRECTORY_FILE;
+        // SAFETY: root is retained, one validated component only, descriptor and all
+        // native records remain owned until terminal completion is observed.
+        let mut status = unsafe {
+            nt::NtCreateFile(
+                &mut call.handle,
+                FILE_GENERIC_READ,
+                &call.attributes,
+                &mut call.status,
+                null(),
+                FILE_ATTRIBUTE_NORMAL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nt::FILE_OPEN,
+                options,
+                null(),
+                0,
+            )
+        };
+        if status == STATUS_PENDING {
+            if call.handle.is_null() || call.handle == INVALID_HANDLE_VALUE {
+                return Err(LeafOpenResult::Unsettled(
+                    crate::fs::LeafOpenUncertainty::retain(
+                        nt_error(status),
+                        RetainedLeafOpen(call),
+                    ),
+                ));
+            }
+            // A classified leaf lookup must not wait past its caller's
+            // cooperative inspection/cancellation budget. An unfinished native
+            // call keeps its original storage and handle in Unsettled.
+            let waited = unsafe { WaitForSingleObject(call.handle, 0) };
+            if waited != WAIT_OBJECT_0 {
+                let error = if waited == WAIT_FAILED {
+                    io::Error::last_os_error()
+                } else {
+                    nt_error(status)
+                };
+                return Err(LeafOpenResult::Unsettled(
+                    crate::fs::LeafOpenUncertainty::retain(error, RetainedLeafOpen(call)),
+                ));
+            }
+            status = unsafe { call.status.Anonymous.Status };
+        }
+        if status == STATUS_PENDING {
+            return Err(LeafOpenResult::Unsettled(
+                crate::fs::LeafOpenUncertainty::retain(nt_error(status), RetainedLeafOpen(call)),
+            ));
+        }
+        if status < 0 {
+            // Raw terminal leaf-name status, never a DOS ErrorKind conversion.
+            return Err(if status == STATUS_OBJECT_NAME_NOT_FOUND {
+                LeafOpenResult::MissingSettled
+            } else {
+                LeafOpenResult::FailedSettled(nt_error(status))
+            });
+        }
+        if call.handle.is_null() || call.handle == INVALID_HANDLE_VALUE {
+            return Err(LeafOpenResult::Unsettled(
+                crate::fs::LeafOpenUncertainty::retain(nt_error(status), RetainedLeafOpen(call)),
+            ));
+        }
+        // SAFETY: NtCreateFile completed successfully and transfers this unique handle.
+        let file = unsafe { File::from_raw_handle(call.handle) };
+        validate(&file, false).map_err(LeafOpenResult::FailedSettled)?;
+        // Required file identity must work before the handle is used as evidence.
+        let _: FILE_ID_INFO = query(&file, FileIdInfo).map_err(LeafOpenResult::FailedSettled)?;
+        Ok(file)
+    })();
+    match result {
+        Ok(file) => LeafOpenResult::Opened(file),
+        Err(result) => result,
+    }
+}
+
 pub(in crate::fs) fn open_dir(parent: &File, name: &OsStr) -> io::Result<File> {
     relative(parent, name, true, false)
 }
@@ -503,6 +627,59 @@ pub fn read_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) -> io::
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pending_open_call_storage_retention_model_not_native_pending_io() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let parent = open_root(temp.path(), RootPolicy::LeafNoFollow)?;
+        let mut call = Box::new(OpenCall {
+            handle: null_mut(),
+            status: unsafe { zeroed() },
+            name: wide(OsStr::new("reader"))?,
+            unicode: unsafe { zeroed() },
+            attributes: unsafe { zeroed() },
+            security: None,
+            parent,
+        });
+        call.status.Anonymous.Status = STATUS_PENDING;
+        call.unicode = UNICODE_STRING {
+            Length: 12,
+            MaximumLength: 14,
+            Buffer: call.name.as_mut_ptr(),
+        };
+        call.attributes.RootDirectory = call.parent.as_raw_handle();
+        call.attributes.ObjectName = &call.unicode;
+        let call_pointer = std::ptr::from_ref(&*call);
+        let name_pointer = call.name.as_ptr();
+        let parent_handle = call.parent.as_raw_handle();
+        let error = nt_error(STATUS_PENDING);
+        let original_error = error.raw_os_error();
+        let propagated = io::Error::other(crate::fs::LeafOpenUncertainty::retain(
+            error,
+            RetainedLeafOpen(call),
+        ));
+        let pending = propagated
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<crate::fs::LeafOpenUncertainty>()
+            .unwrap();
+        assert_eq!(pending.error().raw_os_error(), original_error);
+        let retained = pending
+            ._retained
+            .downcast_ref::<RetainedLeafOpen>()
+            .unwrap();
+        assert_eq!(std::ptr::from_ref(&*retained.0), call_pointer);
+        assert_eq!(retained.0.name.as_ptr(), name_pointer);
+        assert!(std::ptr::eq(
+            retained.0.attributes.ObjectName,
+            &retained.0.unicode
+        ));
+        assert_eq!(retained.0.attributes.RootDirectory, parent_handle);
+        drop(propagated);
+        // The retained original parent handle remains valid after incomplete Drop.
+        assert_eq!(unsafe { GetFileType(parent_handle) }, FILE_TYPE_DISK);
+        // No NtCreateFile was issued: supplemental ownership model only.
+        Ok(())
+    }
     #[test]
     fn unsupported_profile_and_identity_errors_fail_closed() {
         for (characteristics, flags, name) in [

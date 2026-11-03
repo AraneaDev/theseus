@@ -66,6 +66,125 @@ fn open_store(root: &Path) -> Result<ReportStore> {
     })
 }
 impl ReportStore {
+    /// Classify every reserved family name through the retained directory.
+    /// Only a completed native missing result proves absence.
+    pub fn artifact_family(&self) -> Result<crate::native::storage::ArtifactFamily> {
+        use crate::native::storage::ArtifactFamily as F;
+        use theseus_host::fs::LeafOpenResult;
+        let mut family = F::Empty;
+        for (name, current) in [
+            ("report.json", F::Docker),
+            ("journal.json", F::Docker),
+            ("native-report.json", F::Native),
+            ("native-journal.json", F::Native),
+            ("comparison.json", F::Comparison),
+        ] {
+            match self
+                .directory
+                .open_leaf_classified(std::ffi::OsStr::new(name))
+            {
+                LeafOpenResult::Opened(_) => {
+                    ensure!(
+                        family == F::Empty || family == current,
+                        "mixed artifact families"
+                    );
+                    family = current;
+                }
+                LeafOpenResult::MissingSettled => (),
+                LeafOpenResult::FailedSettled(error) => {
+                    return Err(error).context("classify retained artifact family");
+                }
+                LeafOpenResult::Unsettled(owner) => {
+                    return Err(owner).context("unsettled artifact open");
+                }
+            }
+        }
+        Ok(family)
+    }
+    /// Retain a private native intent namespace under this run's directory owner.
+    /// Reopening never prepares, republishes, or manufactures an original intent.
+    pub fn intent_store(&self) -> Result<theseus_native_helper_store::IntentStore> {
+        crate::native::storage::require_family(
+            self.artifact_family()?,
+            crate::native::storage::ArtifactFamily::Native,
+        )?;
+        let name = std::ffi::OsStr::new("native-intents");
+        let directory = match self.directory.create_child(name) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.directory.open_child_name(name)?
+            }
+            Err(error) => return Err(error).context("create retained native intent directory"),
+        };
+        Ok(theseus_native_helper_store::IntentStore::new(directory))
+    }
+    pub fn open_intent_store(&self) -> Result<theseus_native_helper_store::IntentStore> {
+        crate::native::storage::require_family(
+            self.artifact_family()?,
+            crate::native::storage::ArtifactFamily::Native,
+        )?;
+        Ok(theseus_native_helper_store::IntentStore::new(
+            self.directory
+                .open_child_name(std::ffi::OsStr::new("native-intents"))?,
+        ))
+    }
+    pub fn native_report_path(&self) -> PathBuf {
+        self.root.join(crate::native::model::REPORT_FILENAME)
+    }
+    pub fn save_native_report(&self, report: &crate::native::model::NativeReport) -> Result<()> {
+        crate::native::storage::validate_report(report)?;
+        crate::native::storage::require_family(
+            self.artifact_family()?,
+            crate::native::storage::ArtifactFamily::Native,
+        )?;
+        self.atomic_json(crate::native::model::REPORT_FILENAME, report)
+    }
+    pub fn save_native_journal(&self, journal: &crate::native::model::NativeJournal) -> Result<()> {
+        journal.validate()?;
+        crate::native::storage::require_family(
+            self.artifact_family()?,
+            crate::native::storage::ArtifactFamily::Native,
+        )?;
+        self.atomic_json(crate::native::model::JOURNAL_FILENAME, journal)
+    }
+    pub fn load_native_report(&self) -> Result<crate::native::model::NativeReport> {
+        crate::native::storage::require_family(
+            self.artifact_family()?,
+            crate::native::storage::ArtifactFamily::Native,
+        )?;
+        let report = crate::native::model::NativeReport::decode(
+            &self.read_bytes(crate::native::model::REPORT_FILENAME)?,
+        )?;
+        crate::native::storage::validate_report(&report)?;
+        Ok(report)
+    }
+    pub fn load_native_journal(&self) -> Result<crate::native::model::NativeJournal> {
+        crate::native::storage::require_family(
+            self.artifact_family()?,
+            crate::native::storage::ArtifactFamily::Native,
+        )?;
+        crate::native::model::NativeJournal::decode(
+            &self.read_bytes(crate::native::model::JOURNAL_FILENAME)?,
+        )
+    }
+    pub fn load_selected_report(&self) -> Result<crate::engine::domain::StoredRun> {
+        use crate::{engine::domain::StoredRun, native::storage::ArtifactFamily};
+        match self.artifact_family()? {
+            ArtifactFamily::Native => Ok(StoredRun::Native(self.load_native_report()?)),
+            ArtifactFamily::Docker => Ok(StoredRun::Docker(decode_report(
+                &self.read_bytes("report.json")?,
+            )?)),
+            _ => bail!("run report family missing or unsupported"),
+        }
+    }
+    pub fn load_selected_journal(&self) -> Result<crate::engine::domain::StoredJournal> {
+        use crate::{engine::domain::StoredJournal, native::storage::ArtifactFamily};
+        match self.artifact_family()? {
+            ArtifactFamily::Native => Ok(StoredJournal::Native(self.load_native_journal()?)),
+            ArtifactFamily::Docker => Ok(StoredJournal::Docker(self.load_journal()?)),
+            _ => bail!("run journal family missing or unsupported"),
+        }
+    }
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -73,6 +192,10 @@ impl ReportStore {
         self.root.join("report.json")
     }
     pub fn save(&self, report: &RunReport) -> Result<()> {
+        crate::native::storage::require_family(
+            self.artifact_family()?,
+            crate::native::storage::ArtifactFamily::Docker,
+        )?;
         validate_report(report)?;
         if report.schema_version >= 4 {
             let mut normalized = report.clone();
@@ -83,6 +206,10 @@ impl ReportStore {
         }
     }
     pub fn save_journal(&self, journal: &RunJournal) -> Result<()> {
+        crate::native::storage::require_family(
+            self.artifact_family()?,
+            crate::native::storage::ArtifactFamily::Docker,
+        )?;
         validate_journal(journal)?;
         self.atomic_json("journal.json", journal)
     }
@@ -263,7 +390,13 @@ impl ReportStore {
         })
     }
     pub(crate) fn load_journal(&self) -> Result<RunJournal> {
-        let journal = self.read_json("journal.json")?;
+        crate::native::storage::require_family(
+            self.artifact_family()?,
+            crate::native::storage::ArtifactFamily::Docker,
+        )?;
+        let bytes = self.read_bytes("journal.json")?;
+        crate::native::storage::ensure_legacy_namespace(&bytes)?;
+        let journal = serde_json::from_slice(&bytes)?;
         validate_journal(&journal)?;
         Ok(journal)
     }
@@ -284,7 +417,15 @@ fn log_components(relative: &str) -> Result<Vec<&str>> {
         "unsafe log reference"
     );
     ensure!(
-        !matches!(parts[0], "report.json" | "journal.json"),
+        !matches!(
+            parts[0],
+            "report.json"
+                | "journal.json"
+                | "native-report.json"
+                | "native-journal.json"
+                | "comparison.json"
+                | "native-intents"
+        ),
         "log reference conflicts with report metadata"
     );
     // Component checks are deliberately lexical, before any filesystem access.
@@ -526,9 +667,15 @@ fn validate_report(report: &RunReport) -> Result<()> {
 }
 pub fn load(path: &Path) -> Result<RunReport> {
     let root = report_root(path, "report.json")?;
-    decode_report(&open_store(&root)?.read_bytes("report.json")?)
+    let store = open_store(&root)?;
+    crate::native::storage::require_family(
+        store.artifact_family()?,
+        crate::native::storage::ArtifactFamily::Docker,
+    )?;
+    decode_report(&store.read_bytes("report.json")?)
 }
 pub(crate) fn decode_report(bytes: &[u8]) -> Result<RunReport> {
+    crate::native::storage::ensure_legacy_namespace(bytes)?;
     let mut report: RunReport = serde_json::from_slice(bytes).context("decode report JSON")?;
     validate_report(&report)?;
     if report.schema_version >= 4 {
@@ -538,7 +685,14 @@ pub(crate) fn decode_report(bytes: &[u8]) -> Result<RunReport> {
 }
 pub fn load_journal(path: &Path) -> Result<RunJournal> {
     let root = report_root(path, "journal.json")?;
-    let journal: RunJournal = open_store(&root)?.read_json("journal.json")?;
+    let store = open_store(&root)?;
+    crate::native::storage::require_family(
+        store.artifact_family()?,
+        crate::native::storage::ArtifactFamily::Docker,
+    )?;
+    let bytes = store.read_bytes("journal.json")?;
+    crate::native::storage::ensure_legacy_namespace(&bytes)?;
+    let journal: RunJournal = serde_json::from_slice(&bytes)?;
     validate_journal(&journal)?;
     Ok(journal)
 }

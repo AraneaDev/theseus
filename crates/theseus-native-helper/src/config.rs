@@ -56,6 +56,10 @@ fn io_error(e: io::Error) -> ConfigError {
 #[serde(deny_unknown_fields)]
 struct Config {
     schema: u8,
+    profile: Option<String>,
+    capabilities: Option<Vec<String>>,
+    provider_epoch: Option<String>,
+    artifacts: Option<Artifacts>,
     ledger_root: String,
     workspace_root: String,
     binding: String,
@@ -63,6 +67,18 @@ struct Config {
     workspace_marker: String,
     os: String,
     programs: Vec<Program>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Artifacts {
+    base: Artifact,
+    target: Artifact,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Artifact {
+    length: u64,
+    sha256: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -105,13 +121,66 @@ fn parse_bytes(b: &[u8]) -> Result<Config, ConfigError> {
     let c: Config = serde_json::from_slice(b).map_err(|e| ConfigError {
         kind: ConfigErrorKind::Json(e),
     })?;
-    if c.schema != 1
+    if !matches!(c.schema, 1 | 2)
         || !absolute(&c.ledger_root)
         || !absolute(&c.workspace_root)
         || c.programs.is_empty()
         || c.programs.len() > 8
     {
         return Err(invalid());
+    }
+    if c.schema == 1 {
+        let value: serde_json::Value = serde_json::from_slice(b).map_err(|_| invalid())?;
+        if ["profile", "capabilities", "provider_epoch", "artifacts"]
+            .iter()
+            .any(|k| value.get(k).is_some())
+        {
+            return Err(invalid());
+        }
+    } else {
+        if c.profile.as_deref() != Some("native_catalog_v1")
+            || c.capabilities.as_ref().is_none_or(|v| {
+                !v.iter()
+                    .map(String::as_str)
+                    .eq(v2::NativeCapabilities::NAMES)
+            })
+        {
+            return Err(invalid());
+        }
+        v2::Digest::parse(c.provider_epoch.as_deref().ok_or_else(invalid)?)
+            .map_err(|_| invalid())?;
+        let artifacts = c.artifacts.as_ref().ok_or_else(invalid)?;
+        for a in [&artifacts.base, &artifacts.target] {
+            if a.length == 0 || a.length > v2::MAX_NATIVE_FILE_BYTES {
+                return Err(invalid());
+            }
+            v2::Digest::parse(&a.sha256).map_err(|_| invalid())?;
+        }
+        const IDS: [&str; 8] = [
+            "check_base",
+            "check_data",
+            "check_target",
+            "configure",
+            "exercise",
+            "install_base",
+            "install_target",
+            "uninstall",
+        ];
+        if !c.programs.iter().map(|p| p.id.as_str()).eq(IDS) {
+            return Err(invalid());
+        }
+        let reader = Path::new(&c.workspace_root).join(if c.os == "windows" {
+            "reader.exe"
+        } else {
+            "reader"
+        });
+        for p in &c.programs {
+            if ["check_base", "check_data", "check_target", "exercise"].contains(&p.id.as_str())
+                && Path::new(&p.program) != reader
+            {
+                return Err(invalid());
+            }
+        }
     }
     v2::BindingId::parse(&c.binding).map_err(|_| invalid())?;
     v2::Digest::parse(&c.manifest_digest).map_err(|_| invalid())?;
@@ -159,8 +228,32 @@ fn parse_bytes(b: &[u8]) -> Result<Config, ConfigError> {
 // Only validated schema values reach the encoder; counts/lengths fit their widths.
 fn authority_digest(c: &Config) -> String {
     let mut h = Sha256::new();
-    h.update(b"theseus-native-helper-config-v1\0");
-    h.update(c.binding.as_bytes());
+    if c.schema == 1 {
+        h.update(b"theseus-native-helper-config-v1\0");
+    } else {
+        h.update(b"theseus-native-helper-config-v2\0");
+        let profile = c.profile.as_deref().expect("validated native profile");
+        h.update([profile.len() as u8]);
+        h.update(profile.as_bytes());
+        for root in [&c.ledger_root, &c.workspace_root] {
+            h.update((root.len() as u32).to_be_bytes());
+            h.update(root.as_bytes());
+        }
+        for name in v2::NativeCapabilities::NAMES {
+            h.update([name.len() as u8]);
+            h.update(name.as_bytes());
+        }
+        for a in [
+            &c.artifacts.as_ref().expect("native artifacts").base,
+            &c.artifacts.as_ref().unwrap().target,
+        ] {
+            h.update(a.length.to_be_bytes());
+            h.update(a.sha256.as_bytes());
+        }
+    }
+    if c.schema == 1 {
+        h.update(c.binding.as_bytes());
+    }
     h.update([
         match c.os.as_str() {
             "linux" => 1,
@@ -188,6 +281,12 @@ fn authority_digest(c: &Config) -> String {
         }
     }
     format!("{:x}", h.finalize())
+}
+/// Compute the manifest over explicit, strictly validated configuration authority.
+/// The supplied manifest_digest is syntax checked but not compared by this helper.
+pub fn config_manifest_digest(bytes: &[u8]) -> Result<v2::Digest, ConfigError> {
+    let config = parse_bytes(bytes)?;
+    v2::Digest::parse(&authority_digest(&config)).map_err(|_| invalid())
 }
 /// Load a bounded, explicit regular config; verify authority before opening roots.
 /// UTF-8 paths/argv are this CLI profile's restriction, not a native API restriction.
@@ -220,6 +319,14 @@ pub fn load_config(path: &Path) -> Result<Invocation, ConfigError> {
         workspace_marker: v2::WorkspaceMarker::parse(&c.workspace_marker).map_err(|_| invalid())?,
         os: os(&c.os)?,
     };
+    let provider_epoch = if c.schema == 2 {
+        Some(
+            v2::Digest::parse(c.provider_epoch.as_deref().ok_or_else(invalid)?)
+                .map_err(|_| invalid())?,
+        )
+    } else {
+        None
+    };
     let catalog = c
         .programs
         .into_iter()
@@ -239,13 +346,33 @@ pub fn load_config(path: &Path) -> Result<Invocation, ConfigError> {
             })
         })
         .collect::<Result<Vec<_>, ConfigError>>()?;
-    Invocation::new(
-        c.ledger_root.into(),
-        c.workspace_root.into(),
-        expected,
-        catalog,
-    )
-    .map_err(|e| ConfigError {
+    let result = if let Some(provider_epoch) = provider_epoch {
+        Invocation::new_native(
+            c.ledger_root.into(),
+            c.workspace_root.into(),
+            expected,
+            catalog,
+            provider_epoch,
+            {
+                let artifacts = c.artifacts.as_ref().ok_or_else(invalid)?;
+                v2::artifact_commitment(
+                    artifacts.base.length,
+                    v2::Digest::parse(&artifacts.base.sha256).map_err(|_| invalid())?,
+                    artifacts.target.length,
+                    v2::Digest::parse(&artifacts.target.sha256).map_err(|_| invalid())?,
+                )
+                .map_err(|_| invalid())?
+            },
+        )
+    } else {
+        Invocation::new(
+            c.ledger_root.into(),
+            c.workspace_root.into(),
+            expected,
+            catalog,
+        )
+    };
+    result.map_err(|e| ConfigError {
         kind: ConfigErrorKind::Invocation(e),
     })
 }
@@ -263,6 +390,142 @@ mod tests {
     }
     fn parse(v: &serde_json::Value) -> Result<Config, ConfigError> {
         parse_bytes(&serde_json::to_vec(v).unwrap())
+    }
+    fn native_vector() -> serde_json::Value {
+        let mut v = vector();
+        v["schema"] = serde_json::json!(2);
+        v["profile"] = serde_json::json!("native_catalog_v1");
+        v["capabilities"] = serde_json::json!(v2::NativeCapabilities::NAMES);
+        v["provider_epoch"] = serde_json::json!("44".repeat(32));
+        v["artifacts"] = serde_json::json!({"base":{"length":10000,"sha256":"55".repeat(32)},"target":{"length":20000,"sha256":"66".repeat(32)}});
+        let program = v["programs"][0].clone();
+        v["programs"] = serde_json::json!(
+            [
+                "check_base",
+                "check_data",
+                "check_target",
+                "configure",
+                "exercise",
+                "install_base",
+                "install_target",
+                "uninstall"
+            ]
+            .map(|id| {
+                let mut p = program.clone();
+                p["id"] = serde_json::json!(id);
+                if ["check_base", "check_data", "check_target", "exercise"].contains(&id) {
+                    let prefix = Path::new(v["workspace_root"].as_str().unwrap());
+                    p["program"] = serde_json::json!(prefix.join(if v["os"] == "windows" {
+                        "reader.exe"
+                    } else {
+                        "reader"
+                    }));
+                    p["args"] = serde_json::json!([id, prefix.join("data").to_str().unwrap()]);
+                }
+                p
+            })
+        );
+        v
+    }
+    #[test]
+    fn native_manifest_binds_catalog_and_reader_selection_not_instance_identity() {
+        let v = native_vector();
+        let original = authority_digest(&parse(&v).unwrap());
+        for (pointer, value) in [
+            (
+                "/programs/5/program",
+                serde_json::json!(if cfg!(windows) {
+                    "C:\\bin\\other"
+                } else {
+                    "/bin/other"
+                }),
+            ),
+            ("/programs/5/args", serde_json::json!(["different"])),
+            (
+                "/programs/5/environment/entries/0/value",
+                serde_json::json!("different"),
+            ),
+            (
+                "/artifacts/target/sha256",
+                serde_json::json!("77".repeat(32)),
+            ),
+        ] {
+            let mut changed = v.clone();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            assert_ne!(original, authority_digest(&parse(&changed).unwrap()));
+        }
+        for id in [0, 1, 2, 4] {
+            let mut bad = v.clone();
+            bad["programs"][id]["program"] = serde_json::json!(std::env::current_exe().unwrap());
+            assert!(
+                parse(&bad).is_err(),
+                "native check must select installed reader"
+            );
+            let mut changed = v.clone();
+            changed["programs"][id]["args"] = serde_json::json!(["--version"]);
+            assert_ne!(original, authority_digest(&parse(&changed).unwrap()));
+        }
+        let mut bad = v;
+        bad["profile"] = serde_json::json!("another_profile");
+        assert!(parse(&bad).is_err());
+    }
+    #[test]
+    fn native_config_digest_matches_independent_binary_vector() {
+        let mut v = native_vector();
+        v["workspace_root"] = serde_json::json!("/missing/workspace");
+        v["ledger_root"] = serde_json::json!("/missing/ledger");
+        v["os"] = serde_json::json!("linux");
+        for p in v["programs"].as_array_mut().unwrap() {
+            let id = p["id"].as_str().unwrap().to_owned();
+            if ["check_base", "check_data", "check_target", "exercise"].contains(&id.as_str()) {
+                p["program"] = serde_json::json!("/missing/workspace/reader");
+                p["args"] = serde_json::json!([id, "/missing/workspace/data".to_owned()]);
+            } else {
+                p["program"] = serde_json::json!("/bin/probe");
+            }
+        }
+        let c: Config = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            authority_digest(&c),
+            "0fabb114943b8e79b452d6b5241ab7b0ef75e4934075a3189af0a7950a630228"
+        );
+    }
+    #[test]
+    fn native_config_requires_exact_profile_epoch_artifacts_and_catalog() {
+        let v = native_vector();
+        let original = authority_digest(&parse(&v).unwrap());
+        for key in ["profile", "capabilities", "provider_epoch", "artifacts"] {
+            let mut bad = v.clone();
+            bad.as_object_mut().unwrap().remove(key);
+            assert!(parse(&bad).is_err());
+            let mut fixture = vector();
+            fixture[key] = serde_json::Value::Null;
+            assert!(parse(&fixture).is_err());
+        }
+        for (key, value) in [
+            ("profile", serde_json::json!("trusted_fixture_v1")),
+            ("provider_epoch", serde_json::json!("not an epoch")),
+            ("capabilities", serde_json::json!(["catalog_run"])),
+        ] {
+            let mut bad = v.clone();
+            bad[key] = value;
+            assert!(parse(&bad).is_err());
+        }
+        for (key, value) in [
+            ("binding", "88".repeat(16)),
+            ("provider_epoch", "77".repeat(32)),
+            ("workspace_marker", "99".repeat(16)),
+        ] {
+            let mut changed = v.clone();
+            changed[key] = serde_json::json!(value);
+            assert_eq!(original, authority_digest(&parse(&changed).unwrap()));
+        }
+        let mut changed = v.clone();
+        changed["artifacts"]["target"]["sha256"] = serde_json::json!("77".repeat(32));
+        assert_ne!(original, authority_digest(&parse(&changed).unwrap()));
+        let mut bad = v;
+        bad["programs"].as_array_mut().unwrap().pop();
+        assert!(parse(&bad).is_err());
     }
     #[test]
     fn config_digest_matches_independent_literal_binary_vector() {

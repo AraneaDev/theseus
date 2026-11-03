@@ -5,6 +5,7 @@ mod comparison;
 mod editor;
 pub mod evidence;
 mod input;
+mod native;
 pub mod paging;
 mod preview_edit;
 mod refresh;
@@ -188,6 +189,17 @@ pub fn run_with_options(mut app: App, options: AnimationOptions) -> Result<i32> 
     drop(signals);
     result
 }
+#[derive(Debug)]
+struct SecondaryNativeFailures(Vec<anyhow::Error>);
+impl std::fmt::Display for SecondaryNativeFailures {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} secondary native cleanup failure(s) retained",
+            self.0.len()
+        )
+    }
+}
 fn finish_runtime<T>(
     runtime: tokio::runtime::Runtime,
     cancel: &CancellationToken,
@@ -227,13 +239,38 @@ fn finish_runtime<T>(
     }
     let retained = retained.settled();
     let pending = retained.pending();
+    let mut secondary = Vec::new();
     let outcome = match (result, final_worker, restoration) {
-        (Err(original), _, _) => Err(original),
-        (Ok(_), Some(Err(error)), _) => Err(error),
+        (Err(original), worker, restore) => {
+            if let Some(Err(error)) = worker
+                && engine::native_cleanup_pending(&error)
+            {
+                secondary.push(error);
+            }
+            if let Err(error) = restore
+                && engine::native_cleanup_pending(&error)
+            {
+                secondary.push(error);
+            }
+            Err(original)
+        }
+        (Ok(_), Some(Err(error)), restore) => {
+            if let Err(other) = restore
+                && engine::native_cleanup_pending(&other)
+            {
+                secondary.push(other);
+            }
+            Err(error)
+        }
         (Ok(_), _, Err(error)) => Err(error),
         (Ok(code), _, Ok(())) => Ok(code),
     };
     outcome.map_err(|error| {
+        let error = if secondary.is_empty() {
+            error
+        } else {
+            error.context(SecondaryNativeFailures(secondary))
+        };
         // Typed context retains every pending/panic owner while preserving the
         // primary error's downcast and original source chain.
         let error = if pending {
@@ -365,6 +402,13 @@ impl Signals {
 }
 
 enum Work {
+    Native(
+        Box<(
+            crate::native::recipe::ValidatedNativeRecipe,
+            engine::domain::NativeRunOptions,
+            crate::native::launch::LaunchAuthority,
+        )>,
+    ),
     Run(crate::recipe::ValidatedRecipe, engine::RunOptions),
     Suite(
         crate::comparison::ValidatedSuite,
@@ -376,12 +420,26 @@ enum WorkEvent {
     Suite(crate::comparison::ComparisonEvent),
 }
 enum WorkResult {
+    Native(Box<engine::domain::SelectedRunResult>),
     Run(Box<RunResult>),
     Suite(crate::comparison::ComparisonResult),
 }
 impl Work {
     fn run(self, token: CancellationToken, events: mpsc::Sender<WorkEvent>) -> Result<WorkResult> {
         match self {
+            Self::Native(input) => {
+                let (recipe, options, launch) = *input;
+                engine::run_selected(
+                    &engine::domain::SelectedRecipe::Native(recipe),
+                    engine::domain::SelectedRunOptions::Native(options),
+                    Some(&launch),
+                    token,
+                    |e| {
+                        let _ = events.try_send(WorkEvent::Run(e));
+                    },
+                )
+                .map(|result| WorkResult::Native(Box::new(result)))
+            }
             Self::Run(recipe, options) => engine::run(&recipe, options, token, |e| {
                 let _ = events.try_send(WorkEvent::Run(e));
             })
@@ -404,6 +462,13 @@ fn take_work(app: &mut App) -> Result<Option<Work>> {
         || app.work_consumed
     {
         return Ok(None);
+    }
+    if let Some(view) = &mut app.native {
+        let work = view
+            .take_execution()?
+            .map(|input| Work::Native(Box::new(input)));
+        app.work_consumed = work.is_some();
+        return Ok(work);
     }
     if let Some(view) = &app.comparison {
         if view.report.is_some() {
@@ -439,7 +504,15 @@ fn apply_event(
 ) -> (refresh::Kind, PathBuf) {
     let (kind, path, status) = match event {
         WorkEvent::Run(event) => (
-            refresh::Kind::Run,
+            if event
+                .report_path
+                .file_name()
+                .is_some_and(|n| n == crate::native::model::REPORT_FILENAME)
+            {
+                refresh::Kind::Native
+            } else {
+                refresh::Kind::Run
+            },
             event.report_path,
             format!(
                 "Running {:?} {} {}",
@@ -475,6 +548,13 @@ fn apply_event(
 fn complete_work(app: &mut App, result: Result<WorkResult>) -> Result<()> {
     app.active = false;
     match result {
+        Ok(WorkResult::Native(result)) => {
+            let engine::domain::StoredRun::Native(report) = result.report else {
+                anyhow::bail!("native worker returned another backend");
+            };
+            app.set_native_report(report, result.report_path.parent().unwrap().to_path_buf());
+            app.status = format!("Finished | {}", result.report_path.display());
+        }
         Ok(WorkResult::Run(result)) => {
             let root = result.report_path.parent().unwrap().to_path_buf();
             app.set_report(result.report, root);
@@ -492,7 +572,7 @@ fn complete_work(app: &mut App, result: Result<WorkResult>) -> Result<()> {
             cleanup.retain(&error);
             // An unresolved native owner must leave the UI with its typed error;
             // the outer terminal guard restores modes before propagating it.
-            if cleanup.pending() {
+            if cleanup.pending() || engine::native_cleanup_pending(&error) {
                 return Err(error);
             }
             let diagnostic = format!("Engine error: {error:#}");
@@ -504,6 +584,8 @@ fn complete_work(app: &mut App, result: Result<WorkResult>) -> Result<()> {
                     app.root
                         .join(if app.comparison.is_some() {
                             "comparison.json"
+                        } else if app.native.is_some() {
+                            crate::native::model::REPORT_FILENAME
                         } else {
                             "report.json"
                         })
@@ -516,7 +598,10 @@ fn complete_work(app: &mut App, result: Result<WorkResult>) -> Result<()> {
             app.evidence_index = 0;
             app.scroll = 0;
             app.refresh_logs();
-            if app.report.is_none() && app.comparison.as_ref().is_none_or(|v| v.report.is_none()) {
+            if app.report.is_none()
+                && app.native.as_ref().is_none_or(|v| v.report.is_none())
+                && app.comparison.as_ref().is_none_or(|v| v.report.is_none())
+            {
                 return Err(error);
             }
         }

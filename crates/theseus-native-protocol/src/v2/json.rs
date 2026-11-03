@@ -39,6 +39,78 @@ impl Object {
         }
     }
 }
+impl Wire for NativeCapabilities {
+    fn read(v: Value) -> Result<Self, Error> {
+        if v == serde_json::json!(NativeCapabilities::NAMES) {
+            Ok(Self)
+        } else {
+            Err(Error::InvalidValue)
+        }
+    }
+    fn write<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        NativeCapabilities::NAMES.serialize(s)
+    }
+}
+impl Wire for PrefixAuthorityFailure {
+    fn read(v: Value) -> Result<Self, Error> {
+        match String::read(v)?.as_str() {
+            "missing" => Ok(Self::Missing),
+            "replaced" => Ok(Self::Replaced),
+            "renamed" => Ok(Self::Renamed),
+            "mapping_unproved" => Ok(Self::MappingUnproved),
+            _ => Err(Error::InvalidValue),
+        }
+    }
+    fn write<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(match self {
+            Self::Missing => "missing",
+            Self::Replaced => "replaced",
+            Self::Renamed => "renamed",
+            Self::MappingUnproved => "mapping_unproved",
+        })
+    }
+}
+impl Wire for Provenance<String> {
+    fn read(v: Value) -> Result<Self, Error> {
+        let mut o = Object::new(v)?;
+        let v = match o.take::<String>("kind")?.as_str() {
+            "observed" => Self::Observed {
+                value: o.take("value")?,
+                source: o.take("source")?,
+            },
+            "provider_reported" => Self::ProviderReported {
+                value: o.take("value")?,
+                provider: o.take("provider")?,
+            },
+            "unavailable" => Self::Unavailable {
+                reason: o.take("reason")?,
+            },
+            _ => return Err(Error::InvalidValue),
+        };
+        o.end()?;
+        Ok(v)
+    }
+    fn write<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(None)?;
+        match self {
+            Self::Observed { value, source } => {
+                m.serialize_entry("kind", "observed")?;
+                m.serialize_entry("value", value)?;
+                m.serialize_entry("source", source)?;
+            }
+            Self::ProviderReported { value, provider } => {
+                m.serialize_entry("kind", "provider_reported")?;
+                m.serialize_entry("value", value)?;
+                m.serialize_entry("provider", provider)?;
+            }
+            Self::Unavailable { reason } => {
+                m.serialize_entry("kind", "unavailable")?;
+                m.serialize_entry("reason", reason)?;
+            }
+        };
+        m.end()
+    }
+}
 impl Wire for String {
     fn read(v: Value) -> Result<Self, Error> {
         match v {
@@ -732,6 +804,10 @@ impl Wire for Request {
                 offset: object.take::<u64>("offset")?,
                 length: object.take::<u16>("length")?,
             },
+            "inspect_native_file" => Self::InspectNativeFile {
+                lease: object.take("lease")?,
+                path: object.take("path")?,
+            },
             "inspect_file" => Self::InspectFile {
                 lease: object.take::<LeaseId>("lease")?,
                 path: object.take::<LeafName>("path")?,
@@ -819,6 +895,13 @@ impl Wire for Request {
                 map.serialize_entry("length", &Ref(length))?;
                 map.end()
             }
+            Self::InspectNativeFile { lease, path } => {
+                let mut map = s.serialize_map(Some(3))?;
+                map.serialize_entry("kind", "inspect_native_file")?;
+                map.serialize_entry("lease", &Ref(lease))?;
+                map.serialize_entry("path", &Ref(path))?;
+                map.end()
+            }
             Self::InspectFile { lease, path } => {
                 let mut map = s.serialize_map(Some(3))?;
                 map.serialize_entry("kind", "inspect_file")?;
@@ -872,6 +955,39 @@ impl Wire for Reply {
         let mut object = Object::new(value)?;
         let kind = object.take::<String>("kind")?;
         let result = match kind.as_str() {
+            "native_description" => {
+                object.literal("profile", "native_catalog_v1")?;
+                object.literal("authority", "supplied_disposable_target")?;
+                Self::NativeDescription {
+                    description: Box::new(NativeDescription {
+                        binding: object.take("binding")?,
+                        manifest_digest: object.take("manifest_digest")?,
+                        workspace_marker: object.take("workspace_marker")?,
+                        os: object.take("os")?,
+                        helper_principal: object.take("helper_principal")?,
+                        programs: object.take("programs")?,
+                        capabilities: object.take("capabilities")?,
+                        provider_epoch: object.take("provider_epoch")?,
+                        artifact_commitment: object.take("artifact_commitment")?,
+                        build: object.take("build")?,
+                        os_build: object.take("os_build")?,
+                    }),
+                }
+            }
+            "native_file_info" => Self::NativeFileInfo {
+                lease: object.take("lease")?,
+                path: object.take("path")?,
+                length: object.take("length")?,
+                sha256: object.take("sha256")?,
+            },
+            "file_absent" => Self::FileAbsent {
+                lease: object.take("lease")?,
+                path: object.take("path")?,
+            },
+            "prefix_authority_revoked" => Self::PrefixAuthorityRevoked {
+                lease: object.take("lease")?,
+                reason: object.take("reason")?,
+            },
             "description" => {
                 object.literal("profile", "trusted_fixture_v1")?;
                 object.literal("authority", "explicit_fixture_only")?;
@@ -922,6 +1038,52 @@ impl Wire for Reply {
     }
     fn write<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         match self {
+            Self::NativeDescription { description: d } => {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry("kind", "native_description")?;
+                m.serialize_entry("profile", "native_catalog_v1")?;
+                m.serialize_entry("authority", "supplied_disposable_target")?;
+                m.serialize_entry("binding", &Ref(&d.binding))?;
+                m.serialize_entry("manifest_digest", &Ref(&d.manifest_digest))?;
+                m.serialize_entry("workspace_marker", &Ref(&d.workspace_marker))?;
+                m.serialize_entry("os", &Ref(&d.os))?;
+                m.serialize_entry("helper_principal", &Ref(&d.helper_principal))?;
+                m.serialize_entry("programs", &Ref(&d.programs))?;
+                m.serialize_entry("capabilities", &Ref(&d.capabilities))?;
+                m.serialize_entry("provider_epoch", &Ref(&d.provider_epoch))?;
+                m.serialize_entry("artifact_commitment", &Ref(&d.artifact_commitment))?;
+                m.serialize_entry("build", &Ref(&d.build))?;
+                m.serialize_entry("os_build", &Ref(&d.os_build))?;
+                m.end()
+            }
+            Self::NativeFileInfo {
+                lease,
+                path,
+                length,
+                sha256,
+            } => {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry("kind", "native_file_info")?;
+                m.serialize_entry("lease", &Ref(lease))?;
+                m.serialize_entry("path", &Ref(path))?;
+                m.serialize_entry("length", &Ref(length))?;
+                m.serialize_entry("sha256", &Ref(sha256))?;
+                m.end()
+            }
+            Self::FileAbsent { lease, path } => {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry("kind", "file_absent")?;
+                m.serialize_entry("lease", &Ref(lease))?;
+                m.serialize_entry("path", &Ref(path))?;
+                m.end()
+            }
+            Self::PrefixAuthorityRevoked { lease, reason } => {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry("kind", "prefix_authority_revoked")?;
+                m.serialize_entry("lease", &Ref(lease))?;
+                m.serialize_entry("reason", &Ref(reason))?;
+                m.end()
+            }
             Self::Description {
                 binding,
                 manifest_digest,

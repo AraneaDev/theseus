@@ -1,9 +1,9 @@
-//! CLI parsing is offline; handlers only construct Docker for execution/cleanup.
+//! CLI parsing is offline; handlers select explicitly authorized runtime backends.
 use crate::{
     comparison,
     engine::{self, CancellationToken, RunOptions},
     model::{ProfileName, ScenarioKind},
-    recipe, report,
+    report,
     runner::Docker,
 };
 use anyhow::Result;
@@ -30,6 +30,9 @@ pub enum Action {
         project_root: PathBuf,
         #[arg(long)]
         output_root: PathBuf,
+        /// Server-selected native authority; tool arguments cannot change the target.
+        #[arg(long)]
+        native_target: Option<PathBuf>,
         #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u64).range(1..=86400))]
         max_run_seconds: u64,
     },
@@ -43,8 +46,14 @@ pub enum Action {
         headless: bool,
         #[arg(long, default_value = "theseus.toml")]
         recipe: PathBuf,
-        #[arg(long, value_enum, default_value = "all")]
-        profile: ProfileSelection,
+        #[arg(long, value_enum)]
+        profile: Option<ProfileSelection>,
+        /// Explicit server/helper target; used only with a native catalog recipe.
+        #[arg(long)]
+        native_target: Option<PathBuf>,
+        /// Display accepted selection without runtime authentication or process creation.
+        #[arg(long)]
+        preview: bool,
         #[arg(long, value_enum, default_value = "all")]
         scenario: ScenarioSelection,
         #[arg(long)]
@@ -70,6 +79,9 @@ pub enum Action {
     },
     Cleanup {
         run_directory: PathBuf,
+        /// Explicit matching launch authority for native recovery only.
+        #[arg(long)]
+        native_target: Option<PathBuf>,
     },
 }
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -100,13 +112,28 @@ pub fn execute(cli: Cli) -> Result<i32> {
         Some(Action::Serve {
             project_root,
             output_root,
+            native_target,
             max_run_seconds,
-        }) => Ok(serve(&project_root, &output_root, max_run_seconds)),
+        }) => Ok(serve(
+            &project_root,
+            &output_root,
+            max_run_seconds,
+            native_target.as_deref(),
+        )),
         None => {
             crate::tui::terminal::require_tty()?;
-            let recipe = recipe::load(std::path::Path::new("theseus.toml"))?;
-            let options = RunOptions::all(&recipe);
-            crate::tui::run_with_options(crate::tui::App::preview(recipe, options), animation)
+            match crate::native::storage::load_recipe(Path::new("theseus.toml"))? {
+                engine::domain::SelectedRecipe::Docker(recipe) => {
+                    let options = RunOptions::all(&recipe);
+                    crate::tui::run_with_options(
+                        crate::tui::App::preview(recipe, options),
+                        animation,
+                    )
+                }
+                engine::domain::SelectedRecipe::Native(recipe) => {
+                    run_native(recipe, None, false, true, ScenarioSelection::All, animation)
+                }
+            }
         }
         Some(Action::Init) => {
             init()?;
@@ -116,26 +143,44 @@ pub fn execute(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Some(Action::Validate { recipe: path }) => {
-            let recipe = recipe::load(&path)?;
-            println!(
-                "Valid recipe: {} ({} profiles)",
-                recipe.recipe.name,
-                recipe.recipe.profiles.len()
-            );
+            match crate::native::storage::load_recipe(&path)? {
+                engine::domain::SelectedRecipe::Docker(recipe) => println!(
+                    "Valid recipe: {} ({} profiles)",
+                    recipe.recipe.name,
+                    recipe.recipe.profiles.len()
+                ),
+                engine::domain::SelectedRecipe::Native(recipe) => println!(
+                    "Valid native recipe: {} ({} scenarios)",
+                    recipe.digest,
+                    recipe.recipe.scenarios.len()
+                ),
+            }
             Ok(0)
         }
         Some(Action::Report {
             run_directory,
             json,
         }) => {
-            let report = report::load(&run_directory)?;
-            if !json {
-                return crate::tui::run_with_options(
-                    crate::tui::App::offline(report, run_directory),
-                    animation,
-                );
+            match crate::native::storage::load_run(&run_directory)? {
+                engine::domain::StoredRun::Docker(report) => {
+                    if !json {
+                        return crate::tui::run_with_options(
+                            crate::tui::App::offline(report, run_directory),
+                            animation,
+                        );
+                    }
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                }
+                engine::domain::StoredRun::Native(report) => {
+                    if !json {
+                        return crate::tui::run_with_options(
+                            crate::tui::App::native_offline(report, run_directory),
+                            animation,
+                        );
+                    }
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                }
             }
-            println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(0)
         }
         Some(Action::Comparison {
@@ -206,7 +251,10 @@ pub fn execute(cli: Cli) -> Result<i32> {
             }
             Ok(result.report.outcome.exit_code())
         }
-        Some(Action::Cleanup { run_directory }) => {
+        Some(Action::Cleanup {
+            run_directory,
+            native_target,
+        }) => {
             // Shape is only a routing hint; comparison cleanup validates the entire
             // envelope and pinned journals before any external removal.
             if run_directory
@@ -217,9 +265,44 @@ pub fn execute(cli: Cli) -> Result<i32> {
                     .symlink_metadata()
                     .is_ok()
             {
+                anyhow::ensure!(
+                    native_target.is_none(),
+                    "--native-target requires a native run"
+                );
                 comparison::cleanup(&run_directory)?;
             } else {
-                Docker::default().cleanup(&run_directory)?;
+                let store = report::open_existing(&run_directory)?;
+                match store.load_selected_journal()? {
+                    engine::domain::StoredJournal::Docker(_) => {
+                        anyhow::ensure!(
+                            native_target.is_none(),
+                            "--native-target requires a native run"
+                        );
+                        Docker::default().cleanup(&run_directory)?
+                    }
+                    engine::domain::StoredJournal::Native(_) => {
+                        let path = native_target.as_deref().ok_or_else(|| anyhow::anyhow!(
+                            "native cleanup requires --native-target with explicit matching launch authority; saved report endpoints do not authorize recovery"
+                        ))?;
+                        let launch = read_native_launch(path)?;
+                        let cancel = CancellationToken::default();
+                        let _signals = crate::tui::Signals::register(&cancel)?;
+                        let result = engine::recover_native(store, &launch, cancel, |_| {})?;
+                        println!(
+                            "{}",
+                            crate::tui::safe_text(&format!(
+                                "Recovery report: {}",
+                                result.report_path.display()
+                            ))
+                        );
+                        if !result.complete() {
+                            eprintln!(
+                                "Native recovery remains incomplete; retained evidence records unresolved cleanup dispositions."
+                            );
+                            return Ok(2);
+                        }
+                    }
+                }
             }
             println!("Journaled resources cleaned up.");
             Ok(0)
@@ -230,14 +313,37 @@ pub fn execute(cli: Cli) -> Result<i32> {
             profile,
             scenario,
             pull,
+            native_target,
+            preview,
         }) => {
             if !headless {
                 crate::tui::terminal::require_tty()?;
             }
-            let recipe = recipe::load(&recipe)?;
+            let selected = crate::native::storage::load_recipe(&recipe)?;
+            let recipe = match selected {
+                engine::domain::SelectedRecipe::Native(recipe) => {
+                    anyhow::ensure!(
+                        profile.is_none() && !pull,
+                        "Docker profile/pull options do not apply to native recipes"
+                    );
+                    return run_native(
+                        recipe,
+                        native_target.as_deref(),
+                        headless,
+                        preview,
+                        scenario,
+                        animation,
+                    );
+                }
+                engine::domain::SelectedRecipe::Docker(recipe) => recipe,
+            };
+            anyhow::ensure!(
+                native_target.is_none(),
+                "--native-target requires a native recipe"
+            );
             let mut options = RunOptions::all(&recipe);
             options.pull = pull;
-            options.profiles = match profile {
+            options.profiles = match profile.unwrap_or(ProfileSelection::All) {
                 ProfileSelection::User => vec![ProfileName::User],
                 ProfileSelection::System => vec![ProfileName::System],
                 ProfileSelection::All => options.profiles,
@@ -254,7 +360,14 @@ pub fn execute(cli: Cli) -> Result<i32> {
                 ScenarioSelection::InterruptedUpgrade => vec![ScenarioKind::InterruptedUpgrade],
                 ScenarioSelection::All => options.scenarios,
             };
-            if !headless {
+            if !headless || preview {
+                if headless {
+                    println!(
+                        "{}",
+                        crate::tui::App::preview(recipe, options).preview_text()
+                    );
+                    return Ok(0);
+                }
                 return crate::tui::run_with_options(
                     crate::tui::App::preview(recipe, options),
                     animation,
@@ -283,6 +396,96 @@ pub fn execute(cli: Cli) -> Result<i32> {
             Ok(result.report.outcome.exit_code())
         }
     }
+}
+fn run_native(
+    recipe: crate::native::recipe::ValidatedNativeRecipe,
+    launch_path: Option<&Path>,
+    headless: bool,
+    preview: bool,
+    scenario: ScenarioSelection,
+    animation: crate::tui::AnimationOptions,
+) -> Result<i32> {
+    let launch = launch_path.map(read_native_launch).transpose()?;
+    let scenarios = match scenario {
+        ScenarioSelection::All => recipe.recipe.scenarios.clone(),
+        ScenarioSelection::Clean => vec![ScenarioKind::Clean],
+        ScenarioSelection::Upgrade => vec![ScenarioKind::Upgrade],
+        ScenarioSelection::Reinstall => vec![ScenarioKind::Reinstall],
+        _ => anyhow::bail!("unsupported native scenario"),
+    };
+    let options = engine::domain::NativeRunOptions {
+        output_root: recipe
+            .path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(".theseus-runs"),
+        scenarios,
+        limits: recipe.recipe.limits.clone(),
+    };
+    recipe.validate_selection(&options.scenarios, &options.limits)?;
+    if !headless {
+        let mut app = crate::tui::App::native_preview(crate::native::view::preview(
+            &recipe,
+            launch.as_ref(),
+        )?);
+        if !preview {
+            app.native
+                .as_mut()
+                .unwrap()
+                .set_execution(recipe, options, launch);
+        }
+        return crate::tui::run_with_options(app, animation);
+    }
+    if preview {
+        println!(
+            "{}",
+            crate::tui::safe_text(&crate::native::view::preview(&recipe, launch.as_ref())?)
+        );
+        return Ok(0);
+    }
+    let launch = launch.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "native execution requires --native-target; use --preview for offline inspection"
+        )
+    })?;
+    let cancel = CancellationToken::default();
+    let _registration = theseus_host::cancel::CancellationRegistration::install(cancel.flag())?;
+    let result = engine::run_selected(
+        &engine::domain::SelectedRecipe::Native(recipe),
+        engine::domain::SelectedRunOptions::Native(options),
+        Some(launch),
+        cancel,
+        |_| {},
+    )?;
+    let engine::domain::StoredRun::Native(report) = result.report else {
+        anyhow::bail!("native execution returned another backend");
+    };
+    println!(
+        "Report: {}",
+        crate::tui::safe_text(&result.report_path.display().to_string())
+    );
+    println!("{}", report.outcome);
+    for failure in &report.failures {
+        eprintln!("{}", crate::tui::safe_text(failure));
+    }
+    Ok(report.outcome.exit_code())
+}
+fn read_native_launch(path: &Path) -> Result<crate::native::launch::LaunchAuthority> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let directory = HostDir::open(parent, RootPolicy::AllComponentsNoFollow)?;
+    let leaf = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid launch filename"))?;
+    let mut bytes = Vec::new();
+    directory
+        .open_file(&RelativePath::parse(leaf)?)?
+        .take(65537)
+        .read_to_end(&mut bytes)?;
+    crate::native::launch::LaunchAuthority::decode(&bytes)
 }
 fn init() -> Result<()> {
     let mut text = String::from(
@@ -333,7 +536,12 @@ fn write_comparison_json(
     Ok(())
 }
 /// Serve has its own quiet binary boundary: errors never enter the CLI printer.
-fn serve(project_root: &Path, output_root: &Path, max_run_seconds: u64) -> i32 {
+fn serve(
+    project_root: &Path,
+    output_root: &Path,
+    max_run_seconds: u64,
+    native_target: Option<&Path>,
+) -> i32 {
     use crate::mcp_server::{
         coordinator::{IDLE_WAIT, ServerRuntime},
         diagnostics,
@@ -353,7 +561,19 @@ fn serve(project_root: &Path, output_root: &Path, max_run_seconds: u64) -> i32 {
     let Ok(_signals) = theseus_host::cancel::CancellationRegistration::install(stop.flag()) else {
         return 2;
     };
-    let roots = Roots::open(project_root, output_root).map(Arc::new);
+    let roots = Roots::open(project_root, output_root).and_then(|mut roots| {
+        roots.native_target = native_target
+            .map(read_native_launch)
+            .transpose()
+            .map_err(|e| {
+                crate::mcp_server::types::QueryError::new(
+                    crate::mcp_server::types::ErrorCode::InvalidArguments,
+                    e,
+                )
+            })?
+            .map(Arc::new);
+        Ok(Arc::new(roots))
+    });
     let transport = theseus_host::stdio::Stdio::acquire();
     let mut runtime = ServerRuntime::new(
         transport,

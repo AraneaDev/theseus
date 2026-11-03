@@ -237,11 +237,24 @@ impl SessionGuard {
         Ok(())
     }
     fn reply(&mut self, request: &Request, result: &Reply) -> Result<(), Error> {
+        if let Reply::PrefixAuthorityRevoked { lease, .. } = result {
+            return match request {
+                Request::Run { lease: l, .. }
+                | Request::CreateFile { lease: l, .. }
+                | Request::InspectNativeFile { lease: l, .. }
+                    if l == lease
+                        && matches!(self.description, Some(Reply::NativeDescription { .. })) =>
+                {
+                    Ok(())
+                }
+                _ => Err(Error::UnexpectedReply),
+            };
+        }
         if matches!(result, Reply::Refused { .. }) {
             return Ok(());
         }
         match (request, result) {
-            (Request::Describe, Reply::Description { .. }) => {
+            (Request::Describe, Reply::Description { .. } | Reply::NativeDescription { .. }) => {
                 if self.description.as_ref().is_some_and(|old| old != result) {
                     return Err(Error::UnexpectedMessage);
                 }
@@ -296,6 +309,25 @@ impl SessionGuard {
                 && path == rp
                 && offset == ro
                 && bytes.as_slice().len() <= usize::from(*length) => {}
+            (
+                Request::InspectNativeFile { lease, path },
+                Reply::NativeFileInfo {
+                    lease: rl,
+                    path: rp,
+                    ..
+                }
+                | Reply::FileAbsent {
+                    lease: rl,
+                    path: rp,
+                },
+            ) if lease == rl
+                && path == rp
+                && matches!(self.description, Some(Reply::NativeDescription { .. })) => {}
+            (
+                Request::InspectNativeFile { lease, .. },
+                Reply::PrefixAuthorityRevoked { lease: rl, .. },
+            ) if lease == rl
+                && matches!(self.description, Some(Reply::NativeDescription { .. })) => {}
             (
                 Request::InspectFile { lease, path },
                 Reply::FileInfo {
@@ -375,6 +407,7 @@ impl SessionGuard {
                 }
                 let os = match self.description.as_ref() {
                     Some(Reply::Description { os, .. }) => *os,
+                    Some(Reply::NativeDescription { description }) => description.os,
                     _ => return Err(Error::UnexpectedMessage),
                 };
                 super::types::validate_outcome_for_os(outcome, os)?;

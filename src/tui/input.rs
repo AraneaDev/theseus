@@ -5,6 +5,9 @@ pub fn input(app: &mut App, key: KeyEvent) {
     if key.kind == KeyEventKind::Release {
         return;
     }
+    if super::native::input(app, key) {
+        return;
+    }
     if super::preview_edit::input(app, key) {
         return;
     }

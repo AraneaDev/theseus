@@ -701,3 +701,73 @@ fn saved_bindings_published_between_pre_drain_and_join_survive_worker_release() 
         "bounded post-join drain reads both fixed cells"
     );
 }
+
+#[test]
+#[cfg(feature = "native-catalog-test-support")]
+fn native_admission_dispatches_through_existing_query_worker_and_retains_uncertain_owner() {
+    use super::super::worker::native_execution_tests::{fixture_launch, recipe_bytes};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let bytes = recipe_bytes();
+    std::fs::write(root.join("native.json"), &bytes).unwrap();
+    let recipe =
+        crate::native::recipe::ValidatedNativeRecipe::decode(&bytes, root.join("native.json"))
+            .unwrap();
+    let mut roots = Roots::open(&root, &root.join("output")).unwrap();
+    roots.native_target = Some(Arc::new(fixture_launch(&root)));
+    let roots = Arc::new(roots);
+    let mut runtime = runtime();
+    runtime.roots = Some(roots.clone());
+    runtime.query = Some(QueryWorker::spawn(roots.clone(), 3600).unwrap());
+    let args:StartArgs=serde_json::from_value(serde_json::json!({"server_instance":runtime.instance,"request_key":"native-coordinator","recipe_path":"native.json","recipe_digest":recipe.digest,"scenarios":["clean"]})).unwrap();
+    let now = Instant::now();
+    request(&mut runtime, 1, ToolCall::RunStart(args.clone()), now);
+    let handle = Handle::parse(&format!("{}:1", runtime.instance.as_str())).unwrap();
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        runtime.control(now);
+        if runtime
+            .registry
+            .cached(&handle)
+            .is_ok_and(|r| r.state == RunState::WorkerError)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < end,
+            "native coordinator did not join execution"
+        );
+        std::thread::yield_now();
+    }
+    let view = runtime.registry.cached(&handle).unwrap();
+    assert_eq!(view.cleanup.native, NativeCleanup::Unknown);
+    assert!(
+        view.report_id.is_some(),
+        "failed execution retains its actual saved binding"
+    );
+    let binding = runtime.registry.binding(&handle).unwrap().unwrap();
+    let saved = roots.output.open_child(&binding.report_id).unwrap();
+    assert!(
+        !saved
+            .load_native_journal()
+            .unwrap()
+            .provider_calls
+            .is_empty()
+    );
+    assert!(saved.load_native_journal().unwrap().operations.is_empty());
+    assert!(!saved.root().join("report.json").exists());
+    let mut next = args;
+    next.request_key = Key::parse("next").unwrap();
+    assert_eq!(
+        runtime.registry.admit(next, true).unwrap_err().error.code,
+        ErrorCode::CleanupPending
+    );
+    assert!(runtime.engine.is_none());
+    let mut query = runtime.query.take().unwrap();
+    query.request_stop();
+    while query.try_join().is_none() {
+        let _ = query.try_complete();
+        assert!(Instant::now() < end);
+        std::thread::yield_now();
+    }
+}

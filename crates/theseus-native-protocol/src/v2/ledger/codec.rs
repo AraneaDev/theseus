@@ -45,6 +45,44 @@ impl Serialize for EntryRef<'_> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let mut m = s.serialize_map(None)?;
         match self.0 {
+            Entry::NativeAuthorityRevoked { lease, reason } => {
+                m.serialize_entry("kind", "native_authority_revoked")?;
+                m.serialize_entry("lease", &lease.to_hex())?;
+                m.serialize_entry(
+                    "reason",
+                    match reason {
+                        PrefixAuthorityFailure::Missing => "missing",
+                        PrefixAuthorityFailure::Replaced => "replaced",
+                        PrefixAuthorityFailure::Renamed => "renamed",
+                        PrefixAuthorityFailure::MappingUnproved => "mapping_unproved",
+                    },
+                )?;
+            }
+            Entry::NativeHeader {
+                binding,
+                manifest_digest,
+                workspace_marker,
+                os,
+                capabilities: _,
+                provider_epoch,
+            } => {
+                m.serialize_entry("kind", "native_header")?;
+                m.serialize_entry("profile", "native_catalog_v1")?;
+                m.serialize_entry("capabilities", &NativeCapabilities::NAMES)?;
+                m.serialize_entry("provider_epoch", &provider_epoch.to_hex())?;
+                m.serialize_entry("binding", &binding.to_hex())?;
+                m.serialize_entry("manifest_digest", &manifest_digest.to_hex())?;
+                m.serialize_entry("workspace_marker", &workspace_marker.to_hex())?;
+                m.serialize_entry(
+                    "os",
+                    match os {
+                        Os::Linux => "linux",
+                        Os::Macos => "macos",
+                        Os::Windows => "windows",
+                    },
+                )?;
+                m.serialize_entry("durability", "file_flushed_process_crash")?;
+            }
             Entry::Header {
                 binding,
                 manifest_digest,
@@ -206,6 +244,41 @@ fn decode(b: &[u8], hash: &[u8; 32]) -> Result<Record, LedgerError> {
     let mut e = Object::new(o.take("record")?)?;
     o.end()?;
     let entry = match e.text("kind")?.as_str() {
+        "native_authority_revoked" => Entry::NativeAuthorityRevoked {
+            lease: scalar(LeaseId::parse(&e.text("lease")?))?,
+            reason: match e.text("reason")?.as_str() {
+                "missing" => PrefixAuthorityFailure::Missing,
+                "replaced" => PrefixAuthorityFailure::Replaced,
+                "renamed" => PrefixAuthorityFailure::Renamed,
+                "mapping_unproved" => PrefixAuthorityFailure::MappingUnproved,
+                _ => return Err(LedgerError::InvalidRecord),
+            },
+        },
+        "native_header" => {
+            e.literal("profile", "native_catalog_v1")?;
+            if e.take("capabilities")? != serde_json::json!(NativeCapabilities::NAMES) {
+                return Err(LedgerError::InvalidRecord);
+            }
+            let provider_epoch = scalar(Digest::parse(&e.text("provider_epoch")?))?;
+            let binding = scalar(BindingId::parse(&e.text("binding")?))?;
+            let manifest_digest = scalar(Digest::parse(&e.text("manifest_digest")?))?;
+            let workspace_marker = scalar(WorkspaceMarker::parse(&e.text("workspace_marker")?))?;
+            let os = match e.text("os")?.as_str() {
+                "linux" => Os::Linux,
+                "macos" => Os::Macos,
+                "windows" => Os::Windows,
+                _ => return Err(LedgerError::InvalidRecord),
+            };
+            e.literal("durability", "file_flushed_process_crash")?;
+            Entry::NativeHeader {
+                binding,
+                manifest_digest,
+                workspace_marker,
+                os,
+                capabilities: NativeCapabilities,
+                provider_epoch,
+            }
+        }
         "header" => {
             e.literal("profile", "trusted_fixture_v1")?;
             let binding = scalar(BindingId::parse(&e.text("binding")?))?;

@@ -1,0 +1,94 @@
+{
+  "kind": "theseus_native_recipe",
+  "schema": 1,
+  "os": "linux",
+  "manifest_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+  "leaves": {
+    "reader": "reader",
+    "app": "app",
+    "data": "data"
+  },
+  "base": {
+    "length": 1,
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "target": {
+    "length": 1,
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "scenarios": [
+    "clean"
+  ],
+  "steps": {
+    "install_target": {
+      "id": "install_target",
+      "program": "install_target",
+      "expected_status": {
+        "kind": "posix_exit",
+        "code": 0
+      },
+      "stdout_literal": null
+    },
+    "configure": {
+      "id": "configure",
+      "program": "configure",
+      "expected_status": {
+        "kind": "posix_exit",
+        "code": 0
+      },
+      "stdout_literal": null
+    },
+    "exercise": {
+      "id": "exercise",
+      "program": "exercise",
+      "expected_status": {
+        "kind": "posix_exit",
+        "code": 0
+      },
+      "stdout_literal": null
+    },
+    "uninstall": {
+      "id": "uninstall",
+      "program": "uninstall",
+      "expected_status": {
+        "kind": "posix_exit",
+        "code": 0
+      },
+      "stdout_literal": null
+    }
+  },
+  "checks": [
+    {
+      "id": "target_version",
+      "checkpoint": "target_installed",
+      "command": {
+        "id": "target_version",
+        "program": "check_target",
+        "expected_status": {
+          "kind": "posix_exit",
+          "code": 0
+        },
+        "stdout_literal": "target\n"
+      }
+    },
+    {
+      "id": "configured_data",
+      "checkpoint": "configured",
+      "command": {
+        "id": "configured_data",
+        "program": "check_data",
+        "expected_status": {
+          "kind": "posix_exit",
+          "code": 0
+        },
+        "stdout_literal": "data\n"
+      }
+    }
+  ],
+  "limits": {
+    "run_seconds": 30,
+    "inspection_seconds": 30,
+    "max_operations": 128,
+    "output_bytes": 16384
+  }
+}

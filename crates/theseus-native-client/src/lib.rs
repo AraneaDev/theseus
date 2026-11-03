@@ -12,5 +12,8 @@ mod error;
 mod pump;
 mod recovery;
 mod transport;
-pub use client::{Action, Client, Event, ExpectedHelper, Poll, RequestId, StartFailure};
+pub use client::{
+    Action, Client, ClientMode, Event, ExpectedHelper, Poll, RecoveredOperation, RecoveryImage,
+    RequestId, StartFailure,
+};
 pub use error::{ClientError, Failure};

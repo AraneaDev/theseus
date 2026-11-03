@@ -28,6 +28,7 @@ pub(crate) enum FileFailureKind {
 }
 #[derive(Debug)]
 pub(crate) enum FileFailure {
+    NativeUnsettled(theseus_host::fs::LeafOpenUncertainty),
     OpenUnclassified(io::Error),
     IoAfterOpen { stage: FileStage, error: io::Error },
     Changed,
@@ -36,6 +37,7 @@ pub(crate) enum FileFailure {
 #[derive(Debug, Default)]
 pub(crate) struct FileOwner {
     pub(crate) handle: Option<File>,
+    pub(crate) native_reopened: Option<File>,
     pub(crate) attempted: bool,
     pub(crate) opening: bool,
     pub(crate) primary: Option<FileFailure>,
@@ -63,7 +65,9 @@ pub(crate) struct CreatedFile {
 impl FileFailure {
     fn kind(&self) -> FileFailureKind {
         match self {
-            Self::OpenUnclassified(_) => FileFailureKind::OpenUnclassified,
+            Self::NativeUnsettled(_) | Self::OpenUnclassified(_) => {
+                FileFailureKind::OpenUnclassified
+            }
             Self::IoAfterOpen { .. } => FileFailureKind::IoAfterOpen,
             Self::Changed => FileFailureKind::Changed,
             Self::ReadbackMismatch => FileFailureKind::ReadbackMismatch,
@@ -73,6 +77,7 @@ impl FileFailure {
 impl std::fmt::Display for FileFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::NativeUnsettled(error) => write!(f, "native leaf completion unproved: {error}"),
             Self::OpenUnclassified(error) => {
                 write!(f, "file open completion unclassified: {error}")
             }
@@ -85,6 +90,7 @@ impl std::fmt::Display for FileFailure {
 impl std::error::Error for FileFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::NativeUnsettled(error) => Some(error),
             Self::OpenUnclassified(error) | Self::IoAfterOpen { error, .. } => Some(error),
             Self::Changed | Self::ReadbackMismatch => None,
         }
@@ -283,6 +289,115 @@ pub(crate) fn create(
     })
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NativeObservation {
+    Present { length: u64, sha256: v2::Digest },
+    Absent,
+}
+pub(crate) fn inspect_native(
+    owner: &mut FileOwner,
+    root: &HostDir,
+    path: &v2::LeafName,
+    deadline: std::time::Instant,
+    cancelled: impl Fn() -> bool,
+) -> Result<NativeObservation, FileFailureKind> {
+    use theseus_host::fs::LeafOpenResult;
+    if let Some(e) = &owner.primary {
+        return Err(e.kind());
+    }
+    if owner.attempted {
+        return Err(owner.fail(FileFailure::Changed));
+    }
+    let check = || !cancelled() && std::time::Instant::now() < deadline;
+    if !check() {
+        return Err(owner.fail(FileFailure::Changed));
+    }
+    owner.attempted = true;
+    owner.opening = true;
+    match root.open_leaf_classified(std::ffi::OsStr::new(path.as_str())) {
+        LeafOpenResult::Opened(file) => {
+            owner.handle = Some(file);
+            owner.opening = false;
+        }
+        LeafOpenResult::MissingSettled => {
+            owner.opening = false;
+            return Ok(NativeObservation::Absent);
+        }
+        LeafOpenResult::FailedSettled(e) => {
+            owner.opening = false;
+            return Err(owner.fail(FileFailure::OpenUnclassified(e)));
+        }
+        LeafOpenResult::Unsettled(e) => {
+            owner.opening = false;
+            owner.sticky_open = true;
+            return Err(owner.fail(FileFailure::NativeUnsettled(e)));
+        }
+    }
+    let before = io_step(owner, FileStage::FingerprintBefore, |f| fingerprint(f))?;
+    if before.len > v2::MAX_NATIVE_FILE_BYTES {
+        return Err(owner.fail(FileFailure::Changed));
+    }
+    let mut hash = Sha256::new();
+    let mut count = 0u64;
+    let mut buffer = [0u8; v2::NATIVE_INSPECT_BUFFER_BYTES];
+    loop {
+        if !check() {
+            return Err(owner.fail(FileFailure::Changed));
+        }
+        // One extra bounded read proves EOF, even for the exact 64MiB boundary.
+        let n = io_step(owner, FileStage::Read, |f| f.read(&mut buffer))?;
+        if n == 0 {
+            break;
+        }
+        count = count
+            .checked_add(n as u64)
+            .ok_or_else(|| owner.fail(FileFailure::Changed))?;
+        if count > v2::MAX_NATIVE_FILE_BYTES {
+            return Err(owner.fail(FileFailure::Changed));
+        }
+        hash.update(&buffer[..n]);
+    }
+    let after = io_step(owner, FileStage::FingerprintAfter, |f| fingerprint(f))?;
+    if !check() || before != after || after.len != count {
+        return Err(owner.fail(FileFailure::Changed));
+    }
+    #[cfg(test)]
+    tests::native_reopen_checkpoint();
+    owner.opening = true;
+    match root.open_leaf_classified(std::ffi::OsStr::new(path.as_str())) {
+        LeafOpenResult::Opened(file) => {
+            owner.native_reopened = Some(file);
+            owner.opening = false;
+        }
+        LeafOpenResult::MissingSettled => {
+            owner.opening = false;
+            return Err(owner.fail(FileFailure::Changed));
+        }
+        LeafOpenResult::FailedSettled(e) => {
+            owner.opening = false;
+            return Err(owner.fail(FileFailure::OpenUnclassified(e)));
+        }
+        LeafOpenResult::Unsettled(e) => {
+            owner.opening = false;
+            owner.sticky_open = true;
+            return Err(owner.fail(FileFailure::NativeUnsettled(e)));
+        }
+    }
+    let reopened = fingerprint(owner.native_reopened.as_ref().unwrap()).map_err(|error| {
+        owner.fail(FileFailure::IoAfterOpen {
+            stage: FileStage::FingerprintAfter,
+            error,
+        })
+    })?;
+    if !check() || reopened != after {
+        return Err(owner.fail(FileFailure::Changed));
+    }
+    Ok(NativeObservation::Present {
+        length: count,
+        sha256: v2::Digest::from_bytes(hash.finalize().into()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,6 +410,167 @@ mod tests {
     }
     fn root(temp: &tempfile::TempDir) -> HostDir {
         HostDir::open(temp.path(), RootPolicy::LeafNoFollow).unwrap()
+    }
+    #[test]
+    fn native_exact_limit_eof_overlimit_and_cancel() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = root(&temp);
+        let path = temp.path().join("leaf");
+        let file = File::create(&path).unwrap();
+        file.set_len(v2::MAX_NATIVE_FILE_BYTES).unwrap();
+        drop(file);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert_eq!(
+            inspect_native(&mut FileOwner::new(), &root, &leaf(), deadline, || false).unwrap(),
+            NativeObservation::Present {
+                length: v2::MAX_NATIVE_FILE_BYTES,
+                sha256: v2::Digest::parse(
+                    "3b6a07d0d404fab4e23b6d34bc6696a6a312dd92821332385e5af7c01c421351"
+                )
+                .unwrap()
+            }
+        );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(v2::MAX_NATIVE_FILE_BYTES + 1)
+            .unwrap();
+        assert!(inspect_native(&mut FileOwner::new(), &root, &leaf(), deadline, || false).is_err());
+        assert!(
+            inspect_native(
+                &mut FileOwner::new(),
+                &root,
+                &leaf(),
+                std::time::Instant::now(),
+                || false
+            )
+            .is_err()
+        );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(1024 * 1024)
+            .unwrap();
+        let calls = std::cell::Cell::new(0);
+        let mut owner = FileOwner::new();
+        assert!(
+            inspect_native(&mut owner, &root, &leaf(), deadline, || {
+                calls.set(calls.get() + 1);
+                calls.get() > 2
+            })
+            .is_err()
+        );
+        assert!(owner.handle.is_some());
+    }
+    #[test]
+    fn native_after_read_change_and_same_size_replacement_refuse() {
+        for replace in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = root(&temp);
+            let path = temp.path().join("leaf");
+            std::fs::write(&path, b"original").unwrap();
+            let mutation = Box::new(move || {
+                if replace {
+                    std::fs::rename(&path, path.with_extension("moved")).unwrap();
+                }
+                std::fs::write(&path, b"modified").unwrap();
+            });
+            if replace {
+                NATIVE_REOPEN_HOOK.with(|hook| *hook.borrow_mut() = Some(mutation));
+            } else {
+                NATIVE_HOOK.with(|hook| *hook.borrow_mut() = Some(mutation));
+            }
+            let mut owner = FileOwner::new();
+            assert!(
+                inspect_native(
+                    &mut owner,
+                    &root,
+                    &leaf(),
+                    std::time::Instant::now() + std::time::Duration::from_secs(30),
+                    || false
+                )
+                .is_err()
+            );
+            assert!(owner.handle.is_some());
+            assert_eq!(owner.native_reopened.is_some(), replace);
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn native_permission_denied_is_settled_error_never_absence() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = root(&temp);
+        let path = temp.path().join("leaf");
+        std::fs::write(&path, b"private").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root is permitted to bypass mode bits; this test requires a real denial.
+        if File::open(&path).is_ok() {
+            return;
+        }
+        let mut owner = FileOwner::new();
+        assert!(
+            inspect_native(
+                &mut owner,
+                &root,
+                &leaf(),
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+                || false
+            )
+            .is_err()
+        );
+        assert!(!owner.sticky_open);
+        assert!(matches!(
+            owner.primary,
+            Some(FileFailure::OpenUnclassified(_))
+        ));
+    }
+    #[test]
+    fn native_nonregular_and_symlink_are_never_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = root(&temp);
+        std::fs::create_dir(temp.path().join("leaf")).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert!(inspect_native(&mut FileOwner::new(), &root, &leaf(), deadline, || false).is_err());
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir(temp.path().join("leaf")).unwrap();
+            std::os::unix::fs::symlink("missing", temp.path().join("leaf")).unwrap();
+            assert!(
+                inspect_native(&mut FileOwner::new(), &root, &leaf(), deadline, || false).is_err()
+            );
+        }
+    }
+    pub(super) fn native_reopen_checkpoint() {
+        NATIVE_REOPEN_HOOK.with(|h| {
+            if let Some(hook) = h.borrow_mut().take() {
+                hook();
+            }
+        });
+    }
+    thread_local! {static NATIVE_REOPEN_HOOK:std::cell::RefCell<Option<Box<dyn FnOnce()>>>=const{std::cell::RefCell::new(None)};}
+    thread_local! {static NATIVE_HOOK:std::cell::RefCell<Option<Box<dyn FnOnce()>>>=const{std::cell::RefCell::new(None)};}
+    #[test]
+    fn native_streams_large_reader_and_settled_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = root(&temp);
+        let bytes = vec![0x5a; 16385];
+        std::fs::write(temp.path().join("leaf"), &bytes).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert_eq!(
+            inspect_native(&mut FileOwner::new(), &root, &leaf(), deadline, || false).unwrap(),
+            NativeObservation::Present {
+                length: bytes.len() as u64,
+                sha256: digest(&bytes)
+            }
+        );
+        std::fs::remove_file(temp.path().join("leaf")).unwrap();
+        assert_eq!(
+            inspect_native(&mut FileOwner::new(), &root, &leaf(), deadline, || false).unwrap(),
+            NativeObservation::Absent
+        );
     }
     #[test]
     fn fresh_empty_and_full_create_read_actual_digest() {
@@ -580,6 +856,13 @@ mod tests {
         OPEN_CALLS.set(OPEN_CALLS.get() + 1);
     }
     pub(super) fn checkpoint(stage: FileStage, file: &mut File) -> io::Result<()> {
+        if stage == FileStage::FingerprintAfter {
+            NATIVE_HOOK.with(|h| {
+                if let Some(hook) = h.borrow_mut().take() {
+                    hook();
+                }
+            });
+        }
         match FAULT.get() {
             Some(Fault::Error(target)) if target == stage => {
                 FAULT.set(None);

@@ -99,7 +99,10 @@ impl Cache {
                 operations,
             } => {
                 if self.description.is_some()
-                    || !matches!(description, v2::Reply::Description { .. })
+                    || !matches!(
+                        description,
+                        v2::Reply::Description { .. } | v2::Reply::NativeDescription { .. }
+                    )
                     || operations.len() > v2::MAX_OPERATIONS
                 {
                     return Err(RuntimeError::InvalidState);
@@ -299,6 +302,14 @@ impl Cache {
                         manifest_digest: d,
                         ..
                     }) if binding == b && manifest_digest == d => {}
+                    Some(Reply::NativeDescription { description })
+                        if binding == &description.binding
+                            && manifest_digest == &description.manifest_digest => {}
+                    Some(Reply::NativeDescription { description })
+                        if binding != &description.binding =>
+                    {
+                        return Some(refused(RefusalCode::WrongBinding));
+                    }
                     Some(Reply::Description { binding: b, .. }) if binding != b => {
                         return Some(refused(RefusalCode::WrongBinding));
                     }

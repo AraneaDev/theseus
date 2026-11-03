@@ -21,19 +21,25 @@ checks; independent review and combined acceptance are separate unchecked gates.
 | Native helper protocol, host primitives, durable store and runtime | Local complete; final cross-platform acceptance pending |
 | Typed native helper client | Local complete after review fixes; final cross-platform acceptance pending |
 | Native helper file operations | Local complete and reviewed; native macOS/Windows acceptance pending |
-| Native machine/VM adapter integration | In progress: ordinary scenarios run locally through the shared engine; MCP execution, public recovery and final qualification remain |
+| Native machine/VM adapter integration | In progress: ordinary scenarios, MCP execution and public recovery implemented locally; review fixes and final qualification remain |
 | Native services and desktop application observations | Planned |
 
 The latest accepted `main` is `d4e5304` (0.12). Later native foundations and the
-client/file operations are committed locally through `8dd1986`; they have not been pushed or
-merged into `main`. Existing Docker workflows remain the supported execution
+client/file operations are committed through `8dd1986` and published with the
+tracker in [draft PR #1](https://github.com/AraneaDev/theseus/pull/1).
+The adapter integration remains local and uncommitted; neither is merged into
+`main`. Intermediate CI is deferred until the combined acceptance batch.
+Existing Docker workflows remain the supported execution
 backend. A native controller is distinct from a native guest adapter.
 
 ### Work queue
 
-1. Finish native MCP execution/admission and ownership-aware cleanup reporting.
-2. Finish public native recovery/cleanup using retained original identities.
-3. Review the integrated adapter, fix findings and run source-pinned local gates.
+1. Resolve native adapter review findings: original provider-query ordering,
+   retained failure ownership, recovery consistency, cleanup finalization,
+   artifact binding and bounded pending filesystem observations.
+2. Complete scoped re-review and source-pinned local gates for CLI/TUI/MCP,
+   helper transport, provider fixtures and public recovery.
+3. Finish native operator documentation and example verification.
 4. Implement service observations, then desktop/session observations, with
    deterministic fixtures and documentation for each supported platform.
 5. Run the combined CI batch, resolve failures and merge accepted work to `main`.
@@ -153,17 +159,23 @@ review, full local qualification and external acceptance remain separate gates.
   through the selected environment; provide native saved-report/evidence views.
 - [x] add MCP native recipe validation,
   read-only inspection, status and bounded evidence browsing.
-- [ ] Wire MCP native execution into the owned worker and admission lifecycle;
-  keep unresolved native cleanup/disposal ownership visible and blocking.
-- [ ] Complete public native recovery/cleanup: verify original retained intent
-  and launch bindings; query/cancel/release original work without replaying Run.
-- [ ] Define native comparison compatibility before enabling native comparisons.
+- [x] Wire MCP native execution into the existing owned worker and admission
+  lifecycle; retain unresolved ownership and block further admission.
+- [x] Add public native recovery/cleanup with explicit launch authority and
+  original intent verification; query/cancel/release without replaying Run.
+- [x] Define the initial native comparison boundary: reject native variants
+  before suite creation; native comparison execution remains unsupported.
 - [x] add deterministic helper, compiled
   reader, transport/provider and publication-failure fixtures. Local selected
   engine tests exercise clean/upgrade/reinstall on fresh inert targets.
 - [ ] Complete native examples and operator documentation, including target
   configuration, provider ownership, evidence limits and recovery procedures.
 - [ ] Complete independent integration review and resolve findings.
+- [ ] Resolve review findings in provider preparation/disposal ordering, retained
+  panic ownership, terminal recovery consistency and local cleanup finalization;
+  keep remote uncertainty separate from actual local-process status, bind recipe
+  artifact facts to the helper catalog and retain unfinished filesystem owners
+  without an unbounded pending-status wait.
 - [ ] Run the complete source-pinned local test inventory, fixture integrity
   checks and required cross-platform compile checks for the integrated adapter.
 - [ ] Run true Linux/macOS/Windows guest lifecycle acceptance when disposable

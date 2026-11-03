@@ -38,6 +38,7 @@ pub fn bootstrap(
         ledger_root,
         workspace_root,
         request,
+        None,
         theseus_host::random_bytes,
         |file, bytes| {
             use std::io::Write;
@@ -46,10 +47,30 @@ pub fn bootstrap(
         },
     )
 }
+pub fn bootstrap_native(
+    ledger_root: &HostDir,
+    workspace_root: &HostDir,
+    request: BootstrapRequest,
+    provider_epoch: Digest,
+) -> Result<BootstrapReceipt, StoreError> {
+    bootstrap_with(
+        ledger_root,
+        workspace_root,
+        request,
+        Some(provider_epoch),
+        theseus_host::random_bytes,
+        |f, b| {
+            use std::io::Write;
+            f.write_all(b)?;
+            f.sync_all()
+        },
+    )
+}
 fn bootstrap_with(
     ledger_root: &HostDir,
     workspace_root: &HostDir,
     request: BootstrapRequest,
+    provider_epoch: Option<Digest>,
     random: impl FnOnce(&mut [u8]) -> std::io::Result<()>,
     mut write_sync: impl FnMut(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
 ) -> Result<BootstrapReceipt, StoreError> {
@@ -76,11 +97,22 @@ fn bootstrap_with(
     let marker = WorkspaceMarker::from_bytes(bytes);
     let header = Record::new(
         0,
-        Entry::Header {
-            binding: request.binding,
-            manifest_digest: request.manifest_digest,
-            workspace_marker: marker,
-            os: request.os,
+        if let Some(provider_epoch) = provider_epoch {
+            Entry::NativeHeader {
+                binding: request.binding,
+                manifest_digest: request.manifest_digest,
+                workspace_marker: marker,
+                os: request.os,
+                capabilities: theseus_native_protocol::v2::NativeCapabilities,
+                provider_epoch,
+            }
+        } else {
+            Entry::Header {
+                binding: request.binding,
+                manifest_digest: request.manifest_digest,
+                workspace_marker: marker,
+                os: request.os,
+            }
         },
     )?;
     let encoded = encode(&header)?;
@@ -123,6 +155,7 @@ mod tests {
                 &l,
                 &w,
                 request(),
+                None,
                 |bytes| {
                     if stage == 0 {
                         Err(std::io::Error::from_raw_os_error(123))
@@ -162,6 +195,7 @@ mod tests {
             &l,
             &w,
             request(),
+            None,
             |b| {
                 b.fill(8);
                 Ok(())
@@ -207,6 +241,7 @@ mod write_tests {
             &l,
             &w,
             request,
+            None,
             |b| {
                 b.fill(8);
                 Ok(())

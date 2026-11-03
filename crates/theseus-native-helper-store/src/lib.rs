@@ -4,7 +4,9 @@ mod bootstrap;
 mod error;
 mod intent;
 mod store;
-pub use bootstrap::{BootstrapReceipt, BootstrapRequest, BootstrapScope, bootstrap};
+pub use bootstrap::{
+    BootstrapReceipt, BootstrapRequest, BootstrapScope, bootstrap, bootstrap_native,
+};
 pub use error::{IntentError, StoreError};
-pub use intent::{IntentRecord, IntentStore, PreparedAcquire};
+pub use intent::{IntentRecord, IntentStore, PreparedAcquire, VerifiedOriginalIntent};
 pub use store::{CommittedRecord, LedgerStore, StoreBinding};

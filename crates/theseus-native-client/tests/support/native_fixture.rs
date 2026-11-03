@@ -298,6 +298,7 @@ pub fn pinned_hash(name: &str) -> String {
 impl Fixture {
     pub fn expected(&self) -> ExpectedHelper {
         ExpectedHelper {
+            profile: theseus_native_protocol::v2::HelperProfile::Fixture,
             binding: StoreBinding {
                 binding: self.binding,
                 manifest_digest: self.digest,

@@ -4,6 +4,26 @@ use theseus_host::fs::CommitScope;
 use theseus_native_helper_store::IntentRecord;
 use theseus_native_protocol::v2;
 
+/// Full canonical mutation identity; a prior publication scope is provenance only.
+#[derive(Clone)]
+pub struct RecoveredOperation {
+    pub request: v2::Request,
+    pub digest: v2::Digest,
+}
+#[derive(Clone)]
+pub struct RecoveryImage {
+    pub binding: IntentRecord,
+    pub profile: v2::HelperProfile,
+    pub operations: Vec<RecoveredOperation>,
+    pub lease: Option<v2::LeaseId>,
+}
+pub enum ClientMode {
+    Fresh,
+    Recover {
+        image: Box<RecoveryImage>,
+        original: theseus_native_helper_store::VerifiedOriginalIntent,
+    },
+}
 #[derive(Default)]
 pub(crate) struct Recovery {
     intents: Vec<(IntentRecord, CommitScope, Option<v2::LeaseId>)>,
@@ -11,6 +31,7 @@ pub(crate) struct Recovery {
     quarantined: Vec<v2::LeaseId>,
     identities: Vec<MutationIdentity>,
     captures: Vec<StreamEvidence>,
+    original: Option<(IntentRecord, v2::HelperProfile, Option<v2::LeaseId>)>,
 }
 // Owned before encoding; retained across transport epochs in this live process.
 struct MutationIdentity {
@@ -98,6 +119,95 @@ impl StreamEvidence {
     }
 }
 impl Recovery {
+    pub(crate) fn from_mode(
+        mode: ClientMode,
+        expected: &crate::ExpectedHelper,
+    ) -> Result<(Self, bool), ClientError> {
+        match mode {
+            ClientMode::Fresh => Ok((Self::default(), false)),
+            ClientMode::Recover { image, original } => {
+                let image = *image;
+                let b = &expected.binding;
+                if image.binding != *original.record()
+                    || image.binding.binding != b.binding
+                    || image.binding.manifest_digest != b.manifest_digest
+                    || image.binding.workspace_marker != b.workspace_marker
+                    || image.profile != expected.profile
+                    || image.operations.len() > v2::MAX_OPERATIONS
+                {
+                    return Err(ClientError::Preflight);
+                }
+                let mut r = Self::default();
+                for op in image.operations {
+                    if v2::request_digest(&op.request).map_err(|_| ClientError::Protocol)?
+                        != op.digest
+                    {
+                        return Err(ClientError::Protocol);
+                    }
+                    let (lease, operation, run) = match &op.request {
+                        v2::Request::Run {
+                            lease,
+                            operation,
+                            program,
+                        } if expected.programs.as_slice().contains(program) => {
+                            (*lease, *operation, true)
+                        }
+                        v2::Request::CreateFile {
+                            lease, operation, ..
+                        } => (*lease, *operation, false),
+                        _ => return Err(ClientError::Protocol),
+                    };
+                    if Some(lease) != image.lease
+                        || r.operations
+                            .iter()
+                            .any(|(l, o, _)| *l == lease && *o == operation)
+                    {
+                        return Err(ClientError::Protocol);
+                    }
+                    r.identities.push(MutationIdentity {
+                        request: op.request,
+                        digest: op.digest,
+                    });
+                    r.operations.push((lease, operation, None));
+                    if run {
+                        r.stream(lease, operation, false)?;
+                    }
+                }
+                r.original = Some((image.binding, image.profile, image.lease));
+                Ok((r, true))
+            }
+        }
+    }
+    pub(crate) fn export(
+        &self,
+        expected: &crate::ExpectedHelper,
+    ) -> Result<RecoveryImage, ClientError> {
+        if self.intents.len() > 1 {
+            return Err(ClientError::Capacity);
+        }
+        let (binding, profile, lease) = match self.original.clone() {
+            Some(v) => v,
+            None => {
+                let (record, _, lease) =
+                    self.intents.first().ok_or(ClientError::RecoveryRequired)?;
+                (record.clone(), expected.profile, *lease)
+            }
+        };
+        Ok(RecoveryImage {
+            binding,
+            profile,
+            lease,
+            operations: self
+                .identities
+                .iter()
+                .map(|i| RecoveredOperation {
+                    request: i.request.clone(),
+                    digest: i.digest,
+                })
+                .collect(),
+        })
+    }
+
     fn stream(
         &mut self,
         lease: v2::LeaseId,
@@ -166,7 +276,42 @@ impl Recovery {
         action: Action<'_>,
         expected: &crate::ExpectedHelper,
     ) -> Result<v2::Request, ClientError> {
+        if let Some((_, _, lease)) = &self.original {
+            let valid = match &action {
+                Action::QueryOriginalAcquire(p) => self
+                    .original
+                    .as_ref()
+                    .is_some_and(|(record, _, _)| record == p.record()),
+                Action::Query {
+                    lease: l,
+                    operation,
+                }
+                | Action::Cancel {
+                    lease: l,
+                    operation,
+                } => self.identities.iter().any(|i| i.ids() == (*l, *operation)),
+                Action::QueryLease(l) | Action::Release(l) => Some(*l) == *lease,
+                _ => false,
+            };
+            if !valid {
+                return Err(ClientError::RecoveryRequired);
+            }
+        }
         Ok(match action {
+            Action::QueryOriginalAcquire(p) => {
+                let record = p.record();
+                if record.binding != expected.binding.binding
+                    || record.manifest_digest != expected.binding.manifest_digest
+                    || record.workspace_marker != expected.binding.workspace_marker
+                {
+                    return Err(ClientError::Preflight);
+                }
+                v2::Request::QueryAcquire {
+                    intent: record.intent,
+                    binding: record.binding,
+                    manifest_digest: record.manifest_digest,
+                }
+            }
             Action::Acquire(p) | Action::RecoverAcquire(p) => {
                 let record = p.record();
                 let b = &expected.binding;
@@ -224,15 +369,20 @@ impl Recovery {
                 operation,
                 path,
                 bytes,
-            } => self.mutation(
-                v2::Request::CreateFile {
-                    lease,
-                    operation,
-                    path,
-                    bytes,
-                },
-                false,
-            )?,
+            } => {
+                if matches!(expected.profile, v2::HelperProfile::Native { .. }) {
+                    return Err(ClientError::Preflight);
+                }
+                self.mutation(
+                    v2::Request::CreateFile {
+                        lease,
+                        operation,
+                        path,
+                        bytes,
+                    },
+                    false,
+                )?
+            }
             Action::ReadFile {
                 lease,
                 path,
@@ -244,6 +394,9 @@ impl Recovery {
                 offset,
                 length,
             },
+            Action::InspectNativeFile { lease, path } => {
+                v2::Request::InspectNativeFile { lease, path }
+            }
             Action::InspectFile { lease, path } => v2::Request::InspectFile { lease, path },
             Action::Query { lease, operation } => v2::Request::QueryOperation { lease, operation },
             Action::Cancel { lease, operation } => v2::Request::Cancel { lease, operation },
@@ -281,6 +434,7 @@ impl Recovery {
     }
     pub(crate) fn observe(&mut self, reply: &v2::Reply) -> Result<(), ClientError> {
         match reply {
+            v2::Reply::PrefixAuthorityRevoked { lease, .. } => self.quarantine(*lease)?,
             v2::Reply::Operation {
                 lease,
                 operation,
@@ -333,6 +487,27 @@ impl Recovery {
                 manifest_digest,
                 state,
             } => {
+                if let Some((record, _, observed)) = &mut self.original {
+                    if record.intent != *intent
+                        || record.binding != *binding
+                        || record.manifest_digest != *manifest_digest
+                    {
+                        return Err(ClientError::Protocol);
+                    }
+                    match state {
+                        v2::AcquireView::NotFound if observed.is_some() => {
+                            return Err(ClientError::Protocol);
+                        }
+                        v2::AcquireView::Lease { lease, .. } => {
+                            if observed.is_some_and(|old| old != *lease) {
+                                return Err(ClientError::Protocol);
+                            }
+                            *observed = Some(*lease);
+                        }
+                        _ => {}
+                    }
+                    return Ok(());
+                }
                 let index = self
                     .intents
                     .iter()
@@ -849,5 +1024,298 @@ mod file_tests {
             Err(ClientError::Protocol)
         );
         assert!(r.captures.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod durable_tests {
+    use super::*;
+    use theseus_native_helper_store::IntentStore;
+    fn mode(tamper: bool) -> (tempfile::TempDir, ClientMode, crate::ExpectedHelper) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = IntentStore::new(
+            theseus_host::fs::HostDir::create_private(&temp.path().join("intent")).unwrap(),
+        );
+        let expected = crate::pump::tests::expected();
+        let b = &expected.binding;
+        let record = IntentRecord {
+            intent: v2::IntentId::from_bytes([8; 16]),
+            binding: b.binding,
+            manifest_digest: b.manifest_digest,
+            workspace_marker: b.workspace_marker,
+        };
+        store.prepare(record.clone()).unwrap();
+        let lease = v2::LeaseId::from_bytes([5; 16]);
+        let request = v2::Request::Run {
+            lease,
+            operation: v2::OperationId::from_bytes([6; 16]),
+            program: expected.programs.as_slice()[0].clone(),
+        };
+        let digest = if tamper {
+            v2::Digest::from_bytes([0; 32])
+        } else {
+            v2::request_digest(&request).unwrap()
+        };
+        let image = RecoveryImage {
+            binding: record.clone(),
+            profile: expected.profile,
+            operations: vec![RecoveredOperation { request, digest }],
+            lease: Some(lease),
+        };
+        let original = store.verify_original(&record).unwrap();
+        (
+            temp,
+            ClientMode::Recover {
+                image: Box::new(image),
+                original,
+            },
+            expected,
+        )
+    }
+    #[test]
+    fn canonical_durable_image_roundtrips_and_rejects_truncation_trailing_and_duplicate_identity() {
+        let (_temp, mode, expected) = mode(false);
+        let ClientMode::Recover { image, original } = mode else {
+            unreachable!()
+        };
+        let bytes = image.encode().unwrap();
+        let decoded = RecoveryImage::decode(&bytes).unwrap();
+        assert_eq!(decoded.encode().unwrap(), bytes);
+        assert!(RecoveryImage::decode(&bytes[..bytes.len() - 1]).is_err());
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(RecoveryImage::decode(&trailing).is_err());
+        let mut duplicate = decoded.clone();
+        duplicate.operations.push(duplicate.operations[0].clone());
+        assert!(duplicate.encode().is_err());
+        let (mut recovery, query_only) = Recovery::from_mode(
+            ClientMode::Recover {
+                image: Box::new(decoded),
+                original,
+            },
+            &expected,
+        )
+        .unwrap();
+        assert!(query_only);
+        let (lease, operation) = recovery.identities[0].ids();
+        assert!(
+            recovery
+                .request(Action::Query { lease, operation }, &expected)
+                .is_ok()
+        );
+        assert_eq!(
+            recovery.request(
+                Action::Run {
+                    lease,
+                    operation,
+                    program: expected.programs.as_slice()[0].clone()
+                },
+                &expected
+            ),
+            Err(ClientError::RecoveryRequired)
+        );
+    }
+    #[test]
+    fn recovered_image_rejects_digest_changes_and_all_new_mutations() {
+        let (_t, m, e) = mode(true);
+        assert!(matches!(
+            Recovery::from_mode(m, &e),
+            Err(ClientError::Protocol)
+        ));
+        let (_t, m, e) = mode(false);
+        let (mut recovery, query_only) = Recovery::from_mode(m, &e).unwrap();
+        assert!(query_only);
+        let lease = v2::LeaseId::from_bytes([5; 16]);
+        let operation = v2::OperationId::from_bytes([6; 16]);
+        assert!(
+            recovery
+                .request(Action::Query { lease, operation }, &e)
+                .is_ok()
+        );
+        assert_eq!(
+            recovery.request(
+                Action::Run {
+                    lease,
+                    operation,
+                    program: e.programs.as_slice()[0].clone()
+                },
+                &e
+            ),
+            Err(ClientError::RecoveryRequired)
+        );
+        assert_eq!(
+            recovery.request(
+                Action::Query {
+                    lease,
+                    operation: v2::OperationId::from_bytes([7; 16])
+                },
+                &e
+            ),
+            Err(ClientError::RecoveryRequired)
+        );
+    }
+}
+
+impl RecoveryImage {
+    /// Bounded canonical image bytes for caller-owned durable publication.
+    /// This does not create a PreparedAcquire or grant mutation authority.
+    pub fn encode(&self) -> Result<Vec<u8>, ClientError> {
+        if self.operations.len() > v2::MAX_OPERATIONS {
+            return Err(ClientError::Capacity);
+        }
+        let mut bytes = b"theseus_native_client_recovery\0\x01".to_vec();
+        for field in [
+            self.binding.intent.to_hex(),
+            self.binding.binding.to_hex(),
+            self.binding.manifest_digest.to_hex(),
+            self.binding.workspace_marker.to_hex(),
+        ] {
+            bytes.extend_from_slice(field.as_bytes())
+        }
+        match self.profile {
+            v2::HelperProfile::Fixture => bytes.push(0),
+            v2::HelperProfile::Native { provider_epoch } => {
+                bytes.push(1);
+                bytes.extend_from_slice(provider_epoch.to_hex().as_bytes())
+            }
+        }
+        match self.lease {
+            None => bytes.push(0),
+            Some(lease) => {
+                bytes.push(1);
+                bytes.extend_from_slice(lease.to_hex().as_bytes())
+            }
+        }
+        bytes.extend_from_slice(&(self.operations.len() as u16).to_be_bytes());
+        let mut identities = Vec::new();
+        for (index, operation) in self.operations.iter().enumerate() {
+            let ids = match &operation.request {
+                v2::Request::Run {
+                    lease, operation, ..
+                }
+                | v2::Request::CreateFile {
+                    lease, operation, ..
+                } => (*lease, *operation),
+                _ => return Err(ClientError::Protocol),
+            };
+            if Some(ids.0) != self.lease
+                || identities.contains(&ids)
+                || v2::request_digest(&operation.request).map_err(|_| ClientError::Protocol)?
+                    != operation.digest
+            {
+                return Err(ClientError::Protocol);
+            }
+            identities.push(ids);
+            let envelope = v2::Envelope::new(
+                v2::SessionId::from_bytes([0x52; 16]),
+                index as u64,
+                v2::Message::Request {
+                    request: operation.request.clone(),
+                },
+            )
+            .map_err(|_| ClientError::Protocol)?;
+            let frame = v2::encode(&envelope).map_err(|_| ClientError::Protocol)?;
+            bytes.extend_from_slice(operation.digest.to_hex().as_bytes());
+            bytes.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(&frame);
+        }
+        Ok(bytes)
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, ClientError> {
+        if bytes.len() > v2::MAX_OPERATIONS * v2::MAX_FRAME_BYTES + 512 {
+            return Err(ClientError::Capacity);
+        }
+        struct Input<'a> {
+            bytes: &'a [u8],
+            at: usize,
+        }
+        impl<'a> Input<'a> {
+            fn take(&mut self, n: usize) -> Result<&'a [u8], ClientError> {
+                let end = self.at.checked_add(n).ok_or(ClientError::Protocol)?;
+                let b = self.bytes.get(self.at..end).ok_or(ClientError::Protocol)?;
+                self.at = end;
+                Ok(b)
+            }
+            fn text(&mut self, n: usize) -> Result<&'a str, ClientError> {
+                std::str::from_utf8(self.take(n)?).map_err(|_| ClientError::Protocol)
+            }
+        }
+        let mut input = Input { bytes, at: 0 };
+        let header = b"theseus_native_client_recovery\0\x01";
+        if input.take(header.len())? != header {
+            return Err(ClientError::Protocol);
+        }
+        let binding = IntentRecord {
+            intent: v2::IntentId::parse(input.text(32)?).map_err(|_| ClientError::Protocol)?,
+            binding: v2::BindingId::parse(input.text(32)?).map_err(|_| ClientError::Protocol)?,
+            manifest_digest: v2::Digest::parse(input.text(64)?)
+                .map_err(|_| ClientError::Protocol)?,
+            workspace_marker: v2::WorkspaceMarker::parse(input.text(32)?)
+                .map_err(|_| ClientError::Protocol)?,
+        };
+        let profile = match input.take(1)?[0] {
+            0 => v2::HelperProfile::Fixture,
+            1 => v2::HelperProfile::Native {
+                provider_epoch: v2::Digest::parse(input.text(64)?)
+                    .map_err(|_| ClientError::Protocol)?,
+            },
+            _ => return Err(ClientError::Protocol),
+        };
+        let lease = match input.take(1)?[0] {
+            0 => None,
+            1 => Some(v2::LeaseId::parse(input.text(32)?).map_err(|_| ClientError::Protocol)?),
+            _ => return Err(ClientError::Protocol),
+        };
+        let count = u16::from_be_bytes(
+            input
+                .take(2)?
+                .try_into()
+                .map_err(|_| ClientError::Protocol)?,
+        ) as usize;
+        if count > v2::MAX_OPERATIONS {
+            return Err(ClientError::Capacity);
+        }
+        let mut operations = Vec::new();
+        for index in 0..count {
+            let digest = v2::Digest::parse(input.text(64)?).map_err(|_| ClientError::Protocol)?;
+            let length = u32::from_be_bytes(
+                input
+                    .take(4)?
+                    .try_into()
+                    .map_err(|_| ClientError::Protocol)?,
+            ) as usize;
+            if length > v2::MAX_FRAME_BYTES {
+                return Err(ClientError::Capacity);
+            }
+            let frame = input.take(length)?;
+            let mut decoder = v2::Decoder::new();
+            let progress = decoder.feed(frame).map_err(|_| ClientError::Protocol)?;
+            decoder.finish().map_err(|_| ClientError::Protocol)?;
+            let envelope = progress.frame.ok_or(ClientError::Protocol)?;
+            if progress.consumed != length
+                || envelope.sequence() != index as u64
+                || *envelope.session() != v2::SessionId::from_bytes([0x52; 16])
+            {
+                return Err(ClientError::Protocol);
+            }
+            let request = match envelope.message() {
+                v2::Message::Request { request } => request.clone(),
+                _ => return Err(ClientError::Protocol),
+            };
+            operations.push(RecoveredOperation { request, digest });
+        }
+        if input.at != bytes.len() {
+            return Err(ClientError::Protocol);
+        }
+        let image = Self {
+            binding,
+            profile,
+            operations,
+            lease,
+        };
+        if image.encode()?.as_slice() != bytes {
+            return Err(ClientError::Protocol);
+        }
+        Ok(image)
     }
 }

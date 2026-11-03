@@ -8,6 +8,6 @@ pub use types::*;
 pub const MAX_RECORD_BODY_BYTES: usize = 16384;
 pub const MAX_RECORD_BYTES: usize = 16420;
 pub const MAX_LEDGER_BYTES: usize = 1048576;
-pub const MAX_RECORDS: usize = 259;
+pub const MAX_RECORDS: usize = 260;
 pub const FINISH_RESERVE: usize = 4096;
 pub const CLOSE_RESERVE: usize = 8192;

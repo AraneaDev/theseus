@@ -8,6 +8,8 @@ pub(crate) mod evidence_records;
 pub(crate) mod framing;
 pub(crate) mod inspection;
 pub(crate) mod inspection_records;
+pub(crate) mod native_evidence;
+pub(crate) mod native_inspection;
 pub(crate) mod owned_error;
 pub(crate) mod query;
 pub(crate) mod range_writer;

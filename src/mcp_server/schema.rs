@@ -74,7 +74,7 @@ fn definitions() -> BTreeMap<String, Value> {
     let steps = "install_base|install_target|configure|upgrade|exercise|reinstall|uninstall|interrupt_install|recover_install|interrupt_upgrade|recover_upgrade|downgrade|exercise_downgraded|backup|attempt_upgrade|rollback|exercise_rolled_back|cleanup_backup|disable_plugin|enable_plugin";
     def!(
         "RecordId",
-        json!({"type":"string","maxLength":128,"pattern":format!("^(?:run|artifact/(?:base|target)|(?:env|observe|error|artifact)/{index}|artifact/{index}/file/{index}|p/(?:user|system)/(?:step/(?:{steps})|check/{index}|policy/(?:mcp|plugin|downgrade|rollback|interrupted_rollback))|s/{index}(?:/(?:finding|error)/{index}|/stage/{index}(?:/(?:command|check|baseline|change|error)/{index}|/snapshot/{index}(?:/entry/{index})?)?)?)$")})
+        json!({"type":"string","maxLength":128,"pattern":format!("^(?:run|native_recipe|native/(?:leaves|limits|artifact/(?:base|target)|check/{index}|step/(?:{steps}))|native_identity/{index}|native_disposition/{index}|artifact/(?:base|target)|(?:env|observe|error|artifact)/{index}|artifact/{index}/file/{index}|p/(?:user|system)/(?:step/(?:{steps})|check/{index}|policy/(?:mcp|plugin|downgrade|rollback|interrupted_rollback))|s/{index}(?:/(?:finding|error)/{index}|/stage/{index}(?:/(?:command|check|baseline|change|error|native_file)/{index}|/snapshot/{index}(?:/entry/{index})?)?)?)$")})
     );
     def!("Profile", enumeration(&["user", "system"]));
     def!(
@@ -109,6 +109,10 @@ fn definitions() -> BTreeMap<String, Value> {
     def!(
         "RecordKind",
         enumeration(&[
+            "native_recipe",
+            "native_file",
+            "native_disposition",
+            "native_identity",
             "recipe_step",
             "recipe_check",
             "recipe_artifact",
@@ -244,14 +248,41 @@ fn definitions() -> BTreeMap<String, Value> {
         ])
     );
     def!(
-        "SavedView",
+        "NativeDispositionView",
+        json!({"oneOf":[exact(&[("state",json!({"const":"not_started"}))]),exact(&[("state",json!({"const":"complete"})),("receipt",r("TextPreview"))]),exact(&[("state",json!({"const":"unknown"})),("reason",r("TextPreview"))]),exact(&[("state",json!({"const":"failed"})),("reason",r("TextPreview"))])]})
+    );
+    def!(
+        "NativeScenarioDispositions",
         exact(&[
-            ("revision", r("Revision")),
-            ("schema_version", bounded(1, 8)),
-            ("outcome", r("Outcome")),
-            ("counts", r("Counts")),
-            ("finished_at", nullable(r("TextPreview")))
+            ("scenario_id", r("TextPreview")),
+            ("local", r("NativeDispositionView")),
+            ("remote", r("NativeDispositionView")),
+            ("release", r("NativeDispositionView")),
+            ("reset", r("NativeDispositionView"))
         ])
+    );
+    def!(
+        "SavedView",
+        object(
+            &[
+                ("revision", r("Revision")),
+                ("schema_version", bounded(1, 8)),
+                ("outcome", r("Outcome")),
+                ("counts", r("Counts")),
+                ("finished_at", nullable(r("TextPreview"))),
+                (
+                    "native_dispositions",
+                    array(r("NativeScenarioDispositions"), 3)
+                )
+            ],
+            &[
+                "revision",
+                "schema_version",
+                "outcome",
+                "counts",
+                "finished_at"
+            ]
+        )
     );
     def!(
         "EngineResult",
@@ -309,6 +340,20 @@ fn definitions() -> BTreeMap<String, Value> {
                     ("target", r("TextPreview"))
                 ])
             ),
+            ("lifetime", json!({"const":"server_process"})),
+            ("max_run_seconds", bounded(1, 86400))
+        ])
+    );
+    def!(
+        "NativeOverviewData",
+        exact(&[
+            ("kind", json!({"const":"native_overview"})),
+            ("recipe_path", r("Path")),
+            ("recipe_digest", r("Digest")),
+            ("schema", json!({"const":1})),
+            ("os", enumeration(&["linux", "macos", "windows"])),
+            ("role", json!({"const":"current_helper_account"})),
+            ("scenarios", scenario_array.clone()),
             ("lifetime", json!({"const":"server_process"})),
             ("max_run_seconds", bounded(1, 86400))
         ])
@@ -407,7 +452,7 @@ fn definitions() -> BTreeMap<String, Value> {
     );
     def!(
         "InspectData",
-        json!({"oneOf":[r("OverviewData"),r("CatalogPage"),r("RecordPage")]})
+        json!({"oneOf":[r("OverviewData"),r("NativeOverviewData"),r("CatalogPage"),r("RecordPage")]})
     );
     def!(
         "EvidenceData",
@@ -452,7 +497,6 @@ fn definitions() -> BTreeMap<String, Value> {
                 "request_key",
                 "recipe_path",
                 "recipe_digest",
-                "profiles",
                 "scenarios"
             ]
         )
@@ -491,7 +535,7 @@ fn definitions() -> BTreeMap<String, Value> {
         json!({"oneOf":[
             selector(&["run","scenarios","artifacts","errors"],&[]),
             selector(&["stages","findings","scenario_errors"],&[("scenario_id",source_id.clone())]),
-            selector(&["commands","checks","snapshots","baseline_changes","stage_changes","stage_errors"],&[("scenario_id",source_id.clone()),("stage_index",r("UInt"))]),
+            selector(&["commands","checks","snapshots","baseline_changes","stage_changes","stage_errors","native_files"],&[("scenario_id",source_id.clone()),("stage_index",r("UInt"))]),
             selector(&["artifact_files"],&[("artifact_index",r("UInt"))]),
             selector(&["snapshot_entries"],&[("scenario_id",source_id.clone()),("stage_index",r("UInt")),("snapshot_index",r("UInt"))]),
             exact(&[("kind",json!({"const":"record"})),("record_id",r("RecordId"))]),

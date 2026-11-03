@@ -17,6 +17,8 @@ pub struct Invocation {
     pub(crate) ledger_root: PathBuf,
     pub(crate) workspace_root: PathBuf,
     pub(crate) expected: StoreBinding,
+    pub(crate) profile: v2::HelperProfile,
+    pub(crate) artifact_commitment: Option<v2::Digest>,
     pub(crate) catalog: Vec<CatalogEntry>,
 }
 pub(crate) fn host_os() -> v2::Os {
@@ -34,6 +36,32 @@ pub(crate) fn host_os() -> v2::Os {
     }
 }
 impl Invocation {
+    pub fn new_native(
+        ledger_root: PathBuf,
+        workspace_root: PathBuf,
+        expected: StoreBinding,
+        catalog: Vec<CatalogEntry>,
+        provider_epoch: v2::Digest,
+        artifact_commitment: v2::Digest,
+    ) -> Result<Self, InvocationError> {
+        let mut inv = Self::new(ledger_root, workspace_root, expected, catalog)?;
+        const IDS: [&str; 8] = [
+            "check_base",
+            "check_data",
+            "check_target",
+            "configure",
+            "exercise",
+            "install_base",
+            "install_target",
+            "uninstall",
+        ];
+        if !inv.catalog.iter().map(|e| e.id.as_str()).eq(IDS) {
+            return Err(InvocationError::InvalidCatalog);
+        }
+        inv.profile = v2::HelperProfile::Native { provider_epoch };
+        inv.artifact_commitment = Some(artifact_commitment);
+        Ok(inv)
+    }
     pub fn new(
         ledger_root: PathBuf,
         workspace_root: PathBuf,
@@ -72,6 +100,8 @@ impl Invocation {
             ledger_root,
             workspace_root,
             expected,
+            profile: v2::HelperProfile::Fixture,
+            artifact_commitment: None,
             catalog,
         })
     }

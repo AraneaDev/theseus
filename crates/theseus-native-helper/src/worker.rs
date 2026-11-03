@@ -120,6 +120,8 @@ struct Worker {
     response: Option<(ResponseTicket, v2::Reply, Option<RunKey>)>,
     failure: Option<OwnedWorkerFailure>,
     stopping: bool,
+    native_authority_failure: Option<v2::PrefixAuthorityFailure>,
+    prefix_mapping_error: Option<io::Error>,
 }
 impl Worker {
     fn new(ports: WorkerPorts, tokens: [DataPermit; 4]) -> Self {
@@ -138,6 +140,8 @@ impl Worker {
             response: None,
             failure: None,
             stopping: false,
+            native_authority_failure: None,
+            prefix_mapping_error: None,
         }
     }
     fn completion(&mut self) -> WorkerCompletion {
@@ -332,8 +336,14 @@ impl Worker {
         if expected.os != crate::invocation::host_os() {
             return Err(WorkerPrimary::Io(io::Error::other("wrong host OS")));
         }
-        let store =
-            LedgerStore::open(&ledger, &workspace, expected).map_err(WorkerPrimary::Store)?;
+        let store = match inv.profile {
+            v2::HelperProfile::Fixture => LedgerStore::open(&ledger, &workspace, expected),
+            v2::HelperProfile::Native { provider_epoch } => {
+                LedgerStore::open_native(&ledger, &workspace, expected, provider_epoch)
+            }
+        }
+        .map_err(WorkerPrimary::Store)?;
+        self.native_authority_failure = store.restart_view().native_authority_failure();
         let helper_principal =
             match theseus_host::principal::current_principal().map_err(WorkerPrimary::Io)? {
                 theseus_host::principal::CurrentPrincipal::Posix {
@@ -390,6 +400,42 @@ impl Worker {
             helper_principal,
             programs: v2::ProgramList::new(inv.catalog.iter().map(|e| e.id.clone()).collect())
                 .map_err(|_| WorkerPrimary::Io(io::Error::other("invalid catalog")))?,
+        };
+        let description = match (inv.profile, description) {
+            (
+                v2::HelperProfile::Native { provider_epoch },
+                v2::Reply::Description {
+                    binding,
+                    manifest_digest,
+                    workspace_marker,
+                    os,
+                    helper_principal,
+                    programs,
+                },
+            ) => v2::Reply::NativeDescription {
+                description: Box::new(v2::NativeDescription {
+                    binding,
+                    manifest_digest,
+                    workspace_marker,
+                    os,
+                    helper_principal,
+                    programs,
+                    capabilities: v2::NativeCapabilities,
+                    provider_epoch,
+                    artifact_commitment: inv.artifact_commitment.ok_or_else(|| {
+                        WorkerPrimary::Io(io::Error::other(
+                            "native catalog artifact commitment missing",
+                        ))
+                    })?,
+                    build: v2::Provenance::Unavailable {
+                        reason: "build provenance unavailable".into(),
+                    },
+                    os_build: v2::Provenance::Unavailable {
+                        reason: "OS build provenance unavailable".into(),
+                    },
+                }),
+            },
+            (_, description) => description,
         };
         self.store = Some(store);
         self.workspace = Some(workspace);
@@ -504,6 +550,14 @@ impl Worker {
         let operation = *operation;
         if !self.lease.as_ref().is_some_and(|(_, l, _)| *l == lease) {
             self.refuse(ticket, v2::RefusalCode::WrongLease);
+            return Ok(());
+        }
+        if let Some(reason) = self.check_native_mapping(lease)? {
+            self.respond(
+                ticket,
+                v2::Reply::PrefixAuthorityRevoked { lease, reason },
+                None,
+            );
             return Ok(());
         }
         let key = cancel.key;
@@ -646,6 +700,48 @@ impl Worker {
         }));
         Ok(())
     }
+    fn native_mapping(&mut self) -> Option<v2::PrefixAuthorityFailure> {
+        if let Some(reason) = self.native_authority_failure {
+            return Some(reason);
+        }
+        let inv = self.invocation.as_ref()?;
+        if inv.profile == v2::HelperProfile::Fixture {
+            return None;
+        }
+        let result =
+            HostDir::open(&inv.workspace_root, RootPolicy::LeafNoFollow).and_then(|current| {
+                self.workspace
+                    .as_ref()
+                    .unwrap()
+                    .same_directory_object(&current)
+            });
+        match result {
+            Ok(true) => None,
+            Ok(false) => Some(v2::PrefixAuthorityFailure::Replaced),
+            Err(error) => {
+                // Generic root/identity errors do not prove completion of every
+                // subordinate native query. Retain the original source and root
+                // through conservative incomplete shutdown, never Clean.
+                self.prefix_mapping_error = Some(error);
+                self.stopping = true;
+                Some(v2::PrefixAuthorityFailure::MappingUnproved)
+            }
+        }
+    }
+    fn check_native_mapping(
+        &mut self,
+        lease: v2::LeaseId,
+    ) -> Result<Option<v2::PrefixAuthorityFailure>, WorkerPrimary> {
+        let Some(reason) = self.native_mapping() else {
+            return Ok(None);
+        };
+        if self.native_authority_failure.is_none() {
+            // Revoke in memory before publication; uncertain persistence cannot grant effects.
+            self.native_authority_failure = Some(reason);
+            self.append(Entry::NativeAuthorityRevoked { lease, reason })?;
+        }
+        Ok(Some(reason))
+    }
     fn held_refusal(&self, lease: v2::LeaseId) -> Option<v2::RefusalCode> {
         match &self.lease {
             Some((_, actual, _)) if *actual != lease => Some(v2::RefusalCode::WrongLease),
@@ -678,6 +774,14 @@ impl Worker {
         let (lease, operation) = (*lease, *operation);
         if !self.lease.as_ref().is_some_and(|(_, l, _)| *l == lease) {
             self.refuse(ticket, v2::RefusalCode::WrongLease);
+            return Ok(());
+        }
+        if let Some(reason) = self.check_native_mapping(lease)? {
+            self.respond(
+                ticket,
+                v2::Reply::PrefixAuthorityRevoked { lease, reason },
+                None,
+            );
             return Ok(());
         }
         let key = cancel.key;
@@ -784,6 +888,78 @@ impl Worker {
         }));
         Ok(())
     }
+    fn inspect_native_file(
+        &mut self,
+        request: v2::Request,
+        ticket: ResponseTicket,
+        lease: v2::LeaseId,
+        path: v2::LeafName,
+    ) -> Result<(), WorkerPrimary> {
+        if !matches!(
+            self.invocation.as_ref().map(|i| i.profile),
+            Some(v2::HelperProfile::Native { .. })
+        ) {
+            self.refuse(ticket, v2::RefusalCode::Unsupported);
+            return Ok(());
+        }
+        if let Some(reason) = self.check_native_mapping(lease)? {
+            self.respond(
+                ticket,
+                v2::Reply::PrefixAuthorityRevoked { lease, reason },
+                None,
+            );
+            return Ok(());
+        }
+        self.file = Some(PendingFileRequest {
+            request,
+            ticket: Some(ticket),
+            owner: Box::new(crate::files::FileOwner::new()),
+            key: None,
+            create: None,
+        });
+        let result = {
+            let pending = self.file.as_mut().unwrap();
+            let stop = &self.ports.stop;
+            crate::files::inspect_native(
+                &mut pending.owner,
+                self.workspace.as_ref().unwrap(),
+                &path,
+                Instant::now() + Duration::from_secs(30),
+                || stop.load(Ordering::Acquire),
+            )
+        };
+        let mapping = self.check_native_mapping(lease)?;
+        let reply = if let Some(reason) = mapping {
+            v2::Reply::PrefixAuthorityRevoked { lease, reason }
+        } else {
+            match result {
+                Ok(crate::files::NativeObservation::Present { length, sha256 }) => {
+                    v2::Reply::NativeFileInfo {
+                        lease,
+                        path,
+                        length,
+                        sha256,
+                    }
+                }
+                Ok(crate::files::NativeObservation::Absent) => {
+                    v2::Reply::FileAbsent { lease, path }
+                }
+                Err(_) => v2::Reply::Refused {
+                    code: v2::RefusalCode::Unsupported,
+                },
+            }
+        };
+        let pending = self.file.as_mut().unwrap();
+        let ticket = pending.ticket.take().unwrap();
+        let sticky = pending.owner.sticky_open;
+        self.respond(ticket, reply, None);
+        if sticky {
+            self.stopping = true;
+        } else {
+            self.file.take();
+        }
+        Ok(())
+    }
     fn observe_file(
         &mut self,
         request: v2::Request,
@@ -791,7 +967,8 @@ impl Worker {
     ) -> Result<(), WorkerPrimary> {
         let (lease, path) = match &request {
             v2::Request::ReadFile { lease, path, .. }
-            | v2::Request::InspectFile { lease, path } => (*lease, path.clone()),
+            | v2::Request::InspectFile { lease, path }
+            | v2::Request::InspectNativeFile { lease, path } => (*lease, path.clone()),
             _ => {
                 self.refuse(ticket, v2::RefusalCode::InvalidRequest);
                 return Ok(());
@@ -804,6 +981,9 @@ impl Worker {
         if self.active.is_some() || self.file.is_some() {
             self.refuse(ticket, v2::RefusalCode::Busy);
             return Ok(());
+        }
+        if matches!(request, v2::Request::InspectNativeFile { .. }) {
+            return self.inspect_native_file(request, ticket, lease, path);
         }
         if let v2::Request::ReadFile { offset, length, .. } = &request
             && (*length == 0 || *length > 4096 || offset.checked_add(u64::from(*length)).is_none())
@@ -1441,10 +1621,11 @@ impl Worker {
         Ok(())
     }
     fn settle_native(&mut self) {
-        if self
-            .file
-            .as_ref()
-            .is_some_and(|f| f.owner.sticky_open || f.owner.opening)
+        if self.prefix_mapping_error.is_some()
+            || self
+                .file
+                .as_ref()
+                .is_some_and(|f| f.owner.sticky_open || f.owner.opening)
         {
             while !self.flush() {
                 thread::sleep(Duration::from_millis(1));
@@ -2074,6 +2255,174 @@ mod private_barrier_tests {
             .unwrap_or_else(|_| panic!("file admission"));
         ports.events.try_recv().unwrap();
         (tmp, worker, ports, grant, spare)
+    }
+    #[test]
+    fn native_prefix_rename_replacement_removal_permanently_blocks_all_catalog_effects() {
+        for replace in [false, true] {
+            let (tmp, mut worker, ports, [p0, p1], mut inv) = fixture();
+            let epoch = v2::Digest::from_bytes([0x44; 32]);
+            inv.profile = v2::HelperProfile::Native {
+                provider_epoch: epoch,
+            };
+            // Synthetic artifact authority for this prefix-only worker fixture.
+            inv.artifact_commitment = Some(v2::Digest::from_bytes([0x66; 32]));
+            let header = Record::new(
+                0,
+                Entry::NativeHeader {
+                    binding: inv.expected.binding,
+                    manifest_digest: inv.expected.manifest_digest,
+                    workspace_marker: inv.expected.workspace_marker,
+                    os: inv.expected.os,
+                    capabilities: v2::NativeCapabilities,
+                    provider_epoch: epoch,
+                },
+            )
+            .unwrap();
+            std::fs::write(
+                inv.ledger_root.join("ledger.bin"),
+                v2::ledger::encode(&header).unwrap(),
+            )
+            .unwrap();
+            let original = inv.workspace_root.clone();
+            let moved = tmp.path().join("moved");
+            let acquire = v2::Request::Acquire {
+                intent: v2::IntentId::from_bytes([3; 16]),
+                binding: inv.expected.binding,
+                manifest_digest: inv.expected.manifest_digest,
+            };
+            worker
+                .initialize(inv)
+                .unwrap_or_else(|_| panic!("native initialize"));
+            ports.events.try_recv().unwrap();
+            worker
+                .acquire(
+                    acquire,
+                    ResponseTicket {
+                        reply_to: 1,
+                        permit: p0,
+                    },
+                )
+                .unwrap_or_else(|_| panic!("native acquire"));
+            ports.events.try_recv().unwrap();
+            worker.response.take();
+            let lease = worker.lease.as_ref().unwrap().1;
+            std::fs::rename(&original, &moved).unwrap();
+            if replace {
+                std::fs::create_dir(&original).unwrap();
+                std::fs::write(original.join("reader"), b"replacement").unwrap();
+            }
+            worker
+                .observe_file(
+                    v2::Request::InspectNativeFile {
+                        lease,
+                        path: v2::LeafName::new("reader").unwrap(),
+                    },
+                    ResponseTicket {
+                        reply_to: 2,
+                        permit: p1,
+                    },
+                )
+                .unwrap_or_else(|_| panic!("native inspect"));
+            let WorkerEvent::ResponseReady {
+                ticket,
+                reply: v2::Reply::PrefixAuthorityRevoked { reason, .. },
+                ..
+            } = ports.events.try_recv().unwrap()
+            else {
+                panic!("must revoke whole native authority")
+            };
+            assert_eq!(worker.native_authority_failure, Some(reason));
+            assert_eq!(worker.prefix_mapping_error.is_some(), !replace);
+            assert_eq!(worker.stopping, !replace);
+            assert_eq!(
+                worker
+                    .store
+                    .as_ref()
+                    .unwrap()
+                    .restart_view()
+                    .native_authority_failure(),
+                Some(reason)
+            );
+            // Restore the original mapping; revocation must remain sticky.
+            if replace {
+                std::fs::remove_file(original.join("reader")).unwrap();
+                std::fs::remove_dir(&original).unwrap();
+            }
+            std::fs::rename(&moved, &original).unwrap();
+            let mut ticket = ticket;
+            for (n, id) in ["check_target", "uninstall"].iter().enumerate() {
+                let key = RunKey {
+                    lease,
+                    operation: v2::OperationId::from_bytes([n as u8 + 8; 16]),
+                    generation: n as u64 + 1,
+                };
+                let (_grant, start) = start_pair(key, 3 + n as u64);
+                worker
+                    .begin(
+                        v2::Request::Run {
+                            lease,
+                            operation: key.operation,
+                            program: v2::ProgramId::new(id).unwrap(),
+                        },
+                        ticket,
+                        CancelToken {
+                            key,
+                            flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        },
+                        start,
+                    )
+                    .unwrap_or_else(|_| panic!("revoked run refusal"));
+                let WorkerEvent::ResponseReady {
+                    ticket: returned,
+                    reply: v2::Reply::PrefixAuthorityRevoked { .. },
+                    ..
+                } = ports.events.try_recv().unwrap()
+                else {
+                    panic!("zero later catalog Run")
+                };
+                ticket = returned;
+            }
+            let key = RunKey {
+                lease,
+                operation: v2::OperationId::from_bytes([10; 16]),
+                generation: 3,
+            };
+            let (_grant, start) = start_pair(key, 5);
+            worker
+                .begin_file(
+                    v2::Request::CreateFile {
+                        lease,
+                        operation: key.operation,
+                        path: v2::LeafName::new("app").unwrap(),
+                        bytes: v2::FileBytes::new(b"forbidden").unwrap(),
+                    },
+                    ticket,
+                    CancelToken {
+                        key,
+                        flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    },
+                    start,
+                )
+                .unwrap_or_else(|_| panic!("revoked create refusal"));
+            assert!(matches!(
+                ports.events.try_recv().unwrap(),
+                WorkerEvent::ResponseReady {
+                    reply: v2::Reply::PrefixAuthorityRevoked { .. },
+                    ..
+                }
+            ));
+            assert!(worker.active.is_none() && worker.file.is_none());
+            assert!(!original.join("app").exists());
+            assert!(
+                !worker
+                    .store
+                    .as_ref()
+                    .unwrap()
+                    .records()
+                    .iter()
+                    .any(|r| matches!(r.entry(), Entry::OperationAccepted { .. }))
+            );
+        }
     }
     #[test]
     fn file_acceptance_grant_actual_finish_and_zero_boundary_retirement() {

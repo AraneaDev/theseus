@@ -22,6 +22,15 @@ pub struct IntentStore {
 }
 #[cfg(test)]
 type TestPublisher = fn(&HostDir, &OsStr, &[u8]) -> io::Result<CommitScope>;
+/// Read-only verification of original canonical bytes; grants no Acquire authority.
+pub struct VerifiedOriginalIntent {
+    record: IntentRecord,
+}
+impl VerifiedOriginalIntent {
+    pub fn record(&self) -> &IntentRecord {
+        &self.record
+    }
+}
 pub struct PreparedAcquire {
     record: IntentRecord,
     scope: CommitScope,
@@ -64,6 +73,27 @@ impl IntentStore {
             .publish(OsStr::new(&name), &bytes)
             .map_err(IntentError::Publication)?;
         Ok(PreparedAcquire { record, scope })
+    }
+    pub fn verify_original(
+        &self,
+        expected: &IntentRecord,
+    ) -> Result<VerifiedOriginalIntent, IntentError> {
+        let path = RelativePath::parse(&format!("{}.json", expected.intent.to_hex()))
+            .map_err(IntentError::Io)?;
+        let file = self.root.open_file(&path).map_err(IntentError::Io)?;
+        let mut bytes = Vec::new();
+        file.take(513)
+            .read_to_end(&mut bytes)
+            .map_err(IntentError::Io)?;
+        if bytes.len() > 512
+            || parse_canonical(&bytes).as_ref() != Some(expected)
+            || bytes != canonical(expected)
+        {
+            return Err(IntentError::InvalidExisting);
+        }
+        Ok(VerifiedOriginalIntent {
+            record: expected.clone(),
+        })
     }
     fn publish(&self, name: &OsStr, bytes: &[u8]) -> io::Result<CommitScope> {
         #[cfg(test)]
@@ -269,5 +299,37 @@ mod tests {
             assert_eq!(store.prepare(record()).unwrap().record(), &record());
             assert_eq!(failure.state, state); // Original failure remains owned.
         }
+    }
+}
+
+#[cfg(test)]
+mod readonly_tests {
+    use super::*;
+    #[test]
+    fn original_verification_never_publishes_and_rejects_changed_or_missing_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = HostDir::create_private(&temp.path().join("intent")).unwrap();
+        let mut store = IntentStore::new(root);
+        let record = IntentRecord {
+            intent: IntentId::from_bytes([1; 16]),
+            binding: BindingId::from_bytes([2; 16]),
+            manifest_digest: Digest::from_bytes([3; 32]),
+            workspace_marker: WorkspaceMarker::from_bytes([4; 16]),
+        };
+        assert!(store.verify_original(&record).is_err());
+        store.prepare(record.clone()).unwrap();
+        store.publisher = Some(|_, _, _| panic!("readonly verification must never publish"));
+        assert_eq!(store.verify_original(&record).unwrap().record(), &record);
+        let path = temp
+            .path()
+            .join("intent")
+            .join(format!("{}.json", record.intent.to_hex()));
+        let before = std::fs::read(&path).unwrap();
+        let mut changed = record.clone();
+        changed.workspace_marker = WorkspaceMarker::from_bytes([5; 16]);
+        assert!(store.verify_original(&changed).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::write(&path, b"{}").unwrap();
+        assert!(store.verify_original(&record).is_err());
     }
 }

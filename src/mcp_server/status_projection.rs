@@ -42,6 +42,7 @@ pub(crate) fn saved_view(snapshot: &ReportSnapshot) -> Result<SavedView, QueryEr
         .filter(|v| (1..=8).contains(v))
         .ok_or_else(|| error(ErrorCode::EvidenceInvalid))?;
     Ok(SavedView {
+        native_dispositions: None,
         revision: Revision::parse(&snapshot.revision)
             .map_err(|_| error(ErrorCode::EvidenceInvalid))?,
         schema_version,
@@ -112,3 +113,80 @@ pub(crate) fn cleanup_view(
 #[cfg(test)]
 #[path = "status_projection_tests.rs"]
 mod tests;
+
+pub(super) fn project_native_snapshot(
+    snapshot: &super::native_evidence::Snapshot,
+) -> Result<SavedProjection, QueryError> {
+    use crate::{model::CheckOutcome, native::model::Disposition};
+    let report = &snapshot.report;
+    let mut total = ResultCounts::default();
+    for scenario in &report.scenarios {
+        for stage in &scenario.stages {
+            total.commands += stage.commands.len();
+            for check in &stage.checks {
+                match check.outcome {
+                    CheckOutcome::Passed => total.passed_checks += 1,
+                    CheckOutcome::Failed => total.failed_checks += 1,
+                    CheckOutcome::Incomplete => total.incomplete_checks += 1,
+                    CheckOutcome::Skipped => total.skipped_checks += 1,
+                }
+            }
+        }
+    }
+    let guest = if report.scenarios.iter().any(|s| {
+        matches!(s.dispositions.remote, Disposition::Failed { .. })
+            || matches!(s.dispositions.release, Disposition::Failed { .. })
+            || matches!(s.dispositions.reset, Disposition::Failed { .. })
+    }) {
+        GuestCleanup::Failed
+    } else if !report.scenarios.is_empty()
+        && report.scenarios.iter().all(|s| {
+            matches!(s.dispositions.remote, Disposition::Complete { .. })
+                && matches!(s.dispositions.release, Disposition::Complete { .. })
+                && matches!(s.dispositions.reset, Disposition::Complete { .. })
+        })
+    {
+        GuestCleanup::Complete
+    } else {
+        GuestCleanup::Unknown
+    };
+    Ok(SavedProjection {
+        saved: SavedView {
+            native_dispositions: Some(
+                report
+                    .scenarios
+                    .iter()
+                    .map(|s| {
+                        let view = |d: &Disposition| match d {
+                            Disposition::NotStarted => NativeDispositionView::NotStarted,
+                            Disposition::Complete { receipt } => NativeDispositionView::Complete {
+                                receipt: TextPreview::new(receipt, false),
+                            },
+                            Disposition::Unknown { reason } => NativeDispositionView::Unknown {
+                                reason: TextPreview::new(reason, false),
+                            },
+                            Disposition::Failed { reason } => NativeDispositionView::Failed {
+                                reason: TextPreview::new(reason, false),
+                            },
+                        };
+                        NativeScenarioDispositions {
+                            scenario_id: TextPreview::new(&s.id, false),
+                            local: view(&s.dispositions.local),
+                            remote: view(&s.dispositions.remote),
+                            release: view(&s.dispositions.release),
+                            reset: view(&s.dispositions.reset),
+                        }
+                    })
+                    .collect(),
+            ),
+            revision: Revision::parse(&snapshot.revision)
+                .map_err(|_| error(ErrorCode::EvidenceInvalid))?,
+            schema_version: 1,
+            outcome: report.outcome,
+            counts: counts(&total)?,
+            finished_at: None,
+        },
+        guest,
+        sampled_hint: snapshot.sampled_hint,
+    })
+}

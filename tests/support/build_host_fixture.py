@@ -59,7 +59,7 @@ def main():
     production = build(['--bin', 'theseus'])
     hosts = [artifact for artifact in production if artifact['target']['name'] == 'theseus_host']
     apps = [artifact for artifact in production if artifact['target']['name'] == 'theseus']
-    if not hosts or not apps or any('test-support' in artifact['features'] for artifact in hosts) or any('mcp-test-support' in artifact['features'] for artifact in apps):
+    if not hosts or not apps or any('test-support' in artifact['features'] for artifact in hosts) or any(set(artifact['features']) & {'mcp-test-support', 'native-catalog-test-support'} for artifact in apps):
         raise RuntimeError('Production graph contains fault support or required artifact is absent')
     metadata['production'] = pin(owned, production, 'theseus', 'production')
     metadata['production_graph'] = production
@@ -76,6 +76,15 @@ def main():
     VALIDATION.check_helper_graph(helper_fixture, fixture=True)
     metadata['helper_fixture'] = pin(owned, helper_fixture, 'theseus-native-helper-fixture', 'helper-fixture')
     metadata['helper_fixture_graph'] = helper_fixture
+    # A fresh Cargo invocation keeps catalog fixtures independent of all fault graphs.
+    catalog_args = ['--features', 'native-catalog-test-support']
+    for target, _ in VALIDATION.CATALOG_ARTIFACTS.values():
+        catalog_args += ['--bin', target]
+    catalog = build(catalog_args)
+    VALIDATION.check_catalog_graph(catalog)
+    metadata['native_catalog_graph'] = catalog
+    for key, (target, _) in VALIDATION.CATALOG_ARTIFACTS.items():
+        metadata[key] = pin(owned, catalog, target, key.replace('_', '-'))
     if VALIDATION.source_identity(ROOT) != identity:
         raise RuntimeError('Source changed while building pinned artifacts; no source binding established')
     # Preserve the original fixture-parent metadata convention for Rust tests.

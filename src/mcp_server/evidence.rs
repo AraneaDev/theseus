@@ -22,6 +22,13 @@ pub(crate) fn load_snapshot(
     store: &ReportStore,
     sampled_hint: u64,
 ) -> Result<ReportSnapshot, QueryError> {
+    crate::native::storage::require_family(
+        store
+            .artifact_family()
+            .map_err(|e| QueryError::new(ErrorCode::EvidenceInvalid, e))?,
+        crate::native::storage::ArtifactFamily::Docker,
+    )
+    .map_err(|e| QueryError::new(ErrorCode::EvidenceInvalid, e))?;
     let bytes = store
         .read_bytes("report.json")
         .map_err(|e| QueryError::new(ErrorCode::IoError, e))?;

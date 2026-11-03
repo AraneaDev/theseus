@@ -92,12 +92,71 @@ def check_native_host(rustc, system, expected):
     return hosts[0]
 
 
+CATALOG_ARTIFACTS = {
+    'native_catalog_fixture': ('theseus-native-catalog-fixture', 'THESEUS_NATIVE_CATALOG_FIXTURE'),
+    'native_base_reader': ('theseus-native-base-reader', 'THESEUS_NATIVE_BASE_READER'),
+    'native_target_reader': ('theseus-native-target-reader', 'THESEUS_NATIVE_TARGET_READER'),
+}
+
+
+def check_catalog_graph(artifacts):
+    """Independent catalog graph must never unify host/helper/client fault support."""
+    if not isinstance(artifacts, list) or any(
+            not isinstance(item, dict) or item.get('reason') != 'compiler-artifact'
+            or not isinstance(item.get('target'), dict)
+            or not isinstance(item['target'].get('name'), str)
+            or not isinstance(item['target'].get('kind'), list)
+            or not isinstance(item.get('features'), list)
+            or any(not isinstance(feature, str) for feature in item['features'])
+            for item in artifacts):
+        raise GateFailure('Malformed independent catalog Cargo graph')
+    required = [('theseus_host', 'lib'), ('theseus_native_helper_store', 'lib'),
+                ('theseus_native_client', 'lib'), ('theseus', 'lib')]
+    required += [(target, 'bin') for target, _ in CATALOG_ARTIFACTS.values()]
+    for target, kind in required:
+        matches = [item for item in artifacts if item.get('reason') == 'compiler-artifact'
+                   and item.get('target', {}).get('name') == target
+                   and item.get('target', {}).get('kind') == [kind]]
+        if len(matches) != 1:
+            raise GateFailure(f'{target}: catalog artifact absent or malformed')
+        for item in matches:
+            features = item['features']
+            if 'test-support' in features or 'mcp-test-support' in features:
+                raise GateFailure(f'{target}: catalog graph contains fault support')
+            if (target == 'theseus' or kind == 'bin') and 'native-catalog-test-support' not in features:
+                raise GateFailure(f'{target}: catalog feature absent')
+    for item in artifacts:
+        if item.get('target', {}).get('name') in {'theseus_host', 'theseus_native_helper', 'theseus_native_client'} and 'test-support' in item.get('features', []):
+            raise GateFailure('Catalog graph contains host/helper/client fault support')
+    forbidden = {'theseus-host-fixture', 'theseus-native-helper-fixture', 'theseus-mcp-fixture'}
+    if any(item.get('target', {}).get('name') in forbidden for item in artifacts):
+        raise GateFailure('Catalog graph contains an unrelated fault fixture')
+
+
 def verify_artifacts(metadata):
-    for key in ('fixture', 'application', 'production', 'mcp_fixture', 'helper_production', 'helper_fixture'):
+    if not isinstance(metadata, dict):
+        raise GateFailure('Malformed pinned artifact metadata')
+    for key in ('fixture', 'application', 'production', 'mcp_fixture', 'helper_production', 'helper_fixture', *CATALOG_ARTIFACTS):
         item = metadata.get(key, {})
-        path = pathlib.Path(item.get('path', ''))
+        if not isinstance(item, dict) or not isinstance(item.get('path'), str) or not isinstance(item.get('sha256'), str) or not re.fullmatch(r'[0-9a-f]{64}', item['sha256']):
+            raise GateFailure(f'Malformed pinned native artifact: {key}')
+        path = pathlib.Path(item['path'])
         if not path.is_file() or path.is_symlink() or (os.name != 'nt' and not os.access(path, os.X_OK)) or sha256(path) != item.get('sha256'):
             raise GateFailure(f'Missing or changed pinned native artifact: {key}')
+
+    graph = metadata.get('native_catalog_graph')
+    if not isinstance(graph, list):
+        raise GateFailure('Missing independent native catalog graph')
+    check_catalog_graph(graph)
+    catalog_paths = []
+    for key, (target, _) in CATALOG_ARTIFACTS.items():
+        artifact = metadata[key].get('cargo_artifact')
+        if not isinstance(artifact, dict) or artifact not in graph or artifact.get('target', {}).get('name') != target or artifact.get('target', {}).get('kind') != ['bin']:
+            raise GateFailure(f'{key}: pinned executable does not match its independent graph')
+        path = pathlib.Path(metadata[key]['path']).resolve()
+        if path in catalog_paths:
+            raise GateFailure('Catalog fixture/readers must have distinct pinned paths')
+        catalog_paths.append(path)
 
     if pathlib.Path(metadata['helper_production']['path']).samefile(metadata['helper_fixture']['path']):
         raise GateFailure('Normal helper and helper fixture must be separate pinned artifacts')
@@ -237,6 +296,8 @@ def load_pinned(runner):
     runner.env['THESEUS_MCP_FIXTURE'] = metadata['mcp_fixture']['path']
     runner.env['THESEUS_NATIVE_HELPER_BINARY'] = metadata['helper_production']['path']
     runner.env['THESEUS_NATIVE_HELPER_FIXTURE'] = metadata['helper_fixture']['path']
+    for key, (_, variable) in CATALOG_ARTIFACTS.items():
+        runner.env[variable] = metadata[key]['path']
     return metadata
 
 
@@ -254,6 +315,8 @@ def fixture(runner):
             output.write(f'THESEUS_MCP_FIXTURE={metadata["mcp_fixture"]["path"]}\n')
             output.write(f'THESEUS_NATIVE_HELPER_BINARY={metadata["helper_production"]["path"]}\n')
             output.write(f'THESEUS_NATIVE_HELPER_FIXTURE={metadata["helper_fixture"]["path"]}\n')
+            for key, (_, variable) in CATALOG_ARTIFACTS.items():
+                output.write(f'{variable}={metadata[key]["path"]}\n')
 
 
 def feature_boundaries(runner):
@@ -273,8 +336,8 @@ def feature_boundaries(runner):
                 applications.append(value)
             if value.get('reason') == 'compiler-artifact' and value.get('target', {}).get('name') == 'theseus_host':
                 artifacts.append(value)
-        if not enabled and (not applications or any('mcp-test-support' in item['features'] for item in applications)):
-            raise GateFailure('Production application unexpectedly enables MCP fixture support')
+        if not enabled and (not applications or any(set(item['features']) & {'mcp-test-support', 'native-catalog-test-support'} for item in applications)):
+            raise GateFailure('Production application unexpectedly enables fixture support')
         if not artifacts or any(('test-support' in artifact['features']) != enabled for artifact in artifacts):
             raise GateFailure(f'{name}: native test-support feature boundary violated or artifact absent')
 
@@ -308,6 +371,22 @@ def feature_boundaries(runner):
             if value.get('reason') == 'compiler-artifact':
                 artifacts.append(value)
         check_client_graph(artifacts, fixture=fixture_graph)
+
+
+    arguments = ['check', '--locked', '--features', 'native-catalog-test-support']
+    for target, _ in CATALOG_ARTIFACTS.values():
+        arguments += ['--bin', target]
+    arguments += ['--message-format=json']
+    text = runner.cargo('catalog-fixture-artifacts', *arguments)
+    artifacts = []
+    for line in text.splitlines():
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if value.get('reason') == 'compiler-artifact':
+            artifacts.append(value)
+    check_catalog_graph(artifacts)
 
 
 def native(runner, stage):
@@ -345,6 +424,9 @@ def native(runner, stage):
         runner.cargo('native-integration-precompile', 'test', '--locked', '--test', 'host_cli', '--test', 'host_terminal', '--no-run')
         runner.cargo('native-helper-precompile', 'test', '--locked', '-p', 'theseus-native-helper', '--features', 'test-support', '--test', 'fixture_runtime', '--no-run', timeout=180)
         runner.cargo('native-client-precompile', 'test', '--locked', '-p', 'theseus-native-client', '--features', 'test-support', '--test', 'fixture_client', '--no-run', timeout=240)
+        runner.cargo('native-profile-precompile', 'test', '--locked', '-p', 'theseus-native-helper', '--test', 'native_profile_runtime', '--no-run', timeout=180)
+        runner.cargo('native-catalog-precompile', 'test', '--locked', '--features', 'native-catalog-test-support', '--test', 'native_catalog_adapter', '--test', 'native_selected', '--test', 'native_recovery', '--no-run', timeout=240)
+        runner.cargo('native-consumers-precompile', 'test', '--locked', '--test', 'native_consumers', '--no-run', timeout=180)
         runner.run('model-action-controls', ['node', 'tests/support/observe_conpty_model_action_test.cjs'])
         if windows:
             runner.run('model-observer-controls', ['pwsh', '-NoProfile', '-File', 'tests/support/observe_conpty_model_test.ps1'])
@@ -376,6 +458,12 @@ def native(runner, stage):
         runner.cargo('native-explicit-terminal-controls', 'test', '--locked', '-p', 'theseus-host', '--features', 'test-support', '--lib', test, '--', '--nocapture', '--test-threads=1', timeout=120, required_cases=CASE_INVENTORY['native']['runtime-windows' if windows else 'runtime-unix'])
         runner.cargo('native-helper-runtime', 'test', '--locked', '-p', 'theseus-native-helper', '--features', 'test-support', '--test', 'fixture_runtime', '--', '--nocapture', '--test-threads=1', timeout=240, required_cases=CASE_INVENTORY['native']['helper-runtime-common'] + (CASE_INVENTORY['native']['helper-runtime-windows'] if windows else []))
         runner.cargo('native-client-runtime', 'test', '--locked', '-p', 'theseus-native-client', '--features', 'test-support', '--test', 'fixture_client', '--', '--nocapture', '--test-threads=1', timeout=240, required_cases=CASE_INVENTORY['native']['client-common'] + (CASE_INVENTORY['native']['client-windows'] if windows else []))
+        runner.cargo('native-profile-runtime', 'test', '--locked', '-p', 'theseus-native-helper', '--test', 'native_profile_runtime', '--', '--nocapture', '--test-threads=1', timeout=240, required_cases=CASE_INVENTORY['native']['profile-runtime-common'])
+        runner.cargo('native-catalog-library', 'test', '--locked', '--features', 'native-catalog-test-support', '--lib', '--', '--nocapture', timeout=300, required_cases=CASE_INVENTORY['native']['catalog-library-common'])
+        runner.cargo('native-catalog-adapter', 'test', '--locked', '--features', 'native-catalog-test-support', '--test', 'native_catalog_adapter', '--', '--nocapture', '--test-threads=1', timeout=240, required_cases=CASE_INVENTORY['native']['catalog-common'])
+        runner.cargo('native-selected', 'test', '--locked', '--features', 'native-catalog-test-support', '--test', 'native_selected', '--', '--nocapture', '--test-threads=1', timeout=300, required_cases=CASE_INVENTORY['native']['selected-common'])
+        runner.cargo('native-recovery', 'test', '--locked', '--features', 'native-catalog-test-support', '--test', 'native_recovery', '--', '--nocapture', '--test-threads=1', timeout=300, required_cases=CASE_INVENTORY['native']['recovery-common'])
+        runner.cargo('native-consumers', 'test', '--locked', '--test', 'native_consumers', '--', '--nocapture', '--test-threads=1', timeout=180, required_cases=CASE_INVENTORY['native']['consumers-common'] + ([] if windows else CASE_INVENTORY['native']['consumers-unix']))
         metadata = load_pinned(runner)
         write_json(runner.evidence / 'native-artifacts-after.json', metadata)
     elif stage == 'release':

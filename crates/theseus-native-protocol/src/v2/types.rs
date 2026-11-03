@@ -261,6 +261,72 @@ pub enum NativeStatus {
     PosixSignal { signal: u16 },
     WindowsExit { code: u32 },
 }
+/// Closed native capability set; no fallback or unknown capabilities are accepted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeCapabilities;
+impl NativeCapabilities {
+    pub const NAMES: [&'static str; 4] = [
+        "catalog_run",
+        "helper_current_account",
+        "settled_leaf_absence",
+        "native_stream_inspect_64m",
+    ];
+}
+pub const MAX_NATIVE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+pub const NATIVE_INSPECT_BUFFER_BYTES: usize = 64 * 1024;
+/// Domain-separated commitment to the catalog's ordered base and target artifacts.
+pub fn artifact_commitment(
+    base_length: u64,
+    base: Digest,
+    target_length: u64,
+    target: Digest,
+) -> Result<Digest, super::Error> {
+    use sha2::{Digest as _, Sha256};
+    if !(1..=MAX_NATIVE_FILE_BYTES).contains(&base_length)
+        || !(1..=MAX_NATIVE_FILE_BYTES).contains(&target_length)
+    {
+        return Err(super::Error::InvalidValue);
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"theseus-native-artifacts-v1\0");
+    hash.update(base_length.to_be_bytes());
+    hash.update(base.0);
+    hash.update(target_length.to_be_bytes());
+    hash.update(target.0);
+    Ok(Digest::from_bytes(hash.finalize().into()))
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelperProfile {
+    Fixture,
+    Native { provider_epoch: Digest },
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Provenance<T> {
+    Observed { value: T, source: String },
+    ProviderReported { value: T, provider: String },
+    Unavailable { reason: String },
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeDescription {
+    pub binding: BindingId,
+    pub manifest_digest: Digest,
+    pub workspace_marker: WorkspaceMarker,
+    pub os: Os,
+    pub helper_principal: Principal,
+    pub programs: ProgramList,
+    pub capabilities: NativeCapabilities,
+    pub provider_epoch: Digest,
+    pub artifact_commitment: Digest,
+    pub build: Provenance<String>,
+    pub os_build: Provenance<String>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefixAuthorityFailure {
+    Missing,
+    Replaced,
+    Renamed,
+    MappingUnproved,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
     Hello {
@@ -314,6 +380,10 @@ pub enum Request {
         offset: u64,
         length: u16,
     },
+    InspectNativeFile {
+        lease: LeaseId,
+        path: LeafName,
+    },
     InspectFile {
         lease: LeaseId,
         path: LeafName,
@@ -340,6 +410,23 @@ pub enum Request {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reply {
+    NativeDescription {
+        description: Box<NativeDescription>,
+    },
+    NativeFileInfo {
+        lease: LeaseId,
+        path: LeafName,
+        length: u64,
+        sha256: Digest,
+    },
+    FileAbsent {
+        lease: LeaseId,
+        path: LeafName,
+    },
+    PrefixAuthorityRevoked {
+        lease: LeaseId,
+        reason: PrefixAuthorityFailure,
+    },
     Description {
         binding: BindingId,
         manifest_digest: Digest,
@@ -519,6 +606,35 @@ fn validate_message(v: &Message) -> Result<(), Error> {
                     return Err(Error::InvalidValue);
                 }
                 checked_end(*offset, bytes.as_slice().len())
+            }
+            Reply::NativeDescription { description } => {
+                const IDS: [&str; 8] = [
+                    "check_base",
+                    "check_data",
+                    "check_target",
+                    "configure",
+                    "exercise",
+                    "install_base",
+                    "install_target",
+                    "uninstall",
+                ];
+                if !description
+                    .programs
+                    .as_slice()
+                    .iter()
+                    .map(ProgramId::as_str)
+                    .eq(IDS)
+                {
+                    return Err(Error::InvalidValue);
+                }
+                match (&description.os, &description.helper_principal) {
+                    (Os::Windows, Principal::Windows { .. })
+                    | (Os::Linux | Os::Macos, Principal::Posix { .. }) => Ok(()),
+                    _ => Err(Error::InvalidValue),
+                }
+            }
+            Reply::NativeFileInfo { length, .. } if *length > MAX_NATIVE_FILE_BYTES => {
+                Err(Error::LimitExceeded)
             }
             Reply::FileInfo { length, .. } => bounded_length(*length),
             _ => Ok(()),
