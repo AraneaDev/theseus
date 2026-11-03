@@ -7,6 +7,8 @@ status whenever a milestone is implemented, reviewed, tested or merged.
 A checked item is complete **at the scope stated**. “Local complete” means
 implemented, reviewed and locally verified; it does not mean merged, released or
 accepted on every operating system. Unchecked acceptance gates remain required.
+In the active implementation section, checked source tasks have focused local
+checks; independent review and combined acceptance are separate unchecked gates.
 
 ## Current position
 
@@ -19,13 +21,27 @@ accepted on every operating system. Unchecked acceptance gates remain required.
 | Native helper protocol, host primitives, durable store and runtime | Local complete; final cross-platform acceptance pending |
 | Typed native helper client | Local complete after review fixes; final cross-platform acceptance pending |
 | Native helper file operations | Local complete and reviewed; native macOS/Windows acceptance pending |
-| Native machine/VM adapter integration | Planned; not available through CLI, TUI or MCP yet |
+| Native machine/VM adapter integration | In progress: ordinary scenarios run locally through the shared engine; MCP execution, public recovery and final qualification remain |
 | Native services and desktop application observations | Planned |
 
 The latest accepted `main` is `d4e5304` (0.12). Later native foundations and the
 client/file operations are committed locally through `8dd1986`; they have not been pushed or
 merged into `main`. Existing Docker workflows remain the supported execution
 backend. A native controller is distinct from a native guest adapter.
+
+### Work queue
+
+1. Finish native MCP execution/admission and ownership-aware cleanup reporting.
+2. Finish public native recovery/cleanup using retained original identities.
+3. Review the integrated adapter, fix findings and run source-pinned local gates.
+4. Implement service observations, then desktop/session observations, with
+   deterministic fixtures and documentation for each supported platform.
+5. Run the combined CI batch, resolve failures and merge accepted work to `main`.
+
+Keep this queue and the checklists below current as work lands. Record source
+implementation, review, local verification, CI acceptance and merge separately.
+Do not estimate a completion percentage from checkbox counts: tasks differ
+substantially in size. No new CI run or feature push is needed for tracker edits.
 
 ## Completed and merged
 
@@ -116,27 +132,49 @@ combined CI batch; neither compilation nor fixture boundary gates replace it.
 - [x] Add focused failure/order/ownership tests and required native cases on all
   three OS jobs; complete review and local qualification before the final batch.
 
-## Next: supplied native machine/VM adapters
+## In progress: supplied native machine/VM adapters
 
-- [ ] Define explicit target/helper/capability bindings and supported native
+Checked tasks below are implemented with focused local checks. Integration
+review, full local qualification and external acceptance remain separate gates.
+
+- [x] define explicit target/helper/capability bindings and supported native
   command, path, principal and termination contracts.
-- [ ] Add bounded transport for an explicitly supplied disposable target, with
+- [x] add bounded transport for an explicitly supplied disposable target, with
   explicit endpoint/identity authority and no automatic host discovery.
-- [ ] Bind an external reset/disposal provider; record the target/reset identity
+- [x] bind an external reset/disposal provider; record the target/reset identity
   and refuse automatic reuse without the required matching receipt.
-- [ ] Integrate through the shared engine: first clean/upgrade/reinstall, with
+- [x] integrate through the shared engine: first clean/upgrade/reinstall, with
   unsupported native scenarios refused before reservation.
-- [ ] Durably publish controller intent before reservation and acquired identity
+- [x] durably publish controller intent before reservation and acquired identity
   before setup; retain original operation identities through recovery.
-- [ ] Introduce explicit native recipe/report/journal representations and
+- [x] introduce explicit native recipe/report/journal representations and
   validators without inventing Docker image/container/UID fields.
-- [ ] Route CLI, TUI and MCP through the selected environment; expose native
-  evidence and cleanup/recovery state in saved/headless views.
+- [x] route CLI/TUI execution and preview
+  through the selected environment; provide native saved-report/evidence views.
+- [x] add MCP native recipe validation,
+  read-only inspection, status and bounded evidence browsing.
+- [ ] Wire MCP native execution into the owned worker and admission lifecycle;
+  keep unresolved native cleanup/disposal ownership visible and blocking.
+- [ ] Complete public native recovery/cleanup: verify original retained intent
+  and launch bindings; query/cancel/release original work without replaying Run.
 - [ ] Define native comparison compatibility before enabling native comparisons.
-- [ ] Add deterministic transport/provider and failure-path fixtures, examples
-  and operator documentation.
+- [x] add deterministic helper, compiled
+  reader, transport/provider and publication-failure fixtures. Local selected
+  engine tests exercise clean/upgrade/reinstall on fresh inert targets.
+- [ ] Complete native examples and operator documentation, including target
+  configuration, provider ownership, evidence limits and recovery procedures.
+- [ ] Complete independent integration review and resolve findings.
+- [ ] Run the complete source-pinned local test inventory, fixture integrity
+  checks and required cross-platform compile checks for the integrated adapter.
 - [ ] Run true Linux/macOS/Windows guest lifecycle acceptance when disposable
   targets and reset-provider authority are supplied.
+
+**Current local evidence:** ordinary selected-engine scenarios use actual child
+processes and compiled readers; an injected journal-publication failure verifies
+that no provider invocation occurs and the bootstrapped workspace is unchanged.
+These fixtures do not establish real SSH, VM reset or native guest acceptance.
+The integrated adapter remains unmerged and is awaiting independent review and
+the combined validation gates.
 
 Native interruption, rollback and guest plugin/MCP checks require their own
 contracts and evidence before being enabled; Docker support does not enable them
