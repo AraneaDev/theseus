@@ -18,12 +18,12 @@ accepted on every operating system. Unchecked acceptance gates remain required.
 | README and documentation restructure | Complete and merged |
 | Native helper protocol, host primitives, durable store and runtime | Local complete; final cross-platform acceptance pending |
 | Typed native helper client | Local complete after review fixes; final cross-platform acceptance pending |
-| Native helper file operations | In progress: implementation reviewed; native ordering/fault coverage being completed |
+| Native helper file operations | Local complete and reviewed; native macOS/Windows acceptance pending |
 | Native machine/VM adapter integration | Planned; not available through CLI, TUI or MCP yet |
 | Native services and desktop application observations | Planned |
 
 The latest accepted `main` is `d4e5304` (0.12). Later native foundations and the
-client are committed locally through `1404599`; they have not been pushed or
+client/file operations are committed locally through `8dd1986`; they have not been pushed or
 merged into `main`. Existing Docker workflows remain the supported execution
 backend. A native controller is distinct from a native guest adapter.
 
@@ -88,32 +88,35 @@ installation interface for the controller machine.
   stream/terminal consistency across reconnects.
 - [x] **Local qualification:** reviewed helper/client source, actual Linux pipe
   fixtures and strict Linux/macOS/Windows compile checks. Latest client checks:
-  29 unit + 2 preflight + 7 native Linux tests, and 29 validation controls.
+  32 unit + 2 preflight + 9 native Linux tests, and 29 validation controls.
 - [ ] **Native macOS/Windows execution:** qualify the new helper/client on both
   actual OS runners in the final combined CI batch. Cross-compilation is not
   native execution evidence.
 - [ ] **Integrate to main:** merge reviewed native work after the combined gates.
 
-## In progress: bounded native helper file operations
+## Local complete: bounded native helper file operations
 
-Implementation checkmarks in this section describe reviewed local source. The
-final native ordering/fault tests and cross-platform acceptance remain unchecked.
+Implementation checkmarks in this section describe reviewed, locally qualified
+source. All 14 helper and 9 client pipe cases passed on Linux; the final fixture
+ordering correction passed its targeted rerun. Strict compile checks passed for
+Linux/macOS/Windows. Actual native macOS/Windows execution remains pending the
+combined CI batch; neither compilation nor fixture boundary gates replace it.
 
 - [x] Retain the validated workspace directory authority for all file requests.
 - [x] Implement existing typed `CreateFile`, `ReadFile` and `InspectFile` requests
   for bounded regular leaf files; no implicit overwrite or recursive access.
-- [ ] Commit acceptance before mutation; publish completion only after actual
+- [x] Commit acceptance before mutation; publish completion only after actual
   file observations and durable ledger completion.
-- [ ] Preserve partial/uncertain effects and quarantine rather than infer success
+- [x] Preserve partial/uncertain effects and quarantine rather than infer success
   or a safe retry from a transport/filesystem error.
-- [ ] Serialize file work with native Run/cleanup on the existing worker; keep
+- [x] Serialize file work with native Run/cleanup on the existing worker; keep
   cached Query/Cancel responsive and refuse conflicting work before filesystem I/O.
 - [x] Extend the typed client and retain explicit Unsupported behavior from older
   helpers; support selection must be explicit.
-- [ ] Add focused failure/order/ownership tests and required native cases on all
+- [x] Add focused failure/order/ownership tests and required native cases on all
   three OS jobs; complete review and local qualification before the final batch.
 
-## Remaining: supplied native machine/VM adapters
+## Next: supplied native machine/VM adapters
 
 - [ ] Define explicit target/helper/capability bindings and supported native
   command, path, principal and termination contracts.
