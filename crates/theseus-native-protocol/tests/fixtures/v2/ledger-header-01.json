@@ -1,0 +1,1 @@
+{"schema":1,"index":0,"record":{"kind":"header","profile":"trusted_fixture_v1","binding":"ffffffffffffffffffffffffffffffff","manifest_digest":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","workspace_marker":"ffffffffffffffffffffffffffffffff","os":"macos","durability":"file_flushed_process_crash"}}

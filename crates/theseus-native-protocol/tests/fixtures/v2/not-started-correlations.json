@@ -1,0 +1,84 @@
+[
+  {
+    "request": {
+      "kind": "create_file",
+      "lease": "ffffffffffffffffffffffffffffffff",
+      "operation": "ffffffffffffffffffffffffffffffff",
+      "path": "probe.bin",
+      "bytes": "00ff"
+    },
+    "result": {
+      "kind": "operation",
+      "lease": "ffffffffffffffffffffffffffffffff",
+      "operation": "ffffffffffffffffffffffffffffffff",
+      "state": {
+        "kind": "finished",
+        "outcome": {
+          "kind": "not_started",
+          "reason": "cancel_requested"
+        }
+      }
+    }
+  },
+  {
+    "request": {
+      "kind": "create_file",
+      "lease": "ffffffffffffffffffffffffffffffff",
+      "operation": "ffffffffffffffffffffffffffffffff",
+      "path": "probe.bin",
+      "bytes": "00ff"
+    },
+    "result": {
+      "kind": "operation",
+      "lease": "ffffffffffffffffffffffffffffffff",
+      "operation": "ffffffffffffffffffffffffffffffff",
+      "state": {
+        "kind": "finished",
+        "outcome": {
+          "kind": "not_started",
+          "reason": "deadline"
+        }
+      }
+    }
+  },
+  {
+    "request": {
+      "kind": "run",
+      "lease": "ffffffffffffffffffffffffffffffff",
+      "operation": "ffffffffffffffffffffffffffffffff",
+      "program": "probe_success"
+    },
+    "result": {
+      "kind": "operation",
+      "lease": "ffffffffffffffffffffffffffffffff",
+      "operation": "ffffffffffffffffffffffffffffffff",
+      "state": {
+        "kind": "finished",
+        "outcome": {
+          "kind": "not_started",
+          "reason": "cancel_requested"
+        }
+      }
+    }
+  },
+  {
+    "request": {
+      "kind": "run",
+      "lease": "ffffffffffffffffffffffffffffffff",
+      "operation": "ffffffffffffffffffffffffffffffff",
+      "program": "probe_success"
+    },
+    "result": {
+      "kind": "operation",
+      "lease": "ffffffffffffffffffffffffffffffff",
+      "operation": "ffffffffffffffffffffffffffffffff",
+      "state": {
+        "kind": "finished",
+        "outcome": {
+          "kind": "not_started",
+          "reason": "deadline"
+        }
+      }
+    }
+  }
+]

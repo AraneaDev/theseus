@@ -1,0 +1,1 @@
+{"schema":1,"index":257,"record":{"kind":"operation_finished","lease":"ffffffffffffffffffffffffffffffff","operation":"ffffffffffffffffffffffffffffffff","outcome":{"kind":"launch_failed","phase":"created_suspended","code":"invalid_catalog","cleanup":"windows_process_exited_job_empty"}}}

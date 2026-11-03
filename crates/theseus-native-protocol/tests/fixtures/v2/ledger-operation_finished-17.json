@@ -1,0 +1,1 @@
+{"schema":1,"index":257,"record":{"kind":"operation_finished","lease":"ffffffffffffffffffffffffffffffff","operation":"ffffffffffffffffffffffffffffffff","outcome":{"kind":"launch_failed","phase":"never_created","code":"invalid_catalog","cleanup":"no_child_created"}}}
