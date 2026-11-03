@@ -21,26 +21,25 @@ checks; independent review and combined acceptance are separate unchecked gates.
 | Native helper protocol, host primitives, durable store and runtime | Local complete; final cross-platform acceptance pending |
 | Typed native helper client | Local complete after review fixes; final cross-platform acceptance pending |
 | Native helper file operations | Local complete and reviewed; native macOS/Windows acceptance pending |
-| Native machine/VM adapter integration | In progress: ordinary scenarios, MCP execution and public recovery implemented locally; review fixes and final qualification remain |
-| Native services and desktop application observations | Planned |
+| Native machine/VM adapter integration | Local complete and independently reviewed; native OS CI and real supplied-target acceptance pending |
+| Native services and desktop application observations | Next: contract review and an integrated systemd service Clean slice, followed by the other managers and desktop ports |
 
 The latest accepted `main` is `d4e5304` (0.12). Later native foundations and the
-client/file operations are committed through `8dd1986` and published with the
-tracker in [draft PR #1](https://github.com/AraneaDev/theseus/pull/1).
-The adapter integration remains local and uncommitted; neither is merged into
-`main`. Intermediate CI is deferred until the combined acceptance batch.
+client/file operations and adapter integration are committed through `fdab2a8`
+for [draft PR #1](https://github.com/AraneaDev/theseus/pull/1).
+The native work is not merged into `main`. Intermediate CI is deferred until the
+combined acceptance batch; feature pushes use the PR workflow instead of
+duplicating both push and PR runs.
 Existing Docker workflows remain the supported execution
 backend. A native controller is distinct from a native guest adapter.
 
 ### Work queue
 
-1. Resolve native adapter review findings: original provider-query ordering,
-   retained failure ownership, recovery consistency, cleanup finalization,
-   artifact binding and bounded pending filesystem observations.
-2. Complete scoped re-review and source-pinned local gates for CLI/TUI/MCP,
-   helper transport, provider fixtures and public recovery.
-3. Finish native operator documentation and example verification.
-4. Implement service observations, then desktop/session observations, with
+1. Finish service/desktop contract review and freeze the shared interfaces.
+2. Deliver systemd service Clean through the shared engine, CLI/TUI/MCP and
+   retained evidence; add the launchd and Windows SCM ports.
+3. Add explicitly bound desktop/session activation and owned lifetime observations.
+4. Complete ordinary scenario/recovery integration for services and desktops, with
    deterministic fixtures and documentation for each supported platform.
 5. Run the combined CI batch, resolve failures and merge accepted work to `main`.
 
@@ -109,8 +108,8 @@ installation interface for the controller machine.
   operation queries, no automatic Run replay, observed lease continuity and
   stream/terminal consistency across reconnects.
 - [x] **Local qualification:** reviewed helper/client source, actual Linux pipe
-  fixtures and strict Linux/macOS/Windows compile checks. Latest client checks:
-  32 unit + 2 preflight + 9 native Linux tests, and 29 validation controls.
+  fixtures and strict Linux/macOS/Windows compile checks. The integrated adapter
+  also has a source-pinned native inventory and 33 validation controls.
 - [ ] **Native macOS/Windows execution:** qualify the new helper/client on both
   actual OS runners in the final combined CI batch. Cross-compilation is not
   native execution evidence.
@@ -138,10 +137,10 @@ combined CI batch; neither compilation nor fixture boundary gates replace it.
 - [x] Add focused failure/order/ownership tests and required native cases on all
   three OS jobs; complete review and local qualification before the final batch.
 
-## In progress: supplied native machine/VM adapters
+## Local complete: supplied native machine/VM adapters
 
-Checked tasks below are implemented with focused local checks. Integration
-review, full local qualification and external acceptance remain separate gates.
+Checked tasks below are implemented, independently reviewed and locally qualified.
+Native OS CI and real supplied-target acceptance remain separate gates.
 
 - [x] define explicit target/helper/capability bindings and supported native
   command, path, principal and termination contracts.
@@ -168,16 +167,17 @@ review, full local qualification and external acceptance remain separate gates.
 - [x] add deterministic helper, compiled
   reader, transport/provider and publication-failure fixtures. Local selected
   engine tests exercise clean/upgrade/reinstall on fresh inert targets.
-- [ ] Complete native examples and operator documentation, including target
+- [x] Complete native examples and operator documentation, including target
   configuration, provider ownership, evidence limits and recovery procedures.
-- [ ] Complete independent integration review and resolve findings.
-- [ ] Resolve review findings in provider preparation/disposal ordering, retained
+- [x] Complete independent integration review and resolve findings.
+- [x] Resolve review findings in provider preparation/disposal ordering, retained
   panic ownership, terminal recovery consistency and local cleanup finalization;
   keep remote uncertainty separate from actual local-process status, bind recipe
   artifact facts to the helper catalog and retain unfinished filesystem owners
   without an unbounded pending-status wait.
-- [ ] Run the complete source-pinned local test inventory, fixture integrity
-  checks and required cross-platform compile checks for the integrated adapter.
+- [x] Run the source-pinned local native inventory, fixture integrity checks and
+  strict cross-platform compile checks; retain isolated environment failures and
+  their exact targeted reruns separately.
 - [ ] Run true Linux/macOS/Windows guest lifecycle acceptance when disposable
   targets and reset-provider authority are supplied.
 
@@ -185,8 +185,11 @@ review, full local qualification and external acceptance remain separate gates.
 processes and compiled readers; an injected journal-publication failure verifies
 that no provider invocation occurs and the bootstrapped workspace is unchanged.
 These fixtures do not establish real SSH, VM reset or native guest acceptance.
-The integrated adapter remains unmerged and is awaiting independent review and
-the combined validation gates.
+All nine pinned runtime artifact hashes matched after final test-fixture and
+formatting corrections. Review findings and targeted reruns are closed; the
+integrated adapter remains unmerged pending the combined CI gates. See the
+[native target guide](docs/guides/native-targets.md) and
+[offline example](examples/native/README.md).
 
 Native interruption, rollback and guest plugin/MCP checks require their own
 contracts and evidence before being enabled; Docker support does not enable them
