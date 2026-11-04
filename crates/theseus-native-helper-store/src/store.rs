@@ -37,6 +37,13 @@ impl CommittedRecord {
     }
 }
 impl LedgerStore {
+    pub fn bootstrap_broker(
+        ledger_root: &HostDir,
+        workspace_root: &HostDir,
+        header: &theseus_native_protocol::v2::broker::IntegrationBrokerHeader,
+    ) -> Result<crate::BootstrapReceipt, StoreError> {
+        crate::bootstrap::bootstrap_broker(ledger_root, workspace_root, header)
+    }
     pub fn open(
         ledger_root: &HostDir,
         workspace_root: &HostDir,
@@ -68,6 +75,43 @@ impl LedgerStore {
         expected: StoreBinding,
         profile: theseus_native_protocol::v2::HelperProfile,
     ) -> Result<Self, StoreError> {
+        Self::open_bound(ledger_root, workspace_root, expected, profile, None)
+    }
+    /// A closed broker profile. Existing helper profile opens reject this header.
+    pub fn open_broker(
+        ledger_root: &HostDir,
+        workspace_root: &HostDir,
+        header: &theseus_native_protocol::v2::broker::IntegrationBrokerHeader,
+    ) -> Result<Self, StoreError> {
+        header.validate().map_err(|_| StoreError::BindingMismatch)?;
+        let expected = StoreBinding {
+            binding: BindingId::parse(&header.binding).map_err(|_| StoreError::BindingMismatch)?,
+            manifest_digest: Digest::parse(&header.manifest_digest)
+                .map_err(|_| StoreError::BindingMismatch)?,
+            workspace_marker: WorkspaceMarker::parse(&header.workspace_marker)
+                .map_err(|_| StoreError::BindingMismatch)?,
+            os: match header.os.as_str() {
+                "linux" => Os::Linux,
+                "macos" => Os::Macos,
+                "windows" => Os::Windows,
+                _ => return Err(StoreError::BindingMismatch),
+            },
+        };
+        Self::open_bound(
+            ledger_root,
+            workspace_root,
+            expected,
+            theseus_native_protocol::v2::HelperProfile::Fixture,
+            Some(header),
+        )
+    }
+    fn open_bound(
+        ledger_root: &HostDir,
+        workspace_root: &HostDir,
+        expected: StoreBinding,
+        profile: theseus_native_protocol::v2::HelperProfile,
+        broker: Option<&theseus_native_protocol::v2::broker::IntegrationBrokerHeader>,
+    ) -> Result<Self, StoreError> {
         if ledger_root.same_object(workspace_root)? {
             return Err(StoreError::AliasedRoots);
         }
@@ -92,12 +136,14 @@ impl LedgerStore {
         decoder.finish()?;
         let restart = LedgerView::replay(&records)?;
         match records[0].entry() {
+            Entry::IntegrationBrokerHeader { header } if broker == Some(header) => {}
             Entry::Header {
                 binding,
                 manifest_digest,
                 workspace_marker,
                 os,
-            } if profile == theseus_native_protocol::v2::HelperProfile::Fixture
+            } if broker.is_none()
+                && profile == theseus_native_protocol::v2::HelperProfile::Fixture
                 && *binding == expected.binding
                 && *manifest_digest == expected.manifest_digest
                 && *workspace_marker == expected.workspace_marker
@@ -109,10 +155,11 @@ impl LedgerStore {
                 os,
                 provider_epoch,
                 ..
-            } if profile
-                == (theseus_native_protocol::v2::HelperProfile::Native {
-                    provider_epoch: *provider_epoch,
-                })
+            } if broker.is_none()
+                && profile
+                    == (theseus_native_protocol::v2::HelperProfile::Native {
+                        provider_epoch: *provider_epoch,
+                    })
                 && *binding == expected.binding
                 && *manifest_digest == expected.manifest_digest
                 && *workspace_marker == expected.workspace_marker
@@ -126,12 +173,13 @@ impl LedgerStore {
                 core_manifest_digest,
                 integration_manifest_digest,
                 ..
-            } if profile
-                == (theseus_native_protocol::v2::HelperProfile::Integration {
-                    provider_epoch: *provider_epoch,
-                    core_manifest_digest: *core_manifest_digest,
-                    integration_manifest_digest: *integration_manifest_digest,
-                })
+            } if broker.is_none()
+                && profile
+                    == (theseus_native_protocol::v2::HelperProfile::Integration {
+                        provider_epoch: *provider_epoch,
+                        core_manifest_digest: *core_manifest_digest,
+                        integration_manifest_digest: *integration_manifest_digest,
+                    })
                 && *binding == expected.binding
                 && *manifest_digest == expected.manifest_digest
                 && *workspace_marker == expected.workspace_marker
@@ -173,6 +221,20 @@ impl LedgerStore {
         &self.restart
     }
     pub fn append(&mut self, record: Record) -> Result<CommittedRecord, StoreError> {
+        if matches!(record.entry(), Entry::LinuxGioQualificationDeclared { .. }) {
+            return Err(crate::qualification::forbidden_qualification_append());
+        }
+        self.append_with(record, |file, bytes| {
+            file.append_and_sync(bytes, ledger::MAX_LEDGER_BYTES as u64)
+        })
+    }
+    pub(crate) fn append_provider_qualification(
+        &mut self,
+        record: Record,
+    ) -> Result<CommittedRecord, StoreError> {
+        if !matches!(record.entry(), Entry::LinuxGioQualificationDeclared { .. }) {
+            return Err(StoreError::BindingMismatch);
+        }
         self.append_with(record, |file, bytes| {
             file.append_and_sync(bytes, ledger::MAX_LEDGER_BYTES as u64)
         })

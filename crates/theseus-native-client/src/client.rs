@@ -13,6 +13,30 @@ pub struct ExpectedHelper {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RequestId(pub(crate) u64);
 pub enum Action<'a> {
+    BrokerBind {
+        original: v2::broker::BrokerBind,
+    },
+    QueryBrokerBind {
+        original: v2::broker::BrokerBind,
+    },
+    DesktopAction {
+        request: v2::broker::DesktopRequest,
+    },
+    InspectDesktop {
+        lease: v2::LeaseId,
+        slot: v2::ResourceSlot,
+    },
+    QueryDesktop {
+        identity: v2::broker::BrokerOperationIdentity,
+    },
+    CancelDesktop {
+        identity: v2::broker::BrokerOperationIdentity,
+    },
+    ProbeDesktopReadiness {
+        identity: v2::broker::BrokerOperationIdentity,
+        nonce: v2::BindingId,
+        deadline_ms: u32,
+    },
     ProbeReadiness {
         deadline_ms: u32,
         lease: v2::LeaseId,
@@ -248,6 +272,9 @@ impl Client {
                 Action::QueryOriginalAcquire(_)
                     | Action::Query { .. }
                     | Action::Cancel { .. }
+                    | Action::QueryBrokerBind { .. }
+                    | Action::QueryDesktop { .. }
+                    | Action::CancelDesktop { .. }
                     | Action::QueryLease(_)
                     | Action::Release(_)
             )
@@ -266,7 +293,7 @@ impl Client {
         if !pump.ready {
             return Err(ClientError::NotReady);
         }
-        let cancel = matches!(action, Action::Cancel { .. });
+        let cancel = matches!(action, Action::Cancel { .. } | Action::CancelDesktop { .. });
         if !pump.available(cancel) {
             return Err(ClientError::Busy);
         }
@@ -469,6 +496,9 @@ impl Client {
     ) -> Result<(), ClientError> {
         if !self.is_settled() {
             return Err(ClientError::NotSettled);
+        }
+        if self.recovery.has_desktop() {
+            self.query_only = true;
         }
         self.attempt(command, spawn)
     }

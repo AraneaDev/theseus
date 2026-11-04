@@ -1,6 +1,12 @@
 //! Explicit integration profile DTOs. No native handles or implicit endpoints.
+mod desktop_definitions;
+mod linux_qualification;
+mod native_desktop;
 mod platform;
 use super::{Digest, Error, NativeDescription};
+pub use desktop_definitions::*;
+pub use linux_qualification::*;
+pub use native_desktop::*;
 pub use platform::*;
 use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,9 +218,62 @@ impl ServiceAuthority {
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IntegrationCapabilities;
+pub enum IntegrationCapabilities {
+    Service,
+    Desktop,
+    NativeDesktop,
+    Combined,
+    NativeCombined,
+}
+// Preserve the original public service-only value spelling and literal bytes.
+#[allow(non_upper_case_globals)]
+pub const IntegrationCapabilities: IntegrationCapabilities = IntegrationCapabilities::Service;
 impl IntegrationCapabilities {
     pub const NAMES: [&'static str; 3] = ["inspect_service", "service_start", "service_stop"];
+    pub const DESKTOP_NAMES: [&'static str; 3] =
+        ["inspect_desktop", "owned_executable", "request_close"];
+    pub fn names(&self) -> &'static [&'static str] {
+        match self {
+            Self::Service => &Self::NAMES,
+            Self::Desktop => &Self::DESKTOP_NAMES,
+            Self::NativeDesktop => &["inspect_desktop", "native_activation", "request_close"],
+            Self::Combined => &[
+                "inspect_service",
+                "service_start",
+                "service_stop",
+                "inspect_desktop",
+                "owned_executable",
+                "request_close",
+            ],
+            Self::NativeCombined => &[
+                "inspect_service",
+                "service_start",
+                "service_stop",
+                "inspect_desktop",
+                "native_activation",
+                "request_close",
+            ],
+        }
+    }
+    pub fn for_manifest(manifest: &IntegrationManifest) -> Result<Self, Error> {
+        match (
+            manifest.service_authority.is_some(),
+            manifest.desktop.is_some(),
+        ) {
+            (true, false) => Ok(Self::Service),
+            (false, true) => Ok(if manifest.desktop_native.is_some() {
+                Self::NativeDesktop
+            } else {
+                Self::Desktop
+            }),
+            (true, true) => Ok(if manifest.desktop_native.is_some() {
+                Self::NativeCombined
+            } else {
+                Self::Combined
+            }),
+            _ => Err(Error::InvalidValue),
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntegrationDescription {
@@ -256,12 +315,14 @@ pub enum ServiceOutcome {
 
 /// Provider-reported per-instance context, independently bound to immutable fullM.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "RuntimeContextInput")]
 pub struct IntegrationRuntimeContext {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub linux_gio_qualification: Option<LinuxGioQualificationRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub installation_instance_digest: Option<String>,
-    #[serde(default, skip_serializing_if = "ManagerPlatform::is_systemd")]
-    pub manager_platform: ManagerPlatform,
+    #[serde(skip_serializing_if = "absent_or_systemd")]
+    pub manager_platform: Option<ManagerPlatform>,
     pub kind: String,
     pub schema: u32,
     pub ownership_id: String,
@@ -270,8 +331,62 @@ pub struct IntegrationRuntimeContext {
     pub workspace_marker: String,
     pub provider_epoch: String,
     pub integration_manifest_digest: String,
-    pub manager_unique_name: String,
-    pub namespace_receipt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manager_unique_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace_receipt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desktop_broker_header: Option<super::broker::IntegrationBrokerHeader>,
+}
+fn absent_or_systemd(value: &Option<ManagerPlatform>) -> bool {
+    value.is_none() || *value == Some(ManagerPlatform::Systemd)
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeContextInput {
+    linux_gio_qualification: Option<LinuxGioQualificationRef>,
+    installation_instance_digest: Option<String>,
+    manager_platform: Option<ManagerPlatform>,
+    kind: String,
+    schema: u32,
+    ownership_id: String,
+    binding: String,
+    manifest_digest: String,
+    workspace_marker: String,
+    provider_epoch: String,
+    integration_manifest_digest: String,
+    manager_unique_name: Option<String>,
+    namespace_receipt: Option<String>,
+    desktop_broker_header: Option<super::broker::IntegrationBrokerHeader>,
+}
+impl TryFrom<RuntimeContextInput> for IntegrationRuntimeContext {
+    type Error = Error;
+    fn try_from(raw: RuntimeContextInput) -> Result<Self, Error> {
+        // Old systemd contexts omit their default platform. A desktop context
+        // with no manager material must not synthesize that manager authority.
+        let manager_platform = raw.manager_platform.or_else(|| {
+            (raw.manager_unique_name.is_some() && raw.namespace_receipt.is_some())
+                .then_some(ManagerPlatform::Systemd)
+        });
+        let value = Self {
+            linux_gio_qualification: raw.linux_gio_qualification,
+            installation_instance_digest: raw.installation_instance_digest,
+            manager_platform,
+            kind: raw.kind,
+            schema: raw.schema,
+            ownership_id: raw.ownership_id,
+            binding: raw.binding,
+            manifest_digest: raw.manifest_digest,
+            workspace_marker: raw.workspace_marker,
+            provider_epoch: raw.provider_epoch,
+            integration_manifest_digest: raw.integration_manifest_digest,
+            manager_unique_name: raw.manager_unique_name,
+            namespace_receipt: raw.namespace_receipt,
+            desktop_broker_header: raw.desktop_broker_header,
+        };
+        value.validate()?;
+        Ok(value)
+    }
 }
 impl IntegrationRuntimeContext {
     pub fn validate(&self) -> Result<(), Error> {
@@ -279,24 +394,35 @@ impl IntegrationRuntimeContext {
             || self.schema != 1
             || self.ownership_id.is_empty()
             || self.ownership_id.len() > 128
-            || self.namespace_receipt.is_empty()
-            || self.namespace_receipt.len() > 4096
-            || self.namespace_receipt.contains('\0')
-            || (self.manager_platform == ManagerPlatform::Systemd)
-                != self.manager_unique_name.starts_with(':')
-            || self.manager_unique_name.is_empty()
-            || self.manager_unique_name.len() > 128
-            || self.manager_unique_name.contains('\0')
         {
             return Err(Error::InvalidValue);
+        }
+        match (
+            &self.manager_platform,
+            &self.manager_unique_name,
+            &self.namespace_receipt,
+        ) {
+            (Some(platform), Some(name), Some(receipt)) => {
+                if receipt.is_empty()
+                    || receipt.len() > 4096
+                    || receipt.contains('\0')
+                    || name.is_empty()
+                    || name.len() > 128
+                    || name.contains('\0')
+                    || (*platform == ManagerPlatform::Systemd) != name.starts_with(':')
+                    || (*platform == ManagerPlatform::Systemd)
+                        != self.installation_instance_digest.is_none()
+                {
+                    return Err(Error::InvalidValue);
+                }
+            }
+            (None, None, None)
+                if self.desktop_broker_header.is_some()
+                    && self.installation_instance_digest.is_none() => {}
+            _ => return Err(Error::InvalidValue),
         }
         if let Some(digest) = &self.installation_instance_digest {
             Digest::parse(digest)?;
-        }
-        if (self.manager_platform == ManagerPlatform::Systemd)
-            != self.installation_instance_digest.is_none()
-        {
-            return Err(Error::InvalidValue);
         }
         super::BindingId::parse(&self.binding)?;
         super::WorkspaceMarker::parse(&self.workspace_marker)?;
@@ -307,7 +433,44 @@ impl IntegrationRuntimeContext {
         ] {
             Digest::parse(value)?;
         }
+        if let Some(reference) = &self.linux_gio_qualification {
+            reference.validate()?;
+        }
+        if self.linux_gio_qualification.as_ref()
+            != self
+                .desktop_broker_header
+                .as_ref()
+                .and_then(|header| header.linux_gio_qualification.as_ref())
+        {
+            return Err(Error::InvalidValue);
+        }
+        if let Some(header) = &self.desktop_broker_header {
+            header.validate()?;
+            if header.binding != self.binding
+                || header.manifest_digest != self.manifest_digest
+                || header.workspace_marker != self.workspace_marker
+                || header.ownership_id != self.ownership_id
+                || header.provider_epoch != self.provider_epoch
+            {
+                return Err(Error::InvalidValue);
+            }
+        }
         Ok(())
+    }
+    /// Digest of the actual supplied namespace or original desktop session receipt.
+    pub fn authority_receipt_digest(&self) -> Result<Digest, Error> {
+        use sha2::{Digest as _, Sha256};
+        self.validate()?;
+        if let Some(receipt) = &self.namespace_receipt {
+            Ok(Digest::from_bytes(
+                Sha256::digest(receipt.as_bytes()).into(),
+            ))
+        } else {
+            self.desktop_broker_header
+                .as_ref()
+                .ok_or(Error::InvalidValue)?
+                .digest()
+        }
     }
     pub fn digest(&self) -> Result<Digest, Error> {
         use sha2::{Digest as _, Sha256};
@@ -341,6 +504,91 @@ pub struct IntegrationArtifactSlot {
     pub length: u64,
     pub sha256: String,
 }
+/// Independently committed owned launch authority. Entry bytes cannot supply or
+/// change any command/environment/path value in this manifest commitment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopExecutable {
+    pub root: String,
+    pub relative_path: String,
+    pub length: u64,
+    pub sha256: String,
+    pub arguments: Vec<String>,
+    /// OwnedExecutable: exact application replacement environment. NativeActivation:
+    /// exact broker startup replacement ceiling only; no application environment promise.
+    pub environment: Vec<DesktopEnvironment>,
+    /// Exact owned application cwd. Native Linux/macOS: broker startup cwd only;
+    /// native Windows additionally binds the exact shortcut application cwd/root.
+    /// Entry bytes and the complete literal argv remain pinned in every mode.
+    pub working_directory: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopEnvironment {
+    pub name: String,
+    pub value: String,
+}
+impl DesktopExecutable {
+    pub fn validate(&self, desktop: &super::broker::DesktopManifest) -> Result<(), Error> {
+        let platform = match &desktop.ready_endpoint {
+            LocalEndpoint::UnixPath { .. } => ManagerPlatform::Systemd,
+            LocalEndpoint::NamedPipe { .. } => ManagerPlatform::Scm,
+        };
+        let parts = self.relative_path.split('/').collect::<Vec<_>>();
+        let slash_executable = format!("{}/{}", self.root, self.relative_path);
+        let native_windows_executable =
+            format!("{}\\{}", self.root, self.relative_path.replace('/', "\\"));
+        let argv_matches = self.arguments.first().is_some_and(|program| {
+            program == &slash_executable
+                || (platform == ManagerPlatform::Scm && program == &native_windows_executable)
+        });
+        if self.length == 0
+            || self.length > super::MAX_NATIVE_FILE_BYTES
+            || self.sha256 != desktop.executable_digest
+            || Digest::parse(&self.sha256).is_err()
+            || !platform_absolute(&self.root, platform)
+            || self.root.ends_with(['/', '\\'])
+            || !platform_absolute(&self.working_directory, platform)
+            || parts.is_empty()
+            || parts.len() > 8
+            || self.relative_path.len() > 4096
+            || parts.iter().any(|p| super::LeafName::new(p).is_err())
+            || self.arguments.is_empty()
+            || self.arguments.len() > 16
+            || !argv_matches
+            || self
+                .arguments
+                .iter()
+                .any(|v| v.len() > 512 || v.contains('\0'))
+            || self.environment.len() > 32
+        {
+            return Err(Error::InvalidValue);
+        }
+        let mut previous: Option<&str> = None;
+        let mut names = std::collections::BTreeSet::new();
+        let mut total = self.arguments.iter().map(String::len).sum::<usize>();
+        for e in &self.environment {
+            let name = e.name.as_bytes();
+            if name.is_empty()
+                || name.len() > 128
+                || !(name[0].is_ascii_alphabetic() || name[0] == b'_')
+                || !name.iter().all(|v| v.is_ascii_alphanumeric() || *v == b'_')
+                || e.value.len() > 1024
+                || e.value.contains('\0')
+                || previous.is_some_and(|p| p >= e.name.as_str())
+                || !names.insert(e.name.to_ascii_uppercase())
+            {
+                return Err(Error::InvalidValue);
+            }
+            previous = Some(&e.name);
+            total += e.name.len() + e.value.len();
+        }
+        if total > 16384 {
+            return Err(Error::InvalidValue);
+        }
+        Ok(())
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IntegrationManifest {
@@ -348,88 +596,189 @@ pub struct IntegrationManifest {
     pub readiness: Option<IntegrationReadiness>,
     pub schema: u32,
     pub core_manifest_digest: String,
-    pub service_authority: ServiceAuthority,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_authority: Option<ServiceAuthority>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop: Option<super::broker::DesktopManifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_executable: Option<DesktopExecutable>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_readiness: Option<ReadinessDefinitionExpectation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_native: Option<NativeDesktopDefinition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub desktop_definitions: Vec<DesktopDefinition>,
     pub definitions: Vec<ServiceDefinition>,
     pub artifact_slots: Vec<IntegrationArtifactSlot>,
     pub readiness_protocol: String,
     pub desktop_capabilities: Vec<String>,
 }
 impl IntegrationManifest {
+    pub fn required_service(&self) -> Result<&ServiceAuthority, Error> {
+        self.service_authority.as_ref().ok_or(Error::InvalidValue)
+    }
     pub fn validate(&self) -> Result<(), Error> {
         if self.schema != 1
-            || self.definitions.is_empty()
-            || self.definitions.len() > 6
             || self.artifact_slots.len() > 8
             || self.readiness_protocol != "theseus_fixture_ready_v1"
-            || !self.desktop_capabilities.is_empty()
-            || (self.service_authority.platform() != ManagerPlatform::Systemd
-                && self.readiness.is_none())
         {
             return Err(Error::InvalidValue);
         }
-        if matches!(&self.service_authority,ServiceAuthority::Launchd{qualification,..} if qualification.absence_profile.is_none())
-        {
-            return Err(Error::InvalidValue);
-        }
-        if let Some(readiness) = &self.readiness {
-            if !readiness.valid_endpoint(self.service_authority.platform())
-                || readiness.expectations.is_empty()
-                || readiness.expectations.len() > 6
-            {
-                return Err(Error::InvalidValue);
-            }
-            match &self.service_authority {
-                ServiceAuthority::Launchd {
-                    domain: LaunchdDomain::User { uid },
-                    ..
-                } if readiness.peer_uid != Some(*uid) => return Err(Error::InvalidValue),
-                ServiceAuthority::Scm { preflight, .. } if !matches!(&readiness.endpoint,LocalEndpoint::NamedPipe{path} if path==&preflight.pipe) =>
+        Digest::parse(&self.core_manifest_digest)?;
+        self.validate_desktop_definitions()?;
+        match &self.desktop {
+            Some(desktop) => {
+                desktop.validate()?;
+                let executable = self
+                    .desktop_executable
+                    .as_ref()
+                    .ok_or(Error::InvalidValue)?;
+                executable.validate(desktop)?;
+                if !self.artifact_slots.iter().any(|slot| {
+                    slot.slot == desktop.slot
+                        && slot.relative_path
+                            == self.native_entry_relative_path().unwrap_or_default()
+                        && slot.sha256 == desktop.entry_digest
+                        && slot.length > 0
+                        && slot.length <= 65536
+                }) {
+                    return Err(Error::InvalidValue);
+                }
+                let readiness = self.desktop_readiness.as_ref().ok_or(Error::InvalidValue)?;
+                readiness.validate()?;
+                if readiness.digest()?.to_hex() != desktop.expectation_digest
+                    || readiness.artifact_sha256 != executable.sha256
+                    || readiness.artifact_length != executable.length
                 {
                     return Err(Error::InvalidValue);
                 }
-                _ => {}
-            }
-            let mut keys = std::collections::BTreeSet::new();
-            for e in &readiness.expectations {
-                e.validate()?;
-                if !keys.insert((&e.role, &e.artifact)) {
+                let capabilities = match &self.desktop_native {
+                    Some(native) => {
+                        native.validate(desktop, executable)?;
+                        if let Some(service) = &self.service_authority {
+                            let same_platform = matches!(
+                                (service.platform(), native.os()),
+                                (ManagerPlatform::Systemd, "linux")
+                                    | (ManagerPlatform::Launchd, "macos")
+                                    | (ManagerPlatform::Scm, "windows")
+                            );
+                            if !same_platform || service.slot() == &desktop.slot {
+                                return Err(Error::InvalidValue);
+                            }
+                        }
+                        if let NativeDesktopDefinition::MacosBundle { info_plist, .. } = native
+                            && !self.artifact_slots.iter().any(|slot| {
+                                slot.slot == desktop.slot
+                                    && slot.length == info_plist.length
+                                    && slot.sha256 == info_plist.sha256
+                            })
+                        {
+                            return Err(Error::InvalidValue);
+                        }
+                        ["inspect_desktop", "native_activation", "request_close"]
+                    }
+                    None => {
+                        if desktop.allowed_modes != [super::broker::DesktopMode::OwnedExecutable] {
+                            return Err(Error::InvalidValue);
+                        }
+                        ["inspect_desktop", "owned_executable", "request_close"]
+                    }
+                };
+                if desktop.core_manifest_digest != self.core_manifest_digest
+                    || self
+                        .desktop_capabilities
+                        .iter()
+                        .map(String::as_str)
+                        .ne(capabilities)
+                {
                     return Err(Error::InvalidValue);
                 }
             }
+            None if !self.desktop_capabilities.is_empty()
+                || self.desktop_executable.is_some()
+                || self.desktop_readiness.is_some()
+                || self.desktop_native.is_some() =>
+            {
+                return Err(Error::InvalidValue);
+            }
+            None => {}
         }
-        Digest::parse(&self.core_manifest_digest)?;
-        self.service_authority.validate()?;
-        let mut keys = std::collections::BTreeSet::new();
-        for d in &self.definitions {
-            if !["base", "configured", "target"].contains(&d.role.as_str())
-                || !["base", "target"].contains(&d.artifact.as_str())
-                || !keys.insert((&d.role, &d.artifact))
-                || !platform_absolute(&d.executable, self.service_authority.platform())
-                || !platform_absolute(&d.working_directory, self.service_authority.platform())
-                || d.arguments.is_empty()
-                || d.arguments.len() > 16
-                || d.arguments[0] != d.executable
-                || d.arguments
-                    .iter()
-                    .chain(&d.environment)
-                    .any(|s| s.len() > 4096 || s.contains('\0'))
-                || d.environment.len() > 32
+        if let Some(authority) = &self.service_authority {
+            if self.definitions.is_empty()
+                || self.definitions.len() > 6
+                || self.artifact_slots.len() > 8
+                || self.readiness_protocol != "theseus_fixture_ready_v1"
+                || (authority.platform() != ManagerPlatform::Systemd && self.readiness.is_none())
             {
                 return Err(Error::InvalidValue);
             }
-            Digest::parse(&d.definition_sha256)?;
-            if self.service_authority.platform() == ManagerPlatform::Scm {
-                let raw = d.scm.as_ref().ok_or(Error::InvalidValue)?;
-                raw.validate(d, &self.service_authority)?;
-                if raw.digest()?.to_hex() != d.definition_sha256 {
+            if matches!(authority,ServiceAuthority::Launchd{qualification,..} if qualification.absence_profile.is_none())
+            {
+                return Err(Error::InvalidValue);
+            }
+            if let Some(readiness) = &self.readiness {
+                if !readiness.valid_endpoint(authority.platform())
+                    || readiness.expectations.is_empty()
+                    || readiness.expectations.len() > 6
+                {
                     return Err(Error::InvalidValue);
                 }
-            } else if d.scm.is_some()
-                || (self.service_authority.platform() == ManagerPlatform::Launchd
-                    && !d.environment.is_empty())
-            {
-                return Err(Error::InvalidValue);
+                match authority {
+                    ServiceAuthority::Launchd {
+                        domain: LaunchdDomain::User { uid },
+                        ..
+                    } if readiness.peer_uid != Some(*uid) => return Err(Error::InvalidValue),
+                    ServiceAuthority::Scm { preflight, .. } if !matches!(&readiness.endpoint,LocalEndpoint::NamedPipe{path} if path==&preflight.pipe) =>
+                    {
+                        return Err(Error::InvalidValue);
+                    }
+                    _ => {}
+                }
+                let mut keys = std::collections::BTreeSet::new();
+                for e in &readiness.expectations {
+                    e.validate()?;
+                    if !keys.insert((&e.role, &e.artifact)) {
+                        return Err(Error::InvalidValue);
+                    }
+                }
             }
+            Digest::parse(&self.core_manifest_digest)?;
+            authority.validate()?;
+            let mut keys = std::collections::BTreeSet::new();
+            for d in &self.definitions {
+                if !["base", "configured", "target"].contains(&d.role.as_str())
+                    || !["base", "target"].contains(&d.artifact.as_str())
+                    || !keys.insert((&d.role, &d.artifact))
+                    || !platform_absolute(&d.executable, authority.platform())
+                    || !platform_absolute(&d.working_directory, authority.platform())
+                    || d.arguments.is_empty()
+                    || d.arguments.len() > 16
+                    || d.arguments[0] != d.executable
+                    || d.arguments
+                        .iter()
+                        .chain(&d.environment)
+                        .any(|s| s.len() > 4096 || s.contains('\0'))
+                    || d.environment.len() > 32
+                {
+                    return Err(Error::InvalidValue);
+                }
+                Digest::parse(&d.definition_sha256)?;
+                if authority.platform() == ManagerPlatform::Scm {
+                    let raw = d.scm.as_ref().ok_or(Error::InvalidValue)?;
+                    raw.validate(d, authority)?;
+                    if raw.digest()?.to_hex() != d.definition_sha256 {
+                        return Err(Error::InvalidValue);
+                    }
+                } else if d.scm.is_some()
+                    || (authority.platform() == ManagerPlatform::Launchd
+                        && !d.environment.is_empty())
+                {
+                    return Err(Error::InvalidValue);
+                }
+            }
+        } else if self.desktop.is_none() || !self.definitions.is_empty() || self.readiness.is_some()
+        {
+            return Err(Error::InvalidValue);
         }
         let mut slots = std::collections::BTreeSet::new();
         for a in &self.artifact_slots {
@@ -775,6 +1124,111 @@ impl ReadinessObservation {
                 || self.version_literal.as_ref() != Some(&self.expectation.version_literal)
                 || self.failure.is_some())
         {
+            return Err(Error::InvalidValue);
+        }
+        Ok(())
+    }
+    /// Desktop structural validation only. Original identity and trusted peer
+    /// ceilings must be supplied independently through the contextual methods.
+    pub fn validate_desktop_fields(&self) -> Result<(), Error> {
+        self.expectation.validate()?;
+        ResourceSlot::new(self.slot.as_str())?;
+        super::OperationId::parse(&self.operation)?;
+        for d in [
+            &self.action_digest,
+            &self.resource_binding_digest,
+            &self.challenge_digest,
+            &self.expectation_digest,
+            &self.instance_binding_digest,
+        ] {
+            Digest::parse(d)?;
+        }
+        if self.expectation.digest()?.to_hex() != self.expectation_digest {
+            return Err(Error::InvalidValue);
+        }
+        for d in [
+            &self.artifact_sha256,
+            &self.data_sha256,
+            &self.configuration_digest,
+            &self.response_digest,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            Digest::parse(d)?;
+        }
+        if self
+            .failure
+            .as_ref()
+            .is_some_and(|s| s.is_empty() || s.len() > 4096 || s.contains('\0'))
+            || self
+                .version_literal
+                .as_ref()
+                .is_some_and(|s| s.len() > 128 || s.contains('\0'))
+        {
+            return Err(Error::InvalidValue);
+        }
+        if self.state == ReadinessState::Ready
+            && (!self.authenticated_instance
+                || !((self.peer_sid.is_none()
+                    && self.peer_uid.is_some()
+                    && self.peer_gid.is_some())
+                    || (self.peer_sid.as_ref().is_some_and(|sid| {
+                        sid.starts_with("S-1-") && sid.len() <= 184 && !sid.contains('\0')
+                    }) && self.peer_uid.is_none()
+                        && self.peer_gid.is_none()))
+                || self.initialized != Some(true)
+                || self.response_digest.is_none()
+                || self.instance_binding_digest != self.action_digest
+                || self.artifact_sha256.as_ref() != Some(&self.expectation.artifact_sha256)
+                || self.data_sha256.as_ref() != Some(&self.expectation.data_sha256)
+                || self.configuration_digest.as_ref()
+                    != Some(&self.expectation.configuration_digest)
+                || self.version_literal.as_ref() != Some(&self.expectation.version_literal)
+                || self.failure.is_some())
+        {
+            return Err(Error::InvalidValue);
+        }
+        Ok(())
+    }
+    pub fn validate_desktop(
+        &self,
+        identity: &super::broker::BrokerOperationIdentity,
+    ) -> Result<(), Error> {
+        self.validate_desktop_fields()?;
+        identity.validate()?;
+        if self.operation != identity.helper_operation
+            || self.action_digest != identity.request_digest
+            || self.instance_binding_digest != identity.request_digest
+        {
+            return Err(Error::InvalidValue);
+        }
+        Ok(())
+    }
+    pub fn validate_desktop_peer(
+        &self,
+        principal: &super::broker::BrokerPrincipal,
+    ) -> Result<(), Error> {
+        self.validate_desktop_fields()?;
+        if self.state != ReadinessState::Ready {
+            return Ok(());
+        }
+        let matches = match principal {
+            super::broker::BrokerPrincipal::Posix {
+                effective_uid,
+                effective_gid,
+            } => {
+                self.peer_sid.is_none()
+                    && self.peer_uid == Some(*effective_uid)
+                    && self.peer_gid == Some(*effective_gid)
+            }
+            super::broker::BrokerPrincipal::Windows { token_user_sid } => {
+                self.peer_sid.as_ref() == Some(token_user_sid)
+                    && self.peer_uid.is_none()
+                    && self.peer_gid.is_none()
+            }
+        };
+        if !matches {
             return Err(Error::InvalidValue);
         }
         Ok(())

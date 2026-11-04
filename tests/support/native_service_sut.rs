@@ -185,6 +185,80 @@ impl NativeServiceSut {
             .ok_or_else(|| invalid("configuration requires original fixture registration"))?;
         self.install(definition_id, deadline, cancel)
     }
+    /// Installer-owned stop before changing a running executable/definition.
+    pub fn stop_for_transition(
+        &mut self,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> io::Result<()> {
+        if self.uncertain {
+            return Err(invalid("original fixture mutation unresolved; no replay"));
+        }
+        self.retained_definition = Some(
+            self.files
+                .current()?
+                .ok_or_else(|| invalid("original fixture registration missing"))?,
+        );
+        let before = self.guard.inspect(deadline, cancel)?;
+        if !before.definition_present || before.loaded.is_none() {
+            return Err(invalid("original loaded fixture registration missing"));
+        }
+        self.uncertain = true;
+        let connection = self.connection.as_mut().expect("original connection");
+        connection.discard_events()?;
+        let job = connection
+            .manager_call(
+                "StopUnit",
+                &[&self.authority.manager.unit, "fail"],
+                deadline,
+                cancel,
+            )?
+            .string(b'o')?;
+        connection.wait_job(&job, &self.authority.manager.unit, deadline, cancel)?;
+        let after = self.guard.inspect(deadline, cancel)?;
+        if !after
+            .loaded
+            .is_some_and(|l| l.active_state == "inactive" && l.main_pid == 0)
+        {
+            return Err(invalid("SUT original stop did not settle"));
+        }
+        self.uncertain = false;
+        Ok(())
+    }
+    pub fn start_after_transition(
+        &mut self,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> io::Result<()> {
+        if self.uncertain {
+            return Err(invalid("original fixture mutation unresolved; no replay"));
+        }
+        self.files
+            .current()?
+            .ok_or_else(|| invalid("configured fixture definition missing"))?;
+        self.guard.inspect(deadline, cancel)?;
+        self.uncertain = true;
+        let connection = self.connection.as_mut().expect("original connection");
+        connection.discard_events()?;
+        let job = connection
+            .manager_call(
+                "StartUnit",
+                &[&self.authority.manager.unit, "fail"],
+                deadline,
+                cancel,
+            )?
+            .string(b'o')?;
+        connection.wait_job(&job, &self.authority.manager.unit, deadline, cancel)?;
+        let after = self.guard.inspect(deadline, cancel)?;
+        if !after.loaded.is_some_and(|l| {
+            l.active_state == "active" && l.sub_state == "running" && l.main_pid != 0
+        }) {
+            return Err(invalid("SUT configured restart not Running"));
+        }
+        self.uncertain = false;
+        self.retained_definition.take();
+        Ok(())
+    }
     pub fn uninstall(&mut self, deadline: Instant, cancel: &AtomicBool) -> io::Result<()> {
         if self.uncertain {
             return Err(invalid("original fixture mutation unresolved; no replay"));

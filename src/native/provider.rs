@@ -5,6 +5,31 @@ use anyhow::{Result, ensure};
 pub struct ValidatedBaseline {
     receipt: ProviderReceipt,
     launch_fingerprint: String,
+    linux_gio: Option<ValidatedLinuxGioPrepare>,
+}
+/// Original owned provider completion, not a deserializable qualification claim.
+#[derive(Clone)]
+pub struct ValidatedLinuxGioPrepare {
+    reference: theseus_native_protocol::v2::LinuxGioQualificationRef,
+    context_digest: theseus_native_protocol::v2::Digest,
+    ownership_id: String,
+}
+impl ValidatedLinuxGioPrepare {
+    pub fn reference(&self) -> &theseus_native_protocol::v2::LinuxGioQualificationRef {
+        &self.reference
+    }
+    pub(crate) fn validate_context(
+        &self,
+        context: &theseus_native_protocol::v2::IntegrationRuntimeContext,
+    ) -> Result<()> {
+        ensure!(
+            context.linux_gio_qualification.as_ref() == Some(&self.reference)
+                && context.digest()? == self.context_digest
+                && context.ownership_id == self.ownership_id,
+            "qualification differs from original owned Prepare context"
+        );
+        Ok(())
+    }
 }
 impl ValidatedBaseline {
     pub fn launch_fingerprint(&self) -> &str {
@@ -12,6 +37,9 @@ impl ValidatedBaseline {
     }
     pub fn receipt(&self) -> &ProviderReceipt {
         &self.receipt
+    }
+    pub fn linux_gio_qualification(&self) -> Option<&ValidatedLinuxGioPrepare> {
+        self.linux_gio.as_ref()
     }
 }
 pub trait NativeProvider {
@@ -48,6 +76,7 @@ pub fn validate_baseline(
     Ok(ValidatedBaseline {
         receipt,
         launch_fingerprint: launch.view().fingerprint.clone(),
+        linux_gio: None,
     })
 }
 
@@ -62,6 +91,7 @@ pub struct CommandProvider {
     failures: Vec<std::io::Error>,
     original: Option<ProviderInvocation>,
     active_owner: Option<String>,
+    observed_receipt: Option<ProviderReceipt>,
 }
 impl CommandProvider {
     pub fn new(name: String, command: theseus_host::process::NativeCommand) -> Result<Self> {
@@ -106,7 +136,72 @@ impl CommandProvider {
             failures: vec![],
             original: None,
             active_owner: None,
+            observed_receipt: None,
         })
+    }
+    fn require_owned_receipt(&self, receipt: &ProviderReceipt) -> Result<()> {
+        ensure!(
+            self.settled() && self.observed_receipt.as_ref() == Some(receipt),
+            "qualification requires the original owned provider completion"
+        );
+        Ok(())
+    }
+    /// The qualifier is minted only from bytes captured and joined by this
+    /// original provider command. Generic validate_baseline never mints it.
+    pub fn validate_original_baseline(
+        &self,
+        launch: &LaunchAuthority,
+        invocation: &ProviderInvocation,
+        receipt: ProviderReceipt,
+    ) -> Result<ValidatedBaseline> {
+        let mut baseline = validate_baseline(launch, invocation, receipt)?;
+        if launch.integration_components().is_none() {
+            return Ok(baseline);
+        }
+        let context: theseus_native_protocol::v2::IntegrationRuntimeContext =
+            super::model::decode(baseline.receipt.receipt.as_bytes())?;
+        let Some(reference) = context.linux_gio_qualification.as_ref() else {
+            return Ok(baseline);
+        };
+        self.require_owned_receipt(&baseline.receipt)?;
+        let expected = launch.provider_command()?;
+        let environment_matches = match (&self.command.environment, &expected.environment) {
+            (
+                theseus_host::process::ChildEnvironment::Inherit,
+                theseus_host::process::ChildEnvironment::Inherit,
+            ) => true,
+            (
+                theseus_host::process::ChildEnvironment::Replace(a),
+                theseus_host::process::ChildEnvironment::Replace(b),
+            ) => a == b,
+            _ => false,
+        };
+        ensure!(
+            self.name == launch.provider_name()
+                && self.command.program == expected.program
+                && self.command.args == expected.args
+                && self.command.cwd == expected.cwd
+                && environment_matches,
+            "qualification provider differs from pinned original command"
+        );
+        context.validate()?;
+        reference.validate()?;
+        ensure!(
+            reference.prepare_invocation_id == invocation.invocation_id
+                && reference.prepare_invocation_digest == invocation.digest()?
+                && context.ownership_id == invocation.ownership_id
+                && context.binding == baseline.receipt.binding
+                && context.manifest_digest == baseline.receipt.manifest_digest
+                && context.workspace_marker == baseline.receipt.workspace_marker
+                && context.provider_epoch == baseline.receipt.reset_epoch,
+            "qualification reference differs from original Prepare identity"
+        );
+        baseline.linux_gio = Some(ValidatedLinuxGioPrepare {
+            reference: reference.clone(),
+            context_digest: context.digest()?,
+            ownership_id: context.ownership_id,
+        });
+        Ok(baseline)
     }
     /// Retained owners/errors are accessible after any partial failure.
     pub fn spawn_failure(&self) -> Option<&theseus_host::process::SpawnFailure> {
@@ -266,6 +361,7 @@ impl CommandProvider {
             &serde_json::to_string(invocation)?,
         ]);
         self.original = Some(invocation.clone());
+        self.observed_receipt = None;
         let (stdout, _) = self.capture_command(command)?;
         if query && std::str::from_utf8(&stdout)?.trim() == "null" {
             return Ok(None);
@@ -278,6 +374,7 @@ impl CommandProvider {
                 && receipt.invocation_digest == invocation.digest()?,
             "provider response identity mismatch"
         );
+        self.observed_receipt = Some(receipt.clone());
         Ok(Some(receipt))
     }
 }
@@ -357,5 +454,45 @@ mod tests {
             provider.spawn_failure.as_ref().unwrap().error.kind() == std::io::ErrorKind::NotFound
         );
         assert!(provider.settled());
+    }
+}
+
+#[cfg(test)]
+mod qualification_origin_tests {
+    use super::*;
+    use theseus_host::process::NativeCommand;
+    fn receipt() -> ProviderReceipt {
+        ProviderReceipt {
+            provider: "qualified-provider".into(),
+            invocation_id: "original-prepare".into(),
+            invocation_digest: "11".repeat(32),
+            binding: "22".repeat(32),
+            manifest_digest: "33".repeat(32),
+            workspace_marker: "44".repeat(32),
+            reset_epoch: "55".repeat(32),
+            receipt: "context".into(),
+        }
+    }
+    #[test]
+    fn qualified_origin_requires_the_actual_owned_provider_completion() {
+        let mut command = NativeCommand::new(if cfg!(windows) {
+            "C:/fixture/provider.exe"
+        } else {
+            "/fixture/provider"
+        });
+        command.environment = theseus_host::process::ChildEnvironment::Replace(vec![]);
+        let mut provider = CommandProvider::new("qualified-provider".into(), command).unwrap();
+        let receipt = receipt();
+        assert!(provider.require_owned_receipt(&receipt).is_err());
+        provider.observed_receipt = Some(receipt.clone());
+        assert!(provider.require_owned_receipt(&receipt).is_ok());
+        let mut forged = receipt.clone();
+        forged.invocation_id = "other-prepare".into();
+        assert!(provider.require_owned_receipt(&forged).is_err());
+        forged = receipt.clone();
+        forged.receipt = "forged-context".into();
+        assert!(provider.require_owned_receipt(&forged).is_err());
+        provider.observed_receipt = None;
+        assert!(provider.require_owned_receipt(&receipt).is_err());
     }
 }

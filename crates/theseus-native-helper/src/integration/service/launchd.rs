@@ -17,7 +17,7 @@ impl ServiceRuntime {
                 qualification: q,
                 allowed_actions,
                 ..
-            } = &self.config.manifest.service_authority
+            } = self.config.authority()
             else {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -52,7 +52,12 @@ impl ServiceRuntime {
                         launchctl_fingerprint: q.launchctl_fingerprint.clone(),
                     },
                     ownership_id: self.config.context.ownership_id.clone(),
-                    context_receipt: self.config.context.namespace_receipt.clone(),
+                    context_receipt: self
+                        .config
+                        .context
+                        .namespace_receipt
+                        .clone()
+                        .expect("validated service context"),
                     allowed_start: allowed_actions.iter().any(|a| a == "start"),
                     allowed_stop: allowed_actions.iter().any(|a| a == "stop"),
                 },
@@ -70,7 +75,7 @@ impl ServiceRuntime {
         cancel: &AtomicBool,
     ) -> io::Result<v2::ServiceObservation> {
         use sha2::{Digest as _, Sha256};
-        if slot != self.config.manifest.service_authority.slot() {
+        if slot != self.config.authority().slot() {
             return Err(io::Error::other("undeclared service slot"));
         }
         if self.inspection_evidence.len() >= 64 {
@@ -78,7 +83,41 @@ impl ServiceRuntime {
                 "bounded original launchd inspection evidence capacity exhausted",
             ));
         }
+        self.ensure_readiness_channel()?;
+        let expected_transition = self
+            .sut_transition
+            .as_ref()
+            .filter(|(program, _)| program != "uninstall")
+            .map(|(program, _)| self.transition_definition(program))
+            .transpose()?;
         self.manager(deadline, cancel)?;
+        if self.owner.is_some()
+            && let Some((program, receipt)) = self.sut_transition.clone()
+            && program != "uninstall"
+        {
+            let expected = self.transition_definition(&program)?;
+            let observed = self.manager.as_mut().unwrap().inspect(deadline, cancel)?;
+            let bytes = observed
+                .definition_bytes
+                .as_deref()
+                .ok_or_else(|| io::Error::other("SUT plist missing"))?;
+            if format!("{:x}", Sha256::digest(bytes)) != expected.definition_sha256 {
+                self.uncertain = true;
+                self.manager.as_mut().unwrap().revoke_context();
+                return Err(io::Error::other(
+                    "SUT replacement differs from admitted plist",
+                ));
+            }
+            self.manager.as_mut().unwrap().admit_configuration(
+                self.owner.as_mut().unwrap(),
+                &raw_definition(&expected),
+                bytes,
+                receipt,
+                deadline,
+                cancel,
+            )?;
+            self.sut_transition = None;
+        }
         let manager = self.manager.as_mut().unwrap();
         let observed = if let Some(owner) = self.owner.as_mut() {
             let uninstall_receipt = self
@@ -123,14 +162,43 @@ impl ServiceRuntime {
             host::Fact::Known(l) => Some(l),
             _ => None,
         };
-        let definition = loaded
-            .and_then(|l| {
-                self.config.manifest.definitions.iter().find(|d| {
-                    Some(&d.definition_sha256) == digest.as_ref()
-                        && l.definition == raw_definition(d)
-                })
-            })
-            .cloned();
+        // launchd can have byte-identical admitted definitions for different
+        // reader roles. Preserve the accepted SUT key instead of inferring the
+        // role from the first equal digest in the manifest.
+        let definition = loaded.and_then(|loaded| {
+            select_exact_definition(
+                expected_transition
+                    .as_ref()
+                    .or(self.observed_definition.as_ref()),
+                &self.config.manifest.definitions,
+                |definition| {
+                    Some(&definition.definition_sha256) == digest.as_ref()
+                        && loaded.definition == raw_definition(definition)
+                },
+            )
+        });
+        if self.owner.is_none()
+            && let (Some(d), Some(receipt)) = (&definition, &self.install_receipt)
+        {
+            self.owner = Some(self.manager.as_mut().unwrap().qualify_registration(
+                &raw_definition(d),
+                receipt.clone(),
+                deadline,
+                cancel,
+            )?);
+            if format!(
+                "{:x}",
+                Sha256::digest(self.owner.as_ref().unwrap().definition_bytes())
+            ) != d.definition_sha256
+            {
+                self.uncertain = true;
+                self.manager.as_mut().unwrap().revoke_context();
+                return Err(io::Error::other(
+                    "original installed plist differs from manifest",
+                ));
+            }
+            self.sut_transition = None;
+        }
         let mut evidence_hash = Sha256::new();
         evidence_hash.update(b"theseus.launchd.command_evidence\0");
         evidence_hash.update((observed.evidence.stdout.len() as u64).to_be_bytes());
@@ -152,7 +220,15 @@ impl ServiceRuntime {
             command_exit_code: observed.evidence.exit_code,
             output_truncated: observed.evidence.truncated,
         });
-        if self.start_complete
+        if self.activation.from_sut
+            && definition.is_some()
+            && self.owner.as_ref().is_some_and(|o| !o.is_revoked())
+            && !self.uncertain
+        {
+            self.activation.complete =
+                loaded.is_some_and(|l| l.state == host::RuntimeState::Running);
+        }
+        if self.activation.complete
             && definition.is_some()
             && let Some(loaded) = loaded
             && loaded.state == host::RuntimeState::Running
@@ -199,28 +275,20 @@ impl ServiceRuntime {
                 configured: definition.is_some(),
                 running: loaded.is_some_and(|l| l.state == host::RuntimeState::Running),
                 origin: loaded.map(|l| l.origin.clone()),
-                manager_generation: self.config.context.manager_unique_name.clone(),
+                manager_generation: self
+                    .config
+                    .context
+                    .manager_unique_name
+                    .clone()
+                    .expect("validated service context"),
                 complete,
                 binding_digest: String::new(),
             },
             definition,
         )
     }
-    pub(crate) fn action(
-        &mut self,
-        slot: &v2::ResourceSlot,
-        prior: v2::Digest,
-        action: v2::ServiceAction,
-        deadline: Instant,
-        cancel: &AtomicBool,
-    ) -> io::Result<Option<v2::ServiceOutcome>> {
-        if slot != self.config.manifest.service_authority.slot()
-            || self.binding != Some(prior)
-            || self.uncertain
-        {
-            return Err(io::Error::other("service prior authority unproved"));
-        }
-        if action == v2::ServiceAction::Start && self.readiness.is_none() {
+    fn ensure_readiness_channel(&mut self) -> io::Result<()> {
+        if self.readiness.is_none() {
             let config =
                 self.config.manifest.readiness.as_ref().ok_or_else(|| {
                     io::Error::other("native launchd readiness prerequisite missing")
@@ -241,6 +309,22 @@ impl ServiceRuntime {
             self.readiness = Some(theseus_host::services::readiness::LocalChallenge::bind(
                 theseus_host::services::readiness::UnixPath::new(path.clone())?,
             )?);
+        }
+        self.renew_readiness_if_needed()
+    }
+    pub(crate) fn action(
+        &mut self,
+        slot: &v2::ResourceSlot,
+        prior: v2::Digest,
+        action: v2::ServiceAction,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> io::Result<Option<v2::ServiceOutcome>> {
+        if slot != self.config.authority().slot() || self.binding != Some(prior) || self.uncertain {
+            return Err(io::Error::other("service prior authority unproved"));
+        }
+        if action == v2::ServiceAction::Start {
+            self.ensure_readiness_channel()?;
         }
         if self.owner.is_none() {
             let d = self
@@ -289,7 +373,7 @@ impl ServiceRuntime {
                 completion,
                 result,
             } => Some(terminal_outcome(
-                &mut self.start_complete,
+                &mut self.activation.complete,
                 action,
                 completion,
                 job,

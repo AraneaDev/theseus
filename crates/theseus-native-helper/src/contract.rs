@@ -100,6 +100,10 @@ pub(crate) enum LivePhase {
     TerminalCommitPending,
 }
 pub(crate) enum CachePatch {
+    DesktopState {
+        identity: v2::broker::BrokerOperationIdentity,
+        state: v2::broker::BrokerState,
+    },
     Initialized {
         description: v2::Reply,
         lease: Option<(v2::IntentId, v2::LeaseId, v2::LeaseView)>,
@@ -157,6 +161,10 @@ pub(crate) enum WorkerEvent {
     },
 }
 pub(crate) enum WorkerCommand {
+    Desktop {
+        request: v2::Request,
+        ticket: ResponseTicket,
+    },
     ProbeReadiness {
         request: v2::Request,
         ticket: ResponseTicket,

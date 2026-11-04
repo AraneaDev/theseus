@@ -9,3 +9,5 @@ pub const PROFILE: &str = "native_integration_v1";
 pub mod view;
 
 pub mod driver;
+
+pub mod desktop;

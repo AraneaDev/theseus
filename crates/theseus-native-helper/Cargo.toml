@@ -7,7 +7,7 @@ publish = false
 license = "MIT"
 
 [features]
-test-support = []
+test-support = ["theseus-host/desktop-test-support", "theseus-native-protocol/test-support"]
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
@@ -16,6 +16,7 @@ sha2 = "0.10.9"
 theseus-host = { path = "../theseus-host" }
 theseus-native-protocol = { path = "../theseus-native-protocol" }
 theseus-native-helper-store = { path = "../theseus-native-helper-store" }
+theseus-native-client = { path = "../theseus-native-client" }
 
 [dev-dependencies]
 tempfile = "3.27.0"
@@ -28,6 +29,10 @@ path = "src/main.rs"
 name = "theseus-native-helper-fixture"
 path = "src/bin/fixture_main.rs"
 required-features = ["test-support"]
+
+[[bin]]
+name = "theseus-native-desktop-broker"
+path = "src/broker_transport/main.rs"
 
 [[test]]
 name = "fixture_runtime"

@@ -4,6 +4,8 @@ mod definition;
 #[cfg(target_os = "linux")]
 #[path = "native_service_sut.rs"]
 mod sut;
+#[cfg(any(target_os = "linux", windows))]
+use anyhow::Context;
 use anyhow::{Result, ensure};
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -15,9 +17,80 @@ use std::{
 use theseus_host::services::systemd::{SystemdAuthority, SystemdScope, UnixPath};
 use theseus_native_protocol::v2;
 
+/// A replacement deletes only the exact source-owned reader pinned before the
+/// SUT stops its service. Frozen executable modes never need a content-write
+/// grant, and a same-name/same-byte replacement cannot inherit this authority.
+#[cfg(unix)]
+struct PinnedUnixReader {
+    root: theseus_host::fs::HostDir,
+    leaf: std::ffi::OsString,
+    file: std::fs::File,
+    fingerprint: theseus_host::fs::FileFingerprint,
+}
+#[cfg(unix)]
+impl PinnedUnixReader {
+    fn pin(path: &Path, length: u64, digest: &str) -> Result<Self> {
+        use std::io::Read;
+        use theseus_host::fs::{HostDir, LeafOpenResult, RootPolicy, fingerprint};
+        let root = HostDir::open(
+            path.parent()
+                .ok_or_else(|| anyhow::anyhow!("reader parent missing"))?,
+            RootPolicy::AllComponentsNoFollow,
+        )?;
+        let leaf = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("reader leaf missing"))?
+            .to_owned();
+        let mut file = match root.open_leaf_classified(&leaf) {
+            LeafOpenResult::Opened(file) => file,
+            other => anyhow::bail!("original reader unavailable: {other:?}"),
+        };
+        let original = fingerprint(&file)?;
+        ensure!(
+            original.len == length && length <= 64 * 1024 * 1024,
+            "original reader length differs"
+        );
+        let mut hash = Sha256::new();
+        let mut bytes = [0u8; 16384];
+        let mut read = 0u64;
+        loop {
+            let count = file.read(&mut bytes)?;
+            if count == 0 {
+                break;
+            }
+            read += count as u64;
+            ensure!(read <= length, "original reader grew during pinning");
+            hash.update(&bytes[..count]);
+        }
+        ensure!(
+            read == length
+                && format!("{:x}", hash.finalize()) == digest
+                && fingerprint(&file)? == original,
+            "original reader changed during pinning"
+        );
+        Ok(Self {
+            root,
+            leaf,
+            file,
+            fingerprint: original,
+        })
+    }
+    fn remove(self) -> Result<()> {
+        ensure!(
+            theseus_host::fs::fingerprint(&self.file)? == self.fingerprint,
+            "original reader changed while service stopped"
+        );
+        self.root.remove_created_leaf(&self.leaf, &self.file)?;
+        Ok(())
+    }
+}
 #[cfg(target_os = "linux")]
 pub fn run(args: &[String]) -> Result<()> {
     ensure!(args.len() == 5, "expected action/config/base/target/fault");
+    ensure!(
+        !(args[0] == "configure" && args[4] == "configure_fails"),
+        "explicit fixture Configure failure before any mutation"
+    );
     ensure!(
         [
             "none",
@@ -75,7 +148,10 @@ pub fn run(args: &[String]) -> Result<()> {
         definition_root,
         unit,
         ..
-    } = &manifest.service_authority
+    } = manifest
+        .service_authority
+        .as_ref()
+        .context("service authority missing")?
     else {
         anyhow::bail!("systemd fixture authority required")
     };
@@ -93,13 +169,19 @@ pub fn run(args: &[String]) -> Result<()> {
         },
         bus_uid: *expected_peer_uid,
         manager_uid: *expected_manager_uid,
-        manager_unique_name: context.manager_unique_name.clone(),
+        manager_unique_name: context
+            .manager_unique_name
+            .clone()
+            .context("service manager name missing")?,
         manager_version: qualification.version.clone(),
         unit: unit.clone(),
         definition_root: definition_root.into(),
         unit_load_paths: unit_load_roots.clone(),
         ownership_id: context.ownership_id.clone(),
-        context_receipt: context.namespace_receipt.clone(),
+        context_receipt: context
+            .namespace_receipt
+            .clone()
+            .context("service namespace receipt missing")?,
         allowed_start: false,
         allowed_stop: false,
     };
@@ -123,7 +205,9 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut manager = sut::NativeServiceSut::connect(
         sut::SutAuthority {
             manager: authority,
-            whole_private_context_receipt: context.namespace_receipt,
+            whole_private_context_receipt: context
+                .namespace_receipt
+                .context("service namespace receipt missing")?,
         },
         definitions,
         deadline,
@@ -142,10 +226,36 @@ pub fn run(args: &[String]) -> Result<()> {
                         == Some(format!("{:x}", Sha256::digest(&bytes)).as_str()),
                 "fixture source artifact commitment differs"
             );
+            let repeating = reader.try_exists()?;
+            if repeating {
+                ensure!(!base, "base install cannot replace an existing reader");
+                let current = std::fs::read(&reader)?;
+                let digest = format!("{:x}", Sha256::digest(&current));
+                ensure!(
+                    ["base", "target"]
+                        .iter()
+                        .any(|role| config["artifacts"][*role]["sha256"].as_str()
+                            == Some(digest.as_str())),
+                    "foreign reader cannot be adopted"
+                );
+                ensure!(
+                    std::fs::read(workspace.join("data"))? == b"theseus fixture data\n"
+                        && std::fs::read(workspace.join("app"))? == b"theseus fixture app\n",
+                    "original configured app/data required"
+                );
+                let pinned = PinnedUnixReader::pin(&reader, current.len() as u64, &digest)?;
+                manager.stop_for_transition(deadline, &cancel)?;
+                pinned.remove()?;
+            }
             std::fs::copy(source, &reader)?;
-            std::fs::write(workspace.join("app"), b"theseus fixture app\n")?;
-            if args[4] != "missing_service" {
-                manager.install(&format!("{role}-{role}"), deadline, &cancel)?;
+            if repeating {
+                manager.configure("configured-target", deadline, &cancel)?;
+                manager.start_after_transition(deadline, &cancel)?;
+            } else {
+                std::fs::write(workspace.join("app"), b"theseus fixture app\n")?;
+                if args[4] != "missing_service" {
+                    manager.install(&format!("{role}-{role}"), deadline, &cancel)?;
+                }
             }
         }
         "configure" => {
@@ -163,6 +273,9 @@ pub fn run(args: &[String]) -> Result<()> {
             }
         }
         "uninstall" => {
+            if args[4] == "leaked_service" {
+                return Ok(());
+            }
             if args[4] != "leaked_service" {
                 manager.uninstall(deadline, &cancel)?;
             }
@@ -179,16 +292,24 @@ pub fn run(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-#[path = "native_service_launchd_sut.rs"]
-mod platform_sut;
+#[cfg(any(target_os = "macos", windows))]
+#[path = "native_service_owner_bridge.rs"]
+mod owner_bridge;
 #[cfg(windows)]
 #[path = "native_service_scm_sut.rs"]
+#[allow(dead_code)]
 mod platform_sut;
 
 #[cfg(any(target_os = "macos", windows))]
 pub fn run(args: &[String]) -> Result<()> {
-    ensure!(args.len() == 5, "expected action/config/base/target/fault");
+    ensure!(
+        args.len() == 6,
+        "expected action/config/base/target/fault/original-operator-root"
+    );
+    ensure!(
+        !(args[0] == "configure" && args[4] == "configure_fails"),
+        "explicit fixture Configure failure before any mutation"
+    );
     ensure!(
         ["install_base", "install_target", "configure", "uninstall"].contains(&args[0].as_str()),
         "unknown fixture SUT action"
@@ -283,7 +404,12 @@ pub fn run(args: &[String]) -> Result<()> {
         }
         #[cfg(windows)]
         {
-            let v2::ServiceAuthority::Scm { preflight, .. } = &manifest.service_authority else {
+            let v2::ServiceAuthority::Scm { preflight, .. } =
+                manifest
+                    .service_authority
+                    .as_ref()
+                    .context("service authority missing")?
+            else {
                 anyhow::bail!("SCM fixture authority required")
             };
             ensure!(
@@ -297,12 +423,9 @@ pub fn run(args: &[String]) -> Result<()> {
     }
     let cancel = AtomicBool::new(false);
     let deadline = Instant::now() + Duration::from_secs(30);
-    #[cfg(target_os = "macos")]
-    let mut manager =
-        platform_sut::NativeServiceSut::connect(&manifest, &context, deadline, &cancel)?;
-    #[cfg(windows)]
-    let mut manager =
-        platform_sut::NativeServiceSut::connect(&manifest, &context, &args[4], deadline, &cancel)?;
+    // The catalog request reaches the fixture's ORIGINAL creator owner. Each
+    // installer process exits without losing or reconstructing that authority.
+    let mut manager = owner_bridge::Client::connect(Path::new(&args[5]), &context)?;
     let choose = |role: &str, artifact: &str| -> Result<&v2::ServiceDefinition> {
         manifest
             .definitions
@@ -323,16 +446,43 @@ pub fn run(args: &[String]) -> Result<()> {
                         == Some(format!("{:x}", Sha256::digest(&bytes)).as_str()),
                 "fixture source artifact commitment differs"
             );
-            // Clean's pre-proved private namespace must be empty; never replace a
-            // foreign installed reader as an installer cleanup shortcut.
-            ensure!(
-                !reader.try_exists()?,
-                "preexisting fixture reader cannot be adopted"
-            );
+            let repeating = reader.try_exists()?;
+            if repeating {
+                ensure!(!base, "base install cannot replace existing reader");
+                let original = std::fs::read(&reader)?;
+                let digest = format!("{:x}", Sha256::digest(&original));
+                ensure!(
+                    ["base", "target"]
+                        .iter()
+                        .any(|role| config["artifacts"][*role]["sha256"].as_str()
+                            == Some(digest.as_str())),
+                    "foreign reader cannot be adopted"
+                );
+                ensure!(
+                    std::fs::read(&data)? == b"theseus fixture data\n"
+                        && std::fs::read(workspace.join("app"))? == b"theseus fixture app\n",
+                    "original configured app/data required"
+                );
+                #[cfg(unix)]
+                let pinned = PinnedUnixReader::pin(&reader, original.len() as u64, &digest)?;
+                #[cfg(windows)]
+                let pinned =
+                    platform_sut::PinnedReader::pin(&reader, original.len() as u64, &digest)?;
+                manager.stop_for_transition(deadline, &cancel)?;
+                #[cfg(unix)]
+                pinned.remove()?;
+                #[cfg(windows)]
+                pinned.remove()?;
+            }
             std::fs::copy(source, &reader)?;
-            std::fs::write(workspace.join("app"), b"theseus fixture app\n")?;
-            if args[4] != "missing_service" {
-                manager.install(choose(role, role)?, deadline, &cancel)?;
+            if repeating {
+                manager.configure(choose("configured", "target")?, deadline, &cancel)?;
+                manager.start_after_transition(deadline, &cancel)?;
+            } else {
+                std::fs::write(workspace.join("app"), b"theseus fixture app\n")?;
+                if args[4] != "missing_service" {
+                    manager.install(choose(role, role)?, deadline, &cancel)?;
+                }
             }
         }
         "configure" => {
@@ -350,6 +500,9 @@ pub fn run(args: &[String]) -> Result<()> {
             }
         }
         "uninstall" => {
+            if args[4] == "leaked_service" {
+                return Ok(());
+            }
             if args[4] != "leaked_service" {
                 manager.uninstall(deadline, &cancel)?;
                 #[cfg(windows)]
@@ -390,4 +543,49 @@ pub fn run(args: &[String]) -> Result<()> {
         _ => unreachable!("validated fixture action"),
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod pinned_reader_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn frozen_reader_replacement_needs_no_content_write_and_preserves_data() {
+        let root = tempfile::tempdir().unwrap();
+        let reader = root.path().join("reader");
+        let source = root.path().join("target");
+        let data = root.path().join("data");
+        std::fs::write(&reader, b"base").unwrap();
+        std::fs::write(&source, b"target").unwrap();
+        std::fs::write(&data, b"original-configured-data").unwrap();
+        for path in [&reader, &source] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        let pinned =
+            PinnedUnixReader::pin(&reader, 4, &format!("{:x}", Sha256::digest(b"base"))).unwrap();
+        pinned.remove().unwrap();
+        std::fs::copy(&source, &reader).unwrap();
+        assert_eq!(std::fs::read(&reader).unwrap(), b"target");
+        assert_eq!(
+            std::fs::metadata(&reader).unwrap().permissions().mode() & 0o777,
+            0o500
+        );
+        assert_eq!(std::fs::read(&data).unwrap(), b"original-configured-data");
+    }
+    #[test]
+    fn pinned_reader_refuses_same_byte_foreign_replacement_after_stop() {
+        let root = tempfile::tempdir().unwrap();
+        let reader = root.path().join("reader");
+        std::fs::write(&reader, b"base").unwrap();
+        let pinned =
+            PinnedUnixReader::pin(&reader, 4, &format!("{:x}", Sha256::digest(b"base"))).unwrap();
+        std::fs::rename(&reader, root.path().join("original-owned-reader")).unwrap();
+        std::fs::write(&reader, b"base").unwrap();
+        assert!(pinned.remove().is_err());
+        assert_eq!(std::fs::read(&reader).unwrap(), b"base");
+        assert_eq!(
+            std::fs::read(root.path().join("original-owned-reader")).unwrap(),
+            b"base"
+        );
+    }
 }

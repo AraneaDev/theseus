@@ -120,7 +120,8 @@ impl LocalChallenge {
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> io::Result<ReadinessObservation> {
-        self.probe_inner(challenge, expectation, peer, None, deadline, cancel)
+        self.probe_inner(challenge, expectation, peer, None, deadline, cancel, false)
+            .and_then(completed_probe)
     }
     /// Adds a kernel peer PID check from the caller's original accepted Start.
     /// The PID is never opened, signalled, or used to reconstruct an owner.
@@ -143,8 +144,35 @@ impl LocalChallenge {
             Some(original_pid),
             deadline,
             cancel,
+            false,
+        )
+        .and_then(completed_probe)
+    }
+    /// One bounded nonblocking advance; None is a scheduling yield, never a
+    /// timeout. The caller must preserve this original semantic deadline.
+    pub fn poll_original(
+        &mut self,
+        challenge: &ReadinessChallenge,
+        expectation: &ReadinessExpectation,
+        peer: &PeerExpectation,
+        original_pid: u32,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> io::Result<Option<ReadinessObservation>> {
+        if original_pid == 0 {
+            return Err(invalid("missing original Start peer PID"));
+        }
+        self.probe_inner(
+            challenge,
+            expectation,
+            peer,
+            Some(original_pid),
+            deadline,
+            cancel,
+            true,
         )
     }
+    #[allow(clippy::too_many_arguments)]
     fn probe_inner(
         &mut self,
         challenge: &ReadinessChallenge,
@@ -153,7 +181,8 @@ impl LocalChallenge {
         original_pid: Option<u32>,
         deadline: Instant,
         cancel: &AtomicBool,
-    ) -> io::Result<ReadinessObservation> {
+        poll_only: bool,
+    ) -> io::Result<Option<ReadinessObservation>> {
         #[cfg(target_os = "macos")]
         if original_pid.is_none() {
             return Err(invalid(
@@ -182,7 +211,9 @@ impl LocalChallenge {
                 return Err(invalid("pending original probe context cannot be replaced"));
             }
             if active.terminal {
-                return Ok(active.last.clone().expect("terminal observation retained"));
+                return Ok(Some(
+                    active.last.clone().expect("terminal observation retained"),
+                ));
             }
         } else {
             let body = encode_challenge(challenge)?;
@@ -208,42 +239,45 @@ impl LocalChallenge {
         }
         loop {
             if let Some(failure) = deadline_failure(deadline, cancel)? {
-                return Ok(self.observe(
+                return Ok(Some(self.observe(
                     ReadinessState::Incomplete,
                     Some(failure),
                     None,
                     false,
-                    false,
-                ));
+                    poll_only,
+                )));
             }
             self.revalidate()?;
-            match self.advance() {
+            match self.advance(poll_only) {
                 Ok(Some(observation)) => {
                     self.revalidate()?;
                     if let Some(failure) = deadline_failure(deadline, cancel)? {
-                        return Ok(self.observe(
+                        return Ok(Some(self.observe(
                             ReadinessState::Incomplete,
                             Some(failure),
                             observation.response,
                             false,
                             true,
-                        ));
+                        )));
                     }
-                    return Ok(observation);
+                    return Ok(Some(observation));
                 }
                 Ok(None) => {}
                 Err(error) => {
                     if self.retained_errors.len() < 16 {
                         self.retained_errors.push(error);
                     }
-                    return Ok(self.observe(
+                    return Ok(Some(self.observe(
                         ReadinessState::Incomplete,
                         Some(ReadinessFailure::PeerClosed),
                         None,
                         false,
                         true,
-                    ));
+                    )));
                 }
+            }
+            if poll_only {
+                return Ok(None);
             }
             let active = self.active.as_ref().expect("original probe retained");
             let (fd, events) = match &active.stream {
@@ -272,13 +306,13 @@ impl LocalChallenge {
                     if self.retained_errors.len() < 16 {
                         self.retained_errors.push(error);
                     }
-                    return Ok(self.observe(
+                    return Ok(Some(self.observe(
                         ReadinessState::Incomplete,
                         Some(ReadinessFailure::PeerClosed),
                         None,
                         false,
                         true,
-                    ));
+                    )));
                 }
             }
         }
@@ -308,7 +342,7 @@ impl LocalChallenge {
         }
         observation
     }
-    fn advance(&mut self) -> io::Result<Option<ReadinessObservation>> {
+    fn advance(&mut self, poll_only: bool) -> io::Result<Option<ReadinessObservation>> {
         let active = self.active.as_mut().expect("original probe retained");
         if active.stream.is_none() {
             let (stream, _) = match self.listener.accept() {
@@ -348,7 +382,12 @@ impl LocalChallenge {
                 }
                 Ok(n) => active.written += n,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    if poll_only {
+                        return Ok(None);
+                    }
+                    continue;
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -365,7 +404,12 @@ impl LocalChallenge {
                 }
                 Ok(n) => active.prefix_read += n,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    if poll_only {
+                        return Ok(None);
+                    }
+                    continue;
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -395,7 +439,12 @@ impl LocalChallenge {
                 }
                 Ok(n) => active.body_read += n,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    if poll_only {
+                        return Ok(None);
+                    }
+                    continue;
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -436,6 +485,37 @@ impl LocalChallenge {
             authenticated_instance,
             true,
         )))
+    }
+    /// Close an idle completed activation's queued peers only after the caller
+    /// has accepted the original SUT transition. Never replace a pending nonce,
+    /// revive revoked authority, or unlink a foreign socket/root.
+    pub fn renew_after_sut_transition(&mut self) -> io::Result<()> {
+        if self.revoked || self.removed || self.active.is_some() {
+            return Err(invalid(
+                "original readiness probe must retire before SUT transition renewal",
+            ));
+        }
+        self.revalidate()?;
+        self.cleanup()?;
+        let mut replacement = match Self::bind(self.endpoint.clone()) {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                self.revoked = true;
+                return Err(error);
+            }
+        };
+        if !self.root.same_object(&replacement.root)? {
+            self.revoked = true;
+            return Err(invalid(
+                "original readiness root changed during SUT transition renewal",
+            ));
+        }
+        replacement.retained_errors = std::mem::take(&mut self.retained_errors);
+        // The old owner is marked removed, so its Drop cannot unlink the new
+        // owned endpoint. Dropping its listener closes all queued old peers.
+        let previous = std::mem::replace(self, replacement);
+        drop(previous);
+        Ok(())
     }
     pub fn pending_observation(&self) -> Option<&ReadinessObservation> {
         self.active.as_ref().and_then(|active| active.last.as_ref())
@@ -647,6 +727,211 @@ mod socket_tests {
             UnixPath::new(dir.path().join("ready.sock").to_str().unwrap().into()).unwrap();
         let channel = LocalChallenge::bind(endpoint.clone()).unwrap();
         (dir, endpoint, channel)
+    }
+
+    #[test]
+    fn poll_partial_response_after_scheduler_yield_completes_before_original_deadline() {
+        let (_dir, endpoint, mut channel) = fixture();
+        let (partial_tx, partial_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let app = std::thread::spawn(move || {
+            let mut stream = UnixStream::connect(endpoint.as_str()).unwrap();
+            let mut prefix = [0; 4];
+            stream.read_exact(&mut prefix).unwrap();
+            let mut request = vec![0; u32::from_be_bytes(prefix) as usize];
+            stream.read_exact(&mut request).unwrap();
+            let body = encode_response(&response()).unwrap();
+            stream
+                .write_all(&(body.len() as u32).to_be_bytes())
+                .unwrap();
+            stream.write_all(&body[..15]).unwrap();
+            partial_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            stream.write_all(&body[15..]).unwrap();
+        });
+        let original = Instant::now() + Duration::from_secs(5);
+        let cancel = AtomicBool::new(false);
+        loop {
+            assert!(
+                channel
+                    .poll_original(
+                        &challenge(),
+                        &expectation(),
+                        &peer(),
+                        std::process::id(),
+                        original,
+                        &cancel
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+            if partial_rx.try_recv().is_ok() {
+                break;
+            }
+            assert!(Instant::now() < original);
+            std::thread::yield_now();
+        }
+        let expired_slice = Instant::now() + Duration::from_millis(2);
+        while Instant::now() < expired_slice {
+            std::thread::yield_now();
+        }
+        assert!(
+            channel
+                .poll_original(
+                    &challenge(),
+                    &expectation(),
+                    &peer(),
+                    std::process::id(),
+                    original,
+                    &cancel
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(channel.active.as_ref().unwrap().body_read > 0);
+        assert!(!channel.active.as_ref().unwrap().terminal);
+        release_tx.send(()).unwrap();
+        let ready = loop {
+            if let Some(observed) = channel
+                .poll_original(
+                    &challenge(),
+                    &expectation(),
+                    &peer(),
+                    std::process::id(),
+                    original,
+                    &cancel,
+                )
+                .unwrap()
+            {
+                break observed;
+            }
+            assert!(Instant::now() < original);
+            std::thread::yield_now();
+        };
+        app.join().unwrap();
+        assert_eq!(ready.state, ReadinessState::Ready);
+        assert!(ready.authenticated_instance);
+        assert_eq!(ready.response, Some(response()));
+        assert_eq!(
+            channel
+                .poll_original(
+                    &challenge(),
+                    &expectation(),
+                    &peer(),
+                    std::process::id(),
+                    original,
+                    &cancel
+                )
+                .unwrap(),
+            Some(ready)
+        );
+        channel.cleanup().unwrap();
+    }
+    #[test]
+    fn poll_true_expiry_and_cancel_stay_terminal_without_resurrecting_nonce() {
+        for cancelled in [false, true] {
+            let (_dir, _endpoint, mut channel) = fixture();
+            let cancel = AtomicBool::new(cancelled);
+            let expired = Instant::now() - Duration::from_millis(1);
+            let observed = channel
+                .poll_original(
+                    &challenge(),
+                    &expectation(),
+                    &peer(),
+                    std::process::id(),
+                    expired,
+                    &cancel,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(observed.state, ReadinessState::Incomplete);
+            assert_eq!(
+                observed.failure,
+                Some(if cancelled {
+                    ReadinessFailure::Cancelled
+                } else {
+                    ReadinessFailure::Deadline
+                })
+            );
+            let later = Instant::now() + Duration::from_secs(5);
+            assert_eq!(
+                channel
+                    .poll_original(
+                        &challenge(),
+                        &expectation(),
+                        &peer(),
+                        std::process::id(),
+                        later,
+                        &AtomicBool::new(false)
+                    )
+                    .unwrap(),
+                Some(observed)
+            );
+            let mut different = challenge();
+            different.nonce = [99; 16];
+            assert!(
+                channel
+                    .poll_original(
+                        &different,
+                        &expectation(),
+                        &peer(),
+                        std::process::id(),
+                        later,
+                        &AtomicBool::new(false)
+                    )
+                    .is_err()
+            );
+            channel.cleanup().unwrap();
+        }
+    }
+    #[test]
+    fn sut_transition_renews_idle_listener_before_queued_old_peer_can_close_new_challenge() {
+        let (_dir, endpoint, mut channel) = fixture();
+        let old = UnixStream::connect(endpoint.as_str()).unwrap();
+        drop(old); // Actual old activation connection queued before it stopped.
+        channel.renew_after_sut_transition().unwrap();
+        let app = application(endpoint, response());
+        let observed = channel
+            .probe_fixture(
+                &challenge(),
+                &expectation(),
+                &peer(),
+                Instant::now() + Duration::from_secs(2),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(observed.state, ReadinessState::Ready);
+        assert!(observed.failure.is_none());
+        assert!(observed.authenticated_instance);
+        channel.take_terminal_probe().unwrap();
+        app.join().unwrap();
+    }
+    #[test]
+    fn sut_transition_cannot_replace_pending_nonce_or_foreign_socket() {
+        let (_dir, _endpoint, mut pending) = fixture();
+        let observed = pending
+            .probe_fixture(
+                &challenge(),
+                &expectation(),
+                &peer(),
+                Instant::now() + Duration::from_millis(10),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(observed.state, ReadinessState::Incomplete);
+        assert!(pending.renew_after_sut_transition().is_err());
+        assert_eq!(pending.active.as_ref().unwrap().challenge, challenge());
+        assert_eq!(pending.pending_observation().unwrap(), &observed);
+        let (dir, endpoint, mut channel) = fixture();
+        std::fs::rename(endpoint.as_str(), dir.path().join("owned-old.sock")).unwrap();
+        let foreign = UnixListener::bind(endpoint.as_str()).unwrap();
+        assert!(channel.renew_after_sut_transition().is_err());
+        assert!(channel.is_revoked());
+        assert!(
+            Path::new(endpoint.as_str()).exists(),
+            "foreign endpoint remains untouched"
+        );
+        drop(foreign);
     }
     fn application(endpoint: UnixPath, response: ReadinessResponse) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {

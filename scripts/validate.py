@@ -24,7 +24,7 @@ DOCKER_SUITES = ('docker_lifecycle', 'interruption_lifecycle', 'downgrade_lifecy
                  'comparison_docker', 'mcp_docker', 'mcp_server_docker')
 CASE_INVENTORY = json.loads((ROOT / 'scripts/validation_cases.json').read_text(encoding='utf-8'))
 NATIVE_STAGES = ('fixture', 'stdio', 'fmt', 'clippy', 'portable', 'features',
-                 'precompile', 'early-controls', 'early-cli', 'runtime', 'release')
+                 'precompile', 'early-controls', 'early-cli', 'runtime', 'integration', 'release')
 
 
 class GateFailure(RuntimeError):
@@ -99,6 +99,95 @@ CATALOG_ARTIFACTS = {
 }
 
 
+INTEGRATION_ARTIFACTS = {
+    'native_service_fixture': ('theseus-native-service-fixture', 'THESEUS_NATIVE_SERVICE_FIXTURE'),
+    'native_service_base': ('theseus-native-service-base', 'THESEUS_NATIVE_SERVICE_BASE'),
+    'native_service_target': ('theseus-native-service-target', 'THESEUS_NATIVE_SERVICE_TARGET'),
+    'native_integration_controller': ('theseus-native-integration-controller', 'THESEUS_NATIVE_INTEGRATION_CONTROLLER'),
+}
+
+
+INTEGRATION_TEST_ARTIFACTS = ('native_services', 'native_service_mcp', 'native_services_platforms', 'native_desktop')
+
+
+def verify_integration_tests(metadata):
+    graph = metadata.get('native_integration_test_graph')
+    if not isinstance(graph, list) or any(not isinstance(item, dict) for item in graph):
+        raise GateFailure('Missing independent integration test graph')
+    paths = set()
+    for target in INTEGRATION_TEST_ARTIFACTS:
+        pin = metadata.get(target)
+        if not isinstance(pin, dict):
+            raise GateFailure(f'{target}: missing pinned test')
+        artifact = pin.get('cargo_artifact')
+        matches = [item for item in graph if item.get('target', {}).get('name') == target
+                   and item.get('target', {}).get('kind') == ['test'] and item.get('executable')]
+        if len(matches) != 1 or artifact != matches[0] or 'native-integration-test-support' not in artifact.get('features', []):
+            raise GateFailure(f'{target}: test graph substitution or feature mismatch')
+        path = pathlib.Path(pin.get('path', ''))
+        if not path.is_file() or path.is_symlink() or (os.name != 'nt' and not os.access(path, os.X_OK)) or sha256(path) != pin.get('sha256'):
+            raise GateFailure(f'{target}: changed pinned integration test')
+        canonical = os.path.normcase(str(path.resolve()))
+        if canonical in paths:
+            raise GateFailure('Integration tests must have distinct copied paths')
+        paths.add(canonical)
+    for item in graph:
+        if item.get('target', {}).get('name') in {'theseus_native_helper', 'theseus_native_client'} and 'test-support' in item.get('features', []):
+            raise GateFailure('Integration test graph contains helper/client fault support')
+
+
+def manager_manifest(metadata, target, system):
+    suffix = {'Linux': '-unknown-linux-gnu', 'Darwin': '-apple-darwin', 'Windows': '-pc-windows-msvc'}.get(system)
+    if not suffix or not target.endswith(suffix) or metadata.get('dirty') is not False or not re.fullmatch(r'[a-f0-9]{40}|[a-f0-9]{64}', metadata.get('source_sha', '')):
+        raise GateFailure('Manager CI requires clean exact source and native target')
+    source = metadata['source_sha']
+    roles = {'THESEUS_NATIVE_HELPER_BINARY': 'helper_production'}
+    roles.update({variable: key for key, (_, variable) in INTEGRATION_ARTIFACTS.items()})
+    if system == 'Linux':
+        roles.update(native_services='native_services', native_service_mcp='native_service_mcp', native_desktop='native_desktop')
+        roles.update(THESEUS_NATIVE_DESKTOP_HELPER_BINARY='helper_fixture',
+                     THESEUS_NATIVE_DESKTOP_BROKER_BINARY='desktop_broker_fixture')
+        cases = [('native_services', name) for name in (
+            'systemd_user_clean_installer_managed_service_uses_shared_product_path',
+            'systemd_installer_missing_service_is_failed_without_harness_repair',
+            'systemd_uninstaller_leaves_service_is_failed_before_and_after_provider_disposal',
+            'systemd_preexisting_or_wrong_owned_unit_is_untouched')]
+        cases.append(('native_service_mcp', 'systemd_supplied_cli_and_fresh_mcp_normalized_frontend_parity'))
+        cases += [('native_desktop', name) for name in (
+            'source_combined_service_desktop_share_one_sequence_provider_and_lease',
+            'source_combined_ordinary_fresh_six_tool_mcp_keeps_one_shared_lease_and_saved_views')]
+    else:
+        roles['native_services_platforms'] = 'native_services_platforms'
+        names = [
+            'native::native_upgrade_sut_transitions_from_running_and_preserves_data',
+            'native::native_reinstall_compares_original_definition_reader_and_data',
+            'native::native_installer_missing_and_leaked_registration_never_passes',
+            'native::native_running_wrong_version_data_or_nonce_never_passes_readiness',
+        ]
+        names += ([
+            'native::scm_own_process_clean_observes_config_status_readiness_and_delete_pending',
+            'owners::scm_delete_success_remains_pending_until_original_handles_close_and_name_is_absent',
+            'owners::scm_native_pipe_rejects_actual_helper_sid_before_challenge',
+        ] if system == 'Windows' else [
+            'native::launchd_user_clean_keeps_loaded_configuration_runtime_and_readiness_distinct',
+            'owners::launchd_wrong_domain_and_replaced_plist_never_authorize_stop_or_bootout',
+            'launchd_running_wrong_native_peer_never_passes_readiness',
+        ])
+        cases = [('native_services_platforms', name) for name in names]
+    artifacts = {}
+    for role, key in roles.items():
+        pin = metadata.get(key)
+        if not isinstance(pin, dict) or not isinstance(pin.get('path'), str) or not re.fullmatch(r'[a-f0-9]{64}', pin.get('sha256', '')):
+            raise GateFailure(f'{role}: exact pinned manager artifact required')
+        length = pin['length'] if 'length' in pin else pathlib.Path(pin['path']).stat().st_size
+        if type(length) is not int or length <= 0:
+            raise GateFailure(f'{role}: nonempty pinned manager artifact required')
+        artifacts[role] = {'path': pin['path'], 'sha256': pin['sha256'], 'length': length, 'source_sha': source}
+    return {'schema': 1, 'source_sha': source,
+            'build': {'source_sha': source, 'target': target, 'profile': 'debug', 'features': ['native-integration-test-support']},
+            'artifacts': artifacts, 'cases': [{'binary': binary, 'name': name} for binary, name in cases]}
+
+
 def check_catalog_graph(artifacts):
     """Independent catalog graph must never unify host/helper/client fault support."""
     if not isinstance(artifacts, list) or any(
@@ -136,7 +225,7 @@ def check_catalog_graph(artifacts):
 def verify_artifacts(metadata):
     if not isinstance(metadata, dict):
         raise GateFailure('Malformed pinned artifact metadata')
-    for key in ('fixture', 'application', 'production', 'mcp_fixture', 'helper_production', 'helper_fixture', *CATALOG_ARTIFACTS):
+    for key in ('fixture', 'application', 'production', 'mcp_fixture', 'helper_production', 'helper_fixture', 'desktop_broker_production', 'desktop_broker_fixture', *CATALOG_ARTIFACTS, *INTEGRATION_ARTIFACTS):
         item = metadata.get(key, {})
         if not isinstance(item, dict) or not isinstance(item.get('path'), str) or not isinstance(item.get('sha256'), str) or not re.fullmatch(r'[0-9a-f]{64}', item['sha256']):
             raise GateFailure(f'Malformed pinned native artifact: {key}')
@@ -157,6 +246,51 @@ def verify_artifacts(metadata):
         if path in catalog_paths:
             raise GateFailure('Catalog fixture/readers must have distinct pinned paths')
         catalog_paths.append(path)
+
+    graph = metadata.get('native_integration_graph')
+    if not isinstance(graph, list) or any(
+            not isinstance(item, dict) or item.get('reason') != 'compiler-artifact'
+            or not isinstance(item.get('target'), dict)
+            or not isinstance(item['target'].get('name'), str)
+            or not isinstance(item['target'].get('kind'), list)
+            or not isinstance(item.get('features'), list)
+            or any(not isinstance(feature, str) for feature in item['features'])
+            for item in graph):
+        raise GateFailure('Missing or malformed independent native integration graph')
+    integration_paths = []
+    for key, (target, _) in INTEGRATION_ARTIFACTS.items():
+        artifact = metadata[key].get('cargo_artifact')
+        matches = [item for item in graph if isinstance(item, dict)
+                   and item.get('target', {}).get('name') == target
+                   and item.get('target', {}).get('kind') == ['bin']]
+        if len(matches) != 1 or artifact != matches[0] or 'native-integration-test-support' not in artifact.get('features', []):
+            raise GateFailure(f'{key}: pinned executable does not match its integration graph')
+        path = pathlib.Path(metadata[key]['path']).resolve()
+        if path in integration_paths:
+            raise GateFailure('Integration fixture/readers/controller must have distinct pinned paths')
+        integration_paths.append(path)
+    for item in graph:
+        if item.get('target', {}).get('name') in {'theseus_host', 'theseus_native_helper', 'theseus_native_client'} and 'test-support' in item.get('features', []):
+            raise GateFailure('Integration fixture graph contains native fault support')
+
+    for key, fixture_graph in (('desktop_broker_production', False), ('desktop_broker_fixture', True)):
+        graph = metadata.get(key + '_graph')
+        artifact = metadata[key].get('cargo_artifact')
+        if not isinstance(graph, list) or not isinstance(artifact, dict) or artifact not in graph:
+            raise GateFailure(f'{key}: missing exact broker graph/artifact')
+        target = artifact.get('target')
+        features = artifact.get('features')
+        if not isinstance(target, dict) or target.get('name') != 'theseus-native-desktop-broker' or target.get('kind') != ['bin'] or not isinstance(features, list):
+            raise GateFailure(f'{key}: malformed broker artifact')
+        if ('test-support' in features) != fixture_graph:
+            raise GateFailure(f'{key}: broker feature boundary violated')
+        for name, feature in (('theseus_host', 'desktop-test-support'), ('theseus_native_protocol', 'test-support')):
+            matches = [item for item in graph if isinstance(item, dict)
+                       and item.get('target', {}).get('name') == name]
+            if len(matches) != 1 or (feature in matches[0].get('features', [])) != fixture_graph:
+                raise GateFailure(f'{key}: {name} source feature boundary violated')
+    if pathlib.Path(metadata['desktop_broker_production']['path']).samefile(metadata['desktop_broker_fixture']['path']):
+        raise GateFailure('Production and source fixture broker must be separately pinned artifacts')
 
     if pathlib.Path(metadata['helper_production']['path']).samefile(metadata['helper_fixture']['path']):
         raise GateFailure('Normal helper and helper fixture must be separate pinned artifacts')
@@ -296,8 +430,12 @@ def load_pinned(runner):
     runner.env['THESEUS_MCP_FIXTURE'] = metadata['mcp_fixture']['path']
     runner.env['THESEUS_NATIVE_HELPER_BINARY'] = metadata['helper_production']['path']
     runner.env['THESEUS_NATIVE_HELPER_FIXTURE'] = metadata['helper_fixture']['path']
-    for key, (_, variable) in CATALOG_ARTIFACTS.items():
+    runner.env['THESEUS_NATIVE_DESKTOP_HELPER_BINARY'] = metadata['helper_fixture']['path']
+    runner.env['THESEUS_NATIVE_DESKTOP_BROKER_BINARY'] = metadata['desktop_broker_fixture']['path']
+    for key, (_, variable) in (CATALOG_ARTIFACTS | INTEGRATION_ARTIFACTS).items():
         runner.env[variable] = metadata[key]['path']
+    if platform.system() == 'Windows':
+        runner.env['THESEUS_WINDOWS_DESKTOP_FIXTURE_EXE'] = metadata['native_service_base']['path']
     return metadata
 
 
@@ -315,7 +453,11 @@ def fixture(runner):
             output.write(f'THESEUS_MCP_FIXTURE={metadata["mcp_fixture"]["path"]}\n')
             output.write(f'THESEUS_NATIVE_HELPER_BINARY={metadata["helper_production"]["path"]}\n')
             output.write(f'THESEUS_NATIVE_HELPER_FIXTURE={metadata["helper_fixture"]["path"]}\n')
-            for key, (_, variable) in CATALOG_ARTIFACTS.items():
+            output.write(f'THESEUS_NATIVE_DESKTOP_HELPER_BINARY={metadata["helper_fixture"]["path"]}\n')
+            output.write(f'THESEUS_NATIVE_DESKTOP_BROKER_BINARY={metadata["desktop_broker_fixture"]["path"]}\n')
+            if platform.system() == 'Windows':
+                output.write(f'THESEUS_WINDOWS_DESKTOP_FIXTURE_EXE={metadata["native_service_base"]["path"]}\n')
+            for key, (_, variable) in (CATALOG_ARTIFACTS | INTEGRATION_ARTIFACTS).items():
                 output.write(f'{variable}={metadata[key]["path"]}\n')
 
 
@@ -393,7 +535,7 @@ def native(runner, stage):
     if stage == 'fixture':
         fixture(runner)
         return
-    load_pinned(runner)
+    metadata = load_pinned(runner)
     py = sys.executable
     windows = platform.system() == 'Windows'
     if platform.system() == 'Darwin':
@@ -413,6 +555,7 @@ def native(runner, stage):
     elif stage == 'portable':
         runner.run('python-version', [py, '--version'])
         runner.run('portable-guest-bytes', [py, 'tests/support/portable_guest_bytes.py'])
+        runner.run('generated-example-controls', [py, 'tests/support/export_native_examples_test.py'])
         template = runner.root / 'tests/fixtures/recipes/v4_downgrade.toml'
         raw = template.read_bytes()
         (runner.evidence / 'engine-downgrade-template.raw').write_bytes(raw)
@@ -466,6 +609,30 @@ def native(runner, stage):
         runner.cargo('native-consumers', 'test', '--locked', '--test', 'native_consumers', '--', '--nocapture', '--test-threads=1', timeout=180, required_cases=CASE_INVENTORY['native']['consumers-common'] + ([] if windows else CASE_INVENTORY['native']['consumers-unix']))
         metadata = load_pinned(runner)
         write_json(runner.evidence / 'native-artifacts-after.json', metadata)
+    elif stage == 'integration':
+        verify_integration_tests(metadata)
+        current = source_identity(runner.root)
+        if any(metadata.get(key) != value for key, value in current.items()):
+            raise GateFailure('Source changed after integration artifact compilation')
+        grammar = (
+            'native_supplied_receipt_requires_explicit_platform_layout_and_instance',
+            'native_supplied_receipt_preserves_exact_launchd_authority_and_rejects_implicit_inputs',
+            'native_acl_policy_refuses_inherited_extra_or_content_write_executable_grants',
+        )
+        for case in grammar:
+            runner.run('integration-' + case, [metadata['native_services_platforms']['path'], case, '--exact', '--nocapture'], required_cases=[case], require_tests=True)
+        if platform.system() == 'Linux':
+            cases = [
+                'source_desktop_clean_uses_original_broker_child_and_public_cli_saved_views',
+                'source_desktop_missing_and_leaked_entries_fail_exact_sut_postconditions',
+                'source_desktop_fresh_six_tool_mcp_matches_own_saved_desktop_and_tui',
+                'source_desktop_upgrade_keeps_original_base_and_target_generations',
+                'source_desktop_reinstall_same_tuple_requires_new_original_sut_generation',
+                'source_desktop_ordinary_fresh_six_tool_mcp_keeps_exact_generations_and_saved_views',
+            ]
+            runner.run('source-desktop-product', [metadata['native_desktop']['path'], 'source_desktop_', '--nocapture', '--test-threads=1'], timeout=600, required_cases=cases, require_tests=True)
+        manifest = manager_manifest(metadata, runner.host, platform.system())
+        write_json(runner.evidence / 'native-manager-manifest.json', manifest)
     elif stage == 'release':
         runner.cargo('workspace-release', 'build', '--locked', '--workspace', '--release')
     else:
@@ -543,6 +710,7 @@ def main():
         write_json(prior, identity)
         rustc = runner.run('rustc', ['rustc', '-Vv'])
         receipt['compiler_host'] = check_native_host(rustc, platform.system(), args.expected_host)
+        runner.host = receipt['compiler_host']
         if args.mode == 'native':
             if args.stage and args.stage not in NATIVE_STAGES:
                 raise GateFailure('Unknown native stage')

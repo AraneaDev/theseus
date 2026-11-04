@@ -1,4 +1,5 @@
 """Behavioral checks for the shared local/CI validation driver (no Cargo/Docker)."""
+import copy
 import importlib.util
 import io
 import json
@@ -47,6 +48,25 @@ class ValidationTests(unittest.TestCase):
             path.chmod(0o755)
             artifact = next(item for item in graph if item['target']['name'] == target)
             metadata[key] = {'path': str(path), 'sha256': validation.sha256(path), 'cargo_artifact': artifact}
+
+        graph = [{'reason': 'compiler-artifact', 'target': {'name': target, 'kind': ['bin']},
+                  'features': ['native-integration-test-support']}
+                 for target, _ in validation.INTEGRATION_ARTIFACTS.values()]
+        metadata['native_integration_graph'] = graph
+        for key, (target, _) in validation.INTEGRATION_ARTIFACTS.items():
+            path = root / key
+            path.write_bytes(key.encode())
+            path.chmod(0o755)
+            artifact = next(item for item in graph if item['target']['name'] == target)
+            metadata[key] = {'path': str(path), 'sha256': validation.sha256(path), 'cargo_artifact': artifact}
+
+        for key, fixture in (('desktop_broker_production', False), ('desktop_broker_fixture', True)):
+            path = root / key
+            path.write_bytes(key.encode())
+            path.chmod(0o755)
+            artifact = {'reason': 'compiler-artifact', 'target': {'name': 'theseus-native-desktop-broker', 'kind': ['bin']}, 'features': ['test-support'] if fixture else []}
+            metadata[key] = {'path': str(path), 'sha256': validation.sha256(path), 'cargo_artifact': artifact}
+            metadata[key + '_graph'] = [artifact, *[{'target': {'name': name}, 'features': [feature] if fixture else []} for name, feature in [('theseus_host', 'desktop-test-support'), ('theseus_native_protocol', 'test-support')]]]
 
     def test_cp1252_console_preserves_raw_utf8_and_required_case_receipt(self):
         raw = ('running 1 test\ntest required_case ... native \U0001f600\nok\n'
@@ -269,6 +289,73 @@ class ValidationTests(unittest.TestCase):
 
 
 
+    def test_integration_metadata_rejects_missing_changed_aliased_and_fault_graph(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            metadata = {}
+            for key in ('fixture', 'application', 'production', 'mcp_fixture', 'helper_production', 'helper_fixture'):
+                path = root / key
+                path.write_bytes(key.encode())
+                path.chmod(0o755)
+                metadata[key] = {'path': str(path), 'sha256': validation.sha256(path)}
+            self.add_catalog_metadata(root, metadata)
+            validation.verify_artifacts(metadata)
+            for key in validation.INTEGRATION_ARTIFACTS:
+                bad = json.loads(json.dumps(metadata))
+                del bad[key]
+                with self.subTest(missing=key), self.assertRaises(validation.GateFailure):
+                    validation.verify_artifacts(bad)
+            for change in ('graph', 'artifact', 'feature', 'alias', 'fault', 'malformed'):
+                bad = json.loads(json.dumps(metadata))
+                if change == 'graph':
+                    del bad['native_integration_graph']
+                elif change == 'artifact':
+                    bad['native_service_base']['cargo_artifact'] = bad['native_service_target']['cargo_artifact']
+                elif change == 'feature':
+                    bad['native_integration_graph'][0]['features'] = []
+                elif change == 'alias':
+                    for field in ('path', 'sha256'):
+                        bad['native_service_base'][field] = bad['native_service_target'][field]
+                elif change == 'fault':
+                    bad['native_integration_graph'].append({'target': {'name': 'theseus_host'}, 'features': ['test-support']})
+                else:
+                    bad['native_integration_graph'].append(None)
+                with self.subTest(change=change), self.assertRaises(validation.GateFailure):
+                    validation.verify_artifacts(bad)
+            pathlib.Path(metadata['native_service_base']['path']).write_bytes(b'replaced')
+            with self.assertRaises(validation.GateFailure):
+                validation.verify_artifacts(metadata)
+
+    def test_broker_artifact_graphs_keep_production_and_source_features_separate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            metadata = {}
+            for key in ('fixture', 'application', 'production', 'mcp_fixture', 'helper_production', 'helper_fixture'):
+                path = root / key
+                path.write_bytes(key.encode())
+                path.chmod(0o755)
+                metadata[key] = {'path': str(path), 'sha256': validation.sha256(path)}
+            self.add_catalog_metadata(root, metadata)
+            validation.verify_artifacts(metadata)
+            for change in ('missing', 'target', 'source', 'host', 'protocol', 'alias'):
+                bad = json.loads(json.dumps(metadata))
+                if change == 'missing':
+                    del bad['desktop_broker_fixture_graph']
+                elif change == 'target':
+                    bad['desktop_broker_fixture']['cargo_artifact']['target']['name'] = 'theseus-native-helper-fixture'
+                elif change == 'source':
+                    bad['desktop_broker_fixture']['cargo_artifact']['features'] = []
+                    bad['desktop_broker_fixture_graph'][0]['features'] = []
+                elif change in ('host', 'protocol'):
+                    index = 1 if change == 'host' else 2
+                    feature = 'desktop-test-support' if change == 'host' else 'test-support'
+                    bad['desktop_broker_production_graph'][index]['features'] = [feature]
+                else:
+                    for field in ('path', 'sha256'):
+                        bad['desktop_broker_production'][field] = bad['desktop_broker_fixture'][field]
+                with self.subTest(change=change), self.assertRaises(validation.GateFailure):
+                    validation.verify_artifacts(bad)
+
     def test_nonexecutable_pinned_helper_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)
@@ -298,33 +385,44 @@ class ValidationTests(unittest.TestCase):
             owned.mkdir()
             cargo = root / 'cargo'
             cargo.mkdir()
-            def graph(names, fixture=False, host_support=False, catalog=False):
+            def graph(names, fixture=False, host_support=False, catalog=False, integration=False):
                 artifacts = []
                 for name in names:
                     path = cargo / name
                     path.write_bytes((name + ('-fixture' if fixture else '-default')).encode())
                     path.chmod(0o755)
-                    kind = 'lib' if '_' in name or (catalog and name == 'theseus') else 'bin'
+                    kind = 'lib' if '_' in name or ((catalog or integration) and name == 'theseus') else 'bin'
                     artifacts.append({'reason': 'compiler-artifact', 'target': {'name': name, 'kind': [kind]},
-                                      'features': ['test-support'] if (host_support and name == 'theseus_host') or
-                                      (fixture and name in ('theseus_native_helper', 'theseus-native-helper-fixture')) else
-                                      ['native-catalog-test-support'] if catalog and (name == 'theseus' or kind == 'bin') else [],
+                                      'features': ['desktop-test-support'] if fixture and name == 'theseus_host' else
+                                      ['test-support'] if (host_support and name == 'theseus_host') or
+                                      (fixture and name in ('theseus_native_helper', 'theseus-native-helper-fixture', 'theseus-native-desktop-broker', 'theseus_native_protocol')) else
+                                      ['native-catalog-test-support'] if catalog and (name == 'theseus' or kind == 'bin') else
+                                      ['native-integration-test-support'] if integration and (name == 'theseus' or kind == 'bin') else [],
                                       'executable': str(path) if kind == 'bin' else None})
                 return artifacts
             def fake_build(args):
                 if args == ['--bin', 'theseus']:
                     return graph(('theseus_host', 'theseus'))
-                if args == ['-p', 'theseus-native-helper', '--bin', 'theseus-native-helper']:
-                    return graph(('theseus_host', 'theseus_native_helper', 'theseus-native-helper'))
+                if args == ['-p', 'theseus-native-helper', '--bin', 'theseus-native-helper', '--bin', 'theseus-native-desktop-broker']:
+                    return graph(('theseus_host', 'theseus_native_protocol', 'theseus_native_helper', 'theseus-native-helper', 'theseus-native-desktop-broker'))
                 if args == ['--workspace', '--bins', '--features', 'theseus-host/test-support']:
                     (cargo / 'theseus-native-helper').write_bytes(b'overwritten-feature-unified-helper')
                     return graph(('theseus_host', 'theseus-host-fixture', 'theseus'), host_support=True)
                 if args == ['--features', 'mcp-test-support', '--bin', 'theseus-mcp-fixture']:
                     return graph(('theseus-mcp-fixture',))
-                if args == ['-p', 'theseus-native-helper', '--features', 'test-support', '--bin', 'theseus-native-helper-fixture']:
-                    return graph(('theseus_host', 'theseus_native_helper', 'theseus-native-helper-fixture'), fixture=True)
+                if args == ['-p', 'theseus-native-helper', '--features', 'test-support', '--bin', 'theseus-native-helper-fixture', '--bin', 'theseus-native-desktop-broker']:
+                    return graph(('theseus_host', 'theseus_native_protocol', 'theseus_native_helper', 'theseus-native-helper-fixture', 'theseus-native-desktop-broker'), fixture=True)
                 if args == ['--features', 'native-catalog-test-support', '--bin', 'theseus-native-catalog-fixture', '--bin', 'theseus-native-base-reader', '--bin', 'theseus-native-target-reader']:
                     return graph(('theseus_host', 'theseus_native_helper_store', 'theseus_native_client', 'theseus', 'theseus-native-catalog-fixture', 'theseus-native-base-reader', 'theseus-native-target-reader'), catalog=True)
+                if args == ['--features', 'native-integration-test-support', *[part for target, _ in validation.INTEGRATION_ARTIFACTS.values() for part in ['--bin', target]]]:
+                    return graph(('theseus_host', 'theseus', *[target for target, _ in validation.INTEGRATION_ARTIFACTS.values()]), integration=True)
+                if args == ['--features', 'native-integration-test-support', '--no-run', *[part for target in validation.INTEGRATION_TEST_ARTIFACTS for part in ['--test', target]]]:
+                    artifacts = graph(validation.INTEGRATION_TEST_ARTIFACTS, integration=True)
+                    for artifact in artifacts:
+                        artifact['target']['kind'] = ['test']
+                        artifact['features'] = ['native-integration-test-support']
+                        artifact['executable'] = str(cargo / artifact['target']['name'])
+                    return artifacts
                 self.fail(f'unexpected build: {args}')
             output = io.StringIO()
             with patch.object(builder, 'build', side_effect=fake_build), \
@@ -346,7 +444,7 @@ class ValidationTests(unittest.TestCase):
                 validation.fixture(runner)
             for key, variable in (('helper_production', 'THESEUS_NATIVE_HELPER_BINARY'),
                                   ('helper_fixture', 'THESEUS_NATIVE_HELPER_FIXTURE'),
-                                  *[(key, variable) for key, (_, variable) in validation.CATALOG_ARTIFACTS.items()]):
+                                  *[(key, variable) for key, (_, variable) in (validation.CATALOG_ARTIFACTS | validation.INTEGRATION_ARTIFACTS).items()]):
                 self.assertEqual(runner.env[variable], metadata[key]['path'])
                 self.assertIn(f'{variable}={metadata[key]["path"]}\n', env_file.read_text())
             self.assertEqual(json.loads((runner.evidence / 'native-artifacts.json').read_text()), metadata)
@@ -706,6 +804,142 @@ class ValidationTests(unittest.TestCase):
             receipt = json.loads((pathlib.Path(temp) / 'docker-suite.result.json').read_text())
             self.assertEqual(receipt['status'], 'not_run_budget_exhausted')
             self.assertFalse(receipt['pass'])
+
+
+    def test_integration_test_graph_rejects_missing_swapped_or_fault_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            graph = []
+            metadata = {'native_integration_test_graph': graph}
+            for target in validation.INTEGRATION_TEST_ARTIFACTS:
+                path = root / target
+                path.write_bytes(target.encode())
+                path.chmod(0o755)
+                artifact = {'reason': 'compiler-artifact', 'target': {'name': target, 'kind': ['test']},
+                            'features': ['native-integration-test-support'], 'executable': str(path)}
+                graph.append(artifact)
+                metadata[target] = {'path': str(path), 'sha256': validation.sha256(path), 'cargo_artifact': artifact}
+            # Root integration tests intentionally have the existing Host dev
+            # dependency; separately pinned executed binaries remain fault-free.
+            graph.append({'reason': 'compiler-artifact', 'target': {'name': 'theseus_host', 'kind': ['lib']}, 'features': ['test-support']})
+            validation.verify_integration_tests(metadata)
+            for mutation in ('missing', 'swapped', 'fault', 'tampered'):
+                bad = copy.deepcopy(metadata)
+                if mutation == 'missing':
+                    del bad['native_desktop']
+                elif mutation == 'swapped':
+                    bad['native_desktop']['cargo_artifact'] = bad['native_services']['cargo_artifact']
+                elif mutation == 'fault':
+                    bad['native_integration_test_graph'].append({'reason': 'compiler-artifact',
+                        'target': {'name': 'theseus_native_helper', 'kind': ['lib']}, 'features': ['test-support']})
+                else:
+                    bad['native_desktop']['sha256'] = '0' * 64
+                with self.subTest(mutation=mutation), self.assertRaises(validation.GateFailure):
+                    validation.verify_integration_tests(bad)
+
+
+    def test_linux_inventory_requires_all_source_desktop_ordinary_cases_and_bound(self):
+        identity = {'source_sha': 'a' * 40, 'dirty': False}
+        metadata = dict(identity)
+        for key in ('helper_production', 'helper_fixture', 'desktop_broker_fixture',
+                    *validation.INTEGRATION_ARTIFACTS, *validation.INTEGRATION_TEST_ARTIFACTS):
+            metadata[key] = {'path': '/private/pinned/' + key, 'sha256': 'b' * 64, 'length': 12}
+        with tempfile.TemporaryDirectory() as temp:
+            runner = validation.Runner(pathlib.Path(temp))
+            runner.host = 'x86_64-unknown-linux-gnu'
+            with patch.object(validation, 'load_pinned', return_value=metadata), patch.object(validation, 'verify_integration_tests'), patch.object(validation, 'source_identity', return_value=identity), patch.object(validation.platform, 'system', return_value='Linux'), patch.object(runner, 'run') as run:
+                validation.native(runner, 'integration')
+            desktop = next(call for call in run.call_args_list if call.args[0] == 'source-desktop-product')
+            self.assertEqual(set(desktop.kwargs['required_cases']), {
+                'source_desktop_clean_uses_original_broker_child_and_public_cli_saved_views',
+                'source_desktop_missing_and_leaked_entries_fail_exact_sut_postconditions',
+                'source_desktop_fresh_six_tool_mcp_matches_own_saved_desktop_and_tui',
+                'source_desktop_upgrade_keeps_original_base_and_target_generations',
+                'source_desktop_reinstall_same_tuple_requires_new_original_sut_generation',
+                'source_desktop_ordinary_fresh_six_tool_mcp_keeps_exact_generations_and_saved_views',
+            })
+            self.assertGreaterEqual(desktop.kwargs['timeout'], 300)
+            self.assertLessEqual(desktop.kwargs['timeout'], 900)
+
+    def test_linux_manager_manifest_pins_real_combined_cases_and_source_owners(self):
+        metadata = {'source_sha': 'a' * 40, 'dirty': False}
+        for key in ('helper_production', 'helper_fixture', 'desktop_broker_fixture',
+                    *validation.INTEGRATION_ARTIFACTS, *validation.INTEGRATION_TEST_ARTIFACTS):
+            metadata[key] = {'path': '/private/pinned/' + key, 'sha256': 'b' * 64, 'length': 12}
+        manifest = validation.manager_manifest(metadata, 'x86_64-unknown-linux-gnu', 'Linux')
+        expected = {
+            ('native_services', 'systemd_user_clean_installer_managed_service_uses_shared_product_path'),
+            ('native_services', 'systemd_installer_missing_service_is_failed_without_harness_repair'),
+            ('native_services', 'systemd_uninstaller_leaves_service_is_failed_before_and_after_provider_disposal'),
+            ('native_services', 'systemd_preexisting_or_wrong_owned_unit_is_untouched'),
+            ('native_service_mcp', 'systemd_supplied_cli_and_fresh_mcp_normalized_frontend_parity'),
+            ('native_desktop', 'source_combined_service_desktop_share_one_sequence_provider_and_lease'),
+            ('native_desktop', 'source_combined_ordinary_fresh_six_tool_mcp_keeps_one_shared_lease_and_saved_views'),
+        }
+        self.assertEqual({(c['binary'], c['name']) for c in manifest['cases']}, expected)
+        for role, key in {'native_desktop': 'native_desktop', 'THESEUS_NATIVE_DESKTOP_HELPER_BINARY': 'helper_fixture', 'THESEUS_NATIVE_DESKTOP_BROKER_BINARY': 'desktop_broker_fixture', 'THESEUS_NATIVE_HELPER_BINARY': 'helper_production'}.items():
+            self.assertEqual(manifest['artifacts'][role]['path'], metadata[key]['path'])
+        for key in ['native_desktop', 'helper_fixture', 'desktop_broker_fixture']:
+            bad = copy.deepcopy(metadata)
+            bad.pop(key)
+            with self.subTest(missing=key), self.assertRaises(validation.GateFailure):
+                validation.manager_manifest(bad, 'x86_64-unknown-linux-gnu', 'Linux')
+
+    def test_manager_manifest_has_exact_native_roles_and_rejects_dirty_source(self):
+        metadata = {'source_sha': 'a' * 40, 'dirty': False}
+        for key in ('helper_production', 'helper_fixture', 'desktop_broker_fixture',
+                    *validation.INTEGRATION_ARTIFACTS, *validation.INTEGRATION_TEST_ARTIFACTS):
+            metadata[key] = {'path': '/private/pinned/' + key, 'sha256': 'b' * 64, 'length': 12}
+        for system, target, test in [('Linux', 'x86_64-unknown-linux-gnu', 'native_services'),
+                                     ('Darwin', 'aarch64-apple-darwin', 'native_services_platforms'),
+                                     ('Windows', 'x86_64-pc-windows-msvc', 'native_services_platforms')]:
+            with self.subTest(system=system):
+                manifest = validation.manager_manifest(metadata, target, system)
+                self.assertEqual(manifest['source_sha'], metadata['source_sha'])
+                self.assertEqual(manifest['build']['target'], target)
+                self.assertIn(test, manifest['artifacts'])
+                self.assertEqual(len(manifest['cases']), 7)
+                self.assertEqual(len(manifest['artifacts']), 10 if system == 'Linux' else 6)
+                self.assertEqual('native_desktop' in manifest['artifacts'], system == 'Linux')
+                self.assertFalse(any('model' in c['name'] for c in manifest['cases']))
+                self.assertEqual(manifest['artifacts']['THESEUS_NATIVE_HELPER_BINARY']['path'], metadata['helper_production']['path'])
+                if system == 'Linux':
+                    import prepare_native_systemd_ci as operator
+                elif system == 'Darwin':
+                    import prepare_native_launchd_ci as operator
+                else:
+                    import prepare_native_scm_ci as operator
+                    for role, pin in manifest['artifacts'].items():
+                        pin['path'] = 'C:\\pinned\\' + role
+                plan = operator.make_plan(manifest, 'abcd1234abcd1234')
+                self.assertEqual(plan['token'], 'abcd1234abcd1234')
+
+        with self.assertRaises(validation.GateFailure):
+            validation.manager_manifest(dict(metadata, dirty=True), 'x86_64-unknown-linux-gnu', 'Linux')
+        with self.assertRaises(validation.GateFailure):
+            validation.manager_manifest(metadata, 'x86_64-pc-windows-msvc', 'Linux')
+
+
+    def test_integration_stage_requires_registered_cases_and_refuses_source_drift(self):
+        identity = {'source_sha': 'a' * 40, 'dirty': False}
+        metadata = dict(identity)
+        for key in ('helper_production', 'helper_fixture', 'desktop_broker_fixture',
+                    *validation.INTEGRATION_ARTIFACTS, *validation.INTEGRATION_TEST_ARTIFACTS):
+            metadata[key] = {'path': '/private/pinned/' + key, 'sha256': 'b' * 64, 'length': 12}
+        for system, host in [('Linux', 'x86_64-unknown-linux-gnu'), ('Windows', 'x86_64-pc-windows-msvc'), ('Darwin', 'aarch64-apple-darwin')]:
+            with self.subTest(system=system), tempfile.TemporaryDirectory() as temp:
+                runner = validation.Runner(pathlib.Path(temp))
+                runner.host = host
+                with patch.object(validation, 'load_pinned', return_value=metadata), patch.object(validation, 'verify_integration_tests') as verify, patch.object(validation, 'source_identity', return_value=identity), patch.object(validation.platform, 'system', return_value=system), patch.object(runner, 'run') as run:
+                    validation.native(runner, 'integration')
+                verify.assert_called_once_with(metadata)
+                self.assertEqual(len(run.call_args_list), 4 if system == 'Linux' else 3)
+                self.assertTrue(all(call.kwargs.get('require_tests') and call.kwargs.get('required_cases') for call in run.call_args_list))
+                manifest = json.loads((runner.evidence / 'native-manager-manifest.json').read_text())
+                self.assertEqual(manifest['build']['target'], host)
+                with patch.object(validation, 'load_pinned', return_value=metadata), patch.object(validation, 'verify_integration_tests'), patch.object(validation, 'source_identity', return_value=dict(identity, source_sha='c' * 40)), patch.object(runner, 'run') as run, self.assertRaises(validation.GateFailure):
+                    validation.native(runner, 'integration')
+                run.assert_not_called()
 
 
 if __name__ == '__main__':

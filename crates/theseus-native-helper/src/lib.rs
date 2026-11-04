@@ -24,4 +24,9 @@ pub use config::{ConfigError, config_manifest_digest, load_config};
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
+pub mod broker;
+pub mod broker_transport;
 mod integration;
+
+#[cfg(feature = "test-support")]
+pub use config::{load_source_desktop_config, source_desktop_config_manifest_digest};

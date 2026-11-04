@@ -24,6 +24,10 @@ directory they assume, and each contract keeps its limits beside its claims. The
 - [Supplied native targets](guides/native-targets.md): how do I preview native
   catalog recipes, supply launch/provider authority and preserve recovery evidence?
 
+- [Services and desktop applications](guides/services-and-desktop.md): what does
+  the installer own, which authority must be supplied, and what do readiness and
+  lifetime observations establish? This integration is under development.
+
 ## Agents
 
 - [Use Theseus as an MCP server](agents/mcp-server.md): how do I launch the

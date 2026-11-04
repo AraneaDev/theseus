@@ -50,6 +50,16 @@ impl MutationIdentity {
             | v2::Request::CreateFile {
                 lease, operation, ..
             } => (*lease, *operation),
+            v2::Request::BrokerBind { original } => (
+                v2::LeaseId::parse(&original.helper_lease).expect("validated bind lease"),
+                v2::OperationId::parse(&original.helper_operation)
+                    .expect("validated bind operation"),
+            ),
+            v2::Request::DesktopAction { request } => (
+                v2::LeaseId::parse(&request.helper_lease).expect("validated desktop lease"),
+                v2::OperationId::parse(&request.helper_operation)
+                    .expect("validated desktop operation"),
+            ),
             _ => unreachable!("mutation identity"),
         }
     }
@@ -169,20 +179,52 @@ impl Recovery {
                         v2::Request::CreateFile {
                             lease, operation, ..
                         } => (*lease, *operation, false),
+                        v2::Request::BrokerBind { original }
+                            if matches!(
+                                expected.profile,
+                                v2::HelperProfile::Integration { .. }
+                            ) =>
+                        {
+                            (
+                                v2::LeaseId::parse(&original.helper_lease)
+                                    .map_err(|_| ClientError::Protocol)?,
+                                v2::OperationId::parse(&original.helper_operation)
+                                    .map_err(|_| ClientError::Protocol)?,
+                                false,
+                            )
+                        }
+                        v2::Request::DesktopAction { request }
+                            if matches!(
+                                expected.profile,
+                                v2::HelperProfile::Integration { .. }
+                            ) =>
+                        {
+                            (
+                                v2::LeaseId::parse(&request.helper_lease)
+                                    .map_err(|_| ClientError::Protocol)?,
+                                v2::OperationId::parse(&request.helper_operation)
+                                    .map_err(|_| ClientError::Protocol)?,
+                                false,
+                            )
+                        }
                         _ => return Err(ClientError::Protocol),
                     };
                     if Some(lease) != image.lease
-                        || r.operations
-                            .iter()
-                            .any(|(l, o, _)| *l == lease && *o == operation)
+                        || r.identities.iter().any(|i| i.ids() == (lease, operation))
                     {
                         return Err(ClientError::Protocol);
                     }
+                    let desktop = matches!(
+                        op.request,
+                        v2::Request::BrokerBind { .. } | v2::Request::DesktopAction { .. }
+                    );
                     r.identities.push(MutationIdentity {
                         request: op.request,
                         digest: op.digest,
                     });
-                    r.operations.push((lease, operation, None));
+                    if !desktop {
+                        r.operations.push((lease, operation, None));
+                    }
                     if run {
                         r.stream(lease, operation, false)?;
                     }
@@ -291,27 +333,75 @@ impl Recovery {
         expected: &crate::ExpectedHelper,
     ) -> Result<v2::Request, ClientError> {
         if let Some((_, _, lease)) = &self.original {
-            let valid = match &action {
-                Action::QueryOriginalAcquire(p) => self
-                    .original
-                    .as_ref()
-                    .is_some_and(|(record, _, _)| record == p.record()),
-                Action::Query {
-                    lease: l,
-                    operation,
-                }
-                | Action::Cancel {
-                    lease: l,
-                    operation,
-                } => self.identities.iter().any(|i| i.ids() == (*l, *operation)),
-                Action::QueryLease(l) | Action::Release(l) => Some(*l) == *lease,
-                _ => false,
+            let valid=match &action {
+                Action::QueryOriginalAcquire(p)=>self.original.as_ref().is_some_and(|(record,_,_)|record==p.record()),
+                Action::Query {lease:l,operation}|Action::Cancel {lease:l,operation}=>self.identities.iter().any(|i|i.ids()==(*l,*operation)),
+                Action::QueryBrokerBind {original}=>self.identities.iter().any(|i|matches!(&i.request,v2::Request::BrokerBind {original:o} if o.as_ref()==original)),
+                Action::QueryDesktop {identity}|Action::CancelDesktop {identity}=>self.require_desktop_identity(identity).is_ok(),
+                Action::QueryLease(l)|Action::Release(l)=>Some(*l)==*lease,
+                _=>false,
             };
             if !valid {
                 return Err(ClientError::RecoveryRequired);
             }
         }
         Ok(match action {
+            Action::BrokerBind { original } => {
+                self.require_integration(expected)?;
+                original.validate().map_err(|_| ClientError::Protocol)?;
+                self.remember_desktop(v2::Request::BrokerBind {
+                    original: Box::new(original),
+                })?
+            }
+            Action::DesktopAction { request } => {
+                self.require_integration(expected)?;
+                request.validate().map_err(|_| ClientError::Protocol)?;
+                self.remember_desktop(v2::Request::DesktopAction {
+                    request: Box::new(request),
+                })?
+            }
+            Action::QueryBrokerBind { original } => {
+                self.require_integration(expected)?;
+                if !self.identities.iter().any(|i|matches!(&i.request,v2::Request::BrokerBind {original:o} if o.as_ref()==&original)) {return Err(ClientError::RecoveryRequired);}
+                v2::Request::QueryBrokerBind {
+                    original: Box::new(original),
+                }
+            }
+            Action::InspectDesktop { lease, slot } => {
+                self.require_integration(expected)?;
+                v2::Request::InspectDesktop {
+                    lease,
+                    slot,
+                    generation: None,
+                }
+            }
+            Action::QueryDesktop { identity } => {
+                self.require_integration(expected)?;
+                self.require_desktop_identity(&identity)?;
+                v2::Request::QueryDesktop {
+                    identity: Box::new(identity),
+                }
+            }
+            Action::CancelDesktop { identity } => {
+                self.require_integration(expected)?;
+                self.require_desktop_identity(&identity)?;
+                v2::Request::CancelDesktop {
+                    identity: Box::new(identity),
+                }
+            }
+            Action::ProbeDesktopReadiness {
+                identity,
+                nonce,
+                deadline_ms,
+            } => {
+                self.require_integration(expected)?;
+                self.require_desktop_identity(&identity)?;
+                v2::Request::ProbeDesktopReadiness {
+                    identity: Box::new(identity),
+                    nonce,
+                    deadline_ms,
+                }
+            }
             Action::QueryOriginalAcquire(p) => {
                 let record = p.record();
                 if record.binding != expected.binding.binding
@@ -471,6 +561,48 @@ impl Recovery {
             Action::Release(lease) => v2::Request::Release { lease },
         })
     }
+    fn require_desktop_identity(
+        &self,
+        identity: &v2::broker::BrokerOperationIdentity,
+    ) -> Result<(), ClientError> {
+        if !self.identities.iter().any(|i|matches!(&i.request,v2::Request::DesktopAction {request} if request.identity().as_ref()==Ok(identity))) {Err(ClientError::RecoveryRequired)}else{Ok(())}
+    }
+    pub(crate) fn has_desktop(&self) -> bool {
+        self.identities.iter().any(|i| {
+            matches!(
+                i.request,
+                v2::Request::BrokerBind { .. } | v2::Request::DesktopAction { .. }
+            )
+        })
+    }
+    fn require_integration(&self, expected: &crate::ExpectedHelper) -> Result<(), ClientError> {
+        if !matches!(expected.profile, v2::HelperProfile::Integration { .. }) {
+            Err(ClientError::Preflight)
+        } else {
+            Ok(())
+        }
+    }
+    fn remember_desktop(&mut self, request: v2::Request) -> Result<v2::Request, ClientError> {
+        let digest = v2::request_digest(&request).map_err(|_| ClientError::Protocol)?;
+        let identity = MutationIdentity {
+            request: request.clone(),
+            digest,
+        };
+        let ids = identity.ids();
+        if self.quarantined.contains(&ids.0)
+            || self.identities.iter().any(|i| i.ids() == ids)
+            || self.operations.iter().any(|(l, _, s)| {
+                *l == ids.0 && !matches!(s, Some(v2::OperationView::Finished { .. }))
+            })
+        {
+            return Err(ClientError::RecoveryRequired);
+        }
+        if self.identities.len() >= v2::MAX_OPERATIONS {
+            return Err(ClientError::Capacity);
+        }
+        self.identities.push(identity);
+        Ok(request)
+    }
     fn mutation(&mut self, request: v2::Request, run: bool) -> Result<v2::Request, ClientError> {
         let digest = v2::request_digest(&request).map_err(|_| ClientError::Protocol)?;
         let identity = MutationIdentity {
@@ -479,6 +611,10 @@ impl Recovery {
         };
         let (lease, operation) = identity.ids();
         if self.quarantined.contains(&lease)
+            || self
+                .identities
+                .iter()
+                .any(|i| i.ids() == (lease, operation))
             || self.operations.iter().any(|(l, o, state)| {
                 *l == lease
                     && (*o == operation

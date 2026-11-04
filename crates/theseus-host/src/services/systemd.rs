@@ -126,6 +126,8 @@ pub enum OwnedActionProgress {
 /// Original qualified registration. Never serializable or reconstructible by PID.
 pub struct RegistrationOwner {
     _file: File,
+    prior_files: Vec<File>,
+    transition_receipts: Vec<String>,
     fingerprint: FileFingerprint,
     definition_bytes: Vec<u8>,
     definition: SystemdDefinition,
@@ -134,6 +136,29 @@ pub struct RegistrationOwner {
     revoked: bool,
 }
 impl RegistrationOwner {
+    fn record_transition(
+        &mut self,
+        file: File,
+        fingerprint: FileFingerprint,
+        bytes: Vec<u8>,
+        definition: &SystemdDefinition,
+        receipt: String,
+    ) -> io::Result<()> {
+        if self.revoked
+            || self.transition_receipts.len() >= 128
+            || receipt == self.install_receipt
+            || self.transition_receipts.contains(&receipt)
+        {
+            return Err(io::Error::other("original owner transition unavailable"));
+        }
+        self.prior_files
+            .push(std::mem::replace(&mut self._file, file));
+        self.fingerprint = fingerprint;
+        self.definition_bytes = bytes;
+        self.definition = definition.clone();
+        self.transition_receipts.push(receipt);
+        Ok(())
+    }
     pub fn install_receipt(&self) -> &str {
         &self.install_receipt
     }
@@ -785,6 +810,8 @@ impl SystemdManager {
         }
         Ok(RegistrationOwner {
             _file: file,
+            prior_files: vec![],
+            transition_receipts: vec![],
             fingerprint,
             definition_bytes,
             definition: definition.clone(),
@@ -792,6 +819,70 @@ impl SystemdManager {
             install_receipt,
             revoked: false,
         })
+    }
+    /// Admit an explicit completed SUT definition transition on the retained owner.
+    /// The old file owners remain held; neither a name lookup nor a restored
+    /// definition can revive a previously revoked registration.
+    pub fn admit_configuration(
+        &mut self,
+        owner: &mut RegistrationOwner,
+        definition: &SystemdDefinition,
+        expected_bytes: &[u8],
+        sut_receipt: String,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> io::Result<()> {
+        if self.revoked || owner.revoked || owner.manager_instance != self.instance {
+            owner.revoked = true;
+            self.revoked = true;
+            return Err(invalid("original registration permanently revoked"));
+        }
+        if self.pending.is_some()
+            || owner.transition_receipts.len() >= 128
+            || owner.install_receipt == sut_receipt
+            || owner.transition_receipts.contains(&sut_receipt)
+            || sut_receipt.is_empty()
+            || sut_receipt.len() > 4096
+            || sut_receipt.chars().any(char::is_control)
+        {
+            return Err(invalid("original systemd SUT transition unavailable"));
+        }
+        let result = (|| {
+            definition.validate()?;
+            self.verify_context(deadline, cancel)?;
+            let observation = self.inspect(deadline, cancel)?;
+            let loaded = observation
+                .loaded
+                .as_ref()
+                .ok_or_else(|| invalid("SUT transition is not loaded"))?;
+            self.check_definition(loaded, definition)?;
+            let (file, fingerprint, bytes) = self
+                .definition_file()?
+                .ok_or_else(|| invalid("SUT transition definition missing"))?;
+            if bytes != expected_bytes
+                || observation.definition_bytes.as_ref() != Some(&bytes)
+                || !matches!(
+                    observation.unit_file_state.as_deref(),
+                    Some("static" | "disabled")
+                )
+            {
+                return Err(invalid(
+                    "SUT transition differs from exact admitted definition",
+                ));
+            }
+            validate_definition_source(&bytes)?;
+            Ok((file, fingerprint, bytes))
+        })();
+        match result {
+            Ok((file, fingerprint, bytes)) => {
+                owner.record_transition(file, fingerprint, bytes, definition, sut_receipt)
+            }
+            Err(error) => {
+                owner.revoked = true;
+                self.revoked = true;
+                Err(error)
+            }
+        }
     }
     fn check_definition(
         &self,
@@ -811,6 +902,14 @@ impl SystemdManager {
             ));
         }
         Ok(())
+    }
+    pub fn verify_registration(
+        &mut self,
+        owner: &mut RegistrationOwner,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> io::Result<()> {
+        self.verify_owner(owner, deadline, cancel)
     }
     fn verify_owner(
         &mut self,
@@ -1153,5 +1252,68 @@ mod definition_model_tests {
         );
         assert!(remaining(Instant::now() + Duration::from_secs(31), &cancel).is_err());
         assert!(remaining(Instant::now() + Duration::from_secs(1), &cancel).unwrap() > 0);
+    }
+}
+
+#[cfg(test)]
+mod sut_transition_owner_tests {
+    use super::*;
+    #[test]
+    fn sut_transition_keeps_original_files_and_never_restores_revoked_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("original");
+        std::fs::write(&path, b"base").unwrap();
+        let file = File::open(&path).unwrap();
+        let fp = crate::fs::fingerprint(&file).unwrap();
+        let definition = SystemdDefinition {
+            executable: "/fixture/base".into(),
+            arguments: vec![],
+            environment: vec![],
+            working_directory: "/fixture".into(),
+        };
+        let mut owner = RegistrationOwner {
+            _file: file,
+            prior_files: vec![],
+            transition_receipts: vec![],
+            fingerprint: fp.clone(),
+            definition_bytes: b"base".to_vec(),
+            definition: definition.clone(),
+            manager_instance: [1; 32],
+            install_receipt: "original-install".into(),
+            revoked: false,
+        };
+        let next = dir.path().join("target");
+        std::fs::write(&next, b"target").unwrap();
+        let replacement = File::open(&next).unwrap();
+        let replacement_fp = crate::fs::fingerprint(&replacement).unwrap();
+        owner
+            .record_transition(
+                replacement,
+                replacement_fp,
+                b"target".to_vec(),
+                &definition,
+                "accepted-upgrade".into(),
+            )
+            .unwrap();
+        assert_eq!(owner.install_receipt(), "original-install");
+        assert_eq!(owner.prior_files.len(), 1);
+        assert_eq!(crate::fs::fingerprint(&owner.prior_files[0]).unwrap(), fp);
+        assert_eq!(owner.definition_bytes(), b"target");
+        owner.revoked = true;
+        let original = File::open(&path).unwrap();
+        assert!(
+            owner
+                .record_transition(
+                    original,
+                    fp,
+                    b"base".to_vec(),
+                    &definition,
+                    "accepted-reinstall".into()
+                )
+                .is_err()
+        );
+        assert!(owner.is_revoked());
+        assert_eq!(owner.definition_bytes(), b"target");
+        assert_eq!(owner.prior_files.len(), 1);
     }
 }

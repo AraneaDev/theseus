@@ -17,3 +17,6 @@ pub use client::{
     RequestId, StartFailure,
 };
 pub use error::{ClientError, Failure};
+
+mod broker;
+pub use broker::BrokerSession;

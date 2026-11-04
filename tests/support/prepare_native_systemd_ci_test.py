@@ -15,16 +15,60 @@ SPEC.loader.exec_module(fixture)
 
 
 def manifest():
-    names = [*fixture.BINARY_ENV, "native_services", "native_service_mcp"]
+    names = ["THESEUS_NATIVE_HELPER_BINARY", "THESEUS_NATIVE_SERVICE_FIXTURE", "THESEUS_NATIVE_SERVICE_BASE", "THESEUS_NATIVE_SERVICE_TARGET", "THESEUS_NATIVE_INTEGRATION_CONTROLLER", "THESEUS_NATIVE_DESKTOP_HELPER_BINARY", "THESEUS_NATIVE_DESKTOP_BROKER_BINARY", "native_services", "native_service_mcp", "native_desktop"]
     return {
         "schema": 1, "source_sha": "a" * 40,
-        "build": {"target": "x86_64-unknown-linux-gnu", "profile": "release", "features": ["native-integration-test-support"]},
-        "artifacts": {name: {"path": f"/build/{name}", "sha256": "b" * 64, "length": 123} for name in names},
-        "cases": [{"binary": "native_services", "name": "systemd_user_clean_installer_managed_service_uses_shared_product_path"}],
+        "build": {"source_sha": "a" * 40, "target": "x86_64-unknown-linux-gnu", "profile": "release", "features": ["native-integration-test-support"]},
+        "artifacts": {name: {"path": f"/build/{name}", "sha256": "b" * 64, "length": 123, "source_sha": "a" * 40} for name in names},
+        "cases": [{"binary": binary, "name": name} for binary, name in [
+            ("native_services", "systemd_user_clean_installer_managed_service_uses_shared_product_path"),
+            ("native_services", "systemd_installer_missing_service_is_failed_without_harness_repair"),
+            ("native_services", "systemd_uninstaller_leaves_service_is_failed_before_and_after_provider_disposal"),
+            ("native_services", "systemd_preexisting_or_wrong_owned_unit_is_untouched"),
+            ("native_service_mcp", "systemd_supplied_cli_and_fresh_mcp_normalized_frontend_parity"),
+            ("native_desktop", "source_combined_service_desktop_share_one_sequence_provider_and_lease"),
+            ("native_desktop", "source_combined_ordinary_fresh_six_tool_mcp_keeps_one_shared_lease_and_saved_views"),
+        ]],
     }
 
 
 class Planning(unittest.TestCase):
+    def test_real_combined_dispatch_has_exact_pinned_owners_and_bounded_case_budget(self):
+        plan = fixture.make_plan(manifest(), "abcd1234abcd1234")
+        self.assertEqual(len(plan["manifest"]["cases"]), 7)
+        environment = fixture.artifact_environment(plan)
+        self.assertEqual(environment["THESEUS_NATIVE_DESKTOP_HELPER_BINARY"], plan["root"] + "/artifacts/THESEUS_NATIVE_DESKTOP_HELPER_BINARY")
+        self.assertEqual(environment["THESEUS_NATIVE_DESKTOP_BROKER_BINARY"], plan["root"] + "/artifacts/THESEUS_NATIVE_DESKTOP_BROKER_BINARY")
+        self.assertEqual(environment["THESEUS_NATIVE_HELPER_BINARY"], plan["root"] + "/artifacts/THESEUS_NATIVE_HELPER_BINARY")
+        self.assertIn("THESEUS_NATIVE_SYSTEMD_RECEIPT", environment)
+        self.assertNotIn("THESEUS_NATIVE_SYSTEMD_MODEL_RECEIPT", environment)
+        for case in plan["manifest"]["cases"]:
+            bound = fixture.case_timeout(case)
+            if case["binary"] == "native_desktop":
+                self.assertGreaterEqual(bound, 360)
+                self.assertLessEqual(bound, 450)
+            else:
+                self.assertEqual(bound, 300)
+
+    def test_no_mandatory_role_case_or_source_binding_can_be_optional_or_aliased(self):
+        good = manifest()
+        mutations = []
+        for role in good["artifacts"]:
+            bad = copy.deepcopy(good); bad["artifacts"].pop(role); mutations.append(bad)
+        for index in range(len(good["cases"])):
+            bad = copy.deepcopy(good); bad["cases"].pop(index); mutations.append(bad)
+        for name in ["private_model_combined_service_desktop_ordinary_cli_one_shared_lease", "unregistered_optional_case"]:
+            bad = copy.deepcopy(good); bad["cases"][-1]["name"] = name; mutations.append(bad)
+        bad = copy.deepcopy(good); bad["cases"][-1]["binary"] = "native_services"; mutations.append(bad)
+        bad = copy.deepcopy(good); bad["cases"].append(copy.deepcopy(good["cases"][-1])); mutations.append(bad)
+        bad = copy.deepcopy(good); bad["artifacts"]["native_desktop"]["path"] = good["artifacts"]["native_services"]["path"]; mutations.append(bad)
+        bad = copy.deepcopy(good); bad["artifacts"]["native_desktop"]["source_sha"] = "c" * 40; mutations.append(bad)
+        bad = copy.deepcopy(good); bad["build"]["source_sha"] = "c" * 40; mutations.append(bad)
+        bad = copy.deepcopy(good); bad["artifacts"]["other_test"] = copy.deepcopy(good["artifacts"]["native_desktop"]); mutations.append(bad)
+        for index, bad in enumerate(mutations):
+            with self.subTest(mutation=index), self.assertRaises(ValueError):
+                fixture.make_plan(bad, "abcd1234abcd1234")
+
     def test_cli_plan_and_non_ci_execution_never_reach_native_operations(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "pins.json"
@@ -35,6 +79,16 @@ class Planning(unittest.TestCase):
             self.assertEqual(planned["manifest"]["source_sha"], "a" * 40)
             with patch.dict(fixture.os.environ, {}, clear=True), patch.object(fixture, "operator", side_effect=AssertionError("provisioning reached")), patch.object(fixture.sys, "argv", ["fixture", "--manifest", str(path), "--execute", "--disposable-github-runner"]), self.assertRaises(ValueError):
                 fixture.main()
+
+    def test_explicit_cli_token_selects_same_exact_plan_root_without_native_calls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'pins.json'
+            path.write_text(json.dumps(manifest()))
+            with patch.object(fixture, 'operator', side_effect=AssertionError('native operator reached')), patch.object(fixture.sys, 'argv', ['fixture', '--manifest', str(path), '--plan', '--token', 'abcd1234abcd1234']), contextlib.redirect_stdout(io.StringIO()) as output:
+                fixture.main()
+            plan = json.loads(output.getvalue())
+            self.assertEqual(plan['root'], '/tmp/th-sd-abcd1234abcd1234')
+            self.assertEqual(plan['token'], 'abcd1234abcd1234')
 
     def test_plan_is_pure_and_explicitly_delegated(self):
         plan = fixture.make_plan(manifest(), "abcd1234abcd1234")

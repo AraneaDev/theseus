@@ -1,4 +1,6 @@
 //! Compiled cooperative fixture application; reports its actual image and data.
+#[path = "native_desktop_app.rs"]
+mod desktop;
 use anyhow::{Result, ensure};
 #[cfg(unix)]
 use std::path::Path;
@@ -9,6 +11,7 @@ pub fn run(version: &str) -> Result<()> {
         return windows::dispatch(version);
     }
     match args.first().map(String::as_str) {
+        Some("desktop") => desktop::run(version, &args[1..]),
         #[cfg(target_os = "linux")]
         Some("service") => {
             ensure!(

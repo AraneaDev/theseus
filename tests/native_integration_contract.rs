@@ -21,7 +21,7 @@ fn clean_requires_every_declared_installer_service_checkpoint() {
     let checks = original["integrations"]["service"]["checks"]
         .as_array()
         .unwrap();
-    for index in 0..checks.len() {
+    for (index, _) in checks.iter().enumerate() {
         let mut missing = original.clone();
         missing["integrations"]["service"]["checks"]
             .as_array_mut()

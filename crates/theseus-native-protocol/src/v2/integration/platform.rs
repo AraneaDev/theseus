@@ -153,7 +153,7 @@ impl ServiceAuthority {
     ) -> Result<(), Error> {
         self.validate()?;
         c.validate_os(os)?;
-        if c.manager_platform != self.platform()
+        if c.manager_platform != Some(self.platform())
             || !matches!(
                 (os, self.platform()),
                 (super::super::Os::Linux, ManagerPlatform::Systemd)
@@ -659,11 +659,43 @@ impl IntegrationManifest {
     ) -> Result<(), Error> {
         use sha2::{Digest as _, Sha256};
         self.validate()?;
-        self.service_authority.validate_context(context, os)?;
+        match (&self.service_authority, context.manager_platform) {
+            (Some(authority), Some(_)) => authority.validate_context(context, os)?,
+            (None, None) if self.desktop.is_some() => context.validate_os(os)?,
+            _ => return Err(Error::InvalidValue),
+        }
+        match (&self.desktop, &context.desktop_broker_header) {
+            (Some(desktop), Some(header))
+                if header
+                    .allowed_modes
+                    .iter()
+                    .all(|mode| desktop.allowed_modes.contains(mode)) => {}
+            (None, None) => {}
+            _ => return Err(Error::InvalidValue),
+        }
+        if let Some(native) = &self.desktop_native {
+            let expected = match os {
+                super::super::Os::Linux => "linux",
+                super::super::Os::Macos => "macos",
+                super::super::Os::Windows => "windows",
+            };
+            if native.os() != expected
+                || context
+                    .desktop_broker_header
+                    .as_ref()
+                    .is_none_or(|header| header.os != native.os())
+            {
+                return Err(Error::InvalidValue);
+            }
+        }
         if context.integration_manifest_digest != self.digest()?.to_hex() {
             return Err(Error::InvalidValue);
         }
-        if self.service_authority.platform() != ManagerPlatform::Systemd {
+        if self
+            .service_authority
+            .as_ref()
+            .is_some_and(|a| a.platform() != ManagerPlatform::Systemd)
+        {
             let instance = self
                 .readiness
                 .as_ref()
@@ -726,10 +758,18 @@ impl IntegrationRuntimeContext {
         self.validate()?;
         if !matches!(
             (os, self.manager_platform),
-            (super::super::Os::Linux, ManagerPlatform::Systemd)
-                | (super::super::Os::Macos, ManagerPlatform::Launchd)
-                | (super::super::Os::Windows, ManagerPlatform::Scm)
-        ) {
+            (super::super::Os::Linux, Some(ManagerPlatform::Systemd))
+                | (super::super::Os::Macos, Some(ManagerPlatform::Launchd))
+                | (super::super::Os::Windows, Some(ManagerPlatform::Scm))
+        ) && !self.desktop_broker_header.as_ref().is_some_and(|h| {
+            self.manager_platform.is_none()
+                && matches!(
+                    (os, h.os.as_str()),
+                    (super::super::Os::Linux, "linux")
+                        | (super::super::Os::Macos, "macos")
+                        | (super::super::Os::Windows, "windows")
+                )
+        }) {
             return Err(Error::InvalidValue);
         }
         Ok(())

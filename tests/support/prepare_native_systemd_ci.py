@@ -29,7 +29,23 @@ BINARY_ENV = (
     "THESEUS_NATIVE_HELPER_BINARY", "THESEUS_NATIVE_SERVICE_FIXTURE",
     "THESEUS_NATIVE_SERVICE_BASE", "THESEUS_NATIVE_SERVICE_TARGET",
     "THESEUS_NATIVE_INTEGRATION_CONTROLLER",
+    "THESEUS_NATIVE_DESKTOP_HELPER_BINARY", "THESEUS_NATIVE_DESKTOP_BROKER_BINARY",
 )
+# Exact real-manager cases, including both three-scenario OwnedDesktop/real-service
+# acceptance paths. Model/optional/arbitrary cases are never operator authority.
+REQUIRED_CASES = {
+    "native_services": (
+        "systemd_user_clean_installer_managed_service_uses_shared_product_path",
+        "systemd_installer_missing_service_is_failed_without_harness_repair",
+        "systemd_uninstaller_leaves_service_is_failed_before_and_after_provider_disposal",
+        "systemd_preexisting_or_wrong_owned_unit_is_untouched",
+    ),
+    "native_service_mcp": ("systemd_supplied_cli_and_fresh_mcp_normalized_frontend_parity",),
+    "native_desktop": (
+        "source_combined_service_desktop_share_one_sequence_provider_and_lease",
+        "source_combined_ordinary_fresh_six_tool_mcp_keeps_one_shared_lease_and_saved_views",
+    ),
+}
 FEATURES = ["unit_properties", "start_stop", "manager_reload"]
 SDK_SYMBOLS = (
     "sd_bus_new", "sd_bus_set_address", "sd_bus_set_bus_client",
@@ -77,26 +93,29 @@ def make_plan(manifest, token):
     require(re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", manifest.get("source_sha", "")), "exact source SHA required")
     build = manifest.get("build", {})
     require(build.get("target") in ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"), "explicit Linux GNU target required")
-    require(build.get("profile") in ("debug", "release"), "build profile required")
+    require(build.get("profile") in ("debug", "release") and build.get("source_sha") == manifest["source_sha"], "matching original source/build profile required")
     require(isinstance(build.get("features"), list) and "native-integration-test-support" in build["features"], "fixture build feature declaration required")
     artifacts = manifest.get("artifacts", {})
-    require(set(BINARY_ENV).issubset(artifacts), "all explicit native binary environment pins required")
-    require("native_services" in artifacts, "native_services test artifact required")
-    for name, artifact in artifacts.items():
-        require(name in (*BINARY_ENV, "native_services", "native_service_mcp", "THESEUS_BINARY"), "unknown artifact role")
-        canonical_path(artifact.get("path"))
+    require(set(artifacts) == {*BINARY_ENV, *REQUIRED_CASES}, "exact source owner and test artifact roles required")
+    paths = set()
+    for artifact in artifacts.values():
+        require(set(artifact) == {"path", "sha256", "length", "source_sha"}, "exact artifact pin fields required")
+        path = canonical_path(artifact.get("path"))
+        require(path not in paths, "pinned artifact roles must not alias")
+        paths.add(path)
         require(re.fullmatch(r"[a-f0-9]{64}", artifact.get("sha256", "")), "artifact SHA256 required")
-        require(type(artifact.get("length")) is int and artifact["length"] > 0, "artifact length required")
+        require(type(artifact.get("length")) is int and 0 < artifact["length"] <= 512 * 1024 * 1024, "bounded artifact length required")
+        require(artifact.get("source_sha") == manifest["source_sha"], "exact matching artifact source required")
     cases = manifest.get("cases", [])
     require(isinstance(cases, list) and cases, "explicit native named cases required")
     seen = set()
+    required = {(binary, name) for binary, names in REQUIRED_CASES.items() for name in names}
     for case in cases:
-        require(case.get("binary") in ("native_services", "native_service_mcp") and case["binary"] in artifacts, "pinned test binary required")
-        name = case.get("name", "")
-        require(re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_:]*", name) and "model" not in name.lower(), "exact non-model test case required")
-        key = (case["binary"], name)
-        require(key not in seen, "duplicate case")
+        require(isinstance(case, dict) and set(case) == {"binary", "name"}, "exact pinned case fields required")
+        key = (case["binary"], case["name"])
+        require(key in required and key not in seen, "exact non-model real-manager case/role required once")
         seen.add(key)
+    require(seen == required, "all original real-manager and Combined cases are mandatory")
     root = "/tmp/th-sd-" + token
     env = {
         "PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8",
@@ -142,6 +161,24 @@ def validate_live_namespace(paths, root):
 def test_command(binary, name, inventory):
     require(inventory.count(name + ": test") == 1, "required exact test not registered exactly once")
     return [binary, name, "--exact", "--nocapture", "--test-threads=1"]
+
+
+def case_timeout(case):
+    require(isinstance(case, dict) and set(case) == {"binary", "name"}, "exact case required")
+    require(case["binary"] in REQUIRED_CASES and case["name"] in REQUIRED_CASES[case["binary"]], "allowlisted real-manager case required")
+    # Each Combined test covers Clean/Upgrade/Reinstall. Captured model timing
+    # was 91s/186s; 450s permits real-manager/artifact variance within existing
+    # outer fixture/CI bounds. Existing service-only budgets stay 300s.
+    return 450 if case["binary"] == "native_desktop" else 300
+
+
+def artifact_environment(plan):
+    environment = dict(plan["worker_environment"])
+    environment["THESEUS_NATIVE_SYSTEMD_RECEIPT"] = plan["root"] + "/manager-receipt.json"
+    for name in BINARY_ENV:
+        require(name in plan["manifest"]["artifacts"], "required original binary role absent")
+        environment[name] = plan["root"] + "/artifacts/" + name
+    return environment
 
 
 def manager_receipt(plan, uid, evidence):
@@ -436,11 +473,7 @@ def worker(document):
         write_new(root / "qualification.json", evidence)
         receipt = manager_receipt(plan, uid, evidence)
         write_new(root / "manager-receipt.json", receipt)
-        test_env = dict(plan["worker_environment"])
-        test_env["THESEUS_NATIVE_SYSTEMD_RECEIPT"] = str(root / "manager-receipt.json")
-        for name in (*BINARY_ENV, "THESEUS_BINARY"):
-            if name in plan["manifest"]["artifacts"]:
-                test_env[name] = str(root / "artifacts" / name)
+        test_env = artifact_environment(plan)
         results = []
         for index, case in enumerate(plan["manifest"]["cases"]):
             require(bus_child.poll() is None and manager_child.poll() is None, "lost original manager/bus during acceptance")
@@ -453,7 +486,7 @@ def worker(document):
             with output_path.open("x") as output:
                 test_child = subprocess.Popen(command, env=test_env, stdout=output, stderr=subprocess.STDOUT)
                 try:
-                    status = test_child.wait(timeout=300)
+                    status = test_child.wait(timeout=case_timeout(case))
                 finally:
                     joined = join_original(test_child)
             text = output_path.read_text()
@@ -495,6 +528,7 @@ def main():
     parser.add_argument("--execute", action="store_true", help="provision only on guarded CI; run precompiled tests and clean original owners")
     parser.add_argument("--disposable-github-runner", action="store_true", help="explicitly attest exclusive disposable GitHub-hosted runner authority")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--token", help="explicit fresh 16-hex reservation, shared by plan and execute")
     args = parser.parse_args()
     document = json.loads(args.manifest.read_text())
     if args.worker:
@@ -502,10 +536,10 @@ def main():
         return
     require(not (args.plan and args.execute), "--plan and --execute are exclusive")
     if not args.execute:
-        print(json.dumps(make_plan(document, "0000000000000000"), indent=2))
+        print(json.dumps(make_plan(document, args.token if args.token is not None else "0000000000000000"), indent=2))
         return
     execution_guard(os.environ, execute=args.execute, disposable=args.disposable_github_runner, uid=os.geteuid(), system=platform.system())
-    plan = make_plan(document, os.urandom(8).hex())
+    plan = make_plan(document, args.token if args.token is not None else os.urandom(8).hex())
     print("retained fixture evidence: " + plan["root"], flush=True)
     operator(plan, os.environ)
 

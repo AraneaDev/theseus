@@ -8,6 +8,8 @@ use std::{
 /// Original, non-serializable registration. A reported PID can never construct it.
 pub struct RegistrationOwner {
     pub(super) file: File,
+    pub(super) prior_files: Vec<File>,
+    pub(super) transition_receipts: Vec<String>,
     pub(super) fingerprint: FileFingerprint,
     pub(super) definition_bytes: Vec<u8>,
     pub(super) definition: LaunchdDefinition,
@@ -16,6 +18,29 @@ pub struct RegistrationOwner {
     pub(super) revoked: bool,
 }
 impl RegistrationOwner {
+    pub(super) fn record_transition(
+        &mut self,
+        file: File,
+        fingerprint: FileFingerprint,
+        bytes: Vec<u8>,
+        definition: &LaunchdDefinition,
+        receipt: String,
+    ) -> io::Result<()> {
+        if self.revoked
+            || self.transition_receipts.len() >= 128
+            || receipt == self.install_receipt
+            || self.transition_receipts.contains(&receipt)
+        {
+            return Err(io::Error::other("original owner transition unavailable"));
+        }
+        self.prior_files
+            .push(std::mem::replace(&mut self.file, file));
+        self.fingerprint = fingerprint;
+        self.definition_bytes = bytes;
+        self.definition = definition.clone();
+        self.transition_receipts.push(receipt);
+        Ok(())
+    }
     pub fn install_receipt(&self) -> &str {
         &self.install_receipt
     }
@@ -120,6 +145,8 @@ mod tests {
         a.exclusive_load_roots = vec![dir.path().into()];
         let owner = RegistrationOwner {
             file,
+            prior_files: vec![],
+            transition_receipts: vec![],
             fingerprint: fp,
             definition_bytes: bytes,
             definition: LaunchdDefinition {
@@ -132,6 +159,43 @@ mod tests {
             revoked: false,
         };
         (dir, root, a, owner)
+    }
+    #[test]
+    fn sut_transition_keeps_original_plist_owner_and_rejects_revoked_restoration() {
+        let (dir, _root, _authority, mut owner) = original();
+        let original_fp = owner.fingerprint.clone();
+        let path = dir.path().join("replacement");
+        std::fs::write(&path, b"configured-target").unwrap();
+        let file = File::open(&path).unwrap();
+        let fp = fingerprint(&file).unwrap();
+        let definition = owner.definition.clone();
+        owner
+            .record_transition(
+                file,
+                fp.clone(),
+                b"configured-target".to_vec(),
+                &definition,
+                "accepted-sut-upgrade".into(),
+            )
+            .unwrap();
+        assert_eq!(owner.prior_files.len(), 1);
+        assert_eq!(fingerprint(&owner.prior_files[0]).unwrap(), original_fp);
+        assert_eq!(owner.install_receipt(), "original accepted installer");
+        owner.revoked = true;
+        let file = File::open(&path).unwrap();
+        assert!(
+            owner
+                .record_transition(
+                    file,
+                    fp,
+                    b"configured-target".to_vec(),
+                    &definition,
+                    "later-matching-sut".into()
+                )
+                .is_err()
+        );
+        assert!(owner.is_revoked());
+        assert_eq!(owner.transition_receipts, ["accepted-sut-upgrade"]);
     }
     #[test]
     fn launchd_replaced_plist_sticky_revocation_survives_restoration() {

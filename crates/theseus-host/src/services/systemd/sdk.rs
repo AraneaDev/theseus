@@ -825,6 +825,8 @@ mod tests {
         let fingerprint = crate::fs::fingerprint(&file).unwrap();
         let mut owner = RegistrationOwner {
             _file: file,
+            prior_files: vec![],
+            transition_receipts: vec![],
             fingerprint,
             definition_bytes: b"definition".to_vec(),
             definition: model_definition(),

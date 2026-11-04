@@ -7,10 +7,77 @@ mod launchd;
 #[cfg(windows)]
 #[path = "service/scm.rs"]
 mod scm;
+/// A cause interval contains accepted identities, never a reconstructed manager
+/// name or PID. A successful SUT mutation closes the previous Start interval.
+#[derive(Default)]
+struct ActivationInterval {
+    original: Option<(v2::LeaseId, v2::OperationId, v2::Digest)>,
+    complete: bool,
+    from_sut: bool,
+}
+impl ActivationInterval {
+    fn accept_sut(&mut self, lease: v2::LeaseId, operation: v2::OperationId, digest: v2::Digest) {
+        self.original = Some((lease, operation, digest));
+        self.from_sut = true;
+        self.complete = false;
+    }
+    fn accept_start(
+        &mut self,
+        lease: v2::LeaseId,
+        operation: v2::OperationId,
+        digest: v2::Digest,
+    ) -> io::Result<()> {
+        if self.original.is_some() && !self.from_sut {
+            return Err(io::Error::other(
+                "new Start requires completed original SUT transition",
+            ));
+        }
+        self.original = Some((lease, operation, digest));
+        self.from_sut = false;
+        self.complete = false;
+        Ok(())
+    }
+}
+pub(crate) fn admitted_sut_transition(program: &v2::ProgramId, outcome: &v2::Outcome) -> bool {
+    matches!(
+        outcome,
+        v2::Outcome::RunCompleted {
+            reason: v2::RunReason::Natural,
+            status: v2::NativeStatus::PosixExit { code: 0 },
+            ..
+        } | v2::Outcome::RunCompleted {
+            reason: v2::RunReason::Natural,
+            status: v2::NativeStatus::WindowsExit { code: 0 },
+            ..
+        }
+    ) && ["configure", "install_target", "install_base", "uninstall"].contains(&program.as_str())
+}
+#[cfg(any(target_os = "macos", test))]
+fn select_exact_definition(
+    preferred: Option<&v2::ServiceDefinition>,
+    definitions: &[v2::ServiceDefinition],
+    matches: impl Fn(&v2::ServiceDefinition) -> bool,
+) -> Option<v2::ServiceDefinition> {
+    if let Some(preferred) = preferred {
+        return matches(preferred).then(|| preferred.clone());
+    }
+    definitions
+        .iter()
+        .find(|definition| matches(definition))
+        .cloned()
+}
 #[derive(Clone)]
 pub(crate) struct ServiceConfig {
     pub(crate) manifest: v2::IntegrationManifest,
     pub(crate) context: v2::IntegrationRuntimeContext,
+}
+impl ServiceConfig {
+    pub(crate) fn authority(&self) -> &v2::ServiceAuthority {
+        self.manifest
+            .service_authority
+            .as_ref()
+            .expect("validated service authority")
+    }
 }
 pub(crate) struct ServiceRuntime {
     config: ServiceConfig,
@@ -30,15 +97,15 @@ pub(crate) struct ServiceRuntime {
     owner: Option<theseus_host::services::scm::RegistrationOwner>,
     #[cfg(windows)]
     deletion: Option<theseus_host::services::scm::DeletionOwner>,
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     sut_transition: Option<(String, String)>,
     binding: Option<v2::Digest>,
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     readiness: Option<theseus_host::services::readiness::LocalChallenge>,
     #[cfg(any(target_os = "macos", windows))]
     original_start_pid: Option<u32>,
-    last_start: Option<(v2::LeaseId, v2::OperationId, v2::Digest)>,
-    start_complete: bool,
+    activation: ActivationInterval,
+    readiness_renewal_pending: bool,
     instance: Option<String>,
     install_receipt: Option<String>,
     observed_definition: Option<v2::ServiceDefinition>,
@@ -57,15 +124,15 @@ impl ServiceRuntime {
             inspection_evidence: Vec::new(),
             #[cfg(windows)]
             deletion: None,
-            #[cfg(any(target_os = "macos", windows))]
+            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             sut_transition: None,
             binding: None,
             #[cfg(any(target_os = "linux", target_os = "macos", windows))]
             readiness: None,
             #[cfg(any(target_os = "macos", windows))]
             original_start_pid: None,
-            last_start: None,
-            start_complete: false,
+            activation: ActivationInterval::default(),
+            readiness_renewal_pending: false,
             instance: None,
             install_receipt: None,
             observed_definition: None,
@@ -76,37 +143,77 @@ impl ServiceRuntime {
     pub(crate) fn note_sut(
         &mut self,
         program: &v2::ProgramId,
+        lease: v2::LeaseId,
         operation: v2::OperationId,
+        request_digest: v2::Digest,
         outcome: &v2::Outcome,
     ) {
-        #[cfg(any(target_os = "macos", windows))]
-        if matches!(
-            outcome,
-            v2::Outcome::RunCompleted {
-                status: v2::NativeStatus::PosixExit { code: 0 },
-                ..
-            } | v2::Outcome::RunCompleted {
-                status: v2::NativeStatus::WindowsExit { code: 0 },
-                ..
-            }
-        ) && ["configure", "install_target", "install_base", "uninstall"]
-            .contains(&program.as_str())
+        if !admitted_sut_transition(program, outcome) {
+            return;
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         {
             self.sut_transition = Some((program.as_str().into(), operation.to_hex()));
         }
-        if matches!(
-            outcome,
-            v2::Outcome::RunCompleted {
-                status: v2::NativeStatus::PosixExit { code: 0 },
-                ..
-            } | v2::Outcome::RunCompleted {
-                status: v2::NativeStatus::WindowsExit { code: 0 },
-                ..
-            }
-        ) && ["install_base", "install_target"].contains(&program.as_str())
-        {
+        if ["install_base", "install_target"].contains(&program.as_str()) {
             self.install_receipt = Some(operation.to_hex());
         }
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        if program.as_str() != "uninstall"
+            && self.activation.original.is_some()
+            && self.readiness.is_some()
+        {
+            self.readiness_renewal_pending = true;
+        }
+        // A completed SUT mutation closes the previous activation interval.
+        // This never revives an uncertain/revoked owner or attaches to a PID.
+        self.activation.accept_sut(lease, operation, request_digest);
+        self.instance = None;
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            self.original_start_pid = None;
+        }
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    fn renew_readiness_if_needed(&mut self) -> io::Result<()> {
+        if !self.readiness_renewal_pending {
+            return Ok(());
+        }
+        let channel = self.readiness.as_mut().ok_or_else(|| {
+            io::Error::other("original readiness channel missing during SUT transition")
+        })?;
+        if let Err(error) = channel.renew_after_sut_transition() {
+            self.uncertain = true;
+            return Err(error);
+        }
+        self.readiness_renewal_pending = false;
+        Ok(())
+    }
+    fn transition_definition(&self, program: &str) -> io::Result<v2::ServiceDefinition> {
+        let previous = self.observed_definition.as_ref();
+        let (role, artifact) = match program {
+            "configure" => (
+                "configured",
+                previous.map(|d| d.artifact.as_str()).unwrap_or("target"),
+            ),
+            "install_target" => (
+                if previous.is_some_and(|d| d.role == "configured") {
+                    "configured"
+                } else {
+                    "target"
+                },
+                "target",
+            ),
+            "install_base" => ("base", "base"),
+            _ => return Err(io::Error::other("unsupported SUT configuration transition")),
+        };
+        self.config
+            .manifest
+            .definitions
+            .iter()
+            .find(|d| d.role == role && d.artifact == artifact)
+            .cloned()
+            .ok_or_else(|| io::Error::other("exact admitted SUT transition definition missing"))
     }
     #[cfg(target_os = "linux")]
     fn manager(
@@ -127,7 +234,7 @@ impl ServiceRuntime {
                 unit,
                 allowed_actions,
                 ..
-            } = &self.config.manifest.service_authority
+            } = self.config.authority()
             else {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -149,13 +256,23 @@ impl ServiceRuntime {
                     },
                     bus_uid: *expected_peer_uid,
                     manager_uid: *expected_manager_uid,
-                    manager_unique_name: self.config.context.manager_unique_name.clone(),
+                    manager_unique_name: self
+                        .config
+                        .context
+                        .manager_unique_name
+                        .clone()
+                        .expect("validated service context"),
                     manager_version: qualification.version.clone(),
                     unit: unit.clone(),
                     definition_root: definition_root.into(),
                     unit_load_paths: unit_load_roots.clone(),
                     ownership_id: self.config.context.ownership_id.clone(),
-                    context_receipt: self.config.context.namespace_receipt.clone(),
+                    context_receipt: self
+                        .config
+                        .context
+                        .namespace_receipt
+                        .clone()
+                        .expect("validated service context"),
                     allowed_start: allowed_actions.iter().any(|s| s == "start"),
                     allowed_stop: allowed_actions.iter().any(|s| s == "stop"),
                 },
@@ -175,9 +292,10 @@ impl ServiceRuntime {
     ) -> io::Result<v2::ServiceObservation> {
         use sha2::{Digest as _, Sha256};
         use theseus_host::services::systemd::SystemdDefinition;
-        if slot != self.config.manifest.service_authority.slot() {
+        if slot != self.config.authority().slot() {
             return Err(io::Error::other("undeclared service slot"));
         }
+        self.ensure_readiness_channel()?;
         let observation = self.manager(deadline, cancel)?.inspect(deadline, cancel)?;
         let actual_definition_digest = observation
             .definition_bytes
@@ -199,6 +317,45 @@ impl ServiceRuntime {
                 })
             })
             .cloned();
+        if let Some((program, receipt)) = self.sut_transition.clone()
+            && program != "uninstall"
+        {
+            let expected = self.transition_definition(&program)?;
+            if definition.as_ref() == Some(&expected) {
+                let raw = SystemdDefinition {
+                    executable: expected.executable.clone(),
+                    arguments: expected.arguments.clone(),
+                    environment: expected.environment.clone(),
+                    working_directory: expected.working_directory.clone(),
+                };
+                if let Some(owner) = self.owner.as_mut() {
+                    self.manager.as_mut().unwrap().admit_configuration(
+                        owner,
+                        &raw,
+                        observation
+                            .definition_bytes
+                            .as_deref()
+                            .ok_or_else(|| io::Error::other("SUT definition bytes missing"))?,
+                        receipt,
+                        deadline,
+                        cancel,
+                    )?;
+                } else {
+                    self.owner = Some(
+                        self.manager
+                            .as_mut()
+                            .unwrap()
+                            .qualify_registration(&raw, receipt, deadline, cancel)?,
+                    );
+                }
+            } else if self.owner.is_some() {
+                // Preserve the complete known SUT mismatch as an observation,
+                // while permanently revoking control of the original owner.
+                self.uncertain = true;
+                self.manager.as_mut().unwrap().revoke_context();
+            }
+            self.sut_transition = None;
+        }
         let mut result = v2::ServiceObservation {
             platform: None,
             instance: observation
@@ -219,10 +376,35 @@ impl ServiceRuntime {
                 .as_ref()
                 .is_some_and(|l| l.active_state == "active" && l.sub_state == "running"),
             origin: observation.loaded.as_ref().map(|l| l.fragment_path.clone()),
-            manager_generation: self.config.context.manager_unique_name.clone(),
+            manager_generation: self
+                .config
+                .context
+                .manager_unique_name
+                .clone()
+                .expect("validated service context"),
             complete: true,
             binding_digest: String::new(),
         };
+        if let Some(owner) = self.owner.as_mut()
+            && !self.uncertain
+            && !self
+                .sut_transition
+                .as_ref()
+                .is_some_and(|(p, _)| p == "uninstall")
+        {
+            self.manager
+                .as_mut()
+                .unwrap()
+                .verify_registration(owner, deadline, cancel)?;
+        }
+        if self.activation.from_sut
+            && result.running
+            && result.configured
+            && result.instance.is_some()
+            && !self.uncertain
+        {
+            self.activation.complete = true;
+        }
         self.observed_definition = definition;
         self.instance = result.instance.clone();
         let mut hash = Sha256::new();
@@ -255,6 +437,20 @@ impl ServiceRuntime {
         ))
     }
     #[cfg(target_os = "linux")]
+    fn ensure_readiness_channel(&mut self) -> io::Result<()> {
+        if self.readiness.is_none()
+            && let Some(config) = &self.config.manifest.readiness
+        {
+            let v2::LocalEndpoint::UnixPath { path } = &config.endpoint else {
+                return Err(io::Error::other("Unix readiness endpoint required"));
+            };
+            self.readiness = Some(theseus_host::services::readiness::LocalChallenge::bind(
+                theseus_host::services::systemd::UnixPath::new(path.clone())?,
+            )?);
+        }
+        self.renew_readiness_if_needed()
+    }
+    #[cfg(target_os = "linux")]
     pub(crate) fn action(
         &mut self,
         slot: &v2::ResourceSlot,
@@ -264,10 +460,7 @@ impl ServiceRuntime {
         cancel: &AtomicBool,
     ) -> io::Result<Option<v2::ServiceOutcome>> {
         use theseus_host::services::systemd::{ServiceAction, SystemdDefinition};
-        if slot != self.config.manifest.service_authority.slot()
-            || self.binding != Some(prior)
-            || self.uncertain
-        {
+        if slot != self.config.authority().slot() || self.binding != Some(prior) || self.uncertain {
             return Err(io::Error::other("service prior authority unproved"));
         }
         if self.owner.is_none() {
@@ -305,16 +498,8 @@ impl ServiceRuntime {
                 ));
             }
         }
-        if action == v2::ServiceAction::Start
-            && self.readiness.is_none()
-            && let Some(config) = &self.config.manifest.readiness
-        {
-            let v2::LocalEndpoint::UnixPath { path } = &config.endpoint else {
-                return Err(io::Error::other("Unix readiness endpoint required"));
-            };
-            self.readiness = Some(theseus_host::services::readiness::LocalChallenge::bind(
-                theseus_host::services::systemd::UnixPath::new(path.clone())?,
-            )?);
+        if action == v2::ServiceAction::Start {
+            self.ensure_readiness_channel()?;
         }
         let owner = self
             .owner
@@ -360,7 +545,7 @@ impl ServiceRuntime {
             OwnedActionProgress::Pending { .. } => None,
             OwnedActionProgress::Terminal { job, result } => {
                 if result == "done" {
-                    self.start_complete = true;
+                    self.activation.complete = true;
                     Some(v2::ServiceOutcome::Complete {
                         receipt: format!("{:x}", Sha256::digest(format!("{job}\0{result}"))),
                     })
@@ -425,6 +610,15 @@ impl ServiceRuntime {
         Ok(observation)
     }
     pub(crate) fn note_action(&mut self, request: &v2::Request) -> io::Result<()> {
+        if matches!(
+            request,
+            v2::Request::ServiceAction {
+                action: v2::ServiceAction::Stop,
+                ..
+            }
+        ) {
+            self.activation.complete = false;
+        }
         if let v2::Request::ServiceAction {
             lease,
             operation,
@@ -432,20 +626,11 @@ impl ServiceRuntime {
             ..
         } = request
         {
-            if self.config.manifest.service_authority.platform() != v2::ManagerPlatform::Systemd
-                && self.last_start.is_some()
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "native service Clean admits only one original Start",
-                ));
-            }
-            self.last_start = Some((
+            self.activation.accept_start(
                 *lease,
                 *operation,
                 v2::request_digest(request).map_err(io::Error::other)?,
-            ));
-            self.start_complete = false;
+            )?;
         }
         Ok(())
     }
@@ -472,11 +657,11 @@ impl ServiceRuntime {
         else {
             return Err(io::Error::other("invalid readiness request"));
         };
-        if self.last_start != Some((*lease, *operation, *action_digest))
-            || !self.start_complete
+        if self.activation.original != Some((*lease, *operation, *action_digest))
+            || !self.activation.complete
             || self.binding != Some(*prior_binding_digest)
             || self.uncertain
-            || slot != self.config.manifest.service_authority.slot()
+            || slot != self.config.authority().slot()
         {
             return Err(io::Error::other(
                 "readiness original Start binding unproved",
@@ -484,6 +669,35 @@ impl ServiceRuntime {
         }
         #[cfg(target_os = "macos")]
         self.verify_readiness_owner()?;
+        #[cfg(target_os = "linux")]
+        self.manager
+            .as_mut()
+            .ok_or_else(|| io::Error::other("original systemd manager missing"))?
+            .verify_registration(
+                self.owner
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("original systemd registration missing"))?,
+                deadline,
+                cancel,
+            )?;
+        #[cfg(windows)]
+        {
+            let observed = self
+                .manager
+                .as_mut()
+                .ok_or_else(|| io::Error::other("original SCM manager missing"))?
+                .inspect(deadline, cancel)?;
+            if !observed.status.is_some_and(|s| {
+                s.state() == theseus_host::services::scm::RuntimeState::Running
+                    && Some(s.process_id) == self.original_start_pid
+            }) {
+                self.uncertain = true;
+                return Err(io::Error::other(
+                    "original SCM runtime changed before readiness",
+                ));
+            }
+        }
+
         let config = self
             .config
             .manifest
@@ -681,9 +895,160 @@ mod platform_regressions {
     }
 }
 
+// Shared policy seams used by the native SCM adapter and host-independent
+// sequence regressions; the actual observations still come from its SC_HANDLE.
+#[cfg(any(windows, test))]
+fn pin_scm_activation_pid(original: &mut Option<u32>, observed: u32) -> io::Result<()> {
+    if observed == 0 || original.is_some_and(|pid| pid != observed) {
+        return Err(io::Error::other("original SCM activation PID changed"));
+    }
+    if original.is_none() {
+        *original = Some(observed);
+    }
+    Ok(())
+}
+#[cfg(any(windows, test))]
+fn scm_uninstall_allows_handle_close(state: Option<u32>) -> bool {
+    state == Some(1)
+}
+
+#[cfg(test)]
+mod scm_transition_policy_tests {
+    use super::*;
+    #[test]
+    fn scm_first_running_pid_is_pinned_until_fresh_committed_sut_interval() {
+        let mut original = None;
+        pin_scm_activation_pid(&mut original, 10).unwrap();
+        pin_scm_activation_pid(&mut original, 10).unwrap();
+        assert!(pin_scm_activation_pid(&mut original, 20).is_err());
+        assert_eq!(original, Some(10));
+        // note_sut resets this field only after successful committed mutation.
+        original = None;
+        pin_scm_activation_pid(&mut original, 20).unwrap();
+        assert_eq!(original, Some(20));
+    }
+    #[test]
+    fn scm_running_leak_is_observed_before_any_original_handle_closure() {
+        assert!(
+            !scm_uninstall_allows_handle_close(Some(4)),
+            "Running leak must remain observable"
+        );
+        for state in [None, Some(2), Some(3), Some(5), Some(7)] {
+            assert!(!scm_uninstall_allows_handle_close(state));
+        }
+        assert!(scm_uninstall_allows_handle_close(Some(1)));
+    }
+}
 // This initial profile admits only a settled native stopped/running observation.
 // Paused can retain a live process and cannot prove the shared Stopped predicate.
 #[cfg(any(windows, test))]
 fn scm_runtime_complete(state: u32) -> bool {
     matches!(state, 1 | 4)
+}
+
+#[cfg(test)]
+mod activation_interval_tests {
+    use super::*;
+    #[test]
+    fn sut_transition_opens_fresh_exact_readiness_cause_without_start_or_pid_attachment() {
+        let lease = v2::LeaseId::from_bytes([1; 16]);
+        let configured = v2::OperationId::from_bytes([2; 16]);
+        let upgraded = v2::OperationId::from_bytes([3; 16]);
+        let reinstalled = v2::OperationId::from_bytes([4; 16]);
+        let mut interval = ActivationInterval::default();
+        for operation in [configured, upgraded, reinstalled] {
+            interval.complete = true;
+            let digest = v2::Digest::from_bytes([operation.as_bytes()[0]; 32]);
+            interval.accept_sut(lease, operation, digest);
+            assert_eq!(interval.original, Some((lease, operation, digest)));
+            assert!(interval.from_sut);
+            assert!(
+                !interval.complete,
+                "accepted SUT Run alone cannot prove Running/Ready"
+            );
+        }
+    }
+    #[test]
+    fn failed_cancelled_or_reader_runs_cannot_authorize_sut_transition() {
+        let mut outcome = v2::Outcome::RunCompleted {
+            reason: v2::RunReason::Natural,
+            status: v2::NativeStatus::PosixExit { code: 0 },
+            cleanup: v2::Cleanup::PosixLeaderReapedGroupTerminationRequested,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            truncated: false,
+        };
+        for program in ["configure", "install_target", "install_base", "uninstall"] {
+            assert!(admitted_sut_transition(
+                &v2::ProgramId::new(program).unwrap(),
+                &outcome
+            ));
+        }
+        assert!(!admitted_sut_transition(
+            &v2::ProgramId::new("check_data").unwrap(),
+            &outcome
+        ));
+        if let v2::Outcome::RunCompleted { reason, .. } = &mut outcome {
+            *reason = v2::RunReason::CancelRequested;
+        }
+        assert!(!admitted_sut_transition(
+            &v2::ProgramId::new("install_target").unwrap(),
+            &outcome
+        ));
+        if let v2::Outcome::RunCompleted { reason, status, .. } = &mut outcome {
+            *reason = v2::RunReason::Natural;
+            *status = v2::NativeStatus::PosixExit { code: 1 };
+        }
+        assert!(!admitted_sut_transition(
+            &v2::ProgramId::new("configure").unwrap(),
+            &outcome
+        ));
+    }
+    #[test]
+    fn byte_identical_launchd_definitions_keep_exact_accepted_sut_role_and_reader() {
+        let definition = |role: &str, artifact: &str| v2::ServiceDefinition {
+            scm: None,
+            role: role.into(),
+            artifact: artifact.into(),
+            executable: "/fixture/reader".into(),
+            arguments: vec![],
+            environment: vec![],
+            working_directory: "/fixture".into(),
+            definition_sha256: "11".repeat(32),
+        };
+        let definitions = vec![
+            definition("base", "base"),
+            definition("configured", "base"),
+            definition("target", "target"),
+            definition("configured", "target"),
+        ];
+        let exact = &definitions[3];
+        let observed = select_exact_definition(Some(exact), &definitions, |d| {
+            d.definition_sha256 == exact.definition_sha256
+        })
+        .unwrap();
+        assert_eq!(observed.role, "configured");
+        assert_eq!(observed.artifact, "target");
+        assert!(
+            select_exact_definition(Some(exact), &definitions, |_| false).is_none(),
+            "mismatched original key cannot adopt another manifest definition"
+        );
+    }
+    #[test]
+    fn rehearsal_start_requires_a_new_completed_sut_interval() {
+        let lease = v2::LeaseId::from_bytes([1; 16]);
+        let op = v2::OperationId::from_bytes([2; 16]);
+        let digest = v2::Digest::from_bytes([3; 32]);
+        let mut interval = ActivationInterval::default();
+        interval.accept_start(lease, op, digest).unwrap();
+        let next = v2::OperationId::from_bytes([4; 16]);
+        assert!(interval.accept_start(lease, next, digest).is_err());
+        assert_eq!(interval.original, Some((lease, op, digest)));
+        interval.accept_sut(lease, next, digest);
+        interval
+            .accept_start(lease, v2::OperationId::from_bytes([5; 16]), digest)
+            .unwrap();
+        assert!(!interval.from_sut);
+        assert!(!interval.complete);
+    }
 }

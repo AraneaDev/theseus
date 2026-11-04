@@ -6,6 +6,7 @@ use crate::{
 use std::time::Instant;
 use theseus_native_protocol::v2;
 pub(crate) struct Cache {
+    desktop_states: Vec<(v2::broker::BrokerOperationIdentity, v2::broker::BrokerState)>,
     pub(crate) description: Option<v2::Reply>,
     pub(crate) lease: Option<(v2::IntentId, v2::LeaseId, v2::LeaseView)>,
     operations: Vec<RecoveredOperation>,
@@ -24,8 +25,21 @@ pub(crate) struct Live {
     pub(crate) terminal: Option<v2::OperationView>,
 }
 impl Cache {
+    pub(crate) fn desktop_query(
+        &self,
+        identity: &v2::broker::BrokerOperationIdentity,
+    ) -> Option<v2::Reply> {
+        self.desktop_states
+            .iter()
+            .find(|(i, _)| i == identity)
+            .map(|(identity, state)| v2::Reply::DesktopState {
+                identity: Box::new(identity.clone()),
+                state: Box::new(state.clone()),
+            })
+    }
     pub(crate) fn new() -> Self {
         Self {
+            desktop_states: vec![],
             description: None,
             lease: None,
             operations: Vec::new(),
@@ -93,6 +107,23 @@ impl Cache {
     }
     pub(crate) fn apply(&mut self, patch: CachePatch) -> Result<(), RuntimeError> {
         match patch {
+            CachePatch::DesktopState { identity, state } => {
+                if let Some((old, saved)) = self
+                    .desktop_states
+                    .iter_mut()
+                    .find(|(i, _)| i.helper_operation == identity.helper_operation)
+                {
+                    if old != &identity {
+                        return Err(RuntimeError::InvalidState);
+                    }
+                    *saved = state;
+                } else {
+                    if self.desktop_states.len() >= v2::MAX_OPERATIONS {
+                        return Err(RuntimeError::Capacity);
+                    }
+                    self.desktop_states.push((identity, state));
+                }
+            }
             CachePatch::Initialized {
                 description,
                 lease,

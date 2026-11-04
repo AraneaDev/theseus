@@ -4,7 +4,9 @@ use anyhow::{Result, ensure};
 use std::{io::Write, path::Path};
 use theseus::native::model::{ProviderAction, ProviderInvocation, ProviderReceipt};
 use theseus_host::fs::{HostDir, RootPolicy};
-use theseus_native_helper_store::{BootstrapRequest, bootstrap_integration};
+use theseus_native_helper_store::{
+    BootstrapRequest, bootstrap_declared_integration, bootstrap_integration,
+};
 use theseus_native_protocol::v2;
 
 pub fn run(args: &[String]) -> Result<()> {
@@ -74,7 +76,29 @@ pub fn run(args: &[String]) -> Result<()> {
         let mut context: v2::IntegrationRuntimeContext =
             serde_json::from_value(config["runtime_context"].clone())?;
         context.ownership_id = invocation.ownership_id.clone();
+        if let Some(header) = &mut context.desktop_broker_header {
+            header.ownership_id = invocation.ownership_id.clone();
+        }
         context.validate()?;
+        let combined = context.desktop_broker_header.is_some();
+        let combined_manifest = if combined {
+            let manifest: v2::IntegrationManifest =
+                serde_json::from_value(config["integration_manifest"].clone())?;
+            ensure!(
+                v2::IntegrationCapabilities::for_manifest(&manifest)?
+                    == v2::IntegrationCapabilities::Combined
+                    && manifest.desktop_native.is_none(),
+                "source combined provider has only owned executable authority"
+            );
+            manifest.validate_context(&context, v2::Os::Linux)?;
+            let marker = root.join("broker-sidecar-owner");
+            let mut file = std::fs::File::create_new(marker)?;
+            file.write_all(invocation.ownership_id.as_bytes())?;
+            file.sync_all()?;
+            Some(manifest)
+        } else {
+            None
+        };
         let field = |name: &str| -> Result<&str> {
             config[name]
                 .as_str()
@@ -88,42 +112,50 @@ pub fn run(args: &[String]) -> Result<()> {
             Path::new(field("workspace_root")?),
             RootPolicy::AllComponentsNoFollow,
         )?;
-        bootstrap_integration(
-            &ledger,
-            &workspace,
-            BootstrapRequest {
-                binding: v2::BindingId::parse(field("binding")?)?,
-                manifest_digest: v2::Digest::parse(field("manifest_digest")?)?,
-                os: if cfg!(windows) {
-                    v2::Os::Windows
-                } else if cfg!(target_os = "macos") {
-                    v2::Os::Macos
-                } else {
-                    v2::Os::Linux
-                },
+        let request = BootstrapRequest {
+            binding: v2::BindingId::parse(field("binding")?)?,
+            manifest_digest: v2::Digest::parse(field("manifest_digest")?)?,
+            os: if cfg!(windows) {
+                v2::Os::Windows
+            } else if cfg!(target_os = "macos") {
+                v2::Os::Macos
+            } else {
+                v2::Os::Linux
             },
-            &context,
-            v2::Digest::parse(field("core_manifest_digest")?)?,
-            v2::Digest::parse(field("integration_manifest_digest")?)?,
-            v2::artifact_commitment(
-                config["artifacts"]["base"]["length"]
-                    .as_u64()
-                    .ok_or_else(|| anyhow::anyhow!("missing base length"))?,
-                v2::Digest::parse(
-                    config["artifacts"]["base"]["sha256"]
-                        .as_str()
-                        .ok_or_else(|| anyhow::anyhow!("missing base digest"))?,
-                )?,
-                config["artifacts"]["target"]["length"]
-                    .as_u64()
-                    .ok_or_else(|| anyhow::anyhow!("missing target length"))?,
-                v2::Digest::parse(
-                    config["artifacts"]["target"]["sha256"]
-                        .as_str()
-                        .ok_or_else(|| anyhow::anyhow!("missing target digest"))?,
-                )?,
+        };
+        let commitment = v2::artifact_commitment(
+            config["artifacts"]["base"]["length"]
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("missing base length"))?,
+            v2::Digest::parse(
+                config["artifacts"]["base"]["sha256"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("missing base digest"))?,
+            )?,
+            config["artifacts"]["target"]["length"]
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("missing target length"))?,
+            v2::Digest::parse(
+                config["artifacts"]["target"]["sha256"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("missing target digest"))?,
             )?,
         )?;
+        if let Some(manifest) = &combined_manifest {
+            bootstrap_declared_integration(
+                &ledger, &workspace, request, &context, manifest, commitment,
+            )?;
+        } else {
+            bootstrap_integration(
+                &ledger,
+                &workspace,
+                request,
+                &context,
+                v2::Digest::parse(field("core_manifest_digest")?)?,
+                v2::Digest::parse(field("integration_manifest_digest")?)?,
+                commitment,
+            )?;
+        }
         receipt.receipt = serde_json::to_string(&context)?;
         config["runtime_context"] = serde_json::to_value(context)?;
         let temporary =
@@ -135,7 +167,31 @@ pub fn run(args: &[String]) -> Result<()> {
         file.write_all(&serde_json::to_vec(&config)?)?;
         file.sync_all()?;
         std::fs::rename(&temporary, config_path)?;
+        if combined {
+            #[cfg(target_os = "linux")]
+            crate::desktop_provider::prepare_broker_sidecar(
+                root,
+                &invocation,
+                &serde_json::from_value(config["runtime_context"].clone())?,
+            )?;
+            #[cfg(not(target_os = "linux"))]
+            anyhow::bail!(
+                "compiled combined provider fixture currently requires supplied Linux manager"
+            );
+        }
     } else {
+        let marker = root.join("broker-sidecar-owner");
+        if marker.try_exists()? {
+            ensure!(
+                std::fs::read(&marker)? == invocation.ownership_id.as_bytes(),
+                "sidecar belongs to another original ownership"
+            );
+            #[cfg(target_os = "linux")]
+            crate::desktop_provider::stop_broker_sidecar(root, &invocation)?;
+            #[cfg(not(target_os = "linux"))]
+            anyhow::bail!("compiled combined sidecar unsupported on this fixture platform");
+            std::fs::remove_file(marker)?;
+        }
         let mut epoch = [0; 32];
         theseus_host::random_bytes(&mut epoch)?;
         receipt.reset_epoch = v2::Digest::from_bytes(epoch).to_hex();
@@ -180,7 +236,9 @@ mod tests {
         let integration = v2::Digest::from_bytes([4; 32]);
         let full = v2::integration_manifest_digest(core, integration);
         let context = v2::IntegrationRuntimeContext {
-            manager_platform: v2::ManagerPlatform::Systemd,
+            linux_gio_qualification: None,
+            manager_platform: Some(v2::ManagerPlatform::Systemd),
+            desktop_broker_header: None,
             installation_instance_digest: None,
             kind: "theseus_native_integration_context".into(),
             schema: 1,
@@ -190,8 +248,8 @@ mod tests {
             workspace_marker: "02".repeat(16),
             provider_epoch: "05".repeat(32),
             integration_manifest_digest: integration.to_hex(),
-            manager_unique_name: ":1.42".into(),
-            namespace_receipt: "explicit-model-context".into(),
+            manager_unique_name: Some(":1.42".into()),
+            namespace_receipt: Some("explicit-model-context".into()),
         };
         let config = root.path().join("config.json");
         std::fs::write(&config,serde_json::to_vec(&serde_json::json!({"ledger_root":ledger,"workspace_root":workspace,"binding":context.binding,"manifest_digest":context.manifest_digest,"core_manifest_digest":core.to_hex(),"integration_manifest_digest":integration.to_hex(),"runtime_context":context,"artifacts":{"base":{"length":1,"sha256":"07".repeat(32)},"target":{"length":2,"sha256":"08".repeat(32)}}})).unwrap()).unwrap();

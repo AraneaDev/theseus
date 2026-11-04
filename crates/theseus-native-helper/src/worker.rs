@@ -60,6 +60,7 @@ pub(crate) fn spawn(
 }
 struct Active {
     key: RunKey,
+    request_digest: v2::Digest,
     cancel: CancelToken,
     start: StartWatch,
     _accepted: Option<CommittedRecord>,
@@ -116,6 +117,8 @@ struct PendingService {
     published: bool,
 }
 struct Worker {
+    desktop: Option<crate::integration::desktop::DesktopRuntime>,
+    desktop_tickets: std::collections::VecDeque<(v2::Request, ResponseTicket)>,
     ports: WorkerPorts,
     tokens: Vec<DataPermit>,
     pending: Option<WorkerEvent>,
@@ -138,6 +141,8 @@ struct Worker {
 impl Worker {
     fn new(ports: WorkerPorts, tokens: [DataPermit; 4]) -> Self {
         Self {
+            desktop: None,
+            desktop_tickets: std::collections::VecDeque::with_capacity(2),
             ports,
             tokens: Vec::from(tokens),
             pending: None,
@@ -178,6 +183,23 @@ impl Worker {
                     cleanup_errors: std::array::from_fn(|_| None),
                 });
             }
+        }
+        let desktop_errors = self
+            .desktop
+            .as_mut()
+            .map(|d| std::mem::take(&mut d.errors))
+            .unwrap_or_default();
+        if !desktop_errors.is_empty() {
+            if self.failure.is_none() {
+                self.fail(WorkerPrimary::Io(io::Error::other(
+                    "original desktop broker transport failed",
+                )));
+            }
+            self.failure
+                .as_mut()
+                .unwrap()
+                .retained_service_errors
+                .extend(desktop_errors);
         }
         let service_errors = self
             .service
@@ -292,6 +314,20 @@ impl Worker {
             {
                 self.fail(primary);
             }
+            if self.pending.is_none()
+                && self.response.is_none()
+                && self.desktop.as_ref().is_some_and(|d| d.is_pending())
+                && let Err(error) = self.advance_desktop()
+            {
+                self.fail(error);
+            }
+            if self.desktop.as_ref().is_some_and(|d| d.unavailable)
+                && self.pending.is_none()
+                && self.response.is_none()
+                && let Some((_, ticket)) = self.desktop_tickets.pop_front()
+            {
+                self.refuse(ticket, v2::RefusalCode::OwnershipPending);
+            }
             if self.failure.is_some() {
                 break;
             }
@@ -332,6 +368,7 @@ impl Worker {
     }
     fn command(&mut self, command: WorkerCommand) -> Result<(), WorkerPrimary> {
         match command {
+            WorkerCommand::Desktop { request, ticket } => self.begin_desktop(request, ticket)?,
             WorkerCommand::ProbeReadiness { request, ticket } => {
                 self.probe_readiness(request, ticket)?
             }
@@ -504,6 +541,21 @@ impl Worker {
             let config = inv.integration.as_ref().ok_or_else(|| {
                 WorkerPrimary::Io(io::Error::other("integration context missing"))
             })?;
+            if config.manifest.desktop.is_some() {
+                let declared = v2::broker::declared_desktop(store.records())
+                    .map_err(|e| WorkerPrimary::Io(io::Error::other(e)))?;
+                if declared
+                    != config
+                        .manifest
+                        .desktop
+                        .as_ref()
+                        .zip(config.context.desktop_broker_header.as_ref())
+                {
+                    return Err(WorkerPrimary::Io(io::Error::other(
+                        "desktop ceiling differs from original helper declaration",
+                    )));
+                }
+            }
             let context_digest = config
                 .context
                 .digest()
@@ -531,24 +583,34 @@ impl Worker {
                     "integration native description missing",
                 )));
             };
-            self.service = Some(crate::integration::service::ServiceRuntime::new(
-                config.as_ref().clone(),
-            ));
+            if config.manifest.desktop.is_some() {
+                let mut desktop =
+                    crate::integration::desktop::DesktopRuntime::new(config, &inv.ledger_root)
+                        .map_err(WorkerPrimary::Io)?;
+                desktop
+                    .retain_provider_qualification(&store, &config.context)
+                    .map_err(WorkerPrimary::Io)?;
+                self.desktop = Some(desktop);
+            }
+            if config.manifest.service_authority.is_some() {
+                self.service = Some(crate::integration::service::ServiceRuntime::new(
+                    config.as_ref().clone(),
+                ));
+            }
             v2::Reply::IntegrationDescription {
                 description: Box::new(v2::IntegrationDescription {
                     manifest: Box::new(config.manifest.clone()),
-                    namespace_receipt_digest: {
-                        use sha2::{Digest as _, Sha256};
-                        v2::Digest::from_bytes(
-                            Sha256::digest(config.context.namespace_receipt.as_bytes()).into(),
-                        )
-                    },
+                    namespace_receipt_digest: config
+                        .context
+                        .authority_receipt_digest()
+                        .map_err(|e| WorkerPrimary::Io(io::Error::other(e)))?,
                     native: *native,
                     core_manifest_digest,
                     integration_manifest_digest,
                     context_digest,
                     ownership_id: config.context.ownership_id.clone(),
-                    capabilities: v2::IntegrationCapabilities,
+                    capabilities: v2::IntegrationCapabilities::for_manifest(&config.manifest)
+                        .map_err(|e| WorkerPrimary::Io(io::Error::other(e)))?,
                 }),
             }
         } else {
@@ -700,6 +762,8 @@ impl Worker {
                 let boundary = out.boundary();
                 self.active = Some(Active {
                     key,
+                    request_digest: v2::request_digest(&request)
+                        .map_err(|e| WorkerPrimary::Io(io::Error::other(e)))?,
                     cancel,
                     start,
                     _accepted: None,
@@ -772,6 +836,7 @@ impl Worker {
         let deadline = accepted_at + Duration::from_secs(30);
         self.active = Some(Active {
             key,
+            request_digest: digest,
             cancel,
             start,
             _accepted: Some(committed),
@@ -1375,6 +1440,14 @@ impl Worker {
         }
     }
     fn release(&mut self, lease: v2::LeaseId, ticket: ResponseTicket) -> Result<(), WorkerPrimary> {
+        if self.desktop.is_some() {
+            let desktop_view =
+                v2::broker::BrokerLedgerView::replay(self.store.as_ref().unwrap().records())
+                    .map_err(|e| WorkerPrimary::Io(io::Error::other(e)))?;
+            if desktop_view.binding_original().is_some() && !desktop_view.helper_released() {
+                return self.begin_desktop(v2::Request::Release { lease }, ticket);
+            }
+        }
         if self.active.is_some() || self.file.is_some() || self.service_action.is_some() {
             self.refuse(ticket, v2::RefusalCode::Busy);
             return Ok(());
@@ -1727,11 +1800,6 @@ impl Worker {
         Ok(())
     }
     fn finish(&mut self, outcome: v2::Outcome) -> Result<(), WorkerPrimary> {
-        if let (Some(service), Some(program), Some(active)) =
-            (&mut self.service, &self.program, &self.active)
-        {
-            service.note_sut(program, active.key.operation, &outcome);
-        }
         let a = self.active.as_mut().unwrap();
         // Producer boundary freezes before the physical terminal barrier. No client
         // acknowledgment or ProducerDrained participates in this persistence decision.
@@ -1765,6 +1833,35 @@ impl Worker {
             }
             self.active.as_mut().unwrap().committed = true;
             self.last_spawn = self.active.as_mut().unwrap().spawn_failure.take();
+            // Only a durably completed original Run may authorize a SUT transition.
+            if let (Some(service), Some(program), Some(active)) =
+                (&mut self.service, &self.program, &self.active)
+            {
+                service.note_sut(
+                    program,
+                    active.key.lease,
+                    active.key.operation,
+                    active.request_digest,
+                    &outcome,
+                );
+            }
+            if let (Some(desktop), Some(program), Some(active), Some(store)) = (
+                &mut self.desktop,
+                &self.program,
+                &self.active,
+                &mut self.store,
+            ) {
+                desktop
+                    .note_sut(
+                        store,
+                        program,
+                        active.key.lease,
+                        active.key.operation,
+                        active.request_digest,
+                        &outcome,
+                    )
+                    .map_err(WorkerPrimary::Io)?;
+            }
             self.active.as_mut().unwrap().outcome = Some(outcome);
         }
         if self.pending.is_none() {
@@ -1782,6 +1879,11 @@ impl Worker {
         Ok(())
     }
     fn settle_native(&mut self) {
+        if let Some(desktop) = &mut self.desktop {
+            while !desktop.poll_settle() {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
         if self.service.as_ref().is_some_and(|s| s.unsettled())
             || self.prefix_mapping_error.is_some()
             || self
@@ -4180,6 +4282,128 @@ impl Worker {
             Err(error) => {
                 service.errors.push(error);
                 self.refuse(ticket, v2::RefusalCode::OwnershipPending);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Worker {
+    fn begin_desktop(
+        &mut self,
+        request: v2::Request,
+        ticket: ResponseTicket,
+    ) -> Result<(), WorkerPrimary> {
+        if self.active.is_some()
+            || self.file.is_some()
+            || self.service_action.is_some()
+            || self.desktop_tickets.len() >= 2
+        {
+            self.refuse(ticket, v2::RefusalCode::Busy);
+            return Ok(());
+        }
+        let lease = match &request {
+            v2::Request::BrokerBind { original } | v2::Request::QueryBrokerBind { original } => {
+                v2::LeaseId::parse(&original.helper_lease)
+            }
+            v2::Request::DesktopAction { request } => v2::LeaseId::parse(&request.helper_lease),
+            v2::Request::InspectDesktop { lease, .. } | v2::Request::Release { lease } => {
+                Ok(*lease)
+            }
+            v2::Request::QueryDesktop { identity }
+            | v2::Request::CancelDesktop { identity }
+            | v2::Request::ProbeDesktopReadiness { identity, .. } => {
+                v2::LeaseId::parse(&identity.helper_lease)
+            }
+            _ => {
+                self.refuse(ticket, v2::RefusalCode::InvalidRequest);
+                return Ok(());
+            }
+        }
+        .map_err(|e| WorkerPrimary::Io(io::Error::other(e)))?;
+        let original_control = matches!(
+            request,
+            v2::Request::QueryBrokerBind { .. }
+                | v2::Request::QueryDesktop { .. }
+                | v2::Request::CancelDesktop { .. }
+        );
+        if original_control {
+            if !self
+                .lease
+                .as_ref()
+                .is_some_and(|(_, actual, _)| *actual == lease)
+            {
+                self.refuse(ticket, v2::RefusalCode::WrongLease);
+                return Ok(());
+            }
+        } else if let Some(code) = self.held_refusal(lease) {
+            self.refuse(ticket, code);
+            return Ok(());
+        }
+        let Some(desktop) = &mut self.desktop else {
+            self.refuse(ticket, v2::RefusalCode::Unsupported);
+            return Ok(());
+        };
+        match desktop.start(self.store.as_mut().unwrap(), lease, request.clone()) {
+            Ok(Some(reply)) => self.respond(ticket, reply, None),
+            Ok(None) => self.desktop_tickets.push_back((request, ticket)),
+            Err(error) => {
+                desktop.fail(error);
+                self.refuse(ticket, v2::RefusalCode::OwnershipPending);
+            }
+        }
+        Ok(())
+    }
+    fn advance_desktop(&mut self) -> Result<(), WorkerPrimary> {
+        if self.stopping {
+            if let Some(desktop) = &mut self.desktop {
+                desktop.request_stop();
+            }
+            self.desktop_tickets.clear();
+            return Ok(());
+        }
+        let result = self
+            .desktop
+            .as_mut()
+            .unwrap()
+            .poll(self.store.as_mut().unwrap());
+        match result {
+            Ok(Some((original, reply))) => {
+                let position = self
+                    .desktop_tickets
+                    .iter()
+                    .position(|(request, _)| request == &original)
+                    .ok_or_else(|| {
+                        WorkerPrimary::Io(io::Error::other(
+                            "original desktop response ticket missing",
+                        ))
+                    })?;
+                let (_, ticket) = self.desktop_tickets.remove(position).unwrap();
+                if let v2::Reply::DesktopState { identity, state } = &reply {
+                    self.publish(WorkerEvent::CacheUpdate(CachePatch::DesktopState {
+                        identity: *identity.clone(),
+                        state: *state.clone(),
+                    }));
+                }
+                if let (
+                    v2::Request::Release { lease },
+                    v2::Reply::Lease {
+                        state: v2::LeaseView::AwaitingExternalReset { .. },
+                        ..
+                    },
+                ) = (&original, &reply)
+                {
+                    self.release(*lease, ticket)?;
+                } else {
+                    self.response = Some((ticket, reply, None));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.desktop.as_mut().unwrap().fail(error);
+                if let Some((_, ticket)) = self.desktop_tickets.pop_front() {
+                    self.refuse(ticket, v2::RefusalCode::OwnershipPending);
+                }
             }
         }
         Ok(())

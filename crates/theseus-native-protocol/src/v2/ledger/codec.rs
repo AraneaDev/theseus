@@ -45,6 +45,23 @@ impl Serialize for EntryRef<'_> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let mut m = s.serialize_map(None)?;
         match self.0 {
+            Entry::LinuxGioQualificationDeclared { attestation } => {
+                m.serialize_entry("kind", "linux_gio_qualification_declared")?;
+                m.serialize_entry("attestation", attestation)?;
+            }
+            Entry::DesktopAuthorityDeclared { manifest, context } => {
+                m.serialize_entry("kind", "desktop_authority_declared")?;
+                m.serialize_entry("manifest", manifest)?;
+                m.serialize_entry("context", context)?;
+            }
+            Entry::IntegrationBrokerHeader { header } => {
+                m.serialize_entry("kind", "integration_broker_header")?;
+                m.serialize_entry("header", header)?;
+            }
+            Entry::Broker { event } => {
+                m.serialize_entry("kind", "broker")?;
+                m.serialize_entry("event", event)?;
+            }
             Entry::IntegrationHeader {
                 artifact_commitment,
                 binding,
@@ -204,9 +221,18 @@ pub fn encode(r: &Record) -> Result<Vec<u8>, LedgerError> {
 pub fn request_digest(v: &Request) -> Result<Digest, Error> {
     if !matches!(
         v,
-        Request::CreateFile { .. } | Request::Run { .. } | Request::ServiceAction { .. }
+        Request::CreateFile { .. }
+            | Request::Run { .. }
+            | Request::ServiceAction { .. }
+            | Request::BrokerBind { .. }
+            | Request::DesktopAction { .. }
     ) {
         return Err(Error::InvalidValue);
+    }
+    match v {
+        Request::BrokerBind { original } => original.validate()?,
+        Request::DesktopAction { request } => request.validate()?,
+        _ => {}
     }
     let mut w = CappedWriter::<{ v2::MAX_BODY_BYTES }>::new();
     serde_json::to_writer(&mut w, &v2::json::RequestRef(v)).map_err(|_| Error::LimitExceeded)?;
@@ -285,6 +311,24 @@ fn decode(b: &[u8], hash: &[u8; 32]) -> Result<Record, LedgerError> {
     let mut e = Object::new(o.take("record")?)?;
     o.end()?;
     let entry = match e.text("kind")?.as_str() {
+        "linux_gio_qualification_declared" => Entry::LinuxGioQualificationDeclared {
+            attestation: serde_json::from_value(e.take("attestation")?)
+                .map_err(|_| LedgerError::InvalidRecord)?,
+        },
+        "desktop_authority_declared" => Entry::DesktopAuthorityDeclared {
+            manifest: serde_json::from_value(e.take("manifest")?)
+                .map_err(|_| LedgerError::InvalidRecord)?,
+            context: serde_json::from_value(e.take("context")?)
+                .map_err(|_| LedgerError::InvalidRecord)?,
+        },
+        "integration_broker_header" => Entry::IntegrationBrokerHeader {
+            header: serde_json::from_value(e.take("header")?)
+                .map_err(|_| LedgerError::InvalidRecord)?,
+        },
+        "broker" => Entry::Broker {
+            event: serde_json::from_value(e.take("event")?)
+                .map_err(|_| LedgerError::InvalidRecord)?,
+        },
         "native_authority_revoked" => Entry::NativeAuthorityRevoked {
             lease: scalar(LeaseId::parse(&e.text("lease")?))?,
             reason: match e.text("reason")?.as_str() {

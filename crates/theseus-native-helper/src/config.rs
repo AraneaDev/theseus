@@ -118,13 +118,58 @@ fn os(s: &str) -> Result<v2::Os, ConfigError> {
         _ => Err(invalid()),
     }
 }
+#[cfg(test)]
 fn parse_bytes(b: &[u8]) -> Result<Config, ConfigError> {
+    parse_profile_bytes(b, false)
+}
+fn parse_profile_bytes(b: &[u8], allow_source_desktop: bool) -> Result<Config, ConfigError> {
     if b.len() > MAX_CONFIG as usize || b.starts_with(&[0xef, 0xbb, 0xbf]) {
+        return Err(invalid());
+    }
+    let raw: serde_json::Value = serde_json::from_slice(b).map_err(|_| invalid())?;
+    if !allow_source_desktop
+        && raw
+            .pointer("/runtime_context/desktop_broker_header/display/kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("source_owned_headless")
+    {
         return Err(invalid());
     }
     let c: Config = serde_json::from_slice(b).map_err(|e| ConfigError {
         kind: ConfigErrorKind::Json(e),
     })?;
+    if allow_source_desktop {
+        if !cfg!(feature = "test-support")
+            || c.schema != 3
+            || raw
+                .pointer("/runtime_context/desktop_broker_header/display/kind")
+                .and_then(serde_json::Value::as_str)
+                != Some("source_owned_headless")
+        {
+            return Err(invalid());
+        }
+        let manifest = c.integration_manifest.as_ref().ok_or_else(invalid)?;
+        let desktop = manifest.desktop.as_ref().ok_or_else(invalid)?;
+        let header = c
+            .runtime_context
+            .as_ref()
+            .and_then(|ctx| ctx.desktop_broker_header.as_ref())
+            .ok_or_else(invalid)?;
+        if manifest.desktop_native.is_some()
+            || desktop.allowed_modes != [v2::broker::DesktopMode::OwnedExecutable]
+            || header.allowed_modes != [v2::broker::DesktopMode::OwnedExecutable]
+            || manifest
+                .service_authority
+                .as_ref()
+                .is_some_and(|service| service.slot() == &desktop.slot)
+            || !matches!(
+                v2::IntegrationCapabilities::for_manifest(manifest),
+                Ok(v2::IntegrationCapabilities::Desktop | v2::IntegrationCapabilities::Combined)
+            )
+        {
+            return Err(invalid());
+        }
+    }
     if !matches!(c.schema, 1..=3)
         || !absolute(&c.ledger_root)
         || !absolute(&c.workspace_root)
@@ -345,7 +390,14 @@ fn authority_digest(c: &Config) -> String {
 /// Compute the manifest over explicit, strictly validated configuration authority.
 /// The supplied manifest_digest is syntax checked but not compared by this helper.
 pub fn config_manifest_digest(bytes: &[u8]) -> Result<v2::Digest, ConfigError> {
-    let config = parse_bytes(bytes)?;
+    manifest_digest_profile(bytes, false)
+}
+#[cfg(feature = "test-support")]
+pub fn source_desktop_config_manifest_digest(bytes: &[u8]) -> Result<v2::Digest, ConfigError> {
+    manifest_digest_profile(bytes, true)
+}
+fn manifest_digest_profile(bytes: &[u8], allow_source: bool) -> Result<v2::Digest, ConfigError> {
+    let config = parse_profile_bytes(bytes, allow_source)?;
     let core = v2::Digest::parse(&authority_digest(&config)).map_err(|_| invalid())?;
     if config.schema == 3 {
         Ok(v2::integration_manifest_digest(
@@ -364,6 +416,13 @@ pub fn config_manifest_digest(bytes: &[u8]) -> Result<v2::Digest, ConfigError> {
 /// Load a bounded, explicit regular config; verify authority before opening roots.
 /// UTF-8 paths/argv are this CLI profile's restriction, not a native API restriction.
 pub fn load_config(path: &Path) -> Result<Invocation, ConfigError> {
+    load_profile_config(path, false)
+}
+#[cfg(feature = "test-support")]
+pub fn load_source_desktop_config(path: &Path) -> Result<Invocation, ConfigError> {
+    load_profile_config(path, true)
+}
+fn load_profile_config(path: &Path, allow_source: bool) -> Result<Invocation, ConfigError> {
     if !path.is_absolute() || path.to_str().is_none_or(|s| !bounded(s, 16384)) {
         return Err(invalid());
     }
@@ -382,7 +441,7 @@ pub fn load_config(path: &Path) -> Result<Invocation, ConfigError> {
     file.take(MAX_CONFIG + 1)
         .read_to_end(&mut b)
         .map_err(io_error)?;
-    let c = parse_bytes(&b)?;
+    let c = parse_profile_bytes(&b, allow_source)?;
     if (if c.schema == 3 {
         Some(authority_digest(&c)) != c.core_manifest_digest
     } else {
@@ -837,5 +896,79 @@ mod tests {
             load_config(&p).err().unwrap().kind,
             ConfigErrorKind::Invalid
         ));
+    }
+    #[cfg(feature = "test-support")]
+    fn source_combined_vector() -> serde_json::Value {
+        let mut value = native_vector();
+        let core = authority_digest(&parse(&value).unwrap());
+        let mut manifest = crate::broker_transport::generation_tests::combined_manifest_fixture();
+        manifest.core_manifest_digest = core.clone();
+        manifest.desktop.as_mut().unwrap().core_manifest_digest = core.clone();
+        let integration = manifest.digest().unwrap();
+        let full = v2::integration_manifest_digest(v2::Digest::parse(&core).unwrap(), integration);
+        let mut header: v2::broker::IntegrationBrokerHeader = serde_json::from_value(
+            crate::broker_transport::native_routing_tests::native_config()["header"].clone(),
+        )
+        .unwrap();
+        header.allowed_modes = vec![v2::broker::DesktopMode::OwnedExecutable];
+        header.display = v2::broker::SuppliedDisplay::SourceOwnedHeadless;
+        header.binding = value["binding"].as_str().unwrap().into();
+        header.manifest_digest = full.to_hex();
+        header.workspace_marker = value["workspace_marker"].as_str().unwrap().into();
+        header.provider_epoch = value["provider_epoch"].as_str().unwrap().into();
+        value["schema"] = serde_json::json!(3);
+        value["profile"] = serde_json::json!("native_integration_v1");
+        value["core_manifest_digest"] = serde_json::json!(core);
+        value["integration_manifest_digest"] = serde_json::json!(integration.to_hex());
+        value["manifest_digest"] = serde_json::json!(full.to_hex());
+        value["integration_manifest"] = serde_json::to_value(manifest).unwrap();
+        value["runtime_context"] = serde_json::json!({"kind":"theseus_native_integration_context","schema":1,"ownership_id":header.ownership_id,"binding":header.binding,"manifest_digest":header.manifest_digest,"workspace_marker":header.workspace_marker,"provider_epoch":header.provider_epoch,"integration_manifest_digest":integration.to_hex(),"manager_unique_name":":1.7","namespace_receipt":"parser-only-owned-fixture","desktop_broker_header":header});
+        value
+    }
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn source_combined_owned_loader_is_separate_from_shipping_raw_boundary() {
+        let value = source_combined_vector();
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(parse_profile_bytes(&bytes, true).is_ok());
+        assert_eq!(
+            source_desktop_config_manifest_digest(&bytes)
+                .unwrap()
+                .to_hex(),
+            value["manifest_digest"].as_str().unwrap()
+        );
+        assert!(parse_profile_bytes(&bytes, false).is_err());
+        assert!(config_manifest_digest(&bytes).is_err());
+    }
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn source_combined_refuses_native_overlapping_slots_and_changed_full_context() {
+        let value = source_combined_vector();
+        for path in [
+            "/integration_manifest/desktop/slot",
+            "/runtime_context/manifest_digest",
+        ] {
+            let mut bad = value.clone();
+            *bad.pointer_mut(path).unwrap() = serde_json::json!(if path.ends_with("slot") {
+                "fixture_service".into()
+            } else {
+                "ff".repeat(32)
+            });
+            assert!(parse_profile_bytes(&serde_json::to_vec(&bad).unwrap(), true).is_err());
+        }
+        let mut bad = value.clone();
+        bad["runtime_context"]["desktop_broker_header"]["allowed_modes"] =
+            serde_json::json!(["native_activation"]);
+        assert!(parse_profile_bytes(&serde_json::to_vec(&bad).unwrap(), true).is_err());
+    }
+    #[test]
+    fn shipping_raw_source_boundary_precedes_typed_parsing() {
+        let raw=br#"{"runtime_context":{"desktop_broker_header":{"display":{"kind":"source_owned_headless"}}}}"#;
+        let error = parse_profile_bytes(raw, false)
+            .err()
+            .expect("shipping source refusal");
+        assert!(matches!(error.kind, ConfigErrorKind::Invalid));
+        let error = config_manifest_digest(raw).expect_err("ordinary digest source refusal");
+        assert!(matches!(error.kind, ConfigErrorKind::Invalid));
     }
 }

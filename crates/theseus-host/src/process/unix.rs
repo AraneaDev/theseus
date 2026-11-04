@@ -14,6 +14,29 @@ pub struct OwnedChild {
     status: Option<ExitStatus>,
 }
 impl OwnedChild {
+    /// Correlation metadata from the original still-reserved child. This number
+    /// is never authority to reopen, reattach, or control another process.
+    pub fn original_peer_pid(&self) -> io::Result<u32> {
+        if self.group.is_none() {
+            return Err(io::Error::other(
+                "original child identity is no longer reserved",
+            ));
+        }
+        Ok(self.child.id())
+    }
+
+    /// A process group cannot prove full descendant-tree settlement: an original
+    /// descendant can leave that group. Preserve the original rights and refuse
+    /// this stronger proof, independently of historical primary/group cleanup.
+    pub fn try_join_original_scope(&mut self) -> io::Result<Option<ExitStatus>> {
+        // Even a cached primary status is not a tree-completion receipt.
+        // Linux desktop callers use the separate dedicated subreaper owner.
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "original process-group descendant join proof unavailable",
+        ))
+    }
+
     /// Shared null/file launch primitive for owned endpoints and mechanism tests.
     #[doc(hidden)]
     pub fn spawn_files(

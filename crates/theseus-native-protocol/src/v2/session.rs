@@ -53,6 +53,7 @@ pub struct SessionGuard {
     directions: [Direction; 2],
     closed: bool,
     description: Option<Reply>,
+    desktop_broker_header: Option<broker::IntegrationBrokerHeader>,
     pending: BTreeMap<u64, Request>,
     stream: Option<RunStream>,
     // Every observed non-Missing ID keeps its slot through refresh/settlement.
@@ -68,6 +69,7 @@ impl SessionGuard {
             directions: [Direction::default(), Direction::default()],
             closed: false,
             description: None,
+            desktop_broker_header: None,
             pending: BTreeMap::new(),
             stream: None,
             known_operations: Vec::new(),
@@ -158,12 +160,35 @@ impl SessionGuard {
         }
         match v.message() {
             Message::Request { request } => {
+                let integration =
+                    matches!(self.description, Some(Reply::IntegrationDescription { .. }));
+                let broker = matches!(self.description, Some(Reply::BrokerDescription { .. }));
+                let desktop = matches!(self.description.as_ref(),Some(Reply::IntegrationDescription {description}) if description.manifest.desktop.is_some());
                 if matches!(
                     request,
                     Request::ServiceAction { .. }
                         | Request::InspectService { .. }
                         | Request::ProbeReadiness { .. }
-                ) && !matches!(self.description, Some(Reply::IntegrationDescription { .. }))
+                ) && !integration
+                {
+                    return Err(Error::UnexpectedMessage);
+                }
+                if matches!(
+                    request,
+                    Request::BrokerBind { .. } | Request::QueryBrokerBind { .. }
+                ) && !desktop
+                {
+                    return Err(Error::UnexpectedMessage);
+                }
+                if matches!(
+                    request,
+                    Request::DesktopAction { .. }
+                        | Request::InspectDesktop { .. }
+                        | Request::QueryDesktop { .. }
+                        | Request::CancelDesktop { .. }
+                        | Request::ProbeDesktopReadiness { .. }
+                ) && !desktop
+                    && !broker
                 {
                     return Err(Error::UnexpectedMessage);
                 }
@@ -270,10 +295,81 @@ impl SessionGuard {
         }
         match (request, result) {
             (
+                Request::BrokerBind { original } | Request::QueryBrokerBind { original },
+                Reply::BrokerBinding { receipt },
+            ) if original.as_ref() == &receipt.original => {
+                let header = &receipt.original.expected_header;
+                if self
+                    .desktop_broker_header
+                    .as_ref()
+                    .is_some_and(|old| old != header)
+                {
+                    return Err(Error::UnexpectedReply);
+                }
+                self.desktop_broker_header = Some(header.clone());
+            }
+            (Request::DesktopAction { request }, Reply::DesktopState { identity, .. })
+                if request.identity().as_ref() == Ok(identity.as_ref()) => {}
+            (
+                Request::QueryDesktop { identity: a } | Request::CancelDesktop { identity: a },
+                Reply::DesktopState { identity: b, .. },
+            ) if a == b => {}
+            (
+                Request::ProbeDesktopReadiness {
+                    identity: a, nonce, ..
+                },
+                Reply::DesktopReadiness {
+                    identity: b,
+                    observation,
+                },
+            ) if a == b => {
+                observation.validate_desktop(a)?;
+                let header = match self.description.as_ref() {
+                    Some(Reply::BrokerDescription { header }) => header.as_ref(),
+                    Some(Reply::IntegrationDescription { .. }) => self
+                        .desktop_broker_header
+                        .as_ref()
+                        .ok_or(Error::UnexpectedReply)?,
+                    _ => return Err(Error::UnexpectedReply),
+                };
+                if a.binding_digest != header.digest()?.to_hex() {
+                    return Err(Error::UnexpectedReply);
+                }
+                observation.validate_desktop_peer(&header.broker_principal)?;
+                let challenge = ReadinessChallengeFields {
+                    lease: a.broker_lease.clone(),
+                    slot: observation.slot.as_str().into(),
+                    resource_binding_digest: observation.resource_binding_digest.clone(),
+                    operation: a.helper_operation.clone(),
+                    action_digest: a.request_digest.clone(),
+                    nonce: nonce.to_hex(),
+                    expectation_digest: observation.expectation_digest.clone(),
+                };
+                if challenge.digest()?.to_hex() != observation.challenge_digest {
+                    return Err(Error::UnexpectedReply);
+                }
+            }
+            (
+                Request::InspectDesktop {
+                    lease: a,
+                    slot,
+                    generation,
+                },
+                Reply::DesktopObservation {
+                    lease: b,
+                    observation,
+                },
+            ) if a == b
+                && slot == &observation.slot
+                && generation
+                    .as_ref()
+                    .is_none_or(|expected| observation.generation.as_ref() == Some(expected)) => {}
+            (
                 Request::Describe,
                 Reply::Description { .. }
                 | Reply::NativeDescription { .. }
-                | Reply::IntegrationDescription { .. },
+                | Reply::IntegrationDescription { .. }
+                | Reply::BrokerDescription { .. },
             ) => {
                 if self.description.as_ref().is_some_and(|old| old != result) {
                     return Err(Error::UnexpectedMessage);
@@ -667,5 +763,57 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod desktop_binding_guard_tests {
+    use super::*;
+    #[test]
+    fn recovery_header_is_retained_only_from_matching_original_query_bind_receipt() {
+        use broker::*;
+        let header:IntegrationBrokerHeader=serde_json::from_value(serde_json::json!({"profile":"native_integration_broker_v1","binding":"11".repeat(16),"manifest_digest":"22".repeat(32),"workspace_marker":"33".repeat(16),"os":"linux","target_id":"fixture","ownership_id":"44".repeat(16),"provider_epoch":"55".repeat(32),"session_id":"session","session_epoch":"66".repeat(32),"broker_endpoint":{"kind":"unix_path","path":"/fixture/broker.sock"},"broker_principal":{"kind":"posix","effective_uid":1000,"effective_gid":1000},"helper_principal":{"kind":"posix","effective_uid":0,"effective_gid":0},"display":{"kind":"x11","display":":92","authority_file":"/fixture/auth","bus":"/fixture/bus.sock"},"allowed_modes":["owned_executable"]})).unwrap();
+        let original = BrokerBind {
+            ownership_id: header.ownership_id.clone(),
+            helper_lease: "77".repeat(16),
+            helper_operation: "88".repeat(16),
+            slot: ResourceSlot::new("desktop").unwrap(),
+            broker_intent: "99".repeat(16),
+            expected_header: header.clone(),
+        };
+        let receipt = BrokerBindingReceipt {
+            request_digest: original.digest().unwrap().to_hex(),
+            original: original.clone(),
+            publication_scope: IntentPublicationScope::FileAndDirectorySynced,
+            broker_lease: "aa".repeat(16),
+        };
+        receipt.validate().unwrap();
+        let mut guard = SessionGuard::new(SessionId::from_bytes([1; 16]), Role::Controller);
+        let mut wrong = original.clone();
+        wrong.helper_operation = "bb".repeat(16);
+        assert!(
+            guard
+                .reply(
+                    &Request::QueryBrokerBind {
+                        original: Box::new(wrong)
+                    },
+                    &Reply::BrokerBinding {
+                        receipt: Box::new(receipt.clone())
+                    }
+                )
+                .is_err()
+        );
+        assert!(guard.desktop_broker_header.is_none());
+        guard
+            .reply(
+                &Request::QueryBrokerBind {
+                    original: Box::new(original),
+                },
+                &Reply::BrokerBinding {
+                    receipt: Box::new(receipt),
+                },
+            )
+            .unwrap();
+        assert_eq!(guard.desktop_broker_header, Some(header));
     }
 }

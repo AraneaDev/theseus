@@ -115,6 +115,9 @@ pub struct ReadinessObservation {
     pub authenticated_instance: bool,
     pub instance_binding_digest: [u8; 32],
 }
+fn completed_probe(value: Option<ReadinessObservation>) -> io::Result<ReadinessObservation> {
+    value.ok_or_else(|| invalid("blocking probe unexpectedly yielded"))
+}
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -419,10 +422,17 @@ fn deadline_failure(
     deadline: Instant,
     cancel: &AtomicBool,
 ) -> io::Result<Option<ReadinessFailure>> {
-    if cancel.load(Ordering::Acquire) {
+    deadline_failure_at(deadline, Instant::now(), cancel.load(Ordering::Acquire))
+}
+fn deadline_failure_at(
+    deadline: Instant,
+    now: Instant,
+    cancelled: bool,
+) -> io::Result<Option<ReadinessFailure>> {
+    if cancelled {
         return Ok(Some(ReadinessFailure::Cancelled));
     }
-    let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+    let Some(left) = deadline.checked_duration_since(now) else {
         return Ok(Some(ReadinessFailure::Deadline));
     };
     if left > Duration::from_secs(30) {
@@ -482,6 +492,30 @@ fn compare(
 
 #[cfg(test)]
 mod platform_model_tests {
+    #[test]
+    fn scheduling_slice_expiry_is_not_original_probe_expiry() {
+        let start = Instant::now();
+        let original = start + Duration::from_secs(5);
+        let slice = start + Duration::from_millis(1);
+        let completed = start + Duration::from_millis(5);
+        assert_eq!(
+            deadline_failure_at(slice, completed, false).unwrap(),
+            Some(ReadinessFailure::Deadline)
+        );
+        assert_eq!(
+            deadline_failure_at(original, completed, false).unwrap(),
+            None
+        );
+        assert_eq!(
+            deadline_failure_at(original, original + Duration::from_nanos(1), false).unwrap(),
+            Some(ReadinessFailure::Deadline)
+        );
+        assert_eq!(
+            deadline_failure_at(original, completed, true).unwrap(),
+            Some(ReadinessFailure::Cancelled)
+        );
+    }
+
     use super::*;
     #[test]
     fn closed_pipe_names_refuse_remote_paths_and_dacl_principals_are_canonical() {

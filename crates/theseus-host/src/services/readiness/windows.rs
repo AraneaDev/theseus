@@ -1,12 +1,18 @@
 //! Local-only first-instance pipe. All OVERLAPPED storage remains owned until
 //! GetOverlappedResult(FALSE) reports terminal completion; cancellation is a request.
 use super::*;
-use std::{ffi::c_void, mem, ptr, rc::Rc};
+use std::{
+    ffi::c_void,
+    mem,
+    os::windows::io::{AsRawHandle, BorrowedHandle},
+    ptr,
+    rc::Rc,
+};
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING,
-        ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
-        LocalFree,
+        CloseHandle, CompareObjectHandles, DuplicateHandle, ERROR_INSUFFICIENT_BUFFER,
+        ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED,
+        GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
     },
     Security::{GetTokenInformation, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser},
     Storage::FileSystem::{
@@ -20,7 +26,7 @@ use windows_sys::Win32::{
             PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
         },
         Threading::{
-            CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken,
+            CreateEventW, GetCurrentProcess, GetProcessId, OpenProcess, OpenProcessToken,
             PROCESS_QUERY_LIMITED_INFORMATION,
         },
     },
@@ -253,6 +259,7 @@ struct ProbeState {
     measured_sid: Option<Sid>,
     // Query-only metadata owners, never process-control/lifetime authorities.
     process: Option<Handle>,
+    original_process: Option<Handle>,
     token: Option<Handle>,
     slot: Option<IoSlot>,
     last: Option<ReadinessObservation>,
@@ -261,6 +268,7 @@ struct ProbeState {
 /// Single native owner; !Send/!Sync so native buffers/events stay on its worker.
 pub struct LocalChallenge {
     endpoint: NamedPipe,
+    helper_sid: Sid,
     pipe: Option<Handle>,
     active: Option<ProbeState>,
     revoked: bool,
@@ -319,6 +327,7 @@ impl LocalChallenge {
         }
         Ok(Self {
             endpoint,
+            helper_sid,
             pipe: Some(Handle(pipe)),
             active: None,
             revoked: false,
@@ -332,6 +341,16 @@ impl LocalChallenge {
     pub fn is_revoked(&self) -> bool {
         self.revoked
     }
+    /// Re-arm the SAME first-instance server handle after an accepted SUT
+    /// transition. A pending OVERLAPPED/nonce is retained, never canceled here.
+    pub fn renew_after_sut_transition(&mut self) -> io::Result<()> {
+        if self.revoked || self.pipe.is_none() || self.active.is_some() {
+            return Err(invalid(
+                "original pipe probe must retire before SUT transition renewal",
+            ));
+        }
+        self.disconnect_original()
+    }
     pub fn pending_observation(&self) -> Option<&ReadinessObservation> {
         self.active.as_ref().and_then(|a| a.last.as_ref())
     }
@@ -343,6 +362,128 @@ impl LocalChallenge {
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> io::Result<ReadinessObservation> {
+        self.probe_inner(challenge, expectation, peer, None, deadline, cancel, false)
+            .and_then(completed_probe)
+    }
+    /// Uses only the supplied original process object. A query-only duplicate
+    /// stays owned during pending I/O and is compared by object on every resume.
+    #[allow(clippy::too_many_arguments)]
+    pub fn probe_original_process(
+        &mut self,
+        challenge: &ReadinessChallenge,
+        expectation: &ReadinessExpectation,
+        peer: &PipePeerExpectation,
+        original: BorrowedHandle<'_>,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> io::Result<ReadinessObservation> {
+        self.original_process_probe(
+            challenge,
+            expectation,
+            peer,
+            original,
+            deadline,
+            cancel,
+            false,
+        )
+        .and_then(completed_probe)
+    }
+    /// One nonblocking advance retaining and comparing the SAME original process
+    /// object on every resume. None yields without changing its semantic deadline.
+    #[allow(clippy::too_many_arguments)]
+    pub fn poll_original_process(
+        &mut self,
+        challenge: &ReadinessChallenge,
+        expectation: &ReadinessExpectation,
+        peer: &PipePeerExpectation,
+        original: BorrowedHandle<'_>,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> io::Result<Option<ReadinessObservation>> {
+        self.original_process_probe(
+            challenge,
+            expectation,
+            peer,
+            original,
+            deadline,
+            cancel,
+            true,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn original_process_probe(
+        &mut self,
+        challenge: &ReadinessChallenge,
+        expectation: &ReadinessExpectation,
+        peer: &PipePeerExpectation,
+        original: BorrowedHandle<'_>,
+        deadline: Instant,
+        cancel: &AtomicBool,
+        poll_only: bool,
+    ) -> io::Result<Option<ReadinessObservation>> {
+        let (pid, sid) = Self::original_process_metadata(original)?;
+        if pid != peer.original_pid || sid != peer.sid {
+            return Err(invalid("original process differs from bound pipe peer"));
+        }
+        let mut duplicate = ptr::null_mut();
+        if unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                original.as_raw_handle(),
+                GetCurrentProcess(),
+                &mut duplicate,
+                PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                0,
+            )
+        } == 0
+        {
+            return Err(last_native_error(
+                "DuplicateHandle(original query metadata)",
+            ));
+        }
+        self.probe_inner(
+            challenge,
+            expectation,
+            peer,
+            Some(Handle(duplicate)),
+            deadline,
+            cancel,
+            poll_only,
+        )
+    }
+    pub fn original_process_metadata(original: BorrowedHandle<'_>) -> io::Result<(u32, Sid)> {
+        let pid = unsafe { GetProcessId(original.as_raw_handle()) };
+        if pid == 0 {
+            return Err(last_native_error("GetProcessId(original)"));
+        }
+        let (sid, _token) = token_sid(original.as_raw_handle())?;
+        Ok((pid, sid))
+    }
+    #[allow(clippy::too_many_arguments)]
+    /// One bounded nonblocking advance using the original semantic deadline.
+    /// None preserves all original OVERLAPPED/buffer/channel owners for polling.
+    pub fn poll(
+        &mut self,
+        challenge: &ReadinessChallenge,
+        expectation: &ReadinessExpectation,
+        peer: &PipePeerExpectation,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> io::Result<Option<ReadinessObservation>> {
+        self.probe_inner(challenge, expectation, peer, None, deadline, cancel, true)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn probe_inner(
+        &mut self,
+        challenge: &ReadinessChallenge,
+        expectation: &ReadinessExpectation,
+        peer: &PipePeerExpectation,
+        original_process: Option<Handle>,
+        deadline: Instant,
+        cancel: &AtomicBool,
+        poll_only: bool,
+    ) -> io::Result<Option<ReadinessObservation>> {
         if self.revoked || self.pipe.is_none() {
             return Err(invalid("original pipe authority revoked or closed"));
         }
@@ -353,13 +494,23 @@ impl LocalChallenge {
             || !literal(&peer.cooperative_instance)
             || peer.instance_binding_digest == [0; 32]
             || peer.original_pid == 0
-            || peer.sid.as_str() != "S-1-5-18"
+            || !admitted_peer_sid(&self.helper_sid, &peer.sid)
         {
             return Err(invalid(
                 "missing original Start/principal/cooperative readiness binding",
             ));
         }
         if let Some(active) = &self.active {
+            let original_matches = match (&active.original_process, &original_process) {
+                (None, None) => true,
+                (Some(held), Some(now)) => (unsafe { CompareObjectHandles(held.0, now.0) }) != 0,
+                _ => false,
+            };
+            if !original_matches {
+                return Err(invalid(
+                    "pending original process object cannot be replaced",
+                ));
+            }
             if &active.challenge != challenge
                 || &active.expectation != expectation
                 || &active.peer != peer
@@ -367,7 +518,7 @@ impl LocalChallenge {
                 return Err(invalid("pending original probe context cannot be replaced"));
             }
             if active.terminal {
-                return Ok(active.last.clone().expect("terminal observation"));
+                return Ok(Some(active.last.clone().expect("terminal observation")));
             }
         } else {
             let body = encode_challenge(challenge)?;
@@ -385,6 +536,7 @@ impl LocalChallenge {
                 authenticated: false,
                 measured_sid: None,
                 process: None,
+                original_process,
                 token: None,
                 slot: None,
                 last: None,
@@ -396,38 +548,41 @@ impl LocalChallenge {
                 if failure == ReadinessFailure::Cancelled {
                     self.cancel_pending();
                 }
-                return Ok(self.observe(
+                return Ok(Some(self.observe(
                     ReadinessState::Incomplete,
                     Some(failure),
                     None,
                     false,
-                    false,
-                ));
+                    poll_only,
+                )));
             }
             match self.advance() {
                 Ok(Some(result)) => {
                     if let Some(failure) = deadline_failure(deadline, cancel)? {
-                        return Ok(self.observe(
+                        return Ok(Some(self.observe(
                             ReadinessState::Incomplete,
                             Some(failure),
                             result.response,
                             false,
                             true,
-                        ));
+                        )));
                     }
-                    return Ok(result);
+                    return Ok(Some(result));
                 }
                 Ok(None) => {}
                 Err(error) => {
                     self.retain_error(error);
-                    return Ok(self.observe(
+                    return Ok(Some(self.observe(
                         ReadinessState::Incomplete,
                         Some(ReadinessFailure::PeerClosed),
                         None,
                         false,
                         true,
-                    ));
+                    )));
                 }
+            }
+            if poll_only {
+                return Ok(None);
             }
             std::thread::sleep(
                 deadline
@@ -486,14 +641,21 @@ impl LocalChallenge {
                 }
                 // QUERY_LIMITED_INFORMATION only: never TERMINATE, VM_WRITE,
                 // CREATE_THREAD, DUP_HANDLE, token impersonation or adjustment.
-                let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-                if process.is_null() {
-                    return Err(last_native_error("OpenProcess"));
+                let process = if let Some(original) = &a.original_process {
+                    original.0
+                } else {
+                    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+                    if raw.is_null() {
+                        return Err(last_native_error("OpenProcess"));
+                    }
+                    a.process = Some(Handle(raw));
+                    raw
+                };
+                if unsafe { GetProcessId(process) } != pid {
+                    return Err(invalid("original process no longer matches pipe peer"));
                 }
-                let process = Handle(process);
-                let (sid, token) = token_sid(process.0)?;
+                let (sid, token) = token_sid(process)?;
                 a.measured_sid = Some(sid.clone());
-                a.process = Some(process);
                 a.token = Some(token);
                 if sid != a.peer.sid {
                     self.revoked = true;
@@ -685,6 +847,26 @@ impl LocalChallenge {
         Ok(())
     }
 }
+// Authentication cannot widen the protected helper+SYSTEM endpoint DACL.
+// Service manifests retain their separate LocalSystem-only account policy.
+fn admitted_peer_sid(helper: &Sid, peer: &Sid) -> bool {
+    peer == helper || peer.as_str() == "S-1-5-18"
+}
+
+#[cfg(test)]
+#[test]
+fn explicit_peer_account_stays_within_original_helper_and_system_dacl() {
+    let helper = Sid::new("S-1-5-21-1001".into()).unwrap();
+    assert!(admitted_peer_sid(&helper, &helper));
+    assert!(admitted_peer_sid(
+        &helper,
+        &Sid::new("S-1-5-18".into()).unwrap()
+    ));
+    assert!(!admitted_peer_sid(
+        &helper,
+        &Sid::new("S-1-5-21-1002".into()).unwrap()
+    ));
+}
 impl Drop for LocalChallenge {
     fn drop(&mut self) {
         if self.cleanup().is_err() {
@@ -708,6 +890,126 @@ mod native_pipe_tests {
     // These tests touch only private process-named test pipes, never SCM/services.
     // They require native Windows execution; cross-compilation is supplemental.
     #[test]
+    fn original_process_probe_keeps_same_object_proof_across_cancelled_resume() {
+        let original = unsafe { BorrowedHandle::borrow_raw(GetCurrentProcess()) };
+        let (pid, sid) = LocalChallenge::original_process_metadata(original).unwrap();
+        let endpoint = NamedPipe::new(format!(
+            r"\\.\pipe\theseus.original-shell-object-{}",
+            std::process::id()
+        ))
+        .unwrap();
+        let mut channel = LocalChallenge::bind(endpoint, sid.clone()).unwrap();
+        let challenge = super::super::tests::challenge();
+        let expectation = super::super::tests::expectation();
+        let peer = PipePeerExpectation {
+            sid,
+            original_pid: pid,
+            cooperative_instance: "original".into(),
+            instance_binding_digest: [8; 32],
+        };
+        let cancelled = AtomicBool::new(true);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let observed = channel
+            .probe_original_process(
+                &challenge,
+                &expectation,
+                &peer,
+                original,
+                deadline,
+                &cancelled,
+            )
+            .unwrap();
+        assert_eq!(observed.state, ReadinessState::Incomplete);
+        let retained = channel
+            .active
+            .as_ref()
+            .unwrap()
+            .original_process
+            .as_ref()
+            .unwrap()
+            .0;
+        assert_ne!(retained, unsafe { GetCurrentProcess() });
+        assert_ne!(
+            unsafe { CompareObjectHandles(retained, GetCurrentProcess()) },
+            0
+        );
+        assert!(
+            channel
+                .probe_original_process(
+                    &challenge,
+                    &expectation,
+                    &peer,
+                    original,
+                    deadline,
+                    &cancelled
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            channel
+                .active
+                .as_ref()
+                .unwrap()
+                .original_process
+                .as_ref()
+                .unwrap()
+                .0,
+            retained
+        );
+        // The new scheduling-yield API resumes the same original object proof;
+        // accidentally routing it through generic poll would fail this assertion.
+        let polled = channel
+            .poll_original_process(
+                &challenge,
+                &expectation,
+                &peer,
+                original,
+                deadline,
+                &cancelled,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(polled.state, ReadinessState::Incomplete);
+        assert_eq!(
+            channel
+                .active
+                .as_ref()
+                .unwrap()
+                .original_process
+                .as_ref()
+                .unwrap()
+                .0,
+            retained
+        );
+        assert!(
+            channel
+                .poll(&challenge, &expectation, &peer, deadline, &cancelled)
+                .is_err(),
+            "generic nonblocking metadata may not replace original-object authority"
+        );
+        // The legacy PID metadata path cannot replace a pending original-object proof.
+        assert!(
+            channel
+                .probe(&challenge, &expectation, &peer, deadline, &cancelled)
+                .is_err()
+        );
+        let mut wrong = peer.clone();
+        wrong.original_pid = wrong.original_pid.wrapping_add(1);
+        assert!(
+            channel
+                .probe_original_process(
+                    &challenge,
+                    &expectation,
+                    &wrong,
+                    original,
+                    deadline,
+                    &cancelled
+                )
+                .is_err()
+        );
+        channel.cleanup().unwrap();
+    }
+    #[test]
     fn original_first_instance_pipe_is_retained_until_explicit_cleanup() {
         let (sid, _token) = token_sid(unsafe { GetCurrentProcess() }).unwrap();
         let endpoint = NamedPipe::new(format!(
@@ -717,6 +1019,13 @@ mod native_pipe_tests {
         .unwrap();
         let mut original = LocalChallenge::bind(endpoint.clone(), sid.clone()).unwrap();
         assert!(LocalChallenge::bind(endpoint.clone(), sid.clone()).is_err());
+        let original_handle = original.pipe.as_ref().unwrap().0;
+        original.renew_after_sut_transition().unwrap();
+        assert_eq!(original.pipe.as_ref().unwrap().0, original_handle);
+        assert!(
+            LocalChallenge::bind(endpoint.clone(), sid.clone()).is_err(),
+            "renewal retains first-instance exclusion"
+        );
         original.cleanup().unwrap();
         let mut fresh = LocalChallenge::bind(endpoint, sid).unwrap();
         fresh.cleanup().unwrap();
@@ -750,6 +1059,7 @@ mod error_retention_tests {
     fn original() -> LocalChallenge {
         LocalChallenge {
             endpoint: NamedPipe::new(r"\\.\pipe\theseus.error-model".into()).unwrap(),
+            helper_sid: Sid::new("S-1-5-18".into()).unwrap(),
             pipe: None,
             active: None,
             revoked: false,
@@ -829,6 +1139,7 @@ mod error_retention_tests {
             authenticated: false,
             measured_sid: None,
             process: None,
+            original_process: None,
             token: None,
             slot,
             last: None,

@@ -250,6 +250,10 @@ fn independent_literals_decode_to_typed_records_and_encode_separately() {
             Entry::LeaseClosed { .. } => 4,
             Entry::NativeHeader { .. }
             | Entry::NativeAuthorityRevoked { .. }
+            | Entry::DesktopAuthorityDeclared { .. }
+            | Entry::IntegrationBrokerHeader { .. }
+            | Entry::LinuxGioQualificationDeclared { .. }
+            | Entry::Broker { .. }
             | Entry::IntegrationHeader { .. } => {
                 panic!("fixture literal table excludes native records")
             }

@@ -21,7 +21,8 @@ SPEC.loader.exec_module(VALIDATION)
 
 
 def build(arguments):
-    result = subprocess.run(['cargo', 'build', '--locked', *arguments, '--message-format=json'],
+    command = 'test' if '--no-run' in arguments else 'build'
+    result = subprocess.run(['cargo', command, '--locked', *arguments, '--message-format=json'],
                             cwd=ROOT, stdout=subprocess.PIPE, text=True, check=False)
     artifacts = []
     for line in result.stdout.splitlines():
@@ -48,7 +49,7 @@ def pin(owned, artifacts, target, key):
     shutil.copy2(source, copied)
     if hashlib.sha256(copied.read_bytes()).hexdigest() != digest:
         raise RuntimeError(f'Native artifact copy changed bytes: {key}')
-    return {'path': str(copied), 'sha256': digest, 'cargo_artifact': artifact}
+    return {'path': str(copied), 'sha256': digest, 'length': copied.stat().st_size, 'cargo_artifact': artifact}
 
 
 def main():
@@ -63,19 +64,23 @@ def main():
         raise RuntimeError('Production graph contains fault support or required artifact is absent')
     metadata['production'] = pin(owned, production, 'theseus', 'production')
     metadata['production_graph'] = production
-    helper = build(['-p', 'theseus-native-helper', '--bin', 'theseus-native-helper'])
+    helper = build(['-p', 'theseus-native-helper', '--bin', 'theseus-native-helper', '--bin', 'theseus-native-desktop-broker'])
     VALIDATION.check_helper_graph(helper)
     metadata['helper_production'] = pin(owned, helper, 'theseus-native-helper', 'helper-production')
     metadata['helper_production_graph'] = helper
+    metadata['desktop_broker_production'] = pin(owned, helper, 'theseus-native-desktop-broker', 'desktop-broker-production')
+    metadata['desktop_broker_production_graph'] = helper
     native = build(['--workspace', '--bins', '--features', 'theseus-host/test-support'])
     metadata['fixture'] = pin(owned, native, 'theseus-host-fixture', 'fixture')
     metadata['application'] = pin(owned, native, 'theseus', 'application')
     mcp = build(['--features', 'mcp-test-support', '--bin', 'theseus-mcp-fixture'])
     metadata['mcp_fixture'] = pin(owned, mcp, 'theseus-mcp-fixture', 'mcp-fixture')
-    helper_fixture = build(['-p', 'theseus-native-helper', '--features', 'test-support', '--bin', 'theseus-native-helper-fixture'])
+    helper_fixture = build(['-p', 'theseus-native-helper', '--features', 'test-support', '--bin', 'theseus-native-helper-fixture', '--bin', 'theseus-native-desktop-broker'])
     VALIDATION.check_helper_graph(helper_fixture, fixture=True)
     metadata['helper_fixture'] = pin(owned, helper_fixture, 'theseus-native-helper-fixture', 'helper-fixture')
     metadata['helper_fixture_graph'] = helper_fixture
+    metadata['desktop_broker_fixture'] = pin(owned, helper_fixture, 'theseus-native-desktop-broker', 'desktop-broker-fixture')
+    metadata['desktop_broker_fixture_graph'] = helper_fixture
     # A fresh Cargo invocation keeps catalog fixtures independent of all fault graphs.
     catalog_args = ['--features', 'native-catalog-test-support']
     for target, _ in VALIDATION.CATALOG_ARTIFACTS.values():
@@ -85,6 +90,22 @@ def main():
     metadata['native_catalog_graph'] = catalog
     for key, (target, _) in VALIDATION.CATALOG_ARTIFACTS.items():
         metadata[key] = pin(owned, catalog, target, key.replace('_', '-'))
+    integration_args = ['--features', 'native-integration-test-support']
+    for target, _ in VALIDATION.INTEGRATION_ARTIFACTS.values():
+        integration_args += ['--bin', target]
+    integration = build(integration_args)
+    metadata['native_integration_graph'] = integration
+    for key, (target, _) in VALIDATION.INTEGRATION_ARTIFACTS.items():
+        metadata[key] = pin(owned, integration, target, key.replace('_', '-'))
+    test_args = ['--features', 'native-integration-test-support', '--no-run']
+    for target in VALIDATION.INTEGRATION_TEST_ARTIFACTS:
+        test_args += ['--test', target]
+    tests = build(test_args)
+    metadata['native_integration_test_graph'] = tests
+    for target in VALIDATION.INTEGRATION_TEST_ARTIFACTS:
+        metadata[target] = pin(owned, tests, target, target.replace('_', '-'))
+    VALIDATION.verify_integration_tests(metadata)
+    VALIDATION.verify_artifacts(metadata)
     if VALIDATION.source_identity(ROOT) != identity:
         raise RuntimeError('Source changed while building pinned artifacts; no source binding established')
     # Preserve the original fixture-parent metadata convention for Rust tests.

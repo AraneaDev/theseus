@@ -795,6 +795,7 @@ dependencies = [
  "rustix 1.1.5",
  "serde",
  "serde_json",
+ "sha2",
  "signal-hook",
  "tempfile",
  "windows-sys 0.61.2",
@@ -822,6 +823,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "theseus-host",
+ "theseus-native-client",
  "theseus-native-helper-store",
  "theseus-native-protocol",
 ]
@@ -830,6 +832,8 @@ dependencies = [
 name = "theseus-native-helper-store"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
+ "sha2",
  "tempfile",
  "theseus-host",
  "theseus-native-protocol",

@@ -1,9 +1,12 @@
 //! Blocking scenario engine. Call on a worker thread; event callbacks must not block.
 pub(crate) mod common;
 pub mod domain;
-mod recovery;
 mod integration_recovery;
-pub use integration_recovery::{recover_selected_native, SelectedNativeRecoveryResult};
+mod recovery;
+pub use integration_recovery::{
+    IntegrationRecoveryResult, RecoveredResourceDisposition, SelectedNativeRecoveryResult,
+    recover_selected_native,
+};
 mod selected;
 pub use recovery::{NativeRecoveryResult, recover_native};
 pub use selected::run_selected;

@@ -3,8 +3,8 @@ use super::domain::{StoredJournal, StoredRun};
 use crate::{
     native::{
         integration::model::{
-            IntegrationActionRecord, IntegrationOutcome, IntegrationRequest,
-            IntegrationResourceRecord,
+            BrokerBindingRecord, IntegrationActionRecord, IntegrationOutcome, IntegrationRequest,
+            IntegrationResourceRecord, NativeIntegrationJournal, OriginalQueryView,
         },
         model::*,
     },
@@ -63,6 +63,14 @@ impl PublishedIntegrationAction {
     }
 }
 
+pub struct PublishedBrokerBind {
+    original: theseus_native_protocol::v2::broker::BrokerBind,
+}
+impl PublishedBrokerBind {
+    pub fn into_original(self) -> theseus_native_protocol::v2::broker::BrokerBind {
+        self.original
+    }
+}
 pub struct PublishedRelease {
     release: NativeRelease,
 }
@@ -72,6 +80,34 @@ impl PublishedRelease {
     }
 }
 
+fn validate_cached_terminal(
+    journal: &NativeIntegrationJournal,
+    action: &IntegrationActionRecord,
+    terminal: &IntegrationOutcome,
+) -> Result<()> {
+    ensure!(
+        action.terminal.as_ref().is_none_or(|old| old == terminal),
+        "integration terminal outcome changed"
+    );
+    for query in journal
+        .integration_recoveries
+        .iter()
+        .filter(|r| r.ownership_id == action.ownership_id)
+        .flat_map(|r| &r.queries)
+        .filter(|q| {
+            q.view == OriginalQueryView::CachedTerminal
+                && q.original.operation == action.operation
+                && q.original.request_digest == action.request_digest
+        })
+    {
+        ensure!(
+            &query.outcome == terminal,
+            "original cached recovery terminal changed"
+        );
+    }
+    Ok(())
+}
+
 pub struct RunProjector<'a> {
     store: &'a ReportStore,
     report: StoredRun,
@@ -79,13 +115,13 @@ pub struct RunProjector<'a> {
 }
 /// Borrow only shared native fields. No compatibility journal is synthesized,
 /// and saves still validate/write the actual versioned envelope.
-struct NativeJournalFields<'a> {
-    launch_fingerprint: &'a mut Option<String>,
-    ownership: &'a mut Vec<NativeResource>,
-    operations: &'a mut Vec<NativeOperation>,
-    provider_calls: &'a mut Vec<NativeProviderCall>,
-    releases: &'a mut Vec<NativeRelease>,
-    recovery_attempts: &'a mut Vec<NativeRecoveryAttempt>,
+pub(crate) struct NativeJournalFields<'a> {
+    pub launch_fingerprint: &'a mut Option<String>,
+    pub ownership: &'a mut Vec<NativeResource>,
+    pub operations: &'a mut Vec<NativeOperation>,
+    pub provider_calls: &'a mut Vec<NativeProviderCall>,
+    pub releases: &'a mut Vec<NativeRelease>,
+    pub recovery_attempts: &'a mut Vec<NativeRecoveryAttempt>,
 }
 impl<'a> RunProjector<'a> {
     pub fn new(store: &'a ReportStore, report: StoredRun, journal: StoredJournal) -> Result<Self> {
@@ -137,6 +173,32 @@ impl<'a> RunProjector<'a> {
             StoredRun::NativeIntegration(report) => Ok(&mut report.catalog.scenarios),
             _ => bail!("native catalog projection requires native report"),
         }
+    }
+    /// Lend only the envelope-free schema2 catalog and original core fields.
+    /// The closure has no store, filename, schema or replacement envelope.
+    pub(crate) fn with_catalog_evidence_mut<T>(
+        &mut self,
+        apply: impl FnOnce(
+            &mut crate::native::integration::model::CatalogRunEvidence,
+            NativeJournalFields<'_>,
+        ) -> Result<T>,
+    ) -> Result<T> {
+        let (StoredRun::NativeIntegration(report), StoredJournal::NativeIntegration(journal)) =
+            (&mut self.report, &mut self.journal)
+        else {
+            bail!("integration catalog seam requires selected schema2 envelopes")
+        };
+        apply(
+            &mut report.catalog,
+            NativeJournalFields {
+                launch_fingerprint: &mut journal.launch_fingerprint,
+                ownership: &mut journal.ownership,
+                operations: &mut journal.operations,
+                provider_calls: &mut journal.provider_calls,
+                releases: &mut journal.releases,
+                recovery_attempts: &mut journal.recovery_attempts,
+            },
+        )
     }
     pub fn into_parts(self) -> (StoredRun, StoredJournal) {
         (self.report, self.journal)
@@ -461,6 +523,73 @@ impl<'a> RunProjector<'a> {
         }
         self.save_journal()
     }
+    pub fn publish_broker_binding(
+        &mut self,
+        resource: &PublishedResource,
+        record: BrokerBindingRecord,
+    ) -> Result<PublishedBrokerBind> {
+        let StoredJournal::NativeIntegration(j) = &mut self.journal else {
+            bail!("broker binding requires schema2 journal")
+        };
+        ensure!(
+            resource.resource.ownership_id == record.ownership_id
+                && matches!(&resource.resource.ownership,NativeOwnership::Acquired {lease,..} if lease==&record.helper_lease),
+            "broker bind requires original acquired helper lease"
+        );
+        ensure!(
+            j.requirements
+                .desktop
+                .as_ref()
+                .is_some_and(|d| d.resource == record.slot),
+            "desktop broker slot undeclared"
+        );
+        ensure!(
+            record.broker_lease.is_none()
+                && record.publication_scope.is_none()
+                && matches!(record.disposition, Disposition::Unknown { .. }),
+            "new broker binding cannot claim an unobserved publication barrier"
+        );
+        ensure!(
+            !j.broker_bindings
+                .iter()
+                .any(|b| b.ownership_id == record.ownership_id),
+            "original broker bind already published; query it"
+        );
+        let original = record.original.clone();
+        j.broker_bindings.push(record);
+        self.save_journal()?;
+        Ok(PublishedBrokerBind { original })
+    }
+    pub fn record_broker_binding(
+        &mut self,
+        receipt: &theseus_native_protocol::v2::broker::BrokerBindingReceipt,
+    ) -> Result<()> {
+        receipt.validate()?;
+        let StoredJournal::NativeIntegration(j) = &mut self.journal else {
+            bail!("broker binding requires schema2 journal")
+        };
+        let record = j
+            .broker_bindings
+            .iter_mut()
+            .find(|r| r.original == receipt.original)
+            .ok_or_else(|| anyhow::anyhow!("original broker binding unpublished"))?;
+        ensure!(
+            record
+                .broker_lease
+                .as_ref()
+                .is_none_or(|l| l == &receipt.broker_lease)
+                && record
+                    .publication_scope
+                    .is_none_or(|s| s == receipt.publication_scope),
+            "original broker mapping changed"
+        );
+        record.broker_lease = Some(receipt.broker_lease.clone());
+        record.publication_scope = Some(receipt.publication_scope);
+        record.disposition = Disposition::Complete {
+            receipt: receipt.request_digest.clone(),
+        };
+        self.save_journal()
+    }
     pub fn publish_integration_action(
         &mut self,
         resource: &PublishedResource,
@@ -554,17 +683,317 @@ impl<'a> RunProjector<'a> {
         let StoredJournal::NativeIntegration(j) = &mut self.journal else {
             bail!("integration completion requires schema2 journal")
         };
-        let action = j
+        let position = j
             .integration_actions
-            .iter_mut()
-            .find(|a| a.lease == lease && a.operation == operation)
+            .iter()
+            .position(|a| a.lease == lease && a.operation == operation)
             .ok_or_else(|| anyhow::anyhow!("integration action not published"))?;
-        ensure!(
-            action.terminal.as_ref().is_none_or(|old| old == &terminal),
-            "integration terminal outcome changed"
-        );
+        validate_cached_terminal(j, &j.integration_actions[position], &terminal)?;
+        let action = &mut j.integration_actions[position];
         action.completion = completion;
         action.terminal = Some(terminal);
+        self.save_journal()
+    }
+    pub(crate) fn publish_integration_recovery(
+        &mut self,
+        record: crate::native::integration::model::IntegrationRecoveryRecord,
+    ) -> Result<()> {
+        let StoredJournal::NativeIntegration(j) = &mut self.journal else {
+            bail!("integration recovery requires selected schema2 journal")
+        };
+        ensure!(
+            j.ownership
+                .iter()
+                .any(|o| o.ownership_id == record.ownership_id),
+            "integration recovery lacks original owner"
+        );
+        ensure!(
+            !j.integration_recoveries
+                .iter()
+                .any(|r| r.recovery_id == record.recovery_id),
+            "integration recovery already published"
+        );
+        let originals = j
+            .integration_actions
+            .iter()
+            .filter(|a| a.ownership_id == record.ownership_id)
+            .map(|a| crate::native::integration::model::ActionReference {
+                operation: a.operation.clone(),
+                request_digest: a.request_digest.clone(),
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            record.broker_effect_baselines
+                == crate::native::integration::model::original_broker_effect_baselines(
+                    j,
+                    &record.ownership_id
+                )?,
+            "recovery desktop terminal baseline differs from original publication knowledge"
+        );
+        ensure!(
+            record.original_actions == originals
+                && record.queries.is_empty()
+                && record.broker_observations.is_empty()
+                && record.broker_release.is_none(),
+            "integration recovery original action set changed"
+        );
+        j.integration_recoveries.push(record);
+        self.save_journal()
+    }
+    pub(crate) fn record_integration_query(
+        &mut self,
+        recovery_id: &str,
+        query: crate::native::integration::model::OriginalQueryOutcome,
+    ) -> Result<()> {
+        let StoredJournal::NativeIntegration(j) = &mut self.journal else {
+            bail!("integration recovery requires selected schema2 journal")
+        };
+        let record = j
+            .integration_recoveries
+            .iter()
+            .find(|r| r.recovery_id == recovery_id)
+            .ok_or_else(|| anyhow::anyhow!("integration recovery not published"))?;
+        ensure!(
+            record.original_actions.contains(&query.original)
+                && !record.queries.iter().any(|q| q.original == query.original),
+            "integration recovery query identity changed or duplicated"
+        );
+        let action = j
+            .integration_actions
+            .iter()
+            .find(|a| {
+                a.ownership_id == record.ownership_id
+                    && a.operation == query.original.operation
+                    && a.request_digest == query.original.request_digest
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("integration recovery query lacks exact original action")
+            })?;
+        match query.view {
+            OriginalQueryView::CachedTerminal => {
+                validate_cached_terminal(j, action, &query.outcome)?;
+                crate::native::integration::model::validate_original_query_broker_receipts(
+                    j,
+                    &record.ownership_id,
+                    &query,
+                )?;
+            }
+            OriginalQueryView::NonterminalUnknown => ensure!(
+                matches!(query.outcome, IntegrationOutcome::Unknown { .. }),
+                "nonterminal recovery query cannot claim a terminal outcome"
+            ),
+        }
+        j.integration_recoveries
+            .iter_mut()
+            .find(|r| r.recovery_id == recovery_id)
+            .expect("published recovery checked")
+            .queries
+            .push(query);
+        self.save_journal()
+    }
+    pub(crate) fn record_broker_recovery_observation(
+        &mut self,
+        recovery_id: &str,
+        observation: crate::native::integration::model::RecoveredBrokerObservation,
+    ) -> Result<()> {
+        use crate::native::integration::model::*;
+        let StoredJournal::NativeIntegration(j) = &self.journal else {
+            bail!("broker recovery requires schema2 journal")
+        };
+        let record = j
+            .integration_recoveries
+            .iter()
+            .find(|r| r.recovery_id == recovery_id)
+            .ok_or_else(|| anyhow::anyhow!("broker recovery not published"))?;
+        let owner = record.ownership_id.clone();
+        let action = j
+            .integration_actions
+            .iter()
+            .find(|a| {
+                a.ownership_id == owner
+                    && a.operation == observation.original.operation
+                    && a.request_digest == observation.original.request_digest
+            })
+            .ok_or_else(|| anyhow::anyhow!("broker state lacks original action"))?;
+        let IntegrationRequest::Desktop { request, .. } = &action.request else {
+            bail!("broker state borrowed service authority")
+        };
+        ensure!(
+            request.identity()? == observation.identity,
+            "broker recovery identity changed"
+        );
+        validate_original_broker_effect(action, &observation.state)?;
+        if let Some(baseline) = record
+            .broker_effect_baselines
+            .iter()
+            .find(|b| b.original == observation.original)
+        {
+            validate_broker_effect_terminal(baseline.terminal.as_ref(), &observation.state)?;
+        }
+        let StoredRun::NativeIntegration(report) = &self.report else {
+            bail!("broker recovery requires original integration report")
+        };
+        validate_original_broker_report_progress(report, action, &observation.state)?;
+        if observation.source == BrokerObservationSource::Cancel {
+            ensure!(
+                matches!(
+                    request.action,
+                    theseus_native_protocol::v2::broker::DesktopAction::Activate { .. }
+                ),
+                "Cancel may control only original activation"
+            );
+        }
+        if let Some(previous) = j
+            .integration_recoveries
+            .iter()
+            .rev()
+            .filter(|r| r.ownership_id == owner)
+            .flat_map(|r| r.broker_observations.iter().rev())
+            .find(|o| o.original == observation.original)
+        {
+            validate_broker_progress(&previous.state, &observation.state)?;
+        }
+        if record
+            .broker_observations
+            .iter()
+            .rev()
+            .find(|o| o.original == observation.original)
+            .is_some_and(|o| o.state == observation.state)
+        {
+            return Ok(());
+        }
+        ensure!(
+            record.broker_observations.len() < 64 * record.original_actions.len().max(1),
+            "broker recovery state budget exceeded"
+        );
+        let state = observation.state.clone();
+        let StoredJournal::NativeIntegration(j) = &mut self.journal else {
+            unreachable!()
+        };
+        j.integration_recoveries
+            .iter_mut()
+            .find(|r| r.recovery_id == recovery_id)
+            .unwrap()
+            .broker_observations
+            .push(observation);
+        self.save_journal()?;
+        if let StoredRun::NativeIntegration(report) = &mut self.report
+            && let Some(evidence) = report
+                .integrations
+                .iter_mut()
+                .find(|s| s.ownership_id == owner)
+        {
+            use theseus_native_protocol::v2::broker::*;
+            evidence.dispositions.primary = if matches!(
+                state.primary,
+                BrokerPrimary::Exited | BrokerPrimary::NotCreated
+            ) {
+                Disposition::Complete {receipt:"original broker observed original primary exited or never created during recovery".into()}
+            } else {
+                Disposition::Unknown {
+                    reason: "original desktop primary exit remains unproved".into(),
+                }
+            };
+            evidence.dispositions.descendant_scope = if matches!(
+                state.descendants,
+                BrokerDescendants::Joined | BrokerDescendants::NotCreated
+            ) && state.cleanup_complete
+            {
+                Disposition::Complete {receipt:"original broker observed original scope joined or never created and IPC settled during recovery".into()}
+            } else {
+                Disposition::Unknown {
+                    reason: "original desktop scope/IPC settlement remains unproved".into(),
+                }
+            };
+            if !settled_original_broker_state(&state) {
+                evidence.dispositions.broker = Disposition::Unknown {
+                    reason: "original broker lifetime, effect or quarantine remains unresolved"
+                        .into(),
+                };
+            }
+        }
+        self.save_report()
+    }
+    pub(crate) fn record_broker_recovery_release(
+        &mut self,
+        recovery_id: &str,
+        release: crate::native::integration::model::RecoveredBrokerRelease,
+    ) -> Result<()> {
+        use crate::native::integration::model::*;
+        let StoredJournal::NativeIntegration(j) = &self.journal else {
+            bail!("broker release recovery requires schema2 journal")
+        };
+        let record = j
+            .integration_recoveries
+            .iter()
+            .find(|r| r.recovery_id == recovery_id)
+            .ok_or_else(|| anyhow::anyhow!("broker recovery not published"))?;
+        let owner = record.ownership_id.clone();
+        let binding = j
+            .broker_bindings
+            .iter()
+            .find(|b| {
+                b.ownership_id == owner
+                    && b.helper_lease == release.helper_lease
+                    && b.broker_lease.as_ref() == Some(&release.broker_lease)
+            })
+            .ok_or_else(|| anyhow::anyhow!("release lacks original broker mapping"))?;
+        ensure!(j.ownership.iter().any(|o|o.ownership_id==owner && matches!(&o.ownership,NativeOwnership::Acquired {prepared,lease} if lease==&release.helper_lease && prepared.intent==release.helper_intent)),"release changed original helper intent");
+        if let Some(old) = &record.broker_release {
+            ensure!(
+                old.helper_lease == release.helper_lease
+                    && old.broker_lease == release.broker_lease
+                    && old.helper_intent == release.helper_intent,
+                "original broker release receipt changed"
+            );
+            return Ok(());
+        }
+        let settled = original_desktop_scope_settled(j, &owner, &binding.slot);
+        let StoredJournal::NativeIntegration(j) = &mut self.journal else {
+            unreachable!()
+        };
+        let record = j
+            .integration_recoveries
+            .iter_mut()
+            .find(|r| r.recovery_id == recovery_id)
+            .unwrap();
+        record.broker_release = Some(release);
+        if settled {
+            record.broker=Disposition::Complete {receipt:"original helper AwaitingExternalReset proves its prior original broker release barrier".into()};
+        }
+        let broker = record.broker.clone();
+        self.save_journal()?;
+        if let StoredRun::NativeIntegration(report) = &mut self.report
+            && let Some(evidence) = report
+                .integrations
+                .iter_mut()
+                .find(|s| s.ownership_id == owner)
+        {
+            evidence.dispositions.broker = broker;
+        }
+        self.save_report()
+    }
+    pub(crate) fn finish_integration_recovery(
+        &mut self,
+        recovery_id: &str,
+        local: Disposition,
+        broker: Disposition,
+        provider: Disposition,
+    ) -> Result<()> {
+        local.validate()?;
+        broker.validate()?;
+        provider.validate()?;
+        let StoredJournal::NativeIntegration(j) = &mut self.journal else {
+            bail!("integration recovery requires selected schema2 journal")
+        };
+        let record = j
+            .integration_recoveries
+            .iter_mut()
+            .find(|r| r.recovery_id == recovery_id)
+            .ok_or_else(|| anyhow::anyhow!("integration recovery not published"))?;
+        record.local = local;
+        record.broker = broker;
+        record.provider = provider;
         self.save_journal()
     }
     pub fn publish_readiness_probe(
@@ -575,7 +1004,8 @@ impl<'a> RunProjector<'a> {
             bail!("readiness publication requires schema2 journal")
         };
         let challenge = &record.challenge;
-        ensure!(j.ownership.iter().any(|owner| owner.ownership_id==challenge.ownership_id && matches!(&owner.ownership,NativeOwnership::Acquired{lease,..} if lease==&challenge.lease)), "readiness challenge lacks original lease");
+        ensure!(j.ownership.iter().any(|owner| owner.ownership_id==challenge.ownership_id && matches!(&owner.ownership,NativeOwnership::Acquired{lease,..} if lease==&challenge.lease))
+            || j.broker_bindings.iter().any(|b|b.ownership_id==challenge.ownership_id && b.broker_lease.as_ref()==Some(&challenge.lease) && matches!(b.disposition,Disposition::Complete {..})), "readiness challenge lacks original lease");
         ensure!(
             j.integration_ownership
                 .iter()

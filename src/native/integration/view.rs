@@ -188,6 +188,11 @@ fn visit_record_values(
                         }
                     }
                     Selector::Desktop => {
+                        if let Some(native) = &s.native_lifetime {
+                            push(
+                                serde_json::json!({"scenario_id":s.scenario_id,"native_lifetime":native}),
+                            );
+                        }
                         for desktop in &s.desktops {
                             for observation in &desktop.observations {
                                 push(
@@ -219,9 +224,13 @@ fn visit_record_values(
                             }
                         }
                     }
-                    Selector::Dispositions => push(
-                        serde_json::json!({"scenario_id":s.scenario_id,"dispositions":s.dispositions}),
-                    ),
+                    Selector::Dispositions => {
+                        let mut value = serde_json::json!({"scenario_id":s.scenario_id,"dispositions":s.dispositions});
+                        if let Some(native) = &s.native_lifetime {
+                            value["native_lifetime"] = serde_json::to_value(native)?;
+                        }
+                        push(value);
+                    }
                     _ => unreachable!(),
                 }
             }
@@ -344,20 +353,43 @@ pub fn readiness_fact(
     check: &IntegrationCheck,
 ) -> Result<serde_json::Value> {
     let mut value = serde_json::to_value(check)?;
-    let observations = report
+    let scenario = report
         .integrations
         .iter()
         .filter(|s| s.scenario_id == check.scenario_id)
+        .collect::<Vec<_>>();
+    let facts = scenario
+        .iter()
         .flat_map(|s| &s.services)
         .flat_map(|s| &s.observations)
-        .filter(|o| check.observation_ids.contains(&o.binding.id))
+        .map(|o| (&o.binding, o.readiness.as_ref()))
+        .chain(
+            scenario
+                .iter()
+                .flat_map(|s| &s.desktops)
+                .flat_map(|s| &s.observations)
+                .map(|o| (&o.binding, o.readiness.as_ref())),
+        )
+        .filter(|(binding, _)| check.observation_ids.contains(&binding.id))
         .collect::<Vec<_>>();
-    value["application_reports"] = serde_json::Value::Array(observations.iter().filter_map(|observation| {
-        let readiness=observation.readiness.as_ref()?;
-        readiness.response_digest.as_ref()?;
-        Some(serde_json::json!({"observation_id":observation.binding.id,"provenance":"application_reported","application":observation.binding.slot,"value":{"artifact_sha256":readiness.artifact_sha256,"version_literal":readiness.version_literal,"data_sha256":readiness.data_sha256,"configuration_digest":readiness.configuration_digest,"initialized":readiness.initialized}}))
+    value["application_reports"]=serde_json::Value::Array(facts.iter().filter_map(|(binding,ready)|{
+        let readiness=ready.as_ref()?;readiness.response_digest.as_ref()?;
+        Some(serde_json::json!({"observation_id":binding.id,"provenance":"application_reported","application":binding.slot,"value":{"artifact_sha256":readiness.artifact_sha256,"version_literal":readiness.version_literal,"data_sha256":readiness.data_sha256,"configuration_digest":readiness.configuration_digest,"initialized":readiness.initialized}}))
     }).collect());
-    value["observations"] = serde_json::to_value(observations)?;
+    let mut observations = Vec::new();
+    for s in scenario {
+        for observation in s.services.iter().flat_map(|s| &s.observations) {
+            if check.observation_ids.contains(&observation.binding.id) {
+                observations.push(serde_json::to_value(observation)?);
+            }
+        }
+        for observation in s.desktops.iter().flat_map(|s| &s.observations) {
+            if check.observation_ids.contains(&observation.binding.id) {
+                observations.push(serde_json::to_value(observation)?);
+            }
+        }
+    }
+    value["observations"] = serde_json::Value::Array(observations);
     Ok(value)
 }
 /// The private probe nonce never crosses a public evidence boundary.
@@ -454,6 +486,25 @@ pub fn summary(report: &NativeIntegrationReport) -> Summary {
                         })
                     })
                 })
+            })
+            .or_else(|| {
+                report.requirements.desktop.as_ref().and_then(|desktop| {
+                    report.selected_scenarios.iter().find_map(|kind| {
+                        let evidence = report
+                            .catalog
+                            .scenarios
+                            .iter()
+                            .find(|s| s.scenario == *kind)
+                            .and_then(|core| scenarios.iter().find(|s| s.scenario_id == core.id));
+                        desktop_scenario_check_specs(desktop, *kind)
+                            .into_iter()
+                            .find_map(|(id, _, _, _)| {
+                                evidence
+                                    .is_none_or(|s| !s.checks.iter().any(|c| c.id == id))
+                                    .then(|| preview(&format!("{id}: required evidence missing")))
+                            })
+                    })
+                })
             }),
         helper_worker: flags(scenarios.iter().map(|s| &s.dispositions.helper_worker)),
         registration: flags(scenarios.iter().map(|s| &s.dispositions.registration)),
@@ -477,6 +528,29 @@ pub fn validate_authority(
         crate::native::recipe::NativeOs::Macos => theseus_native_protocol::v2::Os::Macos,
         crate::native::recipe::NativeOs::Windows => theseus_native_protocol::v2::Os::Windows,
     };
+    ensure!(
+        recipe.recipe.integrations.service.is_some()
+            == launch.integration_service_authority().is_some()
+            && recipe.recipe.integrations.desktop.is_some()
+                == launch.integration_desktop_authority().is_some(),
+        "recipe integration capabilities differ from explicit target ceiling"
+    );
+    if let Some(desktop) = &recipe.recipe.integrations.desktop {
+        let ceiling = launch
+            .integration_desktop_authority()
+            .ok_or_else(|| anyhow::anyhow!("desktop session authority missing"))?;
+        ensure!(
+            desktop.modes.iter().all(|mode| match mode {
+                DesktopMode::OwnedExecutable => ceiling
+                    .allowed_modes
+                    .contains(&theseus_native_protocol::v2::broker::DesktopMode::OwnedExecutable),
+                DesktopMode::NativeActivation => ceiling
+                    .allowed_modes
+                    .contains(&theseus_native_protocol::v2::broker::DesktopMode::NativeActivation),
+            }),
+            "desktop mode exceeds the explicit target ceiling or remains unsupported"
+        );
+    }
     ensure!(
         launch.binding().os == os
             && core.to_hex() == recipe.core.recipe.manifest_digest
@@ -560,6 +634,7 @@ pub(crate) mod tests {
                 outcome: RunOutcome::Incomplete,
             },
             integrations: vec![IntegrationScenarioEvidence {
+                native_lifetime: None,
                 scenario_id: "clean".into(),
                 ownership_id: "owner".into(),
                 services: vec![ServiceEvidence {

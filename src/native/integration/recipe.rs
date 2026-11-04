@@ -49,12 +49,45 @@ impl ValidatedIntegrationRecipe {
         scenarios: &[ScenarioKind],
         limits: &NativeRunLimits,
     ) -> Result<()> {
-        ensure!(
-            scenarios.iter().all(|s| *s == ScenarioKind::Clean),
-            "native integration currently supports Clean only; Upgrade/Reinstall require admitted native configuration transitions"
-        );
         self.recipe.validate()?;
         self.core.validate_selection(scenarios, limits)?;
+        if self.core.recipe.os == crate::native::recipe::NativeOs::Macos
+            && self
+                .recipe
+                .integrations
+                .desktop
+                .as_ref()
+                .is_some_and(|d| d.lifetime == LifetimeRequirement::OwnedProcessTreeSettled)
+        {
+            anyhow::bail!(
+                "macOS original descendant scope cannot prove escaped descendants joined"
+            );
+        }
+        if self.core.recipe.os == crate::native::recipe::NativeOs::Macos
+            && self
+                .recipe
+                .integrations
+                .desktop
+                .as_ref()
+                .is_some_and(|d| d.modes == [DesktopMode::OwnedExecutable])
+        {
+            anyhow::bail!(
+                "product cannot qualify OwnedExecutable lifetime on macOS; choose NativeActivation with manager-instance termination"
+            );
+        }
+        if let Some(desktop) = &self.recipe.integrations.desktop
+            && desktop.modes == [DesktopMode::NativeActivation]
+        {
+            let required = if self.core.recipe.os == crate::native::recipe::NativeOs::Macos {
+                LifetimeRequirement::ActivationInstanceTerminated
+            } else {
+                LifetimeRequirement::OwnedPrimaryExited
+            };
+            ensure!(
+                desktop.lifetime == required,
+                "native mandatory lifetime differs from selected platform capability"
+            );
+        }
         // All catalog commands plus the declared rehearsal controls share one lease budget.
         for scenario in scenarios {
             let (steps, checkpoints): (u32, &[crate::model::Checkpoint]) = match scenario {
@@ -95,19 +128,36 @@ impl ValidatedIntegrationRecipe {
                     .filter(|c| checkpoints.contains(&c.checkpoint))
                     .count() as u32;
             let controls = self.recipe.integrations.service.as_ref().map_or(0, |s| {
-                u32::from(s.controls.configured_activation == ActivationCause::RehearsalStart)
+                let start =
+                    u32::from(s.controls.configured_activation == ActivationCause::RehearsalStart);
+                start
                     + u32::from(
                         s.controls.uninstall_precondition == RuntimePrecondition::HarnessStopped,
                     )
-                    + u32::from(
-                        s.controls.upgrade_precondition == RuntimePrecondition::HarnessStopped,
-                    )
-                    + u32::from(
-                        s.controls.reinstall_precondition == RuntimePrecondition::HarnessStopped,
-                    )
+                    + match scenario {
+                        ScenarioKind::Upgrade => u32::from(
+                            s.controls.upgrade_precondition == RuntimePrecondition::HarnessStopped,
+                        ),
+                        ScenarioKind::Reinstall => u32::from(
+                            s.controls.reinstall_precondition
+                                == RuntimePrecondition::HarnessStopped,
+                        ),
+                        _ => 0,
+                    }
             });
             ensure!(
-                catalog + controls <= limits.max_operations,
+                catalog
+                    + controls
+                    + if self.recipe.integrations.desktop.is_some() {
+                        if *scenario == ScenarioKind::Clean {
+                            3
+                        } else {
+                            5
+                        }
+                    } else {
+                        0
+                    }
+                    <= limits.max_operations,
                 "integration operation budget exceeded"
             );
         }
@@ -174,9 +224,49 @@ impl IntegrationRequirements {
                     check.role.is_some() == check.artifact.is_some(),
                     "partial definition key"
                 );
+                ensure!(
+                    check
+                        .scenarios
+                        .iter()
+                        .copied()
+                        .collect::<BTreeSet<_>>()
+                        .len()
+                        == check.scenarios.len(),
+                    "duplicate integration check scenario"
+                );
+                if let (Some(role), Some(artifact)) = (check.role, check.artifact) {
+                    ensure!(
+                        service
+                            .definitions
+                            .contains(&DefinitionKey { role, artifact }),
+                        "check definition is undeclared"
+                    );
+                }
             }
         }
         if let Some(desktop) = &self.desktop {
+            for scenario in scenarios {
+                ordinary(*scenario)?;
+            }
+            ensure!(
+                desktop.modes == [DesktopMode::OwnedExecutable]
+                    || desktop.modes == [DesktopMode::NativeActivation],
+                "select exactly one explicit desktop mode"
+            );
+            ensure!(
+                desktop.modes != [DesktopMode::NativeActivation]
+                    || desktop.lifetime != LifetimeRequirement::OwnedProcessTreeSettled,
+                "native activation cannot prove owned process-tree settlement"
+            );
+            ensure!(
+                desktop.readiness.kind == ReadyKind::LocalChallenge,
+                "desktop readiness requires an authenticated local challenge"
+            );
+            ensure!(
+                desktop.modes != [DesktopMode::OwnedExecutable]
+                    || desktop.lifetime != LifetimeRequirement::ActivationInstanceTerminated,
+                "owned executable cannot prove native activation instance termination"
+            );
             desktop.resource.validate()?;
             desktop.readiness.validate()?;
             ensure!(
@@ -292,24 +382,53 @@ impl IntegrationRequirements {
                         ServicePredicate::ApplicationReady,
                     ),
                     (
-                        IntegrationPhase::ExerciseFinal,
-                        Some(DefinitionRole::Configured),
-                        Some(ArtifactRole::Target),
-                        ServicePredicate::ApplicationReady,
-                    ),
-                    (
-                        IntegrationPhase::ExerciseFinal,
-                        Some(DefinitionRole::Configured),
-                        Some(ArtifactRole::Target),
-                        ServicePredicate::Running,
-                    ),
-                    (
                         IntegrationPhase::Uninstalled,
                         None,
                         None,
                         ServicePredicate::RegistrationAbsent,
                     ),
                 ];
+                let exercise_phases: &[IntegrationPhase] = if *scenario == ScenarioKind::Reinstall {
+                    &[
+                        IntegrationPhase::ExerciseBeforeReinstall,
+                        IntegrationPhase::ExerciseAfterReinstall,
+                    ]
+                } else {
+                    &[IntegrationPhase::ExerciseFinal]
+                };
+                for phase in exercise_phases {
+                    for predicate in [
+                        ServicePredicate::Running,
+                        ServicePredicate::ApplicationReady,
+                    ] {
+                        required.push((
+                            *phase,
+                            Some(DefinitionRole::Configured),
+                            Some(ArtifactRole::Target),
+                            predicate,
+                        ));
+                    }
+                }
+                let transition_phase = match scenario {
+                    ScenarioKind::Upgrade => Some(IntegrationPhase::TargetInstalledAfterUpgrade),
+                    ScenarioKind::Reinstall => Some(IntegrationPhase::Reinstalled),
+                    _ => None,
+                };
+                if let Some(phase) = transition_phase {
+                    for predicate in [
+                        ServicePredicate::Registration,
+                        ServicePredicate::Configuration,
+                        ServicePredicate::Running,
+                        ServicePredicate::ApplicationReady,
+                    ] {
+                        required.push((
+                            phase,
+                            Some(DefinitionRole::Configured),
+                            Some(ArtifactRole::Target),
+                            predicate,
+                        ));
+                    }
+                }
                 if service.controls.uninstall_precondition == RuntimePrecondition::Running {
                     required.push((
                         IntegrationPhase::Uninstalled,
@@ -438,5 +557,430 @@ mod required_table_review_tests {
                 "missing {predicate:?} at {phase:?} must refuse"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod transition_contract_tests {
+    use super::*;
+
+    fn requirements(scenario: ScenarioKind) -> IntegrationRequirements {
+        let mut requirements = crate::native::integration::view::tests::report().requirements;
+        let service = requirements.service.as_mut().unwrap();
+        service.definitions = vec![
+            DefinitionKey {
+                role: DefinitionRole::Base,
+                artifact: ArtifactRole::Base,
+            },
+            DefinitionKey {
+                role: DefinitionRole::Target,
+                artifact: ArtifactRole::Target,
+            },
+            DefinitionKey {
+                role: DefinitionRole::Configured,
+                artifact: ArtifactRole::Base,
+            },
+            DefinitionKey {
+                role: DefinitionRole::Configured,
+                artifact: ArtifactRole::Target,
+            },
+        ];
+        service.checks.clear();
+        let initial_artifact = if scenario == ScenarioKind::Upgrade {
+            ArtifactRole::Base
+        } else {
+            ArtifactRole::Target
+        };
+        let initial_role = if scenario == ScenarioKind::Upgrade {
+            DefinitionRole::Base
+        } else {
+            DefinitionRole::Target
+        };
+        let initial_phase = if scenario == ScenarioKind::Upgrade {
+            IntegrationPhase::BaseInstalled
+        } else {
+            IntegrationPhase::TargetInstalledInitial
+        };
+        let mut rows = vec![
+            (
+                IntegrationPhase::Baseline,
+                None,
+                None,
+                vec![ServicePredicate::RegistrationAbsent],
+            ),
+            (
+                initial_phase,
+                Some(initial_role),
+                Some(initial_artifact),
+                vec![
+                    ServicePredicate::Registration,
+                    ServicePredicate::Configuration,
+                    ServicePredicate::Stopped,
+                ],
+            ),
+            (
+                IntegrationPhase::Configured,
+                Some(DefinitionRole::Configured),
+                Some(initial_artifact),
+                vec![
+                    ServicePredicate::Configuration,
+                    ServicePredicate::Running,
+                    ServicePredicate::ApplicationReady,
+                ],
+            ),
+            (
+                IntegrationPhase::Uninstalled,
+                None,
+                None,
+                vec![
+                    ServicePredicate::Stopped,
+                    ServicePredicate::RegistrationAbsent,
+                ],
+            ),
+        ];
+        let runtime = vec![
+            ServicePredicate::Running,
+            ServicePredicate::ApplicationReady,
+        ];
+        if scenario == ScenarioKind::Upgrade {
+            rows.push((
+                IntegrationPhase::TargetInstalledAfterUpgrade,
+                Some(DefinitionRole::Configured),
+                Some(ArtifactRole::Target),
+                vec![
+                    ServicePredicate::Registration,
+                    ServicePredicate::Configuration,
+                    ServicePredicate::Running,
+                    ServicePredicate::ApplicationReady,
+                ],
+            ));
+            rows.push((
+                IntegrationPhase::ExerciseFinal,
+                Some(DefinitionRole::Configured),
+                Some(ArtifactRole::Target),
+                runtime,
+            ));
+        } else if scenario == ScenarioKind::Reinstall {
+            rows.push((
+                IntegrationPhase::Reinstalled,
+                Some(DefinitionRole::Configured),
+                Some(ArtifactRole::Target),
+                vec![
+                    ServicePredicate::Registration,
+                    ServicePredicate::Configuration,
+                    ServicePredicate::Running,
+                    ServicePredicate::ApplicationReady,
+                ],
+            ));
+            rows.push((
+                IntegrationPhase::ExerciseBeforeReinstall,
+                Some(DefinitionRole::Configured),
+                Some(ArtifactRole::Target),
+                runtime.clone(),
+            ));
+            rows.push((
+                IntegrationPhase::ExerciseAfterReinstall,
+                Some(DefinitionRole::Configured),
+                Some(ArtifactRole::Target),
+                runtime,
+            ));
+        }
+        for (phase, role, artifact, predicates) in rows {
+            for predicate in predicates {
+                service.checks.push(ServiceCheckRequirement {
+                    id: format!("{phase:?}-{predicate:?}"),
+                    scenarios: vec![scenario],
+                    phase,
+                    role,
+                    artifact,
+                    predicate,
+                });
+            }
+        }
+        requirements
+    }
+
+    #[test]
+    fn service_upgrade_sut_transitions_from_declared_runtime_state_and_preserves_data() {
+        let requirements = requirements(ScenarioKind::Upgrade);
+        requirements
+            .validate_required(&[ScenarioKind::Upgrade])
+            .unwrap();
+        for predicate in [
+            ServicePredicate::Registration,
+            ServicePredicate::Configuration,
+            ServicePredicate::Running,
+            ServicePredicate::ApplicationReady,
+        ] {
+            let mut missing = requirements.clone();
+            missing.service.as_mut().unwrap().checks.retain(|c| {
+                !(c.phase == IntegrationPhase::TargetInstalledAfterUpgrade
+                    && c.predicate == predicate)
+            });
+            assert!(
+                missing.validate_required(&[ScenarioKind::Upgrade]).is_err(),
+                "missing Upgrade postcondition {predicate:?} must refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn service_reinstall_compares_original_definition_reader_and_data() {
+        let requirements = requirements(ScenarioKind::Reinstall);
+        requirements
+            .validate_required(&[ScenarioKind::Reinstall])
+            .unwrap();
+        for phase in [
+            IntegrationPhase::Reinstalled,
+            IntegrationPhase::ExerciseBeforeReinstall,
+            IntegrationPhase::ExerciseAfterReinstall,
+        ] {
+            let mut missing = requirements.clone();
+            missing
+                .service
+                .as_mut()
+                .unwrap()
+                .checks
+                .retain(|c| c.phase != phase);
+            assert!(
+                missing
+                    .validate_required(&[ScenarioKind::Reinstall])
+                    .is_err(),
+                "missing Reinstall phase {phase:?} must refuse"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod desktop_selection_tests {
+    use super::*;
+    #[test]
+    fn macos_owned_primary_refuses_before_setup_without_changing_other_platforms() {
+        use crate::native::recipe::NativeOs;
+        let original = ValidatedIntegrationRecipe::decode(
+            include_bytes!("../../../examples/native/service-recipe.example.json"),
+            "pure-recipe.json".into(),
+        )
+        .unwrap();
+        for os in [NativeOs::Linux, NativeOs::Macos, NativeOs::Windows] {
+            let mut recipe = original.clone();
+            recipe.core.recipe.os = os;
+            recipe.recipe.catalog.os = os;
+            let reader = if os == NativeOs::Windows {
+                "reader.exe"
+            } else {
+                "reader"
+            };
+            recipe.core.recipe.leaves.reader = reader.into();
+            recipe.recipe.catalog.leaves.reader = reader.into();
+            recipe.recipe.integrations.service = None;
+            recipe.recipe.integrations.desktop = Some(DesktopRequirement {
+                resource: ResourceSlot::new("desktop").unwrap(),
+                modes: vec![DesktopMode::OwnedExecutable],
+                readiness: ReadinessRequirement {
+                    kind: ReadyKind::LocalChallenge,
+                    protocol: ReadyProtocol::TheseusFixtureReadyV1,
+                    deadline_ms: 1000,
+                },
+                lifetime: LifetimeRequirement::OwnedPrimaryExited,
+            });
+            let limits = recipe.core.recipe.limits.clone();
+            let selected = recipe.validate_selection(&[ScenarioKind::Clean], &limits);
+            if os == NativeOs::Macos {
+                let error =
+                    selected.expect_err("macOS OwnedPrimary cannot qualify product release");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("OwnedExecutable lifetime on macOS")
+                );
+                assert!(error.to_string().contains("NativeActivation"));
+                recipe
+                    .recipe
+                    .integrations
+                    .desktop
+                    .as_mut()
+                    .unwrap()
+                    .lifetime = LifetimeRequirement::OwnedProcessTreeSettled;
+                assert!(
+                    recipe
+                        .validate_selection(&[ScenarioKind::Clean], &limits)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("descendant scope")
+                );
+                let desktop = recipe.recipe.integrations.desktop.as_mut().unwrap();
+                desktop.modes = vec![DesktopMode::NativeActivation];
+                desktop.lifetime = LifetimeRequirement::ActivationInstanceTerminated;
+                recipe
+                    .validate_selection(&[ScenarioKind::Clean], &limits)
+                    .unwrap();
+            } else {
+                selected.unwrap();
+            }
+        }
+    }
+    #[test]
+    fn native_selection_keeps_each_os_lifetime_and_single_lease_budget() {
+        use crate::native::recipe::NativeOs;
+        let original = ValidatedIntegrationRecipe::decode(
+            include_bytes!("../../../examples/native/service-recipe.example.json"),
+            "pure-recipe.json".into(),
+        )
+        .unwrap();
+        for os in [NativeOs::Linux, NativeOs::Macos, NativeOs::Windows] {
+            let mut recipe = original.clone();
+            recipe.core.recipe.os = os;
+            recipe.recipe.catalog.os = os;
+            let reader = if os == NativeOs::Windows {
+                "reader.exe"
+            } else {
+                "reader"
+            };
+            recipe.core.recipe.leaves.reader = reader.into();
+            recipe.recipe.catalog.leaves.reader = reader.into();
+            recipe.recipe.integrations.service = None;
+            let lifetime = if os == NativeOs::Macos {
+                LifetimeRequirement::ActivationInstanceTerminated
+            } else {
+                LifetimeRequirement::OwnedPrimaryExited
+            };
+            recipe.recipe.integrations.desktop = Some(DesktopRequirement {
+                resource: ResourceSlot::new("desktop").unwrap(),
+                modes: vec![DesktopMode::NativeActivation],
+                readiness: ReadinessRequirement {
+                    kind: ReadyKind::LocalChallenge,
+                    protocol: ReadyProtocol::TheseusFixtureReadyV1,
+                    deadline_ms: 1000,
+                },
+                lifetime,
+            });
+            let limits = recipe.core.recipe.limits.clone();
+            recipe
+                .validate_selection(&[ScenarioKind::Clean], &limits)
+                .unwrap();
+            let mut too_small = limits.clone();
+            too_small.max_operations = 1;
+            assert!(
+                recipe
+                    .validate_selection(&[ScenarioKind::Clean], &too_small)
+                    .is_err()
+            );
+            recipe
+                .recipe
+                .integrations
+                .desktop
+                .as_mut()
+                .unwrap()
+                .lifetime = if os == NativeOs::Macos {
+                LifetimeRequirement::OwnedPrimaryExited
+            } else {
+                LifetimeRequirement::ActivationInstanceTerminated
+            };
+            assert!(
+                recipe
+                    .validate_selection(&[ScenarioKind::Clean], &limits)
+                    .is_err()
+            );
+        }
+    }
+    #[test]
+    fn native_ordinary_and_combined_require_one_mode_and_real_lifetime() {
+        let mut requirements = crate::native::integration::view::tests::report().requirements;
+        requirements.desktop = Some(DesktopRequirement {
+            resource: ResourceSlot::new("desktop").unwrap(),
+            modes: vec![DesktopMode::NativeActivation],
+            readiness: ReadinessRequirement {
+                kind: ReadyKind::LocalChallenge,
+                protocol: ReadyProtocol::TheseusFixtureReadyV1,
+                deadline_ms: 1000,
+            },
+            lifetime: LifetimeRequirement::OwnedPrimaryExited,
+        });
+        // Recipe commitments only; no session, SDK, lease or manager is created.
+        for combined in [true, false] {
+            if !combined {
+                requirements.service = None;
+            }
+            for scenario in [
+                ScenarioKind::Clean,
+                ScenarioKind::Upgrade,
+                ScenarioKind::Reinstall,
+            ] {
+                // This boundary checks declared mode/scenario shape. Mandatory
+                // service checks are independently enforced by validate_required.
+                if let Some(service) = &mut requirements.service {
+                    for check in &mut service.checks {
+                        check.scenarios = vec![scenario];
+                    }
+                }
+                requirements.validate(&[scenario]).unwrap();
+            }
+        }
+        requirements
+            .desktop
+            .as_mut()
+            .unwrap()
+            .modes
+            .push(DesktopMode::OwnedExecutable);
+        assert!(requirements.validate(&[ScenarioKind::Clean]).is_err());
+        requirements.desktop.as_mut().unwrap().modes = vec![DesktopMode::NativeActivation];
+        requirements.desktop.as_mut().unwrap().lifetime =
+            LifetimeRequirement::OwnedProcessTreeSettled;
+        assert!(requirements.validate(&[ScenarioKind::Clean]).is_err());
+    }
+    #[test]
+    fn owned_desktop_ordinary_and_combined_admission_preserves_native_and_slot_boundaries() {
+        let mut requirements = crate::native::integration::view::tests::report().requirements;
+        requirements.service = None;
+        requirements.desktop = Some(DesktopRequirement {
+            resource: ResourceSlot::new("desktop").unwrap(),
+            modes: vec![DesktopMode::OwnedExecutable],
+            readiness: ReadinessRequirement {
+                kind: ReadyKind::LocalChallenge,
+                protocol: ReadyProtocol::TheseusFixtureReadyV1,
+                deadline_ms: 1000,
+            },
+            lifetime: LifetimeRequirement::OwnedProcessTreeSettled,
+        });
+        requirements
+            .validate_required(&[ScenarioKind::Clean])
+            .unwrap();
+        requirements
+            .validate_required(&[ScenarioKind::Upgrade])
+            .unwrap();
+        requirements
+            .validate_required(&[ScenarioKind::Reinstall])
+            .unwrap();
+        requirements.service = crate::native::integration::view::tests::report()
+            .requirements
+            .service;
+        requirements.validate(&[ScenarioKind::Clean]).unwrap();
+        requirements.desktop.as_mut().unwrap().resource =
+            requirements.service.as_ref().unwrap().resource.clone();
+        assert!(requirements.validate(&[ScenarioKind::Clean]).is_err());
+        requirements.desktop.as_mut().unwrap().resource = ResourceSlot::new("desktop").unwrap();
+        requirements.desktop.as_mut().unwrap().modes = vec![DesktopMode::NativeActivation];
+        requirements.desktop.as_mut().unwrap().lifetime = LifetimeRequirement::OwnedPrimaryExited;
+        requirements.validate(&[ScenarioKind::Clean]).unwrap();
+        requirements.desktop.as_mut().unwrap().lifetime =
+            LifetimeRequirement::OwnedProcessTreeSettled;
+        requirements.service = None;
+        requirements.desktop.as_mut().unwrap().modes = vec![DesktopMode::NativeActivation];
+        assert!(
+            requirements
+                .validate_required(&[ScenarioKind::Clean])
+                .is_err()
+        );
+        requirements.desktop.as_mut().unwrap().lifetime = LifetimeRequirement::OwnedPrimaryExited;
+        requirements
+            .validate_required(&[ScenarioKind::Clean])
+            .unwrap();
+        requirements.desktop.as_mut().unwrap().lifetime =
+            LifetimeRequirement::ActivationInstanceTerminated;
+        requirements
+            .validate_required(&[ScenarioKind::Clean])
+            .unwrap();
     }
 }

@@ -38,6 +38,20 @@ pub enum Disposition {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Entry {
+    LinuxGioQualificationDeclared {
+        attestation: Box<LinuxGioBuildAttestation>,
+    },
+    DesktopAuthorityDeclared {
+        manifest: Box<IntegrationManifest>,
+        context: Box<IntegrationRuntimeContext>,
+    },
+
+    IntegrationBrokerHeader {
+        header: crate::v2::broker::IntegrationBrokerHeader,
+    },
+    Broker {
+        event: crate::v2::broker::BrokerEvent,
+    },
     IntegrationHeader {
         artifact_commitment: Digest,
         binding: BindingId,
@@ -102,6 +116,7 @@ impl Record {
                     Entry::Header { .. }
                         | Entry::NativeHeader { .. }
                         | Entry::IntegrationHeader { .. }
+                        | Entry::IntegrationBrokerHeader { .. }
                 ))
         {
             return Err(LedgerError::InvalidRecord);
@@ -109,6 +124,9 @@ impl Record {
         if let Entry::OperationFinished { outcome, .. } = &entry {
             super::super::types::validate_outcome(outcome)
                 .map_err(|_| LedgerError::InvalidRecord)?;
+        }
+        if let Entry::IntegrationBrokerHeader { header } = &entry {
+            header.validate().map_err(|_| LedgerError::InvalidRecord)?;
         }
         Ok(Self { index, entry })
     }

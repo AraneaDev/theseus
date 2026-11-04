@@ -368,6 +368,31 @@ pub enum Message {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
+    BrokerBind {
+        original: Box<super::broker::BrokerBind>,
+    },
+    QueryBrokerBind {
+        original: Box<super::broker::BrokerBind>,
+    },
+    DesktopAction {
+        request: Box<super::broker::DesktopRequest>,
+    },
+    InspectDesktop {
+        lease: LeaseId,
+        slot: super::ResourceSlot,
+        generation: Option<super::broker::DesktopActivationTransition>,
+    },
+    QueryDesktop {
+        identity: Box<super::broker::BrokerOperationIdentity>,
+    },
+    CancelDesktop {
+        identity: Box<super::broker::BrokerOperationIdentity>,
+    },
+    ProbeDesktopReadiness {
+        identity: Box<super::broker::BrokerOperationIdentity>,
+        nonce: BindingId,
+        deadline_ms: u32,
+    },
     ProbeReadiness {
         deadline_ms: u32,
         lease: LeaseId,
@@ -443,6 +468,24 @@ pub enum Request {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reply {
+    BrokerDescription {
+        header: Box<super::broker::IntegrationBrokerHeader>,
+    },
+    BrokerBinding {
+        receipt: Box<super::broker::BrokerBindingReceipt>,
+    },
+    DesktopState {
+        identity: Box<super::broker::BrokerOperationIdentity>,
+        state: Box<super::broker::BrokerState>,
+    },
+    DesktopObservation {
+        lease: LeaseId,
+        observation: Box<super::broker::DesktopObservation>,
+    },
+    DesktopReadiness {
+        identity: Box<super::broker::BrokerOperationIdentity>,
+        observation: Box<super::ReadinessObservation>,
+    },
     ReadinessObservation {
         lease: LeaseId,
         observation: Box<super::ReadinessObservation>,
@@ -609,6 +652,29 @@ fn checked_end(offset: u64, length: usize) -> Result<(), Error> {
 fn validate_message(v: &Message) -> Result<(), Error> {
     match v {
         Message::Request {
+            request: Request::BrokerBind { original } | Request::QueryBrokerBind { original },
+        } => original.validate(),
+        Message::Request {
+            request: Request::DesktopAction { request },
+        } => request.validate(),
+        Message::Request {
+            request: Request::QueryDesktop { identity } | Request::CancelDesktop { identity },
+        } => identity.validate(),
+        Message::Request {
+            request:
+                Request::ProbeDesktopReadiness {
+                    identity,
+                    nonce,
+                    deadline_ms,
+                },
+        } => {
+            identity.validate()?;
+            if nonce.as_bytes() == &[0; 16] || !(1..=30000).contains(deadline_ms) {
+                return Err(Error::InvalidValue);
+            }
+            Ok(())
+        }
+        Message::Request {
             request: Request::ReadFile { offset, length, .. },
         } => {
             bounded_length(*length)?;
@@ -634,7 +700,25 @@ fn validate_message(v: &Message) -> Result<(), Error> {
             }
             Ok(())
         }
+        Message::Request {
+            request:
+                Request::InspectDesktop {
+                    generation: Some(generation),
+                    ..
+                },
+        } => generation.validate(),
         Message::Response { result, .. } => match result {
+            Reply::BrokerDescription { header } => header.validate(),
+            Reply::BrokerBinding { receipt } => receipt.validate(),
+            Reply::DesktopState { identity, state } => {
+                identity.validate()?;
+                state.validate()
+            }
+            Reply::DesktopObservation { observation, .. } => observation.validate(),
+            Reply::DesktopReadiness {
+                identity,
+                observation,
+            } => observation.validate_desktop(identity),
             Reply::Description {
                 os,
                 helper_principal,

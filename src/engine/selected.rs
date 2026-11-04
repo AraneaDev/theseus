@@ -6,7 +6,7 @@ use crate::{
         adapter::NativeDriver,
         launch::{LaunchAuthority, LaunchPreparation},
         model::*,
-        provider::{CommandProvider, NativeProvider, validate_baseline},
+        provider::{CommandProvider, NativeProvider},
         transport::{NativeSession, NativeStartFailure, validate_preparation},
     },
     report::{self, ReportStore},
@@ -429,11 +429,8 @@ fn run_native(
         crate::native::recipe::NativeOs::Windows => v2::Os::Windows,
     };
     if let Some(integration) = integration {
-        ensure!(
-            integration.recipe.integrations.service.is_some()
-                && integration.recipe.integrations.desktop.is_none(),
-            "integration profile requires supplied service authority; desktop session capability is unavailable"
-        );
+        integration.validate_selection(&options.scenarios, &options.limits)?;
+        crate::native::integration::view::validate_authority(integration, launch)?;
         let (core, integration_m) = launch
             .integration_components()
             .ok_or_else(|| anyhow::anyhow!("integration helper profile required"))?;
@@ -530,6 +527,7 @@ fn run_native(
             report
                 .integrations
                 .push(crate::native::integration::IntegrationScenarioEvidence {
+                    native_lifetime: None,
                     scenario_id: scenario_id.clone(),
                     ownership_id: ownership_id.clone(),
                     services: vec![],
@@ -538,15 +536,43 @@ fn run_native(
                     dispositions: crate::native::integration::IntegrationDispositions {
                         helper_worker: Disposition::NotStarted,
                         registration: Disposition::NotStarted,
-                        manager_action: Disposition::NotStarted,
-                        broker: Disposition::Complete {
-                            receipt: "no desktop broker required".into(),
+                        manager_action: if report.requirements.service.is_none() && report.requirements.desktop.is_some() {
+                            Disposition::Complete {
+                                receipt: "no service manager authority declared".into(),
+                            }
+                        } else {
+                            Disposition::NotStarted
                         },
-                        primary: Disposition::Complete {
-                            receipt: "no owned primary required".into(),
+                        broker: if report.requirements.desktop.is_some() {
+                            Disposition::Unknown {
+                                reason: "original desktop broker not yet bound".into(),
+                            }
+                        } else {
+                            Disposition::Complete {
+                                receipt: "no desktop broker required".into(),
+                            }
                         },
-                        descendant_scope: Disposition::Complete {
-                            receipt: "no owned descendant scope required".into(),
+                        primary: if report.requirements.desktop.as_ref().is_some_and(|d|d.modes==[crate::native::integration::DesktopMode::NativeActivation] && d.lifetime==crate::native::integration::LifetimeRequirement::ActivationInstanceTerminated) {
+                            Disposition::NotStarted
+                        } else if report.requirements.desktop.is_some() {
+                            Disposition::Unknown {
+                                reason: "original desktop primary unproved".into(),
+                            }
+                        } else {
+                            Disposition::Complete {
+                                receipt: "no owned primary required".into(),
+                            }
+                        },
+                        descendant_scope: if report.requirements.desktop.as_ref().is_some_and(|d|d.modes==[crate::native::integration::DesktopMode::NativeActivation]) {
+                            Disposition::NotStarted
+                        } else if report.requirements.desktop.is_some() {
+                            Disposition::Unknown {
+                                reason: "original desktop descendant scope unproved".into(),
+                            }
+                        } else {
+                            Disposition::Complete {
+                                receipt: "no owned descendant scope required".into(),
+                            }
                         },
                     },
                 });
@@ -561,6 +587,7 @@ fn run_native(
         );
         let mut provider_started = false;
         let mut provider_prepared = false;
+        let mut desktop_header = None;
         let mut preparation_invocation = None;
         let setup = catch_unwind(AssertUnwindSafe(
             || -> Result<super::projector::PublishedResource> {
@@ -583,7 +610,11 @@ fn run_native(
                 provider_started = true;
                 owners.remote_unknown = true;
                 let receipt = owners.provider.as_mut().unwrap().invoke(saved)?;
-                let baseline = validate_baseline(launch, &prepare, receipt.clone())?;
+                let baseline = owners
+                    .provider
+                    .as_ref()
+                    .unwrap()
+                    .validate_original_baseline(launch, &prepare, receipt.clone())?;
                 ensure!(
                     epochs.insert(receipt.reset_epoch.clone()),
                     "provider reused a baseline epoch"
@@ -593,6 +624,9 @@ fn run_native(
                     .provider_claims
                     .push(receipt.clone());
                 let active_launch = launch.with_baseline(&baseline)?;
+                desktop_header = active_launch
+                    .integration_context()
+                    .and_then(|c| c.desktop_broker_header.clone());
                 if let Some(integration) = integration {
                     crate::native::transport::validate_integration_preparation(
                         &active_launch,
@@ -628,6 +662,36 @@ fn run_native(
                         .as_ref()
                         .unwrap()
                         .validate_integration_context(&active_launch, &ownership_id)?;
+                    if let Some(integration) = integration
+                        && integration.recipe.integrations.desktop.is_some()
+                    {
+                        if owners.session.as_ref().unwrap().integration_description().is_some_and(|d|matches!(d.manifest.desktop_native,Some(theseus_native_protocol::v2::NativeDesktopDefinition::LinuxGio {..}))) {
+                            owners.session.as_mut().unwrap().admit_linux_gio_qualification(&active_launch, &ownership_id)?;
+                        }
+                        let manifest = &owners
+                            .session
+                            .as_ref()
+                            .unwrap()
+                            .integration_description()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("desktop description missing before Acquire")
+                            })?
+                            .manifest;
+                        let header = desktop_header.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!("desktop header missing before Acquire")
+                        })?;
+                        crate::native::integration::desktop::validate_admission(
+                            integration,
+                            manifest,
+                            header,
+                            kind,
+                        )?;
+                        owners
+                            .session
+                            .as_ref()
+                            .unwrap()
+                            .require_linux_gio_admission(manifest, header)?;
+                    }
                 }
                 let prepared = intent_store.prepare(IntentRecord {
                     intent: v2::IntentId::parse(&nonce()?)?,
@@ -679,11 +743,34 @@ fn run_native(
             match catch_unwind(AssertUnwindSafe(|| {
                 driver.set_limits(&options.limits)?;
                 if let Some(integration) = integration {
-                    crate::native::integration::driver::IntegrationDriver::new(
-                        &mut driver,
-                        integration,
-                    )
-                    .run(kind)
+                    if integration.recipe.integrations.desktop.is_some() {
+                        let header = desktop_header.take().ok_or_else(|| {
+                            anyhow::anyhow!("original desktop provider context missing")
+                        })?;
+                        if integration.recipe.integrations.service.is_some() {
+                            crate::native::integration::driver::IntegrationDriver::combined(
+                                &mut driver,
+                                integration,
+                                header,
+                                kind,
+                            )?
+                            .run(kind)
+                        } else {
+                            crate::native::integration::desktop::DesktopDriver::new_for_scenario(
+                                &mut driver,
+                                integration,
+                                header,
+                                kind,
+                            )?
+                            .run(kind)
+                        }
+                    } else {
+                        crate::native::integration::driver::IntegrationDriver::new(
+                            &mut driver,
+                            integration,
+                        )
+                        .run(kind)
+                    }
                 } else {
                     driver.run(kind)
                 }
@@ -726,6 +813,16 @@ fn run_native(
                         .unwrap()
                         .dispositions
                         .release = disposition;
+                    if let StoredRun::NativeIntegration(report) = driver.projector.report_mut()
+                        && report.requirements.desktop.is_some()
+                        && let Some(evidence) = report.integrations.last_mut()
+                    {
+                        evidence.dispositions.broker = Disposition::Complete {
+                            receipt:
+                                "original broker lease released before original helper lease closed"
+                                    .into(),
+                        };
+                    }
                 }
                 Ok(Ok(_)) => owners
                     .errors
@@ -773,7 +870,11 @@ fn run_native(
                         })?;
                         let receipt = owners.provider.as_mut().unwrap().query(prepare)?.ok_or_else(|| anyhow::anyhow!("original provider preparation remains unknown; no new disposition identity authorized"))?;
                         v2::Digest::parse(&receipt.reset_epoch)?;
-                        validate_baseline(launch, prepare, receipt.clone())?;
+                        owners
+                            .provider
+                            .as_ref()
+                            .unwrap()
+                            .validate_original_baseline(launch, prepare, receipt.clone())?;
                         let known = native_provider_calls(&projector)
                             .iter()
                             .find(|call| &call.invocation == prepare)
@@ -875,7 +976,19 @@ fn run_native(
                 _ => RunOutcome::Incomplete,
             }))
         };
-        for _ in &owners.errors {
+        for error in &owners.errors {
+            #[cfg(feature = "native-integration-test-support")]
+            if integration.is_some() {
+                // Fixture controllers retain stderr privately. Keep the actual
+                // source-test cause visible without changing shipping reports.
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "source integration failure: {error:#}"
+                );
+            }
+            #[cfg(not(feature = "native-integration-test-support"))]
+            let _ = error;
             report.failures.push(
                 "native infrastructure or publication failed; original typed failure retained"
                     .into(),
@@ -908,7 +1021,7 @@ fn run_native(
                 .checks
                 .iter()
                 .any(|c| c.outcome != crate::model::CheckOutcome::Passed)
-                || !evidence.dispositions.complete()
+                || !evidence.complete()
             {
                 RunOutcome::Incomplete
             } else {

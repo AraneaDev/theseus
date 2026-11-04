@@ -37,30 +37,44 @@ impl LedgerView {
         if records.len() > MAX_RECORDS {
             return Err(LedgerError::Capacity);
         }
-        let (Entry::Header {
-            binding,
-            manifest_digest,
-            os,
-            ..
-        }
-        | Entry::IntegrationHeader {
-            binding,
-            manifest_digest,
-            os,
-            ..
-        }
-        | Entry::NativeHeader {
-            binding,
-            manifest_digest,
-            os,
-            ..
-        }) = records[0].entry()
-        else {
-            return Err(LedgerError::InvalidTransition);
+        let (binding, manifest_digest, os) = match records[0].entry() {
+            Entry::IntegrationBrokerHeader { header } => {
+                header.validate().map_err(|_| LedgerError::InvalidRecord)?;
+                (
+                    BindingId::parse(&header.binding).map_err(|_| LedgerError::InvalidRecord)?,
+                    Digest::parse(&header.manifest_digest)
+                        .map_err(|_| LedgerError::InvalidRecord)?,
+                    match header.os.as_str() {
+                        "linux" => Os::Linux,
+                        "macos" => Os::Macos,
+                        "windows" => Os::Windows,
+                        _ => return Err(LedgerError::InvalidRecord),
+                    },
+                )
+            }
+            Entry::Header {
+                binding,
+                manifest_digest,
+                os,
+                ..
+            }
+            | Entry::IntegrationHeader {
+                binding,
+                manifest_digest,
+                os,
+                ..
+            }
+            | Entry::NativeHeader {
+                binding,
+                manifest_digest,
+                os,
+                ..
+            } => (*binding, *manifest_digest, *os),
+            _ => return Err(LedgerError::InvalidTransition),
         };
         let mut v = Self {
-            binding: *binding,
-            manifest: *manifest_digest,
+            binding,
+            manifest: manifest_digest,
             lease: None,
             operations: Vec::new(),
             authority_failure: None,
@@ -76,8 +90,28 @@ impl LedgerView {
             match r.entry() {
                 Entry::Header { .. }
                 | Entry::NativeHeader { .. }
+                | Entry::IntegrationBrokerHeader { .. }
                 | Entry::IntegrationHeader { .. } => {
                     if i != 0 {
+                        return Err(LedgerError::InvalidTransition);
+                    }
+                }
+                Entry::LinuxGioQualificationDeclared { .. } => {
+                    crate::v2::declared_linux_gio_qualification(records)?
+                        .ok_or(LedgerError::InvalidTransition)?;
+                }
+                Entry::DesktopAuthorityDeclared { .. } => {
+                    if i != 1 {
+                        return Err(LedgerError::InvalidTransition);
+                    }
+                    crate::v2::broker::declared_desktop(records)?
+                        .ok_or(LedgerError::InvalidTransition)?;
+                }
+                Entry::Broker { .. } => {
+                    if !matches!(
+                        records[0].entry(),
+                        Entry::IntegrationHeader { .. } | Entry::IntegrationBrokerHeader { .. }
+                    ) {
                         return Err(LedgerError::InvalidTransition);
                     }
                 }
@@ -95,7 +129,35 @@ impl LedgerView {
                     v.authority_failure = Some(*reason);
                 }
                 Entry::LeaseReserved { intent, lease } => {
-                    if i != 1 || v.lease.is_some() {
+                    let (expected, qualified) = match records[0].entry() {
+                        Entry::IntegrationBrokerHeader { header } => (
+                            if header.linux_gio_qualification.is_some() {
+                                2
+                            } else {
+                                1
+                            },
+                            header.linux_gio_qualification.is_some(),
+                        ),
+                        Entry::IntegrationHeader { .. } => {
+                            match records.get(1).map(Record::entry) {
+                                Some(Entry::DesktopAuthorityDeclared { context, .. }) => (
+                                    if context.linux_gio_qualification.is_some() {
+                                        3
+                                    } else {
+                                        2
+                                    },
+                                    context.linux_gio_qualification.is_some(),
+                                ),
+                                _ => (1, false),
+                            }
+                        }
+                        _ => (1, false),
+                    };
+                    if i != expected
+                        || v.lease.is_some()
+                        || (qualified
+                            && crate::v2::declared_linux_gio_qualification(records)?.is_none())
+                    {
                         return Err(LedgerError::InvalidTransition);
                     }
                     v.lease = Some((*intent, *lease, LeaseView::Held { intent: *intent }));
@@ -108,8 +170,9 @@ impl LedgerView {
                 } => {
                     v.check_lease(*lease)
                         .map_err(|_| LedgerError::InvalidTransition)?;
-                    if (*operation_kind == OperationKind::ServiceAction
-                        && !matches!(records[0].entry(), Entry::IntegrationHeader { .. }))
+                    if matches!(records[0].entry(), Entry::IntegrationBrokerHeader { .. })
+                        || (*operation_kind == OperationKind::ServiceAction
+                            && !matches!(records[0].entry(), Entry::IntegrationHeader { .. }))
                         || v.authority_failure.is_some()
                         || active.is_some()
                         || v.operations.iter().any(|o| o.operation == *operation)
@@ -155,7 +218,7 @@ impl LedgerView {
                     {
                         return Err(LedgerError::InvalidTransition);
                     }
-                    super::super::types::validate_outcome_for_os(outcome, *os)
+                    super::super::types::validate_outcome_for_os(outcome, os)
                         .map_err(|_| LedgerError::InvalidTransition)?;
                     if n > FINISH_RESERVE {
                         return Err(LedgerError::Capacity);
@@ -168,6 +231,26 @@ impl LedgerView {
                 Entry::LeaseClosed { lease, disposition } => {
                     v.check_lease(*lease)
                         .map_err(|_| LedgerError::InvalidTransition)?;
+                    if matches!(records[0].entry(), Entry::IntegrationBrokerHeader { .. })
+                        && matches!(disposition, Disposition::AwaitingExternalReset)
+                    {
+                        let broker = crate::v2::broker::BrokerLedgerView::replay(&records[..i])?;
+                        if broker.requests().any(|request| {
+                            broker
+                                .query(request)
+                                .map_or(true, |state| !state.original_retired())
+                        }) {
+                            return Err(LedgerError::InvalidTransition);
+                        }
+                    }
+                    if matches!(records[0].entry(), Entry::IntegrationHeader { .. })
+                        && matches!(disposition, Disposition::AwaitingExternalReset)
+                    {
+                        let broker = crate::v2::broker::BrokerLedgerView::replay(&records[..i])?;
+                        if broker.binding_original().is_some() && !broker.helper_released() {
+                            return Err(LedgerError::InvalidTransition);
+                        }
+                    }
                     if n > CLOSE_RESERVE {
                         return Err(LedgerError::Capacity);
                     }
@@ -205,6 +288,18 @@ impl LedgerView {
                     reason,
                 }
             }
+        }
+        let broker = crate::v2::broker::BrokerLedgerView::replay(records)?;
+        if matches!(records[0].entry(), Entry::IntegrationBrokerHeader { .. })
+            && broker
+                .requests()
+                .any(|r| broker.query(r).is_ok_and(|s| !s.original_retired()))
+            && let Some((intent, _, state)) = &mut v.lease
+        {
+            *state = LeaseView::Quarantined {
+                intent: *intent,
+                reason: UnknownReason::ProcessStateUnproved,
+            };
         }
         Ok(v)
     }

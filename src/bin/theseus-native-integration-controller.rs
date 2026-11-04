@@ -43,7 +43,60 @@ struct Graph {
     provider_epoch: String,
     core_manifest_digest: String,
     integration_manifest_digest: String,
-    service_authority: v2::ServiceAuthority,
+    service_authority: Option<v2::ServiceAuthority>,
+    desktop_authority: Option<v2::broker::DesktopAuthority>,
+    source_mode: Option<String>,
+    broker: Option<Pin>,
+    broker_config: Option<Pin>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SourceGraphMode {
+    Service,
+    Desktop,
+    Combined,
+}
+fn source_graph_mode(graph: &Graph) -> Result<SourceGraphMode> {
+    let service = graph.service_authority.is_some();
+    let desktop = graph.desktop_authority.is_some();
+    let broker = graph.broker.is_some() && graph.broker_config.is_some();
+    match graph.source_mode.as_deref() {
+        None => {
+            ensure!(
+                service && !desktop && graph.broker.is_none() && graph.broker_config.is_none(),
+                "service graph authority pairing changed"
+            );
+            Ok(SourceGraphMode::Service)
+        }
+        Some("source_owned_desktop" | "source_owned_combined") => {
+            let combined = graph.source_mode.as_deref() == Some("source_owned_combined");
+            ensure!(
+                desktop && broker && service == combined,
+                "compiled source graph requires exact authority and independent broker pins"
+            );
+            let authority = graph.desktop_authority.as_ref().unwrap();
+            authority.validate()?;
+            ensure!(
+                !combined || authority.os == "linux",
+                "combined source SUT fixture requires supplied Linux manager; other platform acceptance is separate"
+            );
+            ensure!(
+                matches!(
+                    authority.display,
+                    v2::broker::SuppliedDisplay::SourceOwnedHeadless
+                ) && authority.allowed_modes == [v2::broker::DesktopMode::OwnedExecutable],
+                "compiled Source graph has no native activation authority"
+            );
+            if let Some(service) = &graph.service_authority {
+                service.validate()?;
+            }
+            Ok(if combined {
+                SourceGraphMode::Combined
+            } else {
+                SourceGraphMode::Desktop
+            })
+        }
+        _ => anyhow::bail!("unsupported compiled fixture source mode"),
+    }
 }
 struct RetainedPin {
     _directory: HostDir,
@@ -115,10 +168,12 @@ fn execute() -> Result<i32> {
     );
     let graph_source = RetainedLaunchFile::open(&path)?;
     let graph: Graph = serde_json::from_slice(graph_source.bytes())?;
+    let source_mode = source_graph_mode(&graph)?;
     ensure!(
         graph.kind == "theseus_native_integration_fixture_graph" && graph.schema == 1,
         "unsupported fixture graph"
     );
+    let _broker_config_pin = graph.broker_config.as_ref().map(pin).transpose()?;
     let _pins = [
         pin(&graph.launch)?,
         pin(&graph.config)?,
@@ -137,6 +192,7 @@ fn execute() -> Result<i32> {
             &graph.target,
         ]
         .into_iter()
+        .chain(graph.broker.iter())
         .map(|p| (p.path.clone(), p.length, p.sha256.clone()))
         .collect(),
     )?);
@@ -151,11 +207,15 @@ fn execute() -> Result<i32> {
     );
     let _provider_root = HostDir::open(&graph.provider_root, RootPolicy::AllComponentsNoFollow)?;
     let mut helper = NativeCommand::new(&graph.helper.path);
-    helper.args([
-        std::ffi::OsStr::new("serve"),
-        std::ffi::OsStr::new("--config"),
-        graph.config.path.as_os_str(),
-    ]);
+    if source_mode != SourceGraphMode::Service {
+        helper.arg("source-desktop-serve").arg(&graph.config.path);
+    } else {
+        helper.args([
+            std::ffi::OsStr::new("serve"),
+            std::ffi::OsStr::new("--config"),
+            graph.config.path.as_os_str(),
+        ]);
+    }
     helper.environment = ChildEnvironment::Replace(vec![]);
     let mut provider = NativeCommand::new(&graph.provider.path);
     provider
@@ -171,19 +231,57 @@ fn execute() -> Result<i32> {
     } else {
         v2::Os::Linux
     };
-    let authority = LaunchAuthority::fixture_integration(
-        helper,
-        StoreBinding {
-            binding: v2::BindingId::parse(&graph.binding)?,
-            manifest_digest: v2::Digest::parse(&graph.manifest_digest)?,
-            workspace_marker: v2::WorkspaceMarker::parse(&graph.workspace_marker)?,
-            os,
-        },
-        v2::Digest::parse(&graph.provider_epoch)?,
-        v2::Digest::parse(&graph.core_manifest_digest)?,
-        v2::Digest::parse(&graph.integration_manifest_digest)?,
-        graph.service_authority,
-    )?
+    let binding = StoreBinding {
+        binding: v2::BindingId::parse(&graph.binding)?,
+        manifest_digest: v2::Digest::parse(&graph.manifest_digest)?,
+        workspace_marker: v2::WorkspaceMarker::parse(&graph.workspace_marker)?,
+        os,
+    };
+    let epoch = v2::Digest::parse(&graph.provider_epoch)?;
+    let core = v2::Digest::parse(&graph.core_manifest_digest)?;
+    let integration = v2::Digest::parse(&graph.integration_manifest_digest)?;
+    let authority = if source_mode == SourceGraphMode::Combined {
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&graph.config.path)?)?;
+        let manifest: v2::IntegrationManifest =
+            serde_json::from_value(config["integration_manifest"].clone())?;
+        LaunchAuthority::fixture_combined(
+            helper,
+            binding,
+            epoch,
+            core,
+            integration,
+            graph
+                .service_authority
+                .ok_or_else(|| anyhow::anyhow!("combined service ceiling missing"))?,
+            graph
+                .desktop_authority
+                .ok_or_else(|| anyhow::anyhow!("combined desktop ceiling missing"))?,
+            &manifest,
+        )?
+    } else if source_mode == SourceGraphMode::Desktop {
+        LaunchAuthority::fixture_desktop(
+            helper,
+            binding,
+            epoch,
+            core,
+            integration,
+            graph
+                .desktop_authority
+                .ok_or_else(|| anyhow::anyhow!("desktop ceiling missing"))?,
+        )?
+    } else {
+        LaunchAuthority::fixture_integration(
+            helper,
+            binding,
+            epoch,
+            core,
+            integration,
+            graph
+                .service_authority
+                .ok_or_else(|| anyhow::anyhow!("service ceiling missing"))?,
+        )?
+    }
     .with_fixture_provider("integration_fixture_provider".into(), provider)?
     .with_fixture_executable_pins(executables)?;
     let loader = Loader { source, authority };
@@ -209,4 +307,38 @@ fn main() {
         }
     };
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod source_graph_tests {
+    use super::*;
+    fn combined() -> Graph {
+        let pin = serde_json::json!({"path":"/fixture/image","sha256":"11".repeat(32),"length":1});
+        let service = serde_json::json!({"kind":"systemd","slot":"service","scope":"user","bus_endpoint":{"kind":"unix_path","path":"/fixture/bus"},"qualification":{"manager":"systemd","version":"262","api_profile":"systemd_dbus_private_v1","features":["unit_properties","start_stop","manager_reload"],"receipt_sha256":"03".repeat(32)},"namespace":{"kind":"exclusive_owned_registration","slot":"service","unit_load_roots":["/fixture/units"],"dropins":"forbidden","provider_context":"source-fixture"},"manager_context":{"kind":"whole_private","slot":"manager","sut_allowed_actions":["daemon_reload"],"rehearsal_allowed_actions":[],"provider_receipt_required":true},"expected_peer_uid":1000,"expected_manager_uid":1000,"definition_root":"/fixture/units","unit":"theseus-fixture.service","managed_by":"installer","sut_effects":["registration","configuration","removal","daemon_reload"],"allowed_actions":["inspect","start","stop"]});
+        let desktop = serde_json::json!({"target_id":"source-combined","os":"linux","session_id":"source-combined","session_epoch":"66".repeat(32),"broker_endpoint":{"kind":"unix_path","path":"/fixture/broker.sock"},"broker_principal":{"kind":"posix","effective_uid":1000,"effective_gid":1000},"helper_principal":{"kind":"posix","effective_uid":1000,"effective_gid":1000},"display":{"kind":"source_owned_headless"},"allowed_modes":["owned_executable"]});
+        serde_json::from_value(serde_json::json!({"kind":"theseus_native_integration_fixture_graph","schema":1,"launch":pin,"controller":pin,"base":pin,"target":pin,"helper":pin,"config":pin,"provider":pin,"provider_template":pin,"provider_root":"/fixture/provider","binding":"01".repeat(16),"manifest_digest":"11".repeat(32),"workspace_marker":"02".repeat(16),"provider_epoch":"22".repeat(32),"core_manifest_digest":"33".repeat(32),"integration_manifest_digest":"44".repeat(32),"service_authority":service,"desktop_authority":desktop,"source_mode":"source_owned_combined","broker":pin,"broker_config":pin})).unwrap()
+    }
+    #[test]
+    fn source_combined_graph_requires_both_authorities_exact_owned_mode_and_broker_pins() {
+        assert!(source_graph_mode(&combined()).is_ok());
+        let mut bad = combined();
+        bad.service_authority = None;
+        assert!(source_graph_mode(&bad).is_err());
+        let mut bad = combined();
+        bad.desktop_authority = None;
+        assert!(source_graph_mode(&bad).is_err());
+        let mut bad = combined();
+        bad.broker = None;
+        assert!(source_graph_mode(&bad).is_err());
+        let mut bad = combined();
+        bad.broker_config = None;
+        assert!(source_graph_mode(&bad).is_err());
+        let mut bad = combined();
+        bad.desktop_authority.as_mut().unwrap().allowed_modes =
+            vec![v2::broker::DesktopMode::NativeActivation];
+        assert!(source_graph_mode(&bad).is_err());
+        let mut bad = combined();
+        bad.source_mode = Some("native_activation".into());
+        assert!(source_graph_mode(&bad).is_err());
+    }
 }

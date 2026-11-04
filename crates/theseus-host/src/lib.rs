@@ -2,6 +2,7 @@
 pub mod cancel;
 #[cfg(windows)]
 pub mod console;
+pub mod desktop;
 pub mod fs;
 pub mod principal;
 pub mod process;

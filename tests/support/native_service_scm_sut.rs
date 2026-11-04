@@ -1,7 +1,10 @@
 //! Installer-only SCM registration/configuration/removal. Never a helper API.
 #![cfg(windows)]
 use super::definition::{self, ScmReaderConfig};
-use anyhow::{Result, ensure};
+#[path = "native_service_acl.rs"]
+#[allow(unused_imports)] // This SUT uses the shared ACL module without its setup-only probe.
+mod acl;
+use anyhow::{Context, Result, ensure};
 use std::{
     ffi::c_void,
     fs::File,
@@ -41,7 +44,6 @@ struct Status {
 #[link(name = "advapi32")]
 unsafe extern "system" {
     fn OpenSCManagerW(machine: *const u16, database: *const u16, access: u32) -> Handle;
-    fn OpenServiceW(manager: Handle, name: *const u16, access: u32) -> Handle;
     fn CreateServiceW(
         manager: Handle,
         name: *const u16,
@@ -70,6 +72,7 @@ unsafe extern "system" {
         password: *const u16,
         display: *const u16,
     ) -> i32;
+    fn StartServiceW(service: Handle, count: u32, arguments: *const *const u16) -> i32;
     fn DeleteService(service: Handle) -> i32;
     fn ControlService(service: Handle, control: u32, status: *mut Status) -> i32;
     fn QueryServiceStatus(service: Handle, status: *mut Status) -> i32;
@@ -144,7 +147,7 @@ impl Drop for ServiceHandle {
 }
 
 pub struct NativeServiceSut {
-    manager: ServiceHandle,
+    _manager: ServiceHandle,
     observer: host::ScmManager,
     name: Vec<u16>,
     definitions: Vec<v2::ServiceDefinition>,
@@ -152,6 +155,7 @@ pub struct NativeServiceSut {
     input: ScmReaderConfig,
     retained_service: Option<ServiceHandle>,
     uncertain: bool,
+    transitioning: bool,
 }
 impl NativeServiceSut {
     pub fn connect(
@@ -167,7 +171,10 @@ impl NativeServiceSut {
             qualification: q,
             preflight: p,
             ..
-        } = &manifest.service_authority
+        } = manifest
+            .service_authority
+            .as_ref()
+            .context("service authority missing")?
         else {
             anyhow::bail!("SCM authority required")
         };
@@ -202,7 +209,10 @@ impl NativeServiceSut {
             context: host::ScmContext::LocalMachine,
             service_name: service_name.clone(),
             ownership_id: context.ownership_id.clone(),
-            context_receipt: context.namespace_receipt.clone(),
+            context_receipt: context
+                .namespace_receipt
+                .clone()
+                .context("service namespace receipt missing")?,
             qualification_receipt: q.receipt_sha256.clone(),
             allowed_access: 0x35,
             allowed_start: true,
@@ -229,7 +239,7 @@ impl NativeServiceSut {
         let manager =
             ServiceHandle::checked(unsafe { OpenSCManagerW(ptr::null(), ptr::null(), 1) })?;
         Ok(Self {
-            manager,
+            _manager: manager,
             observer,
             name: wide(service_name),
             definitions: manifest.definitions.clone(),
@@ -237,6 +247,7 @@ impl NativeServiceSut {
             input,
             retained_service: None,
             uncertain: false,
+            transitioning: false,
         })
     }
     fn declared(&self, d: &v2::ServiceDefinition) -> Result<&v2::ScmDefinition> {
@@ -273,14 +284,9 @@ impl NativeServiceSut {
     }
     fn open_original(&mut self, deadline: Instant, cancel: &AtomicBool) -> Result<()> {
         ensure!(
-            self.retained_service.is_none(),
-            "original fixture SCM handle already retained"
+            self.retained_service.is_some(),
+            "original CreateServiceW handle missing; never reopen by matching name"
         );
-        // QUERY_CONFIG|QUERY_STATUS|CHANGE_CONFIG|STOP|DELETE, never Start.
-        let original = ServiceHandle::checked(unsafe {
-            OpenServiceW(self.manager.0, self.name.as_ptr(), 0x10027)
-        })?;
-        self.retained_service = Some(original);
         let observation = self.observer.inspect(deadline, cancel)?;
         ensure!(
             observation.registration == host::RegistrationState::Present
@@ -382,6 +388,7 @@ impl NativeServiceSut {
         permissions.set_readonly(true);
         file.set_permissions(permissions)?;
         drop(file);
+        acl::verify_path(&self.sidecar, &self.input.helper_sid, acl::Kind::Sidecar)?;
         self.validate_sidecar()
     }
     pub fn install(
@@ -398,6 +405,16 @@ impl NativeServiceSut {
         self.inspect(None, deadline, cancel)?;
         // Install only: the input is created once before CreateService and Start.
         let _input = self.create_sidecar()?;
+        let reader = self
+            .sidecar
+            .parent()
+            .ok_or_else(|| invalid("reader parent"))?
+            .join("reader.exe");
+        // CopyFile security is never accepted by inheritance or receipt flags.
+        // This exact newly-created SUT object receives its declared initial ACL.
+        acl::initialize_created_path(&reader, &self.input.helper_sid, acl::Kind::Executable)?;
+        acl::verify_path(&reader, &self.input.helper_sid, acl::Kind::Executable)?;
+        acl::verify_path(&self.sidecar, &self.input.helper_sid, acl::Kind::Sidecar)?;
         let command = terminated(&d.command_line);
         let display = terminated(&d.display_name);
         let account = terminated(&d.account);
@@ -410,7 +427,7 @@ impl NativeServiceSut {
                 creator.0,
                 self.name.as_ptr(),
                 display.as_ptr(),
-                0x10027,
+                0x10037,
                 d.service_type,
                 d.start_type,
                 d.error_control,
@@ -424,12 +441,11 @@ impl NativeServiceSut {
         };
         self.retained_service = Some(ServiceHandle::checked(handle)?);
         self.inspect(Some(&d), deadline, cancel)?;
-        if let Some(original) = self.retained_service.as_mut() {
-            original.close()?;
-        }
-        self.retained_service.take();
         self.uncertain = false;
         Ok(())
+    }
+    pub fn has_owned_registration(&self) -> bool {
+        self.retained_service.is_some()
     }
     pub fn configure(
         &mut self,
@@ -442,8 +458,34 @@ impl NativeServiceSut {
             "original fixture SCM mutation unresolved; no replay"
         );
         let d = self.declared(definition)?.clone();
-        self.open_original(deadline, cancel)?;
+        if !self.transitioning {
+            self.open_original(deadline, cancel)?;
+        }
         let _input = self.validate_sidecar()?;
+        let reader = self
+            .sidecar
+            .parent()
+            .ok_or_else(|| invalid("reader parent"))?
+            .join("reader.exe");
+        if self.transitioning {
+            // The stopped original was removed by verified handle; this is the
+            // newly-created pinned target object, never an overwrite grant.
+            acl::initialize_created_path(&reader, &self.input.helper_sid, acl::Kind::Executable)?;
+        }
+        acl::verify_path(&reader, &self.input.helper_sid, acl::Kind::Executable)?;
+        acl::verify_path(&self.sidecar, &self.input.helper_sid, acl::Kind::Sidecar)?;
+        if !self.transitioning {
+            acl::initialize_created_path(
+                Path::new(&self.input.data),
+                &self.input.helper_sid,
+                acl::Kind::Data,
+            )?;
+        }
+        acl::verify_path(
+            Path::new(&self.input.data),
+            &self.input.helper_sid,
+            acl::Kind::Data,
+        )?;
         let command = terminated(&d.command_line);
         let display = terminated(&d.display_name);
         let account = terminated(&d.account);
@@ -468,10 +510,76 @@ impl NativeServiceSut {
             return Err(io::Error::last_os_error().into());
         }
         self.inspect(Some(&d), deadline, cancel)?;
-        if let Some(original) = self.retained_service.as_mut() {
-            original.close()?;
+        self.uncertain = false;
+        Ok(())
+    }
+    /// Hold the SAME original SUT service handle through stop/config/restart.
+    /// No repeat CreateService/DeleteService or reconstructed registration occurs.
+    pub fn stop_for_transition(&mut self, deadline: Instant, cancel: &AtomicBool) -> Result<()> {
+        ensure!(
+            !self.uncertain && !self.transitioning,
+            "original SCM SUT transition unresolved"
+        );
+        self.open_original(deadline, cancel)?;
+        self.uncertain = true;
+        let handle = self.retained_service.as_ref().unwrap().0;
+        let mut status = Status::default();
+        if unsafe { QueryServiceStatus(handle, &mut status) } == 0 {
+            return Err(io::Error::last_os_error().into());
         }
-        self.retained_service.take();
+        ensure!(status.kind == 0x10, "original SCM service type changed");
+        if status.state != 1
+            && status.state != 3
+            && unsafe { ControlService(handle, 1, &mut status) } == 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+        loop {
+            budget(deadline, cancel)?;
+            if unsafe { QueryServiceStatus(handle, &mut status) } == 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            ensure!(
+                status.kind == 0x10,
+                "original SCM service type changed while stopping"
+            );
+            if status.state == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        self.transitioning = true;
+        self.uncertain = false;
+        Ok(())
+    }
+    pub fn start_after_transition(&mut self, deadline: Instant, cancel: &AtomicBool) -> Result<()> {
+        ensure!(
+            !self.uncertain && self.transitioning && self.retained_service.is_some(),
+            "original stopped SCM SUT handle required"
+        );
+        budget(deadline, cancel)?;
+        self.uncertain = true;
+        let handle = self.retained_service.as_ref().unwrap().0;
+        if unsafe { StartServiceW(handle, 0, ptr::null()) } == 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        loop {
+            budget(deadline, cancel)?;
+            let mut status = Status::default();
+            if unsafe { QueryServiceStatus(handle, &mut status) } == 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            ensure!(
+                status.kind == 0x10,
+                "original SCM service type changed while starting"
+            );
+            if status.state == 4 {
+                break;
+            }
+            ensure!(status.state == 2, "original SUT service failed to start");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        self.transitioning = false;
         self.uncertain = false;
         Ok(())
     }
@@ -642,6 +750,124 @@ fn clear_readonly_original(path: &Path, original: &File) -> Result<()> {
     }
     Ok(())
 }
+/// Repeat-install reader owner pinned BEFORE native Stop. Contents alone never
+/// authorize deleting an object opened later under the same path.
+pub struct PinnedReader {
+    root: HostDir,
+    path: PathBuf,
+    leaf: std::ffi::OsString,
+    file: File,
+    original: theseus_host::fs::FileFingerprint,
+}
+impl PinnedReader {
+    pub fn pin(path: &Path, length: u64, sha256: &str) -> Result<Self> {
+        use sha2::{Digest as _, Sha256};
+        let root = HostDir::open(
+            path.parent().ok_or_else(|| invalid("reader parent"))?,
+            RootPolicy::AllComponentsNoFollow,
+        )?;
+        let leaf = path
+            .file_name()
+            .ok_or_else(|| invalid("reader name"))?
+            .to_owned();
+        let mut file = match root.open_leaf_classified(&leaf) {
+            LeafOpenResult::Opened(file) => file,
+            other => anyhow::bail!("original fixture reader unavailable: {other:?}"),
+        };
+        let original = fingerprint(&file)?;
+        ensure!(
+            original.len == length && length <= 64 * 1024 * 1024,
+            "original reader length differs"
+        );
+        let mut hash = Sha256::new();
+        let mut read = 0u64;
+        let mut buffer = [0u8; 16384];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            read += count as u64;
+            ensure!(read <= length, "original reader grew during pinning");
+            hash.update(&buffer[..count]);
+        }
+        ensure!(
+            read == length
+                && format!("{:x}", hash.finalize()) == sha256
+                && fingerprint(&file)? == original,
+            "original reader changed while pinning"
+        );
+        Ok(Self {
+            root,
+            path: path.into(),
+            leaf,
+            file,
+            original,
+        })
+    }
+    pub fn remove(self) -> Result<()> {
+        ensure!(
+            fingerprint(&self.file)? == self.original,
+            "original reader changed while Stop was pending"
+        );
+        clear_readonly_original(&self.path, &self.file)?;
+        self.root.remove_created_leaf(&self.leaf, &self.file)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod repeat_reader_tests {
+    use super::*;
+    use sha2::{Digest as _, Sha256};
+    #[test]
+    fn windows_pre_stop_reader_pin_refuses_same_byte_foreign_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("reader.exe");
+        let data = root.path().join("data");
+        std::fs::write(&path, b"pinned-reader").unwrap();
+        std::fs::write(&data, b"configured-data").unwrap();
+        let pin = PinnedReader::pin(
+            &path,
+            13,
+            &format!("{:x}", Sha256::digest(b"pinned-reader")),
+        )
+        .unwrap();
+        std::fs::rename(&path, root.path().join("owned-original.exe")).unwrap();
+        std::fs::write(&path, b"pinned-reader").unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        assert!(pin.remove().is_err());
+        assert!(
+            std::fs::metadata(&path).unwrap().permissions().readonly(),
+            "foreign attributes untouched"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"pinned-reader");
+        assert_eq!(std::fs::read(&data).unwrap(), b"configured-data");
+    }
+    #[test]
+    fn windows_pre_stop_pin_removes_only_owned_readonly_reader_and_preserves_data() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("reader.exe");
+        let data = root.path().join("data");
+        std::fs::write(&path, b"pinned-reader").unwrap();
+        std::fs::write(&data, b"configured-data").unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        let pin = PinnedReader::pin(
+            &path,
+            13,
+            &format!("{:x}", Sha256::digest(b"pinned-reader")),
+        )
+        .unwrap();
+        pin.remove().unwrap();
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&data).unwrap(), b"configured-data");
+    }
+}
+
 /// Remove only a workspace reader matching one originally pinned artifact.
 /// Clearing readonly uses its original verified handle and cannot alter a
 /// same-path replacement. The private parent remains the namespace authority.

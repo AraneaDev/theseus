@@ -102,65 +102,6 @@ pub(crate) fn load(
     result
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn retained_source_rejects_replacement_and_byte_changes() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("launch.json");
-        std::fs::write(&path, b"trusted").unwrap();
-        let trusted = RetainedLaunchFile::open(&path).unwrap();
-        assert!(
-            RetainedLaunchFile::open(&path)
-                .unwrap()
-                .identity_matches(&trusted)
-                .unwrap()
-        );
-        std::fs::rename(&path, temp.path().join("original")).unwrap();
-        std::fs::write(&path, b"trusted").unwrap();
-        assert!(trusted.verify().is_err());
-    }
-    #[cfg(all(unix, feature = "native-integration-test-support"))]
-    #[test]
-    fn frozen_execution_authority_never_heals_after_mutability_is_observed() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join("images");
-        std::fs::create_dir(&directory).unwrap();
-        let paths = [directory.join("helper"), directory.join("provider")];
-        for path in &paths {
-            std::fs::write(path, b"frozen").unwrap();
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500)).unwrap();
-        }
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let pins = FixtureExecutablePins::retain(
-            paths
-                .into_iter()
-                .map(|path| (path, 6, format!("{:x}", Sha256::digest(b"frozen"))))
-                .collect(),
-        )
-        .unwrap();
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(pins.verify().is_err());
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
-        assert!(
-            pins.verify().is_err(),
-            "matching again cannot restore a revoked execution ceiling"
-        );
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
-    #[test]
-    fn shipping_decoder_never_accepts_program_authority() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("launch.json");
-        std::fs::write(&path, br#"{"program":"/fixture","args":[]}"#).unwrap();
-        assert!(load(&path, &ShippingAuthorityLoader).is_err());
-        std::fs::write(&path, vec![b'x'; 65537]).unwrap();
-        assert!(RetainedLaunchFile::open(&path).is_err());
-    }
-}
-
 /// Test-controller artifact authority, held through deferred execution. Artifacts
 /// live in a fixture-owned frozen directory, independent of Cargo's mutable output.
 #[cfg(feature = "native-integration-test-support")]
@@ -301,5 +242,64 @@ impl FixtureExecutablePins {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn retained_source_rejects_replacement_and_byte_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("launch.json");
+        std::fs::write(&path, b"trusted").unwrap();
+        let trusted = RetainedLaunchFile::open(&path).unwrap();
+        assert!(
+            RetainedLaunchFile::open(&path)
+                .unwrap()
+                .identity_matches(&trusted)
+                .unwrap()
+        );
+        std::fs::rename(&path, temp.path().join("original")).unwrap();
+        std::fs::write(&path, b"trusted").unwrap();
+        assert!(trusted.verify().is_err());
+    }
+    #[cfg(all(unix, feature = "native-integration-test-support"))]
+    #[test]
+    fn frozen_execution_authority_never_heals_after_mutability_is_observed() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("images");
+        std::fs::create_dir(&directory).unwrap();
+        let paths = [directory.join("helper"), directory.join("provider")];
+        for path in &paths {
+            std::fs::write(path, b"frozen").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let pins = FixtureExecutablePins::retain(
+            paths
+                .into_iter()
+                .map(|path| (path, 6, format!("{:x}", Sha256::digest(b"frozen"))))
+                .collect(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(pins.verify().is_err());
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(
+            pins.verify().is_err(),
+            "matching again cannot restore a revoked execution ceiling"
+        );
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    #[test]
+    fn shipping_decoder_never_accepts_program_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("launch.json");
+        std::fs::write(&path, br#"{"program":"/fixture","args":[]}"#).unwrap();
+        assert!(load(&path, &ShippingAuthorityLoader).is_err());
+        std::fs::write(&path, vec![b'x'; 65537]).unwrap();
+        assert!(RetainedLaunchFile::open(&path).is_err());
     }
 }

@@ -211,8 +211,20 @@ impl Dispatcher {
             return self.response(ticket, refused(v2::RefusalCode::LedgerUnavailable), None);
         }
         if self.mutation_pending
-            || self.barrier.as_ref().is_some_and(|b| !b.retired)
-            || self.active.as_ref().is_some_and(|a| !a.terminal_admitted)
+            && let v2::Request::QueryDesktop { identity } = &request
+        {
+            return self.response(
+                ticket,
+                self.cache
+                    .desktop_query(identity)
+                    .unwrap_or_else(|| refused(v2::RefusalCode::OwnershipPending)),
+                None,
+            );
+        }
+        if !matches!(request, v2::Request::CancelDesktop { .. })
+            && (self.mutation_pending
+                || self.barrier.as_ref().is_some_and(|b| !b.retired)
+                || self.active.as_ref().is_some_and(|a| !a.terminal_admitted))
         {
             return self.response(ticket, refused(v2::RefusalCode::Busy), None);
         }
@@ -295,6 +307,15 @@ impl Dispatcher {
                     }
                 }
             }
+            v2::Request::BrokerBind { .. }
+            | v2::Request::QueryBrokerBind { .. }
+            | v2::Request::DesktopAction { .. }
+            | v2::Request::InspectDesktop { .. }
+            | v2::Request::QueryDesktop { .. }
+            | v2::Request::CancelDesktop { .. }
+            | v2::Request::ProbeDesktopReadiness { .. } => {
+                WorkerCommand::Desktop { request, ticket }
+            }
             v2::Request::ProbeReadiness { .. } => WorkerCommand::ProbeReadiness { request, ticket },
             v2::Request::InspectService { .. } => WorkerCommand::InspectService { request, ticket },
             v2::Request::ReadFile { .. } => WorkerCommand::ReadFile { request, ticket },
@@ -322,7 +343,8 @@ impl Dispatcher {
                     | WorkerCommand::ReadFile { ticket, .. }
                     | WorkerCommand::InspectFile { ticket, .. }
                     | WorkerCommand::InspectService { ticket, .. }
-                    | WorkerCommand::ProbeReadiness { ticket, .. } => ticket,
+                    | WorkerCommand::ProbeReadiness { ticket, .. }
+                    | WorkerCommand::Desktop { ticket, .. } => ticket,
                     WorkerCommand::ServiceAction { ticket, .. }
                     | WorkerCommand::Run { ticket, .. }
                     | WorkerCommand::CreateFile { ticket, .. } => {

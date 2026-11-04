@@ -16,7 +16,7 @@ impl ServiceRuntime {
                 preflight: p,
                 allowed_actions,
                 ..
-            } = &self.config.manifest.service_authority
+            } = self.config.authority()
             else {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -29,7 +29,12 @@ impl ServiceRuntime {
                     context: host::ScmContext::LocalMachine,
                     service_name: service_name.clone(),
                     ownership_id: self.config.context.ownership_id.clone(),
-                    context_receipt: self.config.context.namespace_receipt.clone(),
+                    context_receipt: self
+                        .config
+                        .context
+                        .namespace_receipt
+                        .clone()
+                        .expect("validated service context"),
                     qualification_receipt: qualification.receipt_sha256.clone(),
                     allowed_access: *allowed_access,
                     allowed_start: allowed_actions.iter().any(|a| a == "start"),
@@ -64,50 +69,34 @@ impl ServiceRuntime {
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> io::Result<v2::ServiceObservation> {
-        if slot != self.config.manifest.service_authority.slot() {
+        if slot != self.config.authority().slot() {
             return Err(io::Error::other("undeclared service slot"));
         }
+        self.ensure_readiness_channel()?;
         self.manager(deadline, cancel)?;
         if self.owner.is_some()
             && self.deletion.is_none()
             && let Some((program, receipt)) = self.sut_transition.clone()
         {
             if program == "uninstall" {
-                // This explicit transition follows the accepted SUT uninstaller;
-                // it is local original-handle closure, never DeleteService repair.
-                self.deletion = Some(self.manager.as_mut().unwrap().close_after_sut_delete(
-                    self.owner.as_mut().unwrap(),
-                    receipt,
-                    deadline,
-                    cancel,
-                )?);
+                let status = self
+                    .manager
+                    .as_mut()
+                    .unwrap()
+                    .inspect(deadline, cancel)?
+                    .status;
+                if scm_uninstall_allows_handle_close(status.map(|s| s.state)) {
+                    // This explicit transition follows the accepted SUT uninstaller;
+                    // it is local original-handle closure, never DeleteService repair.
+                    self.deletion = Some(self.manager.as_mut().unwrap().close_after_sut_delete(
+                        self.owner.as_mut().unwrap(),
+                        receipt,
+                        deadline,
+                        cancel,
+                    )?);
+                }
             } else {
-                let role = if program == "configure" {
-                    "configured"
-                } else if program == "install_target" {
-                    "target"
-                } else {
-                    "base"
-                };
-                let artifact = if program == "install_target" {
-                    "target"
-                } else if program == "install_base" {
-                    "base"
-                } else {
-                    self.observed_definition
-                        .as_ref()
-                        .map(|d| d.artifact.as_str())
-                        .unwrap_or("target")
-                };
-                let d = self
-                    .config
-                    .manifest
-                    .definitions
-                    .iter()
-                    .find(|d| d.role == role && d.artifact == artifact)
-                    .ok_or_else(|| {
-                        io::Error::other("admitted SUT next-start transition missing")
-                    })?;
+                let d = self.transition_definition(&program)?;
                 self.manager.as_mut().unwrap().admit_configuration(
                     self.owner.as_mut().unwrap(),
                     &raw_definition(
@@ -120,7 +109,9 @@ impl ServiceRuntime {
                     cancel,
                 )?;
             }
-            self.sut_transition = None;
+            if program != "uninstall" || self.deletion.is_some() {
+                self.sut_transition = None;
+            }
         }
         if let Some(owner) = &mut self.deletion {
             let progress = self
@@ -160,7 +151,12 @@ impl ServiceRuntime {
                     configured: false,
                     running: false,
                     origin: None,
-                    manager_generation: self.config.context.manager_unique_name.clone(),
+                    manager_generation: self
+                        .config
+                        .context
+                        .manager_unique_name
+                        .clone()
+                        .expect("validated service context"),
                     complete,
                     binding_digest: String::new(),
                 },
@@ -232,6 +228,32 @@ impl ServiceRuntime {
                 .as_ref()
                 .is_some_and(|o| !o.original_handle_closed()),
         });
+        if self.activation.from_sut
+            && definition.is_some()
+            && self
+                .owner
+                .as_ref()
+                .is_some_and(|o| !o.original_handle_closed())
+            && !self.uncertain
+            && let Some(status) = observed
+                .status
+                .filter(|s| s.state() == host::RuntimeState::Running && s.process_id != 0)
+        {
+            self.activation.complete = true;
+            if let Err(error) =
+                pin_scm_activation_pid(&mut self.original_start_pid, status.process_id)
+            {
+                self.uncertain = true;
+                self.manager.as_mut().unwrap().revoke_context();
+                return Err(error);
+            }
+            self.instance = self
+                .config
+                .manifest
+                .readiness
+                .as_ref()
+                .and_then(|r| r.cooperative_instance.clone());
+        }
         let absent = observed.registration == host::RegistrationState::Absent;
         let complete = absent
             || (observed.registration == host::RegistrationState::Present
@@ -252,29 +274,20 @@ impl ServiceRuntime {
                     .status
                     .is_some_and(|s| s.state() == host::RuntimeState::Running),
                 origin: None,
-                manager_generation: self.config.context.manager_unique_name.clone(),
+                manager_generation: self
+                    .config
+                    .context
+                    .manager_unique_name
+                    .clone()
+                    .expect("validated service context"),
                 complete,
                 binding_digest: String::new(),
             },
             definition,
         )
     }
-    pub(crate) fn action(
-        &mut self,
-        slot: &v2::ResourceSlot,
-        prior: v2::Digest,
-        action: v2::ServiceAction,
-        deadline: Instant,
-        cancel: &AtomicBool,
-    ) -> io::Result<Option<v2::ServiceOutcome>> {
-        if slot != self.config.manifest.service_authority.slot()
-            || self.binding != Some(prior)
-            || self.uncertain
-            || self.deletion.is_some()
-        {
-            return Err(io::Error::other("service prior authority unproved"));
-        }
-        if action == v2::ServiceAction::Start && self.readiness.is_none() {
+    fn ensure_readiness_channel(&mut self) -> io::Result<()> {
+        if self.readiness.is_none() {
             let config = self
                 .config
                 .manifest
@@ -293,9 +306,7 @@ impl ServiceRuntime {
                     "SCM readiness requires exact local NamedPipe",
                 ));
             };
-            let v2::ServiceAuthority::Scm { preflight, .. } =
-                &self.config.manifest.service_authority
-            else {
+            let v2::ServiceAuthority::Scm { preflight, .. } = self.config.authority() else {
                 return Err(io::Error::other("SCM authority required"));
             };
             if path != &preflight.pipe {
@@ -308,6 +319,26 @@ impl ServiceRuntime {
                 NamedPipe::new(path.clone())?,
                 Sid::new(preflight.helper_sid.clone())?,
             )?);
+        }
+        self.renew_readiness_if_needed()
+    }
+    pub(crate) fn action(
+        &mut self,
+        slot: &v2::ResourceSlot,
+        prior: v2::Digest,
+        action: v2::ServiceAction,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> io::Result<Option<v2::ServiceOutcome>> {
+        if slot != self.config.authority().slot()
+            || self.binding != Some(prior)
+            || self.uncertain
+            || self.deletion.is_some()
+        {
+            return Err(io::Error::other("service prior authority unproved"));
+        }
+        if action == v2::ServiceAction::Start {
+            self.ensure_readiness_channel()?;
         }
         if self.owner.is_none() {
             let d = self
@@ -353,8 +384,8 @@ impl ServiceRuntime {
                 succeeded,
             } => {
                 if succeeded {
-                    self.start_complete = action == host::ServiceAction::Start;
-                    if self.start_complete
+                    self.activation.complete = action == host::ServiceAction::Start;
+                    if self.activation.complete
                         && status.state() == host::RuntimeState::Running
                         && status.process_id != 0
                     {

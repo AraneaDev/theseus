@@ -57,6 +57,9 @@ impl<'a, 's> NativeDriver<'a, 's> {
         self.prepare(kind)?;
         common::run_common(self, kind)
     }
+    pub(crate) fn forward_active(&self) -> bool {
+        self.forward
+    }
     pub(crate) fn prepare(&mut self, kind: ScenarioKind) -> Result<()> {
         self.session.validate_artifacts(self.recipe)?;
         self.scenario_kind = Some(kind);

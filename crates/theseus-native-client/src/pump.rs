@@ -28,6 +28,7 @@ impl Frame {
 }
 pub(crate) struct Pump {
     session: v2::SessionId,
+    broker_header: Option<v2::broker::IntegrationBrokerHeader>,
     pub(crate) protocol_failure: Option<v2::Error>,
     guard: v2::SessionGuard,
     decoder: v2::Decoder,
@@ -45,6 +46,7 @@ impl Pump {
     pub(crate) fn new(session: v2::SessionId) -> Result<Self, v2::Error> {
         let mut pump = Self {
             protocol_failure: None,
+            broker_header: None,
             guard: v2::SessionGuard::new(session.clone(), v2::Role::Controller),
             session,
             decoder: v2::Decoder::new(),
@@ -63,6 +65,29 @@ impl Pump {
         })?;
         Ok(pump)
     }
+    pub(crate) fn new_broker(
+        session: v2::SessionId,
+        header: v2::broker::IntegrationBrokerHeader,
+    ) -> Result<Self, v2::Error> {
+        header.validate()?;
+        let mut pump = Self::new(session)?;
+        pump.broker_header = Some(header);
+        Ok(pump)
+    }
+    pub(crate) fn decode_broker(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(usize, Option<Event>), ClientError> {
+        let progress = self.decoder.feed(bytes).map_err(|e| {
+            self.protocol_failure = Some(e);
+            ClientError::Protocol
+        })?;
+        let event = match progress.frame {
+            Some(frame) => self.inbound_peer(frame, None)?,
+            None => None,
+        };
+        Ok((progress.consumed, event))
+    }
     fn queue(&mut self, message: v2::Message) -> Result<u64, v2::Error> {
         if self.frames.len() == 2 {
             return Err(v2::Error::TooManyRequests);
@@ -79,7 +104,10 @@ impl Pump {
         self.frames.len() < 2 && self.pending[usize::from(cancel)].is_none()
     }
     pub(crate) fn submit(&mut self, id: RequestId, request: v2::Request) -> Result<(), v2::Error> {
-        let slot = usize::from(matches!(request, v2::Request::Cancel { .. }));
+        let slot = usize::from(matches!(
+            request,
+            v2::Request::Cancel { .. } | v2::Request::CancelDesktop { .. }
+        ));
         if self.pending[slot].is_some() {
             return Err(v2::Error::TooManyRequests);
         }
@@ -113,6 +141,13 @@ impl Pump {
         frame: v2::Envelope,
         expected: &ExpectedHelper,
     ) -> Result<Option<Event>, ClientError> {
+        self.inbound_peer(frame, Some(expected))
+    }
+    fn inbound_peer(
+        &mut self,
+        frame: v2::Envelope,
+        expected: Option<&ExpectedHelper>,
+    ) -> Result<Option<Event>, ClientError> {
         self.guard.accept_inbound(&frame).map_err(|e| {
             self.protocol_failure = Some(e);
             ClientError::Protocol
@@ -130,6 +165,15 @@ impl Pump {
             v2::Message::Response { reply_to, result } if self.describe == Some(*reply_to) => {
                 self.describe = None;
                 match result {
+                    v2::Reply::BrokerDescription { header } => {
+                        if expected.is_some()
+                            || self.broker_header.as_ref() != Some(header.as_ref())
+                        {
+                            return Err(ClientError::Preflight);
+                        }
+                        self.ready = true;
+                        Some(Event::Ready)
+                    }
                     v2::Reply::Description {
                         binding,
                         manifest_digest,
@@ -138,6 +182,7 @@ impl Pump {
                         programs,
                         ..
                     } => {
+                        let expected = expected.ok_or(ClientError::Preflight)?;
                         let b = &expected.binding;
                         if expected.profile != v2::HelperProfile::Fixture
                             || *binding != b.binding
@@ -152,6 +197,7 @@ impl Pump {
                         Some(Event::Ready)
                     }
                     v2::Reply::IntegrationDescription { description: d } => {
+                        let expected = expected.ok_or(ClientError::Preflight)?;
                         let b = &expected.binding;
                         let native = &d.native;
                         if expected.profile
@@ -169,7 +215,9 @@ impl Pump {
                                 d.core_manifest_digest,
                                 d.integration_manifest_digest,
                             ) != native.manifest_digest
-                            || d.capabilities != v2::IntegrationCapabilities
+                            || d.capabilities
+                                != v2::IntegrationCapabilities::for_manifest(&d.manifest)
+                                    .map_err(|_| ClientError::Preflight)?
                         {
                             return Err(ClientError::Preflight);
                         }
@@ -179,6 +227,7 @@ impl Pump {
                         Some(Event::Ready)
                     }
                     v2::Reply::NativeDescription { description: d } => {
+                        let expected = expected.ok_or(ClientError::Preflight)?;
                         let b = &expected.binding;
                         if expected.profile
                             != (v2::HelperProfile::Native {

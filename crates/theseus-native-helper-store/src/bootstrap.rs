@@ -66,7 +66,72 @@ pub fn bootstrap_native(
         },
     )
 }
+pub(crate) fn bootstrap_broker(
+    ledger_root: &HostDir,
+    workspace_root: &HostDir,
+    header: &theseus_native_protocol::v2::broker::IntegrationBrokerHeader,
+) -> Result<BootstrapReceipt, StoreError> {
+    if header.linux_gio_qualification.is_some() {
+        return Err(StoreError::BindingMismatch);
+    }
+    bootstrap_broker_profile(ledger_root, workspace_root, header)
+}
+pub(crate) fn bootstrap_broker_profile(
+    ledger_root: &HostDir,
+    workspace_root: &HostDir,
+    header: &theseus_native_protocol::v2::broker::IntegrationBrokerHeader,
+) -> Result<BootstrapReceipt, StoreError> {
+    header.validate().map_err(|_| StoreError::BindingMismatch)?;
+    let request = BootstrapRequest {
+        binding: BindingId::parse(&header.binding).map_err(|_| StoreError::BindingMismatch)?,
+        manifest_digest: Digest::parse(&header.manifest_digest)
+            .map_err(|_| StoreError::BindingMismatch)?,
+        os: match header.os.as_str() {
+            "linux" => Os::Linux,
+            "macos" => Os::Macos,
+            "windows" => Os::Windows,
+            _ => return Err(StoreError::BindingMismatch),
+        },
+    };
+    bootstrap_profile_with(
+        ledger_root,
+        workspace_root,
+        request,
+        None,
+        None,
+        Some(header),
+        theseus_host::random_bytes,
+        |file, bytes| {
+            use std::io::Write;
+            file.write_all(bytes)?;
+            file.sync_all()
+        },
+    )
+}
 pub fn bootstrap_integration(
+    ledger_root: &HostDir,
+    workspace_root: &HostDir,
+    request: BootstrapRequest,
+    context: &theseus_native_protocol::v2::IntegrationRuntimeContext,
+    core_manifest_digest: Digest,
+    integration_manifest_digest: Digest,
+    artifact_commitment: Digest,
+) -> Result<BootstrapReceipt, StoreError> {
+    if context.linux_gio_qualification.is_some() {
+        return Err(StoreError::BindingMismatch);
+    }
+    bootstrap_integration_profile(
+        ledger_root,
+        workspace_root,
+        request,
+        context,
+        core_manifest_digest,
+        integration_manifest_digest,
+        artifact_commitment,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bootstrap_integration_profile(
     ledger_root: &HostDir,
     workspace_root: &HostDir,
     request: BootstrapRequest,
@@ -98,6 +163,7 @@ pub fn bootstrap_integration(
             integration_manifest_digest,
             artifact_commitment,
         )),
+        None,
         theseus_host::random_bytes,
         |f, b| {
             use std::io::Write;
@@ -120,10 +186,13 @@ fn bootstrap_with(
         request,
         provider_epoch,
         None,
+        None,
         random,
         write_sync,
     )
 }
+// Keep explicit authority inputs separate from the injected entropy and sync hooks.
+#[allow(clippy::too_many_arguments)]
 fn bootstrap_profile_with(
     ledger_root: &HostDir,
     workspace_root: &HostDir,
@@ -135,6 +204,7 @@ fn bootstrap_profile_with(
         Digest,
         Digest,
     )>,
+    broker: Option<&theseus_native_protocol::v2::broker::IntegrationBrokerHeader>,
     random: impl FnOnce(&mut [u8]) -> std::io::Result<()>,
     mut write_sync: impl FnMut(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
 ) -> Result<BootstrapReceipt, StoreError> {
@@ -158,7 +228,9 @@ fn bootstrap_profile_with(
     }
     let mut bytes = [0; 16];
     random(&mut bytes)?;
-    let marker = if let Some((context, ..)) = integration {
+    let marker = if let Some(header) = broker {
+        WorkspaceMarker::parse(&header.workspace_marker).map_err(|_| StoreError::BindingMismatch)?
+    } else if let Some((context, ..)) = integration {
         WorkspaceMarker::parse(&context.workspace_marker)
             .map_err(|_| StoreError::BindingMismatch)?
     } else {
@@ -166,7 +238,11 @@ fn bootstrap_profile_with(
     };
     let header = Record::new(
         0,
-        if let Some((
+        if let Some(header) = broker {
+            Entry::IntegrationBrokerHeader {
+                header: header.clone(),
+            }
+        } else if let Some((
             context,
             core_manifest_digest,
             integration_manifest_digest,
@@ -347,4 +423,159 @@ mod write_tests {
             b"0"
         );
     }
+}
+
+/// Bootstrap a declared desktop capability in the original integration ledger.
+/// The header and complete immutable declaration are durable before this returns.
+/// An interruption leaves an unacquired header; normal helper open never repairs
+/// or invents the missing declaration from later peer input.
+pub fn bootstrap_declared_integration(
+    ledger_root: &HostDir,
+    workspace_root: &HostDir,
+    request: BootstrapRequest,
+    context: &theseus_native_protocol::v2::IntegrationRuntimeContext,
+    manifest: &theseus_native_protocol::v2::IntegrationManifest,
+    artifact_commitment: Digest,
+) -> Result<BootstrapReceipt, StoreError> {
+    use theseus_native_protocol::v2::{self, ledger::Entry};
+    manifest
+        .validate_context(context, request.os)
+        .map_err(|_| StoreError::BindingMismatch)?;
+    if manifest.desktop.is_none() {
+        return Err(StoreError::BindingMismatch);
+    }
+    let core =
+        Digest::parse(&manifest.core_manifest_digest).map_err(|_| StoreError::BindingMismatch)?;
+    let integration = manifest.digest().map_err(|_| StoreError::BindingMismatch)?;
+    let binding = request.binding;
+    let manifest_digest = request.manifest_digest;
+    let os = request.os;
+    let receipt = bootstrap_integration(
+        ledger_root,
+        workspace_root,
+        request,
+        context,
+        core,
+        integration,
+        artifact_commitment,
+    )?;
+    let mut store = crate::LedgerStore::open_profile(
+        ledger_root,
+        workspace_root,
+        crate::StoreBinding {
+            binding,
+            manifest_digest,
+            workspace_marker: receipt.marker,
+            os,
+        },
+        v2::HelperProfile::Integration {
+            provider_epoch: Digest::parse(&context.provider_epoch)
+                .map_err(|_| StoreError::BindingMismatch)?,
+            core_manifest_digest: core,
+            integration_manifest_digest: integration,
+        },
+    )?;
+    store.append(Record::new(
+        1,
+        Entry::DesktopAuthorityDeclared {
+            manifest: Box::new(manifest.clone()),
+            context: Box::new(context.clone()),
+        },
+    )?)?;
+    Ok(receipt)
+}
+
+/// Provider-only creation of a qualified helper ledger. All original files and
+/// the trusted issuer capability are revalidated before any bootstrap effect.
+#[allow(clippy::too_many_arguments)]
+pub fn bootstrap_provider_declared_integration(
+    ledger_root: &HostDir,
+    workspace_root: &HostDir,
+    request: BootstrapRequest,
+    context: &theseus_native_protocol::v2::IntegrationRuntimeContext,
+    manifest: &theseus_native_protocol::v2::IntegrationManifest,
+    artifact_commitment: Digest,
+    authority: &crate::ProviderLinuxGioQualification,
+) -> Result<BootstrapReceipt, StoreError> {
+    use theseus_native_protocol::v2::{self, ledger::Entry};
+    authority.revalidate()?;
+    authority
+        .attestation()
+        .validate_context(manifest, context)
+        .map_err(|_| StoreError::BindingMismatch)?;
+    let core =
+        Digest::parse(&manifest.core_manifest_digest).map_err(|_| StoreError::BindingMismatch)?;
+    let integration = manifest.digest().map_err(|_| StoreError::BindingMismatch)?;
+    let binding = request.binding;
+    let full = request.manifest_digest;
+    let os = request.os;
+    let receipt = bootstrap_integration_profile(
+        ledger_root,
+        workspace_root,
+        request,
+        context,
+        core,
+        integration,
+        artifact_commitment,
+    )?;
+    let mut store = crate::LedgerStore::open_profile(
+        ledger_root,
+        workspace_root,
+        crate::StoreBinding {
+            binding,
+            manifest_digest: full,
+            workspace_marker: receipt.marker,
+            os,
+        },
+        v2::HelperProfile::Integration {
+            provider_epoch: Digest::parse(&context.provider_epoch)
+                .map_err(|_| StoreError::BindingMismatch)?,
+            core_manifest_digest: core,
+            integration_manifest_digest: integration,
+        },
+    )?;
+    store.append(Record::new(
+        1,
+        Entry::DesktopAuthorityDeclared {
+            manifest: Box::new(manifest.clone()),
+            context: Box::new(context.clone()),
+        },
+    )?)?;
+    authority.revalidate()?;
+    store.append_provider_qualification(Record::new(
+        2,
+        Entry::LinuxGioQualificationDeclared {
+            attestation: Box::new(authority.attestation().clone()),
+        },
+    )?)?;
+    Ok(receipt)
+}
+/// Provider-only creation of the matching dedicated broker's qualified ledger.
+pub fn bootstrap_provider_broker(
+    ledger_root: &HostDir,
+    workspace_root: &HostDir,
+    header: &theseus_native_protocol::v2::broker::IntegrationBrokerHeader,
+    manifest: &theseus_native_protocol::v2::IntegrationManifest,
+    context: &theseus_native_protocol::v2::IntegrationRuntimeContext,
+    authority: &crate::ProviderLinuxGioQualification,
+) -> Result<BootstrapReceipt, StoreError> {
+    use theseus_native_protocol::v2::ledger::Entry;
+    authority.revalidate()?;
+    authority
+        .attestation()
+        .validate_context(manifest, context)
+        .map_err(|_| StoreError::BindingMismatch)?;
+    if context.desktop_broker_header.as_ref() != Some(header) {
+        return Err(StoreError::BindingMismatch);
+    }
+    let receipt = bootstrap_broker_profile(ledger_root, workspace_root, header)?;
+    let mut store = crate::LedgerStore::open_broker(ledger_root, workspace_root, header)?;
+    authority.revalidate()?;
+    store.append_provider_qualification(Record::new(
+        1,
+        Entry::LinuxGioQualificationDeclared {
+            attestation: Box::new(authority.attestation().clone()),
+        },
+    )?)?;
+    Ok(receipt)
 }

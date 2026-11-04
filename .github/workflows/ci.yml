@@ -10,7 +10,7 @@ jobs:
   host-package:
     name: host-package (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -207,6 +207,45 @@ jobs:
           $theseusPython = if ($IsWindows) { 'python' } else { 'python3' }
           & $theseusPython scripts/validate.py native --stage runtime --evidence $env:THESEUS_HOST_EVIDENCE --expected-host '${{ matrix.host }}'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Source-pinned integration and manager manifest (required)
+        shell: pwsh
+        run: |
+          $theseusPython = if ($IsWindows) { 'python' } else { 'python3' }
+          & $theseusPython scripts/validate.py native --stage integration --evidence $env:THESEUS_HOST_EVIDENCE --expected-host '${{ matrix.host }}'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Native manager fixture and exact cases (required)
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          $theseusPython = if ($IsWindows) { 'python' } else { 'python3' }
+          $theseusOperator = if ($IsWindows) { 'prepare_native_scm_ci.py' } elseif ($IsMacOS) { 'prepare_native_launchd_ci.py' } else { 'prepare_native_systemd_ci.py' }
+          $theseusScript = Join-Path 'tests/support' $theseusOperator
+          $theseusManifest = Join-Path $env:THESEUS_HOST_EVIDENCE 'native-manager-manifest.json'
+          $theseusToken = & $theseusPython -c 'import secrets; print(secrets.token_hex(8))'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $theseusPlanRaw = & $theseusPython $theseusScript --manifest $theseusManifest --plan --token $theseusToken
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $theseusPlanRaw | Set-Content -Encoding utf8 (Join-Path $env:THESEUS_HOST_EVIDENCE 'native-manager-plan.json')
+          $theseusPlan = $theseusPlanRaw | ConvertFrom-Json
+          $theseusResult = 1
+          try {
+            if ($IsLinux) {
+              & sudo -E -- $theseusPython $theseusScript --manifest $theseusManifest --execute --token $theseusToken --disposable-github-runner
+            } else {
+              & $theseusPython $theseusScript --manifest $theseusManifest --execute --token $theseusToken --disposable-github-runner
+            }
+            $theseusResult = $LASTEXITCODE
+          } finally {
+            if (Test-Path $theseusPlan.root) {
+              if ($IsLinux) {
+                & sudo tar -cf (Join-Path $env:THESEUS_HOST_EVIDENCE 'native-manager-retained.tar') -C (Split-Path $theseusPlan.root) (Split-Path $theseusPlan.root -Leaf)
+                if ($LASTEXITCODE -ne 0) { $theseusResult = 1 }
+              } else {
+                Copy-Item -LiteralPath $theseusPlan.root -Destination (Join-Path $env:THESEUS_HOST_EVIDENCE 'native-manager-retained') -Recurse -ErrorAction Stop
+              }
+            }
+          }
+          exit $theseusResult
       - name: Optimized native workspace build
         shell: pwsh
         run: |

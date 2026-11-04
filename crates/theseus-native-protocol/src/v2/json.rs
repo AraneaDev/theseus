@@ -39,16 +39,39 @@ impl Object {
         }
     }
 }
+macro_rules! broker_wire {
+    ($($ty:ty),+ $(,)?) => { $(impl Wire for $ty {
+        fn read(value:Value)->Result<Self,Error> { let v:Self=serde_json::from_value(value).map_err(|_|Error::InvalidValue)?; v.validate()?; Ok(v) }
+        fn write<S:Serializer>(&self,s:S)->Result<S::Ok,S::Error> { self.serialize(s) }
+    })+ };
+}
+broker_wire!(
+    broker::IntegrationBrokerHeader,
+    broker::BrokerBind,
+    broker::BrokerBindingReceipt,
+    broker::DesktopRequest,
+    broker::BrokerOperationIdentity,
+    broker::BrokerState,
+    broker::DesktopObservation,
+    broker::DesktopActivationTransition
+);
 impl Wire for IntegrationCapabilities {
     fn read(v: Value) -> Result<Self, Error> {
-        if v == serde_json::json!(Self::NAMES) {
-            Ok(Self)
-        } else {
-            Err(Error::InvalidValue)
+        for caps in [
+            Self::Service,
+            Self::Desktop,
+            Self::NativeDesktop,
+            Self::Combined,
+            Self::NativeCombined,
+        ] {
+            if v == serde_json::json!(caps.names()) {
+                return Ok(caps);
+            }
         }
+        Err(Error::InvalidValue)
     }
     fn write<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        Self::NAMES.serialize(s)
+        self.names().serialize(s)
     }
 }
 impl Wire for ResourceSlot {
@@ -894,6 +917,35 @@ impl Wire for Request {
         let mut object = Object::new(value)?;
         let kind = object.take::<String>("kind")?;
         let result = match kind.as_str() {
+            "broker_bind" => Self::BrokerBind {
+                original: Box::new(object.take("original")?),
+            },
+            "query_broker_bind" => Self::QueryBrokerBind {
+                original: Box::new(object.take("original")?),
+            },
+            "desktop_action" => Self::DesktopAction {
+                request: Box::new(object.take("request")?),
+            },
+            "inspect_desktop" => Self::InspectDesktop {
+                lease: object.take("lease")?,
+                slot: object.take("slot")?,
+                generation: object
+                    .0
+                    .remove("generation")
+                    .map(broker::DesktopActivationTransition::read)
+                    .transpose()?,
+            },
+            "query_desktop" => Self::QueryDesktop {
+                identity: Box::new(object.take("identity")?),
+            },
+            "cancel_desktop" => Self::CancelDesktop {
+                identity: Box::new(object.take("identity")?),
+            },
+            "probe_desktop_readiness" => Self::ProbeDesktopReadiness {
+                identity: Box::new(object.take("identity")?),
+                nonce: object.take("nonce")?,
+                deadline_ms: object.take("deadline_ms")?,
+            },
             "service_action" => Self::ServiceAction {
                 lease: object.take("lease")?,
                 operation: object.take("operation")?,
@@ -973,6 +1025,64 @@ impl Wire for Request {
     }
     fn write<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         match self {
+            Self::BrokerBind { original } | Self::QueryBrokerBind { original } => {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry(
+                    "kind",
+                    if matches!(self, Self::BrokerBind { .. }) {
+                        "broker_bind"
+                    } else {
+                        "query_broker_bind"
+                    },
+                )?;
+                m.serialize_entry("original", &Ref(original.as_ref()))?;
+                m.end()
+            }
+            Self::DesktopAction { request } => {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry("kind", "desktop_action")?;
+                m.serialize_entry("request", &Ref(request.as_ref()))?;
+                m.end()
+            }
+            Self::InspectDesktop {
+                lease,
+                slot,
+                generation,
+            } => {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry("kind", "inspect_desktop")?;
+                m.serialize_entry("lease", &Ref(lease))?;
+                m.serialize_entry("slot", &Ref(slot))?;
+                if let Some(generation) = generation {
+                    m.serialize_entry("generation", &Ref(generation))?;
+                }
+                m.end()
+            }
+            Self::QueryDesktop { identity } | Self::CancelDesktop { identity } => {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry(
+                    "kind",
+                    if matches!(self, Self::QueryDesktop { .. }) {
+                        "query_desktop"
+                    } else {
+                        "cancel_desktop"
+                    },
+                )?;
+                m.serialize_entry("identity", &Ref(identity.as_ref()))?;
+                m.end()
+            }
+            Self::ProbeDesktopReadiness {
+                identity,
+                nonce,
+                deadline_ms,
+            } => {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry("kind", "probe_desktop_readiness")?;
+                m.serialize_entry("identity", &Ref(identity.as_ref()))?;
+                m.serialize_entry("nonce", &Ref(nonce))?;
+                m.serialize_entry("deadline_ms", deadline_ms)?;
+                m.end()
+            }
             Self::ProbeReadiness {
                 deadline_ms,
                 lease,
@@ -1139,6 +1249,37 @@ impl Wire for Reply {
         let mut object = Object::new(value)?;
         let kind = object.take::<String>("kind")?;
         let result = match kind.as_str() {
+            "broker_description" => Self::BrokerDescription {
+                header: Box::new(object.take("header")?),
+            },
+            "broker_binding" => Self::BrokerBinding {
+                receipt: Box::new(object.take("receipt")?),
+            },
+            "desktop_state" => Self::DesktopState {
+                identity: Box::new(object.take("identity")?),
+                state: Box::new(object.take("state")?),
+            },
+            "desktop_observation" => Self::DesktopObservation {
+                lease: object.take("lease")?,
+                observation: Box::new(object.take("observation")?),
+            },
+            "desktop_readiness" => {
+                let identity: broker::BrokerOperationIdentity = object.take("identity")?;
+                // The shared observation's Wire reader is service-only. Desktop
+                // decoding has an independently contextual, additive validator.
+                let observation: ReadinessObservation = serde_json::from_value(
+                    object
+                        .0
+                        .remove("observation")
+                        .ok_or(Error::InvalidEnvelope)?,
+                )
+                .map_err(|_| Error::InvalidValue)?;
+                observation.validate_desktop(&identity)?;
+                Self::DesktopReadiness {
+                    identity: Box::new(identity),
+                    observation: Box::new(observation),
+                }
+            }
             "readiness_observation" => Self::ReadinessObservation {
                 lease: object.take("lease")?,
                 observation: Box::new(object.take("observation")?),
@@ -1269,6 +1410,42 @@ impl Wire for Reply {
     }
     fn write<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         match self {
+            Self::BrokerDescription { header } => {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry("kind", "broker_description")?;
+                m.serialize_entry("header", &Ref(header.as_ref()))?;
+                m.end()
+            }
+            Self::BrokerBinding { receipt } => {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry("kind", "broker_binding")?;
+                m.serialize_entry("receipt", &Ref(receipt.as_ref()))?;
+                m.end()
+            }
+            Self::DesktopState { identity, state } => {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry("kind", "desktop_state")?;
+                m.serialize_entry("identity", &Ref(identity.as_ref()))?;
+                m.serialize_entry("state", &Ref(state.as_ref()))?;
+                m.end()
+            }
+            Self::DesktopObservation { lease, observation } => {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry("kind", "desktop_observation")?;
+                m.serialize_entry("lease", &Ref(lease))?;
+                m.serialize_entry("observation", &Ref(observation.as_ref()))?;
+                m.end()
+            }
+            Self::DesktopReadiness {
+                identity,
+                observation,
+            } => {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry("kind", "desktop_readiness")?;
+                m.serialize_entry("identity", &Ref(identity.as_ref()))?;
+                m.serialize_entry("observation", &Ref(observation.as_ref()))?;
+                m.end()
+            }
             Self::ReadinessObservation { lease, observation } => {
                 let mut m = s.serialize_map(None)?;
                 m.serialize_entry("kind", "readiness_observation")?;

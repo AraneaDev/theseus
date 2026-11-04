@@ -31,8 +31,10 @@ pub struct LaunchAuthority {
 struct IntegrationCeiling {
     core_manifest_digest: v2::Digest,
     integration_manifest_digest: v2::Digest,
-    service: v2::ServiceAuthority,
+    service: Option<v2::ServiceAuthority>,
+    desktop: Option<v2::broker::DesktopAuthority>,
     context: Option<v2::IntegrationRuntimeContext>,
+    linux_gio: Option<super::provider::ValidatedLinuxGioPrepare>,
 }
 impl Clone for LaunchAuthority {
     fn clone(&self) -> Self {
@@ -127,18 +129,33 @@ impl LaunchAuthority {
                 };
                 let core = digest(object.remove("core_manifest_digest"))?;
                 let integration = digest(object.remove("integration_manifest_digest"))?;
-                let service: v2::ServiceAuthority = serde_json::from_value(
+                let service: Option<v2::ServiceAuthority> = serde_json::from_value(
                     object
                         .remove("service_authority")
                         .ok_or_else(|| anyhow::anyhow!("explicit service authority required"))?,
                 )?;
-                service.validate()?;
+                if let Some(service) = &service {
+                    service.validate()?;
+                }
+                let desktop_value = object
+                    .remove("desktop_authority")
+                    .ok_or_else(|| anyhow::anyhow!("explicit desktop authority field required"))?;
                 ensure!(
-                    matches!(
-                        object.remove("desktop_authority"),
-                        Some(serde_json::Value::Null)
-                    ),
-                    "desktop authority is unsupported by the service-only profile"
+                    desktop_value
+                        .get("display")
+                        .and_then(|d| d.get("kind"))
+                        .and_then(serde_json::Value::as_str)
+                        != Some("source_owned_headless"),
+                    "source headless requires explicit compiled fixture authority"
+                );
+                let desktop: Option<v2::broker::DesktopAuthority> =
+                    serde_json::from_value(desktop_value)?;
+                if let Some(desktop) = &desktop {
+                    desktop.validate()?;
+                }
+                ensure!(
+                    service.is_some() || desktop.is_some(),
+                    "integration launch has no declared authority"
                 );
                 object.insert("schema".into(), 1.into());
                 let mut authority = Self::decode_catalog(&serde_json::to_vec(&value)?)?;
@@ -150,18 +167,33 @@ impl LaunchAuthority {
                 ensure!(
                     matches!(
                         (&service, authority.binding.os),
-                        (v2::ServiceAuthority::Systemd { .. }, v2::Os::Linux)
-                            | (v2::ServiceAuthority::Launchd { .. }, v2::Os::Macos)
-                            | (v2::ServiceAuthority::Scm { .. }, v2::Os::Windows)
+                        (None, _)
+                            | (Some(v2::ServiceAuthority::Systemd { .. }), v2::Os::Linux)
+                            | (Some(v2::ServiceAuthority::Launchd { .. }), v2::Os::Macos)
+                            | (Some(v2::ServiceAuthority::Scm { .. }), v2::Os::Windows)
                     ),
                     "service authority differs from target OS"
                 );
+                if let Some(desktop) = &desktop {
+                    ensure!(
+                        desktop.target_id == authority.view.target_id
+                            && matches!(
+                                (authority.binding.os, desktop.os.as_str()),
+                                (v2::Os::Linux, "linux")
+                                    | (v2::Os::Macos, "macos")
+                                    | (v2::Os::Windows, "windows")
+                            ),
+                        "desktop authority differs from explicit target"
+                    );
+                }
                 authority.view.fingerprint = format!("{:x}", Sha256::digest(bytes));
                 authority.integration = Some(IntegrationCeiling {
                     core_manifest_digest: core,
                     integration_manifest_digest: integration,
                     service,
+                    desktop,
                     context: None,
+                    linux_gio: None,
                 });
                 Ok(authority)
             }
@@ -278,10 +310,18 @@ impl LaunchAuthority {
         })
     }
     pub fn integration_service_authority(&self) -> Option<&v2::ServiceAuthority> {
-        self.integration.as_ref().map(|value| &value.service)
+        self.integration.as_ref()?.service.as_ref()
+    }
+    pub fn integration_desktop_authority(&self) -> Option<&v2::broker::DesktopAuthority> {
+        self.integration.as_ref()?.desktop.as_ref()
     }
     pub fn integration_context(&self) -> Option<&v2::IntegrationRuntimeContext> {
         self.integration.as_ref()?.context.as_ref()
+    }
+    pub fn qualified_linux_gio_prepare(
+        &self,
+    ) -> Option<&super::provider::ValidatedLinuxGioPrepare> {
+        self.integration.as_ref()?.linux_gio.as_ref()
     }
     pub fn expected(&self) -> ExpectedHelper {
         ExpectedHelper {
@@ -361,9 +401,113 @@ impl LaunchAuthority {
         authority.integration = Some(IntegrationCeiling {
             core_manifest_digest: core,
             integration_manifest_digest: integration,
-            service,
+            service: Some(service),
+            desktop: None,
             context: None,
+            linux_gio: None,
         });
+        Ok(authority)
+    }
+    #[cfg(feature = "native-integration-test-support")]
+    pub fn fixture_desktop(
+        command: NativeCommand,
+        binding: StoreBinding,
+        epoch: v2::Digest,
+        core: v2::Digest,
+        integration: v2::Digest,
+        desktop: v2::broker::DesktopAuthority,
+    ) -> Result<Self> {
+        desktop.validate()?;
+        ensure!(
+            binding.manifest_digest == v2::integration_manifest_digest(core, integration),
+            "fixture full manifest differs from desktop components"
+        );
+        let mut authority = Self::fixture(command, binding, epoch);
+        authority.view.target_id = desktop.target_id.clone();
+        authority.view.profile = "source_owned_desktop_fixture";
+        authority.view.fingerprint = format!(
+            "{:x}",
+            Sha256::digest(format!(
+                "desktop:{}:{}:{}:{}",
+                authority.view.fingerprint,
+                core.to_hex(),
+                integration.to_hex(),
+                serde_json::to_string(&desktop)?
+            ))
+        );
+        authority.integration = Some(IntegrationCeiling {
+            core_manifest_digest: core,
+            integration_manifest_digest: integration,
+            service: None,
+            desktop: Some(desktop),
+            context: None,
+            linux_gio: None,
+        });
+        Ok(authority)
+    }
+    /// Explicit compiled source fixture only. Shipping raw launch parsing stays closed.
+    #[cfg(feature = "native-integration-test-support")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn fixture_combined(
+        command: NativeCommand,
+        binding: StoreBinding,
+        epoch: v2::Digest,
+        core: v2::Digest,
+        integration: v2::Digest,
+        service: v2::ServiceAuthority,
+        desktop: v2::broker::DesktopAuthority,
+        manifest: &v2::IntegrationManifest,
+    ) -> Result<Self> {
+        manifest.validate()?;
+        desktop.validate()?;
+        service.validate()?;
+        let entry = manifest
+            .desktop
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("combined desktop tuple missing"))?;
+        let os = match binding.os {
+            v2::Os::Linux => "linux",
+            v2::Os::Macos => "macos",
+            v2::Os::Windows => "windows",
+        };
+        ensure!(
+            desktop.os == os
+                && matches!(
+                    (&service, binding.os),
+                    (v2::ServiceAuthority::Systemd { .. }, v2::Os::Linux)
+                        | (v2::ServiceAuthority::Launchd { .. }, v2::Os::Macos)
+                        | (v2::ServiceAuthority::Scm { .. }, v2::Os::Windows)
+                ),
+            "combined original authorities differ from target OS"
+        );
+        ensure!(
+            matches!(
+                desktop.display,
+                v2::broker::SuppliedDisplay::SourceOwnedHeadless
+            ) && desktop.allowed_modes == [v2::broker::DesktopMode::OwnedExecutable]
+                && entry.allowed_modes == [v2::broker::DesktopMode::OwnedExecutable]
+                && manifest.desktop_native.is_none()
+                && manifest.service_authority.as_ref() == Some(&service)
+                && service.slot() != &entry.slot
+                && manifest.digest()? == integration
+                && manifest.core_manifest_digest == core.to_hex()
+                && v2::IntegrationCapabilities::for_manifest(manifest)?
+                    == v2::IntegrationCapabilities::Combined,
+            "compiled combined fixture requires exact distinct service and SourceOwned-only desktop authority"
+        );
+        let desktop_digest = serde_json::to_string(&desktop)?;
+        let mut authority =
+            Self::fixture_integration(command, binding, epoch, core, integration, service)?;
+        authority.view.target_id = desktop.target_id.clone();
+        authority.view.profile = "source_owned_combined_fixture";
+        authority.view.fingerprint = format!(
+            "{:x}",
+            Sha256::digest(format!(
+                "combined:{}:{}",
+                authority.view.fingerprint, desktop_digest
+            ))
+        );
+        authority.integration.as_mut().unwrap().desktop = Some(desktop);
         Ok(authority)
     }
     #[cfg(feature = "native-integration-test-support")]
@@ -452,7 +596,17 @@ impl LaunchAuthority {
             &receipt.reset_epoch,
         )?;
         if result.integration.is_some() {
+            result
+                .integration
+                .as_mut()
+                .expect("declared integration")
+                .linux_gio = None;
             result.bind_integration_context(&receipt.receipt)?;
+            if let Some(qualified) = baseline.linux_gio_qualification() {
+                let ceiling = result.integration.as_mut().expect("declared integration");
+                qualified.validate_context(ceiling.context.as_ref().expect("bound context"))?;
+                ceiling.linux_gio = Some(qualified.clone());
+            }
         }
         Ok(result)
     }
@@ -476,9 +630,16 @@ impl LaunchAuthority {
                     == integration.integration_manifest_digest.to_hex(),
             "provider integration context differs from original binding"
         );
-        integration
-            .service
-            .validate_context(&context, self.binding.os)?;
+        match (&integration.service, context.manager_platform) {
+            (Some(service), Some(_)) => service.validate_context(&context, self.binding.os)?,
+            (None, None) => context.validate_os(self.binding.os)?,
+            _ => anyhow::bail!("provider manager context differs from declared authority"),
+        }
+        match (&integration.desktop, &context.desktop_broker_header) {
+            (Some(desktop), Some(header)) => desktop.validate_header(header)?,
+            (None, None) => {}
+            _ => anyhow::bail!("provider desktop context differs from declared authority"),
+        }
         integration.context = Some(context);
         Ok(())
     }
@@ -685,6 +846,111 @@ mod tests {
         value["desktop_authority"] = serde_json::Value::Null;
         value
     }
+    #[cfg(all(target_os = "linux", feature = "native-integration-test-support"))]
+    #[test]
+    fn source_combined_fixture_keeps_exact_both_authorities_and_shipping_source_refusal() {
+        let service: v2::ServiceAuthority =
+            serde_json::from_value(integration_launch_json()["service_authority"].clone()).unwrap();
+        let mut manifest =
+            crate::native::integration::desktop::readiness_role_review_tests::manifest(
+                "configured",
+                "target",
+            );
+        manifest.service_authority = Some(service.clone());
+        manifest.definitions.push(v2::ServiceDefinition {
+            scm: None,
+            role: "configured".into(),
+            artifact: "target".into(),
+            executable: "/fixture/reader".into(),
+            arguments: vec!["/fixture/reader".into(), "service".into()],
+            environment: vec![],
+            working_directory: "/fixture".into(),
+            definition_sha256: "44".repeat(32),
+        });
+        manifest.validate().unwrap();
+        let desktop:v2::broker::DesktopAuthority=serde_json::from_value(serde_json::json!({"target_id":"source-combined","os":"linux","broker_endpoint":{"kind":"unix_path","path":"/fixture/broker.sock"},"broker_principal":{"kind":"posix","effective_uid":1000,"effective_gid":1000},"helper_principal":{"kind":"posix","effective_uid":1000,"effective_gid":1000},"session_id":"source-combined","session_epoch":"66".repeat(32),"display":{"kind":"source_owned_headless"},"allowed_modes":["owned_executable"]})).unwrap();
+        let core = v2::Digest::parse(&manifest.core_manifest_digest).unwrap();
+        let integration = manifest.digest().unwrap();
+        let binding = StoreBinding {
+            binding: v2::BindingId::from_bytes([1; 16]),
+            workspace_marker: v2::WorkspaceMarker::from_bytes([2; 16]),
+            manifest_digest: v2::integration_manifest_digest(core, integration),
+            os: v2::Os::Linux,
+        };
+        let make = |manifest: &v2::IntegrationManifest, desktop: v2::broker::DesktopAuthority| {
+            LaunchAuthority::fixture_combined(
+                NativeCommand::new("/fixture/helper"),
+                StoreBinding {
+                    binding: binding.binding,
+                    manifest_digest: binding.manifest_digest,
+                    workspace_marker: binding.workspace_marker,
+                    os: binding.os,
+                },
+                v2::Digest::from_bytes([3; 32]),
+                core,
+                integration,
+                service.clone(),
+                desktop,
+                manifest,
+            )
+        };
+        let authority = make(&manifest, desktop.clone()).unwrap();
+        assert!(authority.integration_service_authority().is_some());
+        assert!(authority.integration_desktop_authority().is_some());
+        let mut native = desktop.clone();
+        native.allowed_modes = vec![v2::broker::DesktopMode::NativeActivation];
+        assert!(make(&manifest, native).is_err());
+        let mut missing = manifest.clone();
+        missing.service_authority = None;
+        assert!(make(&missing, desktop.clone()).is_err());
+        let mut missing = manifest.clone();
+        missing.desktop = None;
+        assert!(make(&missing, desktop.clone()).is_err());
+        let mut raw = integration_launch_json();
+        raw["desktop_authority"] = serde_json::to_value(desktop).unwrap();
+        assert!(
+            LaunchAuthority::decode(&serde_json::to_vec(&raw).unwrap()).is_err(),
+            "feature union cannot unseal raw Source authority"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn desktop_launch_admits_only_explicit_supplied_broker_ceiling_without_service() {
+        let mut value = integration_launch_json();
+        value["service_authority"] = serde_json::Value::Null;
+        value["desktop_authority"] = serde_json::json!({
+            "target_id":value["target_id"],"os":"linux","broker_endpoint":{"kind":"unix_path","path":"/fixture/broker.sock"},
+            "broker_principal":{"kind":"posix","effective_uid":1000,"effective_gid":1000},
+            "helper_principal":{"kind":"posix","effective_uid":1000,"effective_gid":1000},
+            "session_id":"supplied-session","session_epoch":"66".repeat(32),
+            "display":{"kind":"x11","display":":92","authority_file":"/fixture/auth","bus":"/fixture/bus.sock"},"allowed_modes":["owned_executable"]
+        });
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let launch =
+            LaunchAuthority::decode(&bytes).expect("desktop-only supplied broker authority");
+        assert!(launch.integration_service_authority().is_none());
+        assert_eq!(
+            launch.view().fingerprint,
+            format!("{:x}", Sha256::digest(&bytes))
+        );
+        for key in [
+            "broker_endpoint",
+            "broker_principal",
+            "helper_principal",
+            "session_id",
+            "display",
+        ] {
+            let mut changed = value.clone();
+            changed["desktop_authority"]
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+            assert!(LaunchAuthority::decode(&serde_json::to_vec(&changed).unwrap()).is_err());
+        }
+        let mut changed = value;
+        changed["desktop_authority"]["broker_endpoint"]["path"] = "unixexec:/bin/sh".into();
+        assert!(LaunchAuthority::decode(&serde_json::to_vec(&changed).unwrap()).is_err());
+    }
     #[cfg(unix)]
     #[test]
     fn integration_launch_commits_full_source_and_both_manifest_components() {
@@ -724,7 +990,9 @@ mod tests {
             LaunchAuthority::decode(&serde_json::to_vec(&integration_launch_json()).unwrap())
                 .unwrap();
         let context = v2::IntegrationRuntimeContext {
-            manager_platform: v2::ManagerPlatform::Systemd,
+            linux_gio_qualification: None,
+            manager_platform: Some(v2::ManagerPlatform::Systemd),
+            desktop_broker_header: None,
             installation_instance_digest: None,
             kind: "theseus_native_integration_context".into(),
             schema: 1,
@@ -734,8 +1002,8 @@ mod tests {
             workspace_marker: authority.binding.workspace_marker.to_hex(),
             provider_epoch: authority.epoch.to_hex(),
             integration_manifest_digest: authority.integration_components().unwrap().1.to_hex(),
-            manager_unique_name: ":1.42".into(),
-            namespace_receipt: "private-context-original".into(),
+            manager_unique_name: Some(":1.42".into()),
+            namespace_receipt: Some("private-context-original".into()),
         };
         authority
             .bind_integration_context(&serde_json::to_string(&context).unwrap())

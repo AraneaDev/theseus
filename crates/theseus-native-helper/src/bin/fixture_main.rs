@@ -86,6 +86,8 @@ fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let code = if args.first().is_some_and(|s| s == "probe") {
         probe(&args)
+    } else if args.first().is_some_and(|s| s == "source-desktop-serve") {
+        source_desktop_serve(&args)
     } else if args.first().is_some_and(|s| s == "fixture-serve") {
         fixture_serve(&args)
     } else {
@@ -251,4 +253,59 @@ impl Drop for RetainedRuntime {
     fn drop(&mut self) {
         let _ = std::fs::write(&self.drop_receipt, self.nonce.as_bytes());
     }
+}
+
+fn source_desktop_serve(args: &[String]) -> i32 {
+    use theseus_native_helper::{Poll, Runtime, load_source_desktop_config};
+    if args.len() != 2 {
+        return 2;
+    }
+    let invocation = match load_source_desktop_config(Path::new(&args[1])) {
+        Ok(v) => v,
+        Err(_) => return 2,
+    };
+    let stdio = match theseus_host::stdio::Stdio::acquire() {
+        Ok(v) => v,
+        Err(mut e) => {
+            e.request_stop();
+            let end = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < end {
+                if e.poll_stop_or_restore().is_ok_and(|v| v) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            return 2;
+        }
+    };
+    let mut runtime = match Runtime::start(invocation, stdio) {
+        Ok(v) => v,
+        Err(mut e) => {
+            e.request_stop();
+            let end = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < end {
+                if e.poll_settle().is_ok_and(|v| v) {
+                    break;
+                }
+            }
+            return 2;
+        }
+    };
+    loop {
+        match runtime.poll() {
+            Ok(Poll::Settled) => return 0,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    runtime.request_stop();
+    let end = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < end {
+        if runtime.poll_settle().is_ok_and(|v| v) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    2
 }

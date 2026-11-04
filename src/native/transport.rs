@@ -1,6 +1,5 @@
 //! Pollable owned local transport. Remote settlement is deliberately separate.
 use super::launch::{LaunchAuthority, LaunchPreparation};
-use sha2::{Digest as _, Sha256};
 use std::time::{Duration, Instant};
 use theseus_native_client::{
     Action, Client, ClientError, ClientMode, Event, Poll, RequestId, StartFailure,
@@ -9,8 +8,107 @@ pub struct NativeSession {
     client: Client,
     preparation: LaunchPreparation,
     prepared_intent: Option<theseus_native_helper_store::PreparedAcquire>,
+    linux_gio_admission: Option<QualifiedLinuxGioAdmission>,
+}
+/// Created only by an authenticated helper session matching its private
+/// provider bootstrap and the original owned Prepare completion.
+pub struct QualifiedLinuxGioAdmission {
+    reference: theseus_native_protocol::v2::LinuxGioQualificationRef,
+    manifest_digest: theseus_native_protocol::v2::Digest,
+}
+impl QualifiedLinuxGioAdmission {
+    pub fn reference(&self) -> &theseus_native_protocol::v2::LinuxGioQualificationRef {
+        &self.reference
+    }
+    pub fn manifest_digest(&self) -> theseus_native_protocol::v2::Digest {
+        self.manifest_digest
+    }
+}
+fn validate_linux_admission_binding(
+    proof: Option<&QualifiedLinuxGioAdmission>,
+    manifest_digest: theseus_native_protocol::v2::Digest,
+    reference: Option<&theseus_native_protocol::v2::LinuxGioQualificationRef>,
+) -> anyhow::Result<()> {
+    let proof = proof.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Linux native activation requires original authenticated qualification admission"
+        )
+    })?;
+    anyhow::ensure!(
+        proof.manifest_digest == manifest_digest && reference == Some(&proof.reference),
+        "Linux qualification differs from original admitted manifest or broker reference"
+    );
+    Ok(())
 }
 impl NativeSession {
+    /// Retain authority from this original ready helper and its owned Prepare;
+    /// a serialized reference or a new session cannot populate this field.
+    pub(crate) fn admit_linux_gio_qualification(
+        &mut self,
+        launch: &LaunchAuthority,
+        ownership_id: &str,
+    ) -> anyhow::Result<()> {
+        let proof = self.validate_linux_gio_qualification(launch, ownership_id)?;
+        self.linux_gio_admission = Some(proof);
+        Ok(())
+    }
+    pub(crate) fn require_linux_gio_admission(
+        &self,
+        manifest: &theseus_native_protocol::v2::IntegrationManifest,
+        header: &theseus_native_protocol::v2::broker::IntegrationBrokerHeader,
+    ) -> anyhow::Result<()> {
+        use theseus_native_protocol::v2;
+        if matches!(
+            manifest.desktop_native,
+            Some(v2::NativeDesktopDefinition::LinuxGio { .. })
+        ) {
+            let full_m = v2::integration_manifest_digest(
+                v2::Digest::parse(&manifest.core_manifest_digest)?,
+                manifest.digest()?,
+            );
+            anyhow::ensure!(
+                header.manifest_digest == full_m.to_hex(),
+                "Linux broker manifest changed after authenticated admission"
+            );
+            validate_linux_admission_binding(
+                self.linux_gio_admission.as_ref(),
+                full_m,
+                header.linux_gio_qualification.as_ref(),
+            )?;
+        }
+        Ok(())
+    }
+    pub fn validate_linux_gio_qualification(
+        &self,
+        launch: &LaunchAuthority,
+        ownership_id: &str,
+    ) -> anyhow::Result<QualifiedLinuxGioAdmission> {
+        self.validate_integration_context(launch, ownership_id)?;
+        let qualified = launch.qualified_linux_gio_prepare().ok_or_else(|| {
+            anyhow::anyhow!("Linux GIO requires original owned provider qualification")
+        })?;
+        let context = launch.integration_context().expect("validated context");
+        qualified.validate_context(context)?;
+        let description = self
+            .integration_description()
+            .expect("validated description");
+        let header = context
+            .desktop_broker_header
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("qualified broker header missing"))?;
+        anyhow::ensure!(
+            matches!(
+                description.manifest.desktop_native,
+                Some(theseus_native_protocol::v2::NativeDesktopDefinition::LinuxGio { .. })
+            ) && context.linux_gio_qualification.as_ref() == Some(qualified.reference())
+                && header.linux_gio_qualification.as_ref() == Some(qualified.reference()),
+            "helper qualification differs from original provider and broker authority"
+        );
+        Ok(QualifiedLinuxGioAdmission {
+            reference: qualified.reference().clone(),
+            manifest_digest: launch.binding().manifest_digest,
+        })
+    }
     pub fn integration_description(
         &self,
     ) -> Option<&theseus_native_protocol::v2::IntegrationDescription> {
@@ -40,14 +138,21 @@ impl NativeSession {
             context.ownership_id == ownership_id
                 && description.ownership_id == ownership_id
                 && description.context_digest == context.digest()?
-                && description.namespace_receipt_digest
-                    == theseus_native_protocol::v2::Digest::from_bytes(
-                        Sha256::digest(context.namespace_receipt.as_bytes()).into()
-                    )
+                && description.namespace_receipt_digest == context.authority_receipt_digest()?
                 && description.core_manifest_digest == core
                 && description.integration_manifest_digest == integration
                 && launch.integration_service_authority()
-                    == Some(&description.manifest.service_authority),
+                    == description.manifest.service_authority.as_ref()
+                && launch.integration_desktop_authority().is_some()
+                    == description.manifest.desktop.is_some()
+                && match (
+                    launch.integration_desktop_authority(),
+                    context.desktop_broker_header.as_ref()
+                ) {
+                    (Some(ceiling), Some(header)) => ceiling.validate_header(header).is_ok(),
+                    (None, None) => true,
+                    _ => false,
+                },
             "helper integration context differs from original provider ownership"
         );
         Ok(())
@@ -101,6 +206,7 @@ impl NativeSession {
                 client,
                 preparation,
                 prepared_intent: None,
+                linux_gio_admission: None,
             }),
             Err(client) => Err(NativeStartFailure {
                 preparation: Box::new(preparation),
@@ -354,3 +460,41 @@ impl std::fmt::Debug for NativeStartFailure {
     }
 }
 impl std::error::Error for NativeStartFailure {}
+
+#[cfg(test)]
+mod linux_admission_gate_tests {
+    use super::*;
+    use theseus_native_protocol::v2::{Digest, LinuxGioQualificationRef};
+    #[test]
+    fn serialized_reference_cannot_replace_original_admission_and_binding() {
+        let reference = LinuxGioQualificationRef {
+            schema: 1,
+            attestation_digest: "11".repeat(32),
+            prepare_invocation_id: "original-prepare-2".into(),
+            prepare_invocation_digest: "33".repeat(32),
+        };
+        let full_m = Digest::from_bytes([4; 32]);
+        assert!(validate_linux_admission_binding(None, full_m, Some(&reference)).is_err());
+        // Pure comparison only: this test does not authenticate a provider or
+        // create a usable session, SDK token, lease, or native activation.
+        let original = QualifiedLinuxGioAdmission {
+            reference: reference.clone(),
+            manifest_digest: full_m,
+        };
+        assert!(
+            validate_linux_admission_binding(Some(&original), full_m, Some(&reference)).is_ok()
+        );
+        assert!(
+            validate_linux_admission_binding(
+                Some(&original),
+                Digest::from_bytes([5; 32]),
+                Some(&reference)
+            )
+            .is_err()
+        );
+        assert!(validate_linux_admission_binding(Some(&original), full_m, None).is_err());
+        let mut changed = reference.clone();
+        changed.attestation_digest = "66".repeat(32);
+        assert!(validate_linux_admission_binding(Some(&original), full_m, Some(&changed)).is_err());
+    }
+}

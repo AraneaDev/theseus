@@ -22,11 +22,12 @@ checks; independent review and combined acceptance are separate unchecked gates.
 | Typed native helper client | Local complete after review fixes; final cross-platform acceptance pending |
 | Native helper file operations | Local complete and reviewed; native macOS/Windows acceptance pending |
 | Native machine/VM adapter integration | Local complete and independently reviewed; native OS CI and real supplied-target acceptance pending |
-| Native services and desktop application observations | In progress: systemd Clean product fixtures; launchd/SCM helper and readiness ports implemented, under review; native fixtures and desktop ports follow |
+| Native services and desktop application observations | In progress: service scenarios and recovery source reviewed and locally tested; desktop Clean/Upgrade/Reinstall CLI and fresh MCP locally passed; native factory source review closed; combined CLI/MCP passed against the private model; native ordinary admission and final native acceptance remain in progress |
 
-The latest accepted `main` is `d4e5304` (0.12). Later native foundations and the
-client/file operations and adapter integration are committed through `fdab2a8`
-for [draft PR #1](https://github.com/AraneaDev/theseus/pull/1).
+The latest accepted `main` is `d4e5304` (0.12). Native foundations,
+client/file operations, adapter integration and the earlier service checkpoint
+were committed through `2fb9c73`. Further service/desktop work continues on
+`feat/native-adapter` for [draft PR #1](https://github.com/AraneaDev/theseus/pull/1).
 The native work is not merged into `main`. Intermediate CI is deferred until the
 combined acceptance batch; feature pushes use the PR workflow instead of
 duplicating both push and PR runs.
@@ -35,13 +36,15 @@ backend. A native controller is distinct from a native guest adapter.
 
 ### Work queue
 
-1. Close service review findings and verify paired CLI/MCP plus offline TUI evidence.
-2. Finish compiled launchd/SCM fixtures and native qualification; then add
-   service upgrade/reinstall and original-operation recovery.
-3. Add explicitly bound desktop/session activation and owned lifetime observations.
-4. Complete ordinary scenario/recovery integration for services and desktops, with
-   deterministic fixtures and documentation for each supported platform.
-5. Run the combined CI batch, resolve failures and merge accepted work to `main`.
+1. Desktop Clean is locally verified through the actual CLI, fresh six-tool MCP,
+   saved TUI and missing/leaked-entry negative cases; maintain these regressions.
+2. Native fixture creator-ownership review is closed; required launchd/SCM/systemd
+   acceptance is wired into the three-OS CI jobs, with execution still pending.
+3. Native activation and ordinary/combined admission source reviews are closed;
+   keep primary, manager-instance and descendant lifetime guarantees explicit.
+4. Finish generated-example validation and the final source-pinned acceptance
+   inventory. Owned ordinary/combined CLI/MCP and recovery local gates pass.
+5. Run one combined CI batch, resolve failures and merge accepted work to `main`.
 
 Keep this queue and the checklists below current as work lands. Record source
 implementation, review, local verification, CI acceptance and merge separately.
@@ -225,25 +228,96 @@ Theseus observes it and performs only declared Start/Stop rehearsals.
   and retained Windows diagnostics. Native execution remains a separate gate.
 - [x] Implement compiled native launchd/SCM installers and service applications;
   fixture contract tests and all-platform compilation pass locally.
-- [ ] Complete and review native receipt/setup fixtures and exact Windows ACL
-  qualification, then exercise the real native product paths.
+- [x] Implement and review native receipt/setup fixture and exact Windows ACL
+  policy source. Exercise the real native product paths in the acceptance gates
+  below; pure policy tests do not establish actual SCM/ACL behavior.
+- [x] Implement and review guarded macOS/Windows CI operator source, alongside
+  the private-systemd operator. The copied artifact dispatch guards are reviewed;
+  27 pure operator tests pass locally. Native execution is still required.
+- [x] Implement and independently review retained original native registration
+  owners for negative-case fixture teardown. Fifteen pure tests and macOS/Windows
+  source checks pass; actual manager execution remains pending. Failed publication,
+  revoked file authority and repeated finish errors retain original evidence;
+  unknown leftovers never authorize cleanup reconstructed by registration name.
+- [x] Wire required source-pinned native manager cases into the existing Linux,
+  macOS and Windows CI jobs. Independent review is closed; 40 validation-driver
+  controls verify artifact, feature, executed-case and source-drift boundaries.
+  Linux requires all six desktop cases and both real-systemd combined CLI/MCP
+  cases, with separately pinned source helper/broker and exact case/role sets.
+  This is reviewed CI source wiring; the combined online batch remains pending.
 - [ ] Qualify actual launchd format/domain and SCM rights, lifecycle and deletion
   behavior on native OS runners. Cross-compilation does not satisfy this gate.
-- [ ] Add ordinary upgrade/reinstall and original-identity service recovery.
+- [x] Implement ordinary upgrade/reinstall and original-identity service recovery.
+  Compiled private-model CLI Upgrade, Reinstall and both HarnessStopped traces
+  pass locally. Original-identity recovery review is closed, with 16 focused
+  recovery tests and seven schema1 recovery regressions passing. All four
+  service review findings are closed; compiled Configure-failure cleanup passes
+  for both runtime preconditions. Actual native OS acceptance remains open above.
+- [x] Implement desktop Host session binding, original owned-process scopes and
+  authenticated readiness/close mechanisms; 39 focused Linux tests pass,
+  including fresh probes, cancellation/backpressure and escaped descendants.
+  This is Host mechanism evidence; broker/product integration and native OS
+  execution remain pending.
+  macOS process-group cleanup cannot establish full descendant-tree settlement;
+  required tree contracts refuse before launch and unknown descendant facts stay
+  visible. Original-primary lifetime is a separate supported observation.
+- [x] Integrate and independently review the durable session broker through the
+  existing protocol/store, worker, Clean scenario and public evidence paths.
+  Actual compiled Linux source fixtures pass CLI Clean, both missing/leaked-entry
+  controls and a fresh six-tool MCP run, including their own saved report/TUI.
+  Two actual IPC regressions verify partial-response scheduling, original
+  deadlines, cancellation and terminal-cache behavior. This proves the explicitly
+  labelled owned headless source path; native OS and GUI activation remain gates.
+- [x] Implement and independently review Linux GIO, macOS AppKit and Windows
+  Shell Host adapter source. All three review findings are closed; focused
+  desktop tests and strict Linux/macOS/Windows Rust lint checks pass locally.
+  Cross-checks do not establish native SDK execution or graphical activation.
+- [x] Implement and independently review native activation through the durable
+  broker and shared driver.
+  The mode-specific router is implemented and its replay-deadline review finding
+  is closed. Mac/Windows original-object polling and Linux original-child source
+  are reviewed; actual SDK/session execution remains pending. The operational
+  Linux provider-qualified bootstrap and stock SDK factory source are implemented
+  and independently reviewed. The controller now retains the original authenticated
+  admission before Acquire; this product seam and native ordinary/combined
+  capability admission are independently reviewed. Missing original qualification
+  still refuses. No actual SDK/graphical execution is claimed.
+- [ ] Add an explicit macOS OwnedExecutable primary-only retirement contract.
+  The product currently refuses this mode before execution: local primary exit
+  cannot satisfy the current broker's descendant settlement/release barrier.
+  Host primary-exit tests do not qualify whole-product completion. Keep native
+  AppKit manager-instance lifetime separate; never relabel unknown descendants.
+- [ ] Qualify native SDK builds and platform test execution. The AppKit bridge
+  requires a native macOS build with the Apple SDK. Real supplied graphical
+  sessions remain a separate external acceptance row.
+- [x] Implement desktop execution from standalone Clean to Upgrade, Reinstall and
+  combined service/desktop scenarios, including explicit SUT generation handoff.
+  Owned desktop Upgrade and Reinstall pass actual compiled CLI tests (27s/30s);
+  fresh six-tool MCP covers all three ordinary scenarios and saved evidence/TUI.
+  Shared generation/store/router source review is closed. Combined private-model
+  CLI and fresh six-tool MCP each pass Clean, Upgrade and Reinstall (91s/186s),
+  including one lease, saved evidence/TUI and release. The earlier failed runs
+  remain retained: the fixture abandoned its original close socket after two
+  seconds. A reviewed fixture-only fix preserves that connection; product
+  deadlines, unknown-effect handling and release rules remain strict.
+  Native ordinary/combined admission source is implemented and reviewed, with
+  exact platform/lifetime/tuple checks and a separate six-capability declaration.
+  Its focused checks pass, including 153 protocol tests. Actual native
+  SDK/interactive execution remains a separate pending qualification gate.
 
 The checked backend work includes private D-Bus primitive and ownership-model
 checks. Actual systemd-manager acceptance remains pending. Local model checks now
 exercise the full compiled product path; they do not qualify a real manager.
 
 
-- [ ] Define service registration/configuration, activation, runtime and declared
+- [x] Define service registration/configuration, activation, runtime and declared
   readiness observations for systemd, launchd and Windows SCM.
-- [ ] Implement service adapters and evidence validators with manager-specific
+- [x] Implement service adapter source and evidence validators with manager-specific
   ownership and cleanup; do not infer authority over a shared host process.
-- [ ] Define desktop entry validity, activation in an explicitly bound session,
+- [x] Define desktop entry validity, activation in an explicitly bound session,
   application readiness and owned process lifetime.
-- [ ] Implement native launcher/session observations and integrate them with the
-  shared engine and evidence views.
+- [x] Implement and review native launcher/session observation source integrated
+  with the shared engine and evidence views; native execution remains gated above.
 - [ ] Add deterministic fixtures, documentation and real disposable-guest/session
   acceptance for each supported manager/desktop.
 

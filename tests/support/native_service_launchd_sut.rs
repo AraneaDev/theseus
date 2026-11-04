@@ -1,17 +1,18 @@
 //! Installer-only launchd effects on one explicitly reserved User-domain job.
 #![cfg(target_os = "macos")]
+use super::creator_state::CreatedFiles;
 use super::definition;
 use anyhow::{Result, ensure};
 use std::{
     ffi::OsStr,
     fs::File,
-    io::{self, Read, Write},
+    io,
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 use theseus_host::{
-    fs::{HostDir, LeafOpenResult, RootPolicy, fingerprint},
+    fs::{HostDir, RootPolicy},
     process::{AcquiredChild, ChildEnvironment, InputMode, NativeCommand, OwnedChild},
     services::launchd as host,
 };
@@ -23,6 +24,13 @@ pub struct NativeServiceSut {
     root: HostDir,
     definitions: Vec<(v2::ServiceDefinition, Vec<u8>)>,
     uncertain: bool,
+    transition_stopped: bool,
+    retained_definition: CreatedFiles,
+}
+enum Mutation {
+    Bootstrap,
+    Bootout,
+    Kickstart,
 }
 impl NativeServiceSut {
     pub fn connect(
@@ -40,7 +48,10 @@ impl NativeServiceSut {
             launchctl,
             qualification: q,
             ..
-        } = &manifest.service_authority
+        } = manifest
+            .service_authority
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("service authority missing"))?
         else {
             anyhow::bail!("explicit launchd User authority required")
         };
@@ -67,7 +78,10 @@ impl NativeServiceSut {
                 launchctl_fingerprint: q.launchctl_fingerprint.clone(),
             },
             ownership_id: context.ownership_id.clone(),
-            context_receipt: context.namespace_receipt.clone(),
+            context_receipt: context
+                .namespace_receipt
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("service namespace receipt missing"))?,
             allowed_start: false,
             allowed_stop: false,
         };
@@ -96,37 +110,21 @@ impl NativeServiceSut {
             root,
             definitions,
             uncertain: false,
+            transition_stopped: false,
+            retained_definition: CreatedFiles::default(),
         })
     }
     fn leaf(&self) -> String {
         format!("{}.plist", self.authority.label)
     }
-    fn current(&self) -> Result<Option<(File, Vec<u8>)>> {
-        let mut file = match self.root.open_leaf_classified(OsStr::new(&self.leaf())) {
-            LeafOpenResult::Opened(file) => file,
-            LeafOpenResult::MissingSettled => return Ok(None),
-            LeafOpenResult::FailedSettled(error) => return Err(error.into()),
-            LeafOpenResult::Unsettled(owner) => return Err(io::Error::other(owner).into()),
-        };
-        let original = fingerprint(&file)?;
-        ensure!(original.len <= 65536, "fixture plist bound");
-        let mut bytes = Vec::new();
-        (&mut file).take(65537).read_to_end(&mut bytes)?;
-        ensure!(
-            fingerprint(&file)? == original && self.definitions.iter().any(|(_, b)| b == &bytes),
-            "foreign or changed fixture plist"
-        );
-        Ok(Some((file, bytes)))
+    fn current(&mut self) -> Result<Option<(File, Vec<u8>)>> {
+        let leaf = self.leaf();
+        self.retained_definition
+            .current(&self.root, &self.authority.definition_root, &leaf)
     }
-    fn verify_root(&self) -> Result<()> {
-        ensure!(
-            self.root.same_object(&HostDir::open(
-                &self.authority.definition_root,
-                RootPolicy::AllComponentsNoFollow
-            )?)?,
-            "original fixture plist root replaced"
-        );
-        Ok(())
+    fn verify_root(&mut self) -> Result<()> {
+        self.retained_definition
+            .verify_root(&self.root, &self.authority.definition_root)
     }
     fn verify_loaded(
         &mut self,
@@ -160,24 +158,64 @@ impl NativeServiceSut {
             .map(|(_, b)| b.clone())
             .ok_or_else(|| anyhow::anyhow!("undeclared fixture definition"))
     }
-    fn command(&mut self, bootstrap: bool, deadline: Instant, cancel: &AtomicBool) -> Result<()> {
+    fn publish_definition(&mut self, bytes: &[u8]) -> Result<()> {
+        let leaf = self.leaf();
+        self.retained_definition.publish(&self.root, &leaf, bytes)?;
+        self.current()?
+            .ok_or_else(|| anyhow::anyhow!("original published plist missing"))?;
+        Ok(())
+    }
+    pub fn has_owned_registration(&self) -> bool {
+        self.retained_definition.has_owners()
+    }
+    pub fn creation_evidence(&self) -> serde_json::Value {
+        let mut evidence = self.retained_definition.evidence();
+        evidence["sut_mutation_unresolved"] = self.uncertain.into();
+        evidence
+    }
+    fn command(
+        &mut self,
+        mutation: Mutation,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<()> {
         self.verify_root()?;
         // Read-only qualified observation immediately precedes the SUT effect.
         // The original launchctl file is pinned and checked by the Host manager.
-        self.manager.inspect(deadline, cancel)?;
         let mut command = NativeCommand::new(&self.authority.launchctl);
         command.environment = ChildEnvironment::Replace(vec![]);
         command.current_dir("/");
-        if bootstrap {
-            command
-                .arg("bootstrap")
-                .arg(self.authority.domain.target())
-                .arg(self.authority.plist_path());
-        } else {
-            command.arg("bootout").arg(self.authority.service_target());
+        match mutation {
+            Mutation::Bootstrap => {
+                command
+                    .arg("bootstrap")
+                    .arg(self.authority.domain.target())
+                    .arg(self.authority.plist_path());
+            }
+            Mutation::Bootout => {
+                command.arg("bootout").arg(self.authority.service_target());
+            }
+            Mutation::Kickstart => {
+                command
+                    .arg("kickstart")
+                    .arg(self.authority.service_target());
+            }
         }
-        let mut owner = LaunchCommand::spawn(&command)?;
-        owner.complete(deadline, cancel)?;
+        let leaf = self.leaf();
+        let manager = &mut self.manager;
+        self.retained_definition.dispatch(
+            &self.root,
+            &self.authority.definition_root,
+            &leaf,
+            || {
+                manager.inspect(deadline, cancel)?;
+                Ok(())
+            },
+            |_retained_dispatch_witness| {
+                let mut owner = LaunchCommand::spawn(&command)?;
+                owner.complete(deadline, cancel)
+            },
+        )?;
         self.verify_root()?;
         Ok(())
     }
@@ -198,9 +236,8 @@ impl NativeServiceSut {
         );
         self.verify_loaded(None, deadline, cancel)?;
         self.uncertain = true;
-        self.root
-            .publish(OsStr::new(&self.leaf()), &mut |file| file.write_all(&bytes))?;
-        self.command(true, deadline, cancel)?;
+        self.publish_definition(&bytes)?;
+        self.command(Mutation::Bootstrap, deadline, cancel)?;
         self.verify_loaded(Some(definition), deadline, cancel)?;
         self.uncertain = false;
         Ok(())
@@ -226,18 +263,83 @@ impl NativeServiceSut {
             .unwrap()
             .0
             .clone();
-        self.verify_loaded(Some(&prior), deadline, cancel)?;
-        self.uncertain = true;
-        self.command(false, deadline, cancel)?;
+        if !self.transition_stopped {
+            self.verify_loaded(Some(&prior), deadline, cancel)?;
+            self.uncertain = true;
+            self.command(Mutation::Bootout, deadline, cancel)?;
+        } else {
+            self.uncertain = true;
+        }
         self.verify_loaded(None, deadline, cancel)?;
         ensure!(
             self.current()?.is_some_and(|(_, now)| now == original),
             "original fixture plist changed during bootout"
         );
-        self.root
-            .publish(OsStr::new(&self.leaf()), &mut |file| file.write_all(&bytes))?;
-        self.command(true, deadline, cancel)?;
+        self.publish_definition(&bytes)?;
+        self.command(Mutation::Bootstrap, deadline, cancel)?;
         self.verify_loaded(Some(definition), deadline, cancel)?;
+        self.uncertain = false;
+        Ok(())
+    }
+    pub fn stop_for_transition(&mut self, deadline: Instant, cancel: &AtomicBool) -> Result<()> {
+        ensure!(
+            !self.uncertain && !self.transition_stopped,
+            "original SUT transition unresolved"
+        );
+        let (_, original) = self
+            .current()?
+            .ok_or_else(|| anyhow::anyhow!("original configured plist missing"))?;
+        let prior = self
+            .definitions
+            .iter()
+            .find(|(_, bytes)| bytes == &original)
+            .unwrap()
+            .0
+            .clone();
+        self.verify_loaded(Some(&prior), deadline, cancel)?;
+        self.uncertain = true;
+        self.command(Mutation::Bootout, deadline, cancel)?;
+        self.verify_loaded(None, deadline, cancel)?;
+        ensure!(
+            self.current()?.is_some_and(|(_, bytes)| bytes == original),
+            "original plist changed while stopping"
+        );
+        self.transition_stopped = true;
+        self.uncertain = false;
+        Ok(())
+    }
+    pub fn start_after_transition(&mut self, deadline: Instant, cancel: &AtomicBool) -> Result<()> {
+        ensure!(
+            !self.uncertain && self.transition_stopped,
+            "original stopped SUT transition required"
+        );
+        let (_, bytes) = self
+            .current()?
+            .ok_or_else(|| anyhow::anyhow!("configured replacement plist missing"))?;
+        let definition = self
+            .definitions
+            .iter()
+            .find(|(_, original)| original == &bytes)
+            .unwrap()
+            .0
+            .clone();
+        self.verify_loaded(Some(&definition), deadline, cancel)?;
+        self.uncertain = true;
+        self.command(Mutation::Kickstart, deadline, cancel)?;
+        loop {
+            ensure!(
+                !cancel.load(Ordering::Acquire) && Instant::now() < deadline,
+                "original SUT kickstart remains pending"
+            );
+            self.verify_loaded(Some(&definition), deadline, cancel)?;
+            let observed = self.manager.inspect(deadline, cancel)?;
+            if matches!(observed.loaded, host::Fact::Known(ref loaded) if loaded.state == host::RuntimeState::Running)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.transition_stopped = false;
         self.uncertain = false;
         Ok(())
     }
@@ -258,13 +360,21 @@ impl NativeServiceSut {
             .clone();
         self.verify_loaded(Some(&prior), deadline, cancel)?;
         self.uncertain = true;
-        self.command(false, deadline, cancel)?;
+        self.command(Mutation::Bootout, deadline, cancel)?;
         self.verify_loaded(None, deadline, cancel)?;
         self.root
             .remove_created_leaf(OsStr::new(&self.leaf()), &file)?;
+        self.retained_definition.clear_committed();
         self.verify_loaded(None, deadline, cancel)?;
         self.uncertain = false;
         Ok(())
+    }
+}
+impl Drop for NativeServiceSut {
+    fn drop(&mut self) {
+        if self.uncertain {
+            self.retained_definition.retain_unresolved();
+        }
     }
 }
 fn raw(d: &v2::ServiceDefinition) -> host::LaunchdDefinition {

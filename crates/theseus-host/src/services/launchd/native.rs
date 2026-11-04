@@ -366,6 +366,8 @@ impl LaunchdManager {
             validate_plist(&bytes, &self.authority, definition)?;
             Ok(RegistrationOwner {
                 file,
+                prior_files: vec![],
+                transition_receipts: vec![],
                 fingerprint: fp,
                 definition_bytes: bytes,
                 definition: definition.clone(),
@@ -380,6 +382,56 @@ impl LaunchdManager {
             self.qualified = true;
         }
         result
+    }
+    /// Pin a successful SUT replacement to the same original owner and exclusive
+    /// namespace. This read-only admission never bootstrap/bootout repairs a job.
+    pub fn admit_configuration(
+        &mut self,
+        owner: &mut RegistrationOwner,
+        definition: &LaunchdDefinition,
+        expected_bytes: &[u8],
+        sut_receipt: String,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> io::Result<()> {
+        if self.revoked || owner.revoked || owner.manager_instance != self.instance {
+            owner.revoked = true;
+            self.revoked = true;
+            return Err(invalid("original registration permanently revoked"));
+        }
+        if self.pending.is_some()
+            || owner.transition_receipts.len() >= 128
+            || owner.install_receipt == sut_receipt
+            || owner.transition_receipts.contains(&sut_receipt)
+            || sut_receipt.is_empty()
+            || sut_receipt.len() > 4096
+            || sut_receipt.chars().any(char::is_control)
+        {
+            return Err(invalid("original launchd SUT transition unavailable"));
+        }
+        let result = (|| {
+            definition.validate()?;
+            self.verify_context()?;
+            let observation = self.inspect(deadline, cancel)?;
+            check_loaded(&self.authority, &observation.loaded, definition)?;
+            let (file, fingerprint, bytes) = read_definition(&self.root, &self.authority.label)?
+                .ok_or_else(|| invalid("SUT replacement plist missing"))?;
+            if bytes != expected_bytes || observation.definition_bytes.as_ref() != Some(&bytes) {
+                return Err(invalid("SUT replacement differs from exact admitted plist"));
+            }
+            validate_plist(&bytes, &self.authority, definition)?;
+            Ok((file, fingerprint, bytes))
+        })();
+        match result {
+            Ok((file, fingerprint, bytes)) => {
+                owner.record_transition(file, fingerprint, bytes, definition, sut_receipt)
+            }
+            Err(error) => {
+                owner.revoked = true;
+                self.revoked = true;
+                Err(error)
+            }
+        }
     }
     pub fn action(
         &mut self,
