@@ -1,6 +1,6 @@
 # Theseus roadmap
 
-Last updated: **2026-11-03**. This is the maintained progress tracker for the
+Last updated: **2026-11-04**. This is the maintained progress tracker for the
 remaining roadmap. Update the relevant checklist, current work and acceptance
 status whenever a milestone is implemented, reviewed, tested or merged.
 
@@ -22,7 +22,7 @@ checks; independent review and combined acceptance are separate unchecked gates.
 | Typed native helper client | Local complete after review fixes; final cross-platform acceptance pending |
 | Native helper file operations | Local complete and reviewed; native macOS/Windows acceptance pending |
 | Native machine/VM adapter integration | Local complete and independently reviewed; native OS CI and real supplied-target acceptance pending |
-| Native services and desktop application observations | Next: contract review and an integrated systemd service Clean slice, followed by the other managers and desktop ports |
+| Native services and desktop application observations | In progress: systemd Clean product fixtures; launchd/SCM helper and readiness ports implemented, under review; native fixtures and desktop ports follow |
 
 The latest accepted `main` is `d4e5304` (0.12). Later native foundations and the
 client/file operations and adapter integration are committed through `fdab2a8`
@@ -35,9 +35,9 @@ backend. A native controller is distinct from a native guest adapter.
 
 ### Work queue
 
-1. Finish service/desktop contract review and freeze the shared interfaces.
-2. Deliver systemd service Clean through the shared engine, CLI/TUI/MCP and
-   retained evidence; add the launchd and Windows SCM ports.
+1. Close service review findings and verify paired CLI/MCP plus offline TUI evidence.
+2. Finish compiled launchd/SCM fixtures and native qualification; then add
+   service upgrade/reinstall and original-operation recovery.
 3. Add explicitly bound desktop/session activation and owned lifetime observations.
 4. Complete ordinary scenario/recovery integration for services and desktops, with
    deterministic fixtures and documentation for each supported platform.
@@ -196,7 +196,39 @@ contracts and evidence before being enabled; Docker support does not enable them
 on native targets automatically. Theseus will not become a VM provisioner or use
 the controller as an implicit installation target.
 
-## Remaining: services and desktop applications
+## In progress: services and desktop applications
+
+The shared contract is reviewed. The first delivery is an installer-managed
+systemd Clean scenario: the installer creates/configures/removes the service;
+Theseus observes it and performs only declared Start/Stop rehearsals.
+
+- [x] Review the service/desktop design and implementation sequence.
+- [x] Implement the systemd native SDK backend with explicit manager binding;
+  focused Host tests and strict Host lint checks pass locally.
+- [x] Add schema2 contracts, helper/client wiring and shared service hooks;
+  focused protocol/store/client/helper and contract checks pass.
+- [x] Implement authenticated local-challenge readiness; bounded native socket
+  checks pass, including wrong identity, nonce and application tuples.
+- [x] Verify the compiled installer/application through CLI and six-tool MCP
+  against an explicitly labelled private model, including saved TUI/MCP evidence.
+  Eight CLI lifecycle/failure cases and the fresh MCP context pass locally.
+- [ ] Exercise the compiled test installer and a real disposable systemd manager.
+- [ ] Independently review and qualify the complete systemd slice.
+- [x] Implement additive launchd/SCM contracts and shared helper integration,
+  preserving the existing systemd and catalog wire formats. Focused shared and
+  protocol tests and strict cross-platform compile checks pass locally.
+- [x] Implement macOS peer-authenticated local socket and Windows first-instance
+  named-pipe readiness source with retained pending I/O ownership.
+- [ ] Resolve independent platform review findings; qualify launchd/SCM source.
+- [ ] Complete compiled native launchd/SCM installers and service applications.
+- [ ] Qualify actual launchd format/domain and SCM rights, lifecycle and deletion
+  behavior on native OS runners. Cross-compilation does not satisfy this gate.
+- [ ] Add ordinary upgrade/reinstall and original-identity service recovery.
+
+The checked backend work includes private D-Bus primitive and ownership-model
+checks. Actual systemd-manager acceptance remains pending. Local model checks now
+exercise the full compiled product path; they do not qualify a real manager.
+
 
 - [ ] Define service registration/configuration, activation, runtime and declared
   readiness observations for systemd, launchd and Windows SCM.
