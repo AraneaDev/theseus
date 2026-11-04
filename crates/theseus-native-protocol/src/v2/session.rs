@@ -158,6 +158,15 @@ impl SessionGuard {
         }
         match v.message() {
             Message::Request { request } => {
+                if matches!(
+                    request,
+                    Request::ServiceAction { .. }
+                        | Request::InspectService { .. }
+                        | Request::ProbeReadiness { .. }
+                ) && !matches!(self.description, Some(Reply::IntegrationDescription { .. }))
+                {
+                    return Err(Error::UnexpectedMessage);
+                }
                 if self.pending.len() == MAX_INFLIGHT_REQUESTS {
                     return Err(Error::TooManyRequests);
                 }
@@ -243,7 +252,13 @@ impl SessionGuard {
                 | Request::CreateFile { lease: l, .. }
                 | Request::InspectNativeFile { lease: l, .. }
                     if l == lease
-                        && matches!(self.description, Some(Reply::NativeDescription { .. })) =>
+                        && matches!(
+                            self.description,
+                            Some(
+                                Reply::NativeDescription { .. }
+                                    | Reply::IntegrationDescription { .. }
+                            )
+                        ) =>
                 {
                     Ok(())
                 }
@@ -254,7 +269,12 @@ impl SessionGuard {
             return Ok(());
         }
         match (request, result) {
-            (Request::Describe, Reply::Description { .. } | Reply::NativeDescription { .. }) => {
+            (
+                Request::Describe,
+                Reply::Description { .. }
+                | Reply::NativeDescription { .. }
+                | Reply::IntegrationDescription { .. },
+            ) => {
                 if self.description.as_ref().is_some_and(|old| old != result) {
                     return Err(Error::UnexpectedMessage);
                 }
@@ -292,6 +312,34 @@ impl SessionGuard {
                 Reply::Lease { lease: rl, .. },
             ) if lease == rl => {}
             (
+                Request::ProbeReadiness {
+                    lease,
+                    slot,
+                    operation,
+                    action_digest,
+                    prior_binding_digest,
+                    ..
+                },
+                Reply::ReadinessObservation {
+                    lease: observed,
+                    observation,
+                },
+            ) if lease == observed
+                && slot == &observation.slot
+                && operation.to_hex() == observation.operation
+                && action_digest.to_hex() == observation.action_digest
+                && prior_binding_digest.to_hex() == observation.resource_binding_digest
+                && matches!(self.description, Some(Reply::IntegrationDescription { .. })) => {}
+            (
+                Request::InspectService { lease, slot },
+                Reply::ServiceObservation {
+                    lease: observed,
+                    observation,
+                },
+            ) if lease == observed
+                && slot == &observation.slot
+                && matches!(self.description, Some(Reply::IntegrationDescription { .. })) => {}
+            (
                 Request::ReadFile {
                     lease,
                     path,
@@ -322,12 +370,18 @@ impl SessionGuard {
                 },
             ) if lease == rl
                 && path == rp
-                && matches!(self.description, Some(Reply::NativeDescription { .. })) => {}
+                && matches!(
+                    self.description,
+                    Some(Reply::NativeDescription { .. } | Reply::IntegrationDescription { .. })
+                ) => {}
             (
                 Request::InspectNativeFile { lease, .. },
                 Reply::PrefixAuthorityRevoked { lease: rl, .. },
             ) if lease == rl
-                && matches!(self.description, Some(Reply::NativeDescription { .. })) => {}
+                && matches!(
+                    self.description,
+                    Some(Reply::NativeDescription { .. } | Reply::IntegrationDescription { .. })
+                ) => {}
             (
                 Request::InspectFile { lease, path },
                 Reply::FileInfo {
@@ -338,6 +392,9 @@ impl SessionGuard {
             ) if lease == rl && path == rp => {}
             (
                 Request::CreateFile {
+                    lease, operation, ..
+                }
+                | Request::ServiceAction {
                     lease, operation, ..
                 }
                 | Request::Run {
@@ -388,6 +445,7 @@ impl SessionGuard {
         }
         let expected = match request {
             Request::Run { .. } => Some(OperationKind::Run),
+            Request::ServiceAction { .. } => Some(OperationKind::ServiceAction),
             Request::CreateFile { .. } => Some(OperationKind::CreateFile),
             _ => None,
         };
@@ -408,6 +466,7 @@ impl SessionGuard {
                 let os = match self.description.as_ref() {
                     Some(Reply::Description { os, .. }) => *os,
                     Some(Reply::NativeDescription { description }) => description.os,
+                    Some(Reply::IntegrationDescription { description }) => description.native.os,
                     _ => return Err(Error::UnexpectedMessage),
                 };
                 super::types::validate_outcome_for_os(outcome, os)?;
@@ -493,11 +552,14 @@ fn opposite(role: Role) -> Role {
 }
 fn outcome_matches(outcome: &Outcome, kind: Option<OperationKind>) -> bool {
     match outcome {
+        Outcome::ServiceActionCompleted { .. } => {
+            kind.is_none_or(|k| k == OperationKind::ServiceAction)
+        }
         Outcome::FileCreated { .. } | Outcome::FileCreateFailed { .. } => {
-            kind != Some(OperationKind::Run)
+            kind.is_none_or(|k| k == OperationKind::CreateFile)
         }
         Outcome::RunCompleted { .. } | Outcome::LaunchFailed { .. } => {
-            kind != Some(OperationKind::CreateFile)
+            kind.is_none_or(|k| k == OperationKind::Run)
         }
         Outcome::NotStarted { .. } => true,
     }

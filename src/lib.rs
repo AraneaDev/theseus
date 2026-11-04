@@ -12,6 +12,7 @@ pub mod recipe;
 pub mod report;
 pub mod runner;
 pub mod snapshot;
+pub mod target_authority;
 pub mod tui;
 
 pub(crate) mod shell;

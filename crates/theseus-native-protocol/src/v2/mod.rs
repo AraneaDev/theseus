@@ -23,3 +23,6 @@ mod session;
 pub use frame::{DecodeProgress, Decoder, encode};
 pub use ledger::request_digest;
 pub use session::SessionGuard;
+
+pub mod integration;
+pub use integration::*;

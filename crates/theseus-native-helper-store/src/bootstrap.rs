@@ -66,11 +66,75 @@ pub fn bootstrap_native(
         },
     )
 }
+pub fn bootstrap_integration(
+    ledger_root: &HostDir,
+    workspace_root: &HostDir,
+    request: BootstrapRequest,
+    context: &theseus_native_protocol::v2::IntegrationRuntimeContext,
+    core_manifest_digest: Digest,
+    integration_manifest_digest: Digest,
+    artifact_commitment: Digest,
+) -> Result<BootstrapReceipt, StoreError> {
+    use theseus_native_protocol::v2;
+    context
+        .validate_os(request.os)
+        .map_err(|_| StoreError::BindingMismatch)?;
+    if v2::integration_manifest_digest(core_manifest_digest, integration_manifest_digest)
+        != request.manifest_digest
+        || context.binding != request.binding.to_hex()
+        || context.manifest_digest != request.manifest_digest.to_hex()
+        || context.integration_manifest_digest != integration_manifest_digest.to_hex()
+    {
+        return Err(StoreError::BindingMismatch);
+    }
+    bootstrap_profile_with(
+        ledger_root,
+        workspace_root,
+        request,
+        None,
+        Some((
+            context,
+            core_manifest_digest,
+            integration_manifest_digest,
+            artifact_commitment,
+        )),
+        theseus_host::random_bytes,
+        |f, b| {
+            use std::io::Write;
+            f.write_all(b)?;
+            f.sync_all()
+        },
+    )
+}
 fn bootstrap_with(
     ledger_root: &HostDir,
     workspace_root: &HostDir,
     request: BootstrapRequest,
     provider_epoch: Option<Digest>,
+    random: impl FnOnce(&mut [u8]) -> std::io::Result<()>,
+    write_sync: impl FnMut(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> Result<BootstrapReceipt, StoreError> {
+    bootstrap_profile_with(
+        ledger_root,
+        workspace_root,
+        request,
+        provider_epoch,
+        None,
+        random,
+        write_sync,
+    )
+}
+fn bootstrap_profile_with(
+    ledger_root: &HostDir,
+    workspace_root: &HostDir,
+    request: BootstrapRequest,
+    provider_epoch: Option<Digest>,
+    integration: Option<(
+        &theseus_native_protocol::v2::IntegrationRuntimeContext,
+        Digest,
+        Digest,
+        Digest,
+    )>,
     random: impl FnOnce(&mut [u8]) -> std::io::Result<()>,
     mut write_sync: impl FnMut(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
 ) -> Result<BootstrapReceipt, StoreError> {
@@ -94,10 +158,35 @@ fn bootstrap_with(
     }
     let mut bytes = [0; 16];
     random(&mut bytes)?;
-    let marker = WorkspaceMarker::from_bytes(bytes);
+    let marker = if let Some((context, ..)) = integration {
+        WorkspaceMarker::parse(&context.workspace_marker)
+            .map_err(|_| StoreError::BindingMismatch)?
+    } else {
+        WorkspaceMarker::from_bytes(bytes)
+    };
     let header = Record::new(
         0,
-        if let Some(provider_epoch) = provider_epoch {
+        if let Some((
+            context,
+            core_manifest_digest,
+            integration_manifest_digest,
+            artifact_commitment,
+        )) = integration
+        {
+            Entry::IntegrationHeader {
+                artifact_commitment,
+                binding: request.binding,
+                manifest_digest: request.manifest_digest,
+                workspace_marker: marker,
+                os: request.os,
+                provider_epoch: Digest::parse(&context.provider_epoch)
+                    .map_err(|_| StoreError::BindingMismatch)?,
+                core_manifest_digest,
+                integration_manifest_digest,
+                context_digest: context.digest().map_err(|_| StoreError::BindingMismatch)?,
+                ownership_id: context.ownership_id.clone(),
+            }
+        } else if let Some(provider_epoch) = provider_epoch {
             Entry::NativeHeader {
                 binding: request.binding,
                 manifest_digest: request.manifest_digest,

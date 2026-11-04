@@ -217,6 +217,7 @@ impl RuntimeOwner {
                     primary: crate::contract::WorkerPrimary::Panic(payload),
                     retained_file: None,
                     retained_spawn: None,
+                    retained_service_errors: vec![],
                     cleanup_errors: std::array::from_fn(|_| None),
                 }),
             });

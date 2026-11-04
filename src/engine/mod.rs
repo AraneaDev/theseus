@@ -2,6 +2,8 @@
 pub(crate) mod common;
 pub mod domain;
 mod recovery;
+mod integration_recovery;
+pub use integration_recovery::{recover_selected_native, SelectedNativeRecoveryResult};
 mod selected;
 pub use recovery::{NativeRecoveryResult, recover_native};
 pub use selected::run_selected;

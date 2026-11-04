@@ -5,7 +5,8 @@ mod error;
 mod intent;
 mod store;
 pub use bootstrap::{
-    BootstrapReceipt, BootstrapRequest, BootstrapScope, bootstrap, bootstrap_native,
+    BootstrapReceipt, BootstrapRequest, BootstrapScope, bootstrap, bootstrap_integration,
+    bootstrap_native,
 };
 pub use error::{IntentError, StoreError};
 pub use intent::{IntentRecord, IntentStore, PreparedAcquire, VerifiedOriginalIntent};

@@ -39,6 +39,117 @@ impl Object {
         }
     }
 }
+impl Wire for IntegrationCapabilities {
+    fn read(v: Value) -> Result<Self, Error> {
+        if v == serde_json::json!(Self::NAMES) {
+            Ok(Self)
+        } else {
+            Err(Error::InvalidValue)
+        }
+    }
+    fn write<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        Self::NAMES.serialize(s)
+    }
+}
+impl Wire for ResourceSlot {
+    fn read(v: Value) -> Result<Self, Error> {
+        Self::new(&String::read(v)?)
+    }
+    fn write<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+impl Wire for ServiceAction {
+    fn read(v: Value) -> Result<Self, Error> {
+        match String::read(v)?.as_str() {
+            "start" => Ok(Self::Start),
+            "stop" => Ok(Self::Stop),
+            _ => Err(Error::InvalidValue),
+        }
+    }
+    fn write<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+        })
+    }
+}
+impl Wire for ReadinessObservation {
+    fn read(v: Value) -> Result<Self, Error> {
+        let o: Self = serde_json::from_value(v).map_err(|_| Error::InvalidValue)?;
+        o.validate()?;
+        ResourceSlot::new(o.slot.as_str())?;
+        OperationId::parse(&o.operation)?;
+        for d in [
+            &o.action_digest,
+            &o.resource_binding_digest,
+            &o.challenge_digest,
+            &o.expectation_digest,
+            &o.instance_binding_digest,
+        ] {
+            Digest::parse(d)?;
+        }
+        for d in [
+            &o.artifact_sha256,
+            &o.data_sha256,
+            &o.configuration_digest,
+            &o.response_digest,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            Digest::parse(d)?;
+        }
+        if o.failure.as_ref().is_some_and(|s| s.len() > 4096)
+            || o.version_literal.as_ref().is_some_and(|s| s.len() > 128)
+        {
+            return Err(Error::InvalidValue);
+        }
+        Ok(o)
+    }
+    fn write<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.serialize(s)
+    }
+}
+impl Wire for ServiceObservation {
+    fn read(v: Value) -> Result<Self, Error> {
+        let value: Self = serde_json::from_value(v).map_err(|_| Error::InvalidValue)?;
+        value.validate()?;
+        ResourceSlot::new(value.slot.as_str())?;
+        Digest::parse(&value.binding_digest)?;
+        if let Some(d) = &value.definition_digest {
+            Digest::parse(d)?;
+        }
+        if value.manager_generation.len() > 128
+            || value.origin.as_ref().is_some_and(|s| s.len() > 4096)
+        {
+            return Err(Error::InvalidValue);
+        }
+        Ok(value)
+    }
+    fn write<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.serialize(s)
+    }
+}
+impl Wire for ServiceOutcome {
+    fn read(v: Value) -> Result<Self, Error> {
+        let value: Self = serde_json::from_value(v).map_err(|_| Error::InvalidValue)?;
+        match &value {
+            Self::Complete { receipt } => {
+                Digest::parse(receipt)?;
+            }
+            Self::Unknown { reason } | Self::Failed { reason } => {
+                if reason.is_empty() || reason.len() > 4096 || reason.contains('\0') {
+                    return Err(Error::InvalidValue);
+                }
+            }
+        }
+        Ok(value)
+    }
+    fn write<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.serialize(s)
+    }
+}
 impl Wire for NativeCapabilities {
     fn read(v: Value) -> Result<Self, Error> {
         if v == serde_json::json!(NativeCapabilities::NAMES) {
@@ -340,6 +451,7 @@ impl Wire for OperationKind {
         match value.as_str() {
             "create_file" => Ok(Self::CreateFile),
             "run" => Ok(Self::Run),
+            "service_action" => Ok(Self::ServiceAction),
             _ => Err(Error::InvalidValue),
         }
     }
@@ -347,6 +459,7 @@ impl Wire for OperationKind {
         match self {
             Self::CreateFile => s.serialize_str("create_file"),
             Self::Run => s.serialize_str("run"),
+            Self::ServiceAction => s.serialize_str("service_action"),
         }
     }
 }
@@ -781,6 +894,28 @@ impl Wire for Request {
         let mut object = Object::new(value)?;
         let kind = object.take::<String>("kind")?;
         let result = match kind.as_str() {
+            "service_action" => Self::ServiceAction {
+                lease: object.take("lease")?,
+                operation: object.take("operation")?,
+                slot: object.take("slot")?,
+                prior_binding_digest: object.take("prior_binding_digest")?,
+                action: object.take("action")?,
+            },
+            "inspect_service" => Self::InspectService {
+                lease: object.take("lease")?,
+                slot: object.take("slot")?,
+            },
+            "probe_readiness" => Self::ProbeReadiness {
+                deadline_ms: object.take("deadline_ms")?,
+                lease: object.take("lease")?,
+                slot: object.take("slot")?,
+                operation: object.take("operation")?,
+                action_digest: object.take("action_digest")?,
+                prior_binding_digest: object.take("prior_binding_digest")?,
+                nonce: object.take("nonce")?,
+                definition_role: object.take("definition_role")?,
+                artifact_role: object.take("artifact_role")?,
+            },
             "describe" => Self::Describe,
             "acquire" => Self::Acquire {
                 intent: object.take::<IntentId>("intent")?,
@@ -838,6 +973,55 @@ impl Wire for Request {
     }
     fn write<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         match self {
+            Self::ProbeReadiness {
+                deadline_ms,
+                lease,
+                slot,
+                operation,
+                action_digest,
+                prior_binding_digest,
+                nonce,
+                definition_role,
+                artifact_role,
+            } => {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry("kind", "probe_readiness")?;
+                m.serialize_entry("deadline_ms", deadline_ms)?;
+                m.serialize_entry("lease", &Ref(lease))?;
+                m.serialize_entry("slot", &Ref(slot))?;
+                m.serialize_entry("operation", &Ref(operation))?;
+                m.serialize_entry("action_digest", &Ref(action_digest))?;
+                m.serialize_entry("prior_binding_digest", &Ref(prior_binding_digest))?;
+                m.serialize_entry("nonce", &Ref(nonce))?;
+                m.serialize_entry("definition_role", definition_role)?;
+                m.serialize_entry("artifact_role", artifact_role)?;
+                m.end()
+            }
+
+            Self::ServiceAction {
+                lease,
+                operation,
+                slot,
+                prior_binding_digest,
+                action,
+            } => {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry("kind", "service_action")?;
+                m.serialize_entry("lease", &Ref(lease))?;
+                m.serialize_entry("operation", &Ref(operation))?;
+                m.serialize_entry("slot", &Ref(slot))?;
+                m.serialize_entry("prior_binding_digest", &Ref(prior_binding_digest))?;
+                m.serialize_entry("action", &Ref(action))?;
+                m.end()
+            }
+            Self::InspectService { lease, slot } => {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry("kind", "inspect_service")?;
+                m.serialize_entry("lease", &Ref(lease))?;
+                m.serialize_entry("slot", &Ref(slot))?;
+                m.end()
+            }
+
             Self::Describe => {
                 let mut map = s.serialize_map(Some(1))?;
                 map.serialize_entry("kind", "describe")?;
@@ -955,6 +1139,53 @@ impl Wire for Reply {
         let mut object = Object::new(value)?;
         let kind = object.take::<String>("kind")?;
         let result = match kind.as_str() {
+            "readiness_observation" => Self::ReadinessObservation {
+                lease: object.take("lease")?,
+                observation: Box::new(object.take("observation")?),
+            },
+            "service_observation" => Self::ServiceObservation {
+                lease: object.take("lease")?,
+                observation: Box::new(object.take("observation")?),
+            },
+            "integration_description" => {
+                object.literal("profile", "native_integration_v1")?;
+                let native = object.take::<Reply>("native")?;
+                let Reply::NativeDescription { description } = native else {
+                    return Err(Error::InvalidValue);
+                };
+                let core_manifest_digest: Digest = object.take("core_manifest_digest")?;
+                let integration_manifest_digest: Digest =
+                    object.take("integration_manifest_digest")?;
+                let manifest: IntegrationManifest = serde_json::from_value(
+                    object.0.remove("manifest").ok_or(Error::InvalidEnvelope)?,
+                )
+                .map_err(|_| Error::InvalidValue)?;
+                manifest.validate()?;
+                if manifest.digest()? != integration_manifest_digest
+                    || manifest.core_manifest_digest != core_manifest_digest.to_hex()
+                {
+                    return Err(Error::InvalidValue);
+                }
+                if super::integration_manifest_digest(
+                    core_manifest_digest,
+                    integration_manifest_digest,
+                ) != description.manifest_digest
+                {
+                    return Err(Error::InvalidValue);
+                }
+                Self::IntegrationDescription {
+                    description: Box::new(IntegrationDescription {
+                        manifest: Box::new(manifest),
+                        namespace_receipt_digest: object.take("namespace_receipt_digest")?,
+                        native: *description,
+                        core_manifest_digest,
+                        integration_manifest_digest,
+                        context_digest: object.take("context_digest")?,
+                        ownership_id: object.take("ownership_id")?,
+                        capabilities: object.take("integration_capabilities")?,
+                    }),
+                }
+            }
             "native_description" => {
                 object.literal("profile", "native_catalog_v1")?;
                 object.literal("authority", "supplied_disposable_target")?;
@@ -1038,6 +1269,47 @@ impl Wire for Reply {
     }
     fn write<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         match self {
+            Self::ReadinessObservation { lease, observation } => {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry("kind", "readiness_observation")?;
+                m.serialize_entry("lease", &Ref(lease))?;
+                m.serialize_entry("observation", &Ref(observation.as_ref()))?;
+                m.end()
+            }
+
+            Self::ServiceObservation { lease, observation } => {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry("kind", "service_observation")?;
+                m.serialize_entry("lease", &Ref(lease))?;
+                m.serialize_entry("observation", &Ref(observation.as_ref()))?;
+                m.end()
+            }
+
+            Self::IntegrationDescription { description: d } => {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry("kind", "integration_description")?;
+                m.serialize_entry("profile", "native_integration_v1")?;
+                m.serialize_entry(
+                    "native",
+                    &Ref(&Reply::NativeDescription {
+                        description: Box::new(d.native.clone()),
+                    }),
+                )?;
+                m.serialize_entry("core_manifest_digest", &Ref(&d.core_manifest_digest))?;
+                m.serialize_entry(
+                    "integration_manifest_digest",
+                    &Ref(&d.integration_manifest_digest),
+                )?;
+                m.serialize_entry("manifest", d.manifest.as_ref())?;
+                m.serialize_entry(
+                    "namespace_receipt_digest",
+                    &Ref(&d.namespace_receipt_digest),
+                )?;
+                m.serialize_entry("integration_capabilities", &Ref(&d.capabilities))?;
+                m.serialize_entry("context_digest", &Ref(&d.context_digest))?;
+                m.serialize_entry("ownership_id", &d.ownership_id)?;
+                m.end()
+            }
             Self::NativeDescription { description: d } => {
                 let mut m = s.serialize_map(None)?;
                 m.serialize_entry("kind", "native_description")?;
@@ -1315,6 +1587,9 @@ impl Wire for Outcome {
         let mut object = Object::new(value)?;
         let kind = object.take::<String>("kind")?;
         let result = match kind.as_str() {
+            "service_action_completed" => Self::ServiceActionCompleted {
+                outcome: object.take("outcome")?,
+            },
             "file_created" => Self::FileCreated {
                 length: object.take::<u16>("length")?,
                 digest: object.take::<Digest>("digest")?,
@@ -1345,6 +1620,13 @@ impl Wire for Outcome {
     }
     fn write<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         match self {
+            Self::ServiceActionCompleted { outcome } => {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry("kind", "service_action_completed")?;
+                m.serialize_entry("outcome", &Ref(outcome))?;
+                m.end()
+            }
+
             Self::FileCreated { length, digest } => {
                 let mut map = s.serialize_map(Some(3))?;
                 map.serialize_entry("kind", "file_created")?;

@@ -37,6 +37,9 @@ macro_rules! identity {
             pub fn parse(v: &str) -> Result<Self, Error> {
                 parse_hex(v).map(Self)
             }
+            pub fn as_bytes(&self) -> &[u8; $len] {
+                &self.0
+            }
             pub fn to_hex(&self) -> String {
                 hex(&self.0)
             }
@@ -161,6 +164,7 @@ pub enum Channel {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperationKind {
+    ServiceAction,
     CreateFile,
     Run,
 }
@@ -298,7 +302,14 @@ pub fn artifact_commitment(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HelperProfile {
     Fixture,
-    Native { provider_epoch: Digest },
+    Native {
+        provider_epoch: Digest,
+    },
+    Integration {
+        provider_epoch: Digest,
+        core_manifest_digest: Digest,
+        integration_manifest_digest: Digest,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Provenance<T> {
@@ -357,6 +368,28 @@ pub enum Message {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
+    ProbeReadiness {
+        deadline_ms: u32,
+        lease: LeaseId,
+        slot: super::ResourceSlot,
+        operation: OperationId,
+        action_digest: Digest,
+        prior_binding_digest: Digest,
+        nonce: BindingId,
+        definition_role: String,
+        artifact_role: String,
+    },
+    ServiceAction {
+        lease: LeaseId,
+        operation: OperationId,
+        slot: super::ResourceSlot,
+        prior_binding_digest: Digest,
+        action: super::ServiceAction,
+    },
+    InspectService {
+        lease: LeaseId,
+        slot: super::ResourceSlot,
+    },
     Describe,
     Acquire {
         intent: IntentId,
@@ -410,6 +443,17 @@ pub enum Request {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reply {
+    ReadinessObservation {
+        lease: LeaseId,
+        observation: Box<super::ReadinessObservation>,
+    },
+    ServiceObservation {
+        lease: LeaseId,
+        observation: Box<super::ServiceObservation>,
+    },
+    IntegrationDescription {
+        description: Box<super::IntegrationDescription>,
+    },
     NativeDescription {
         description: Box<NativeDescription>,
     },
@@ -495,6 +539,9 @@ pub enum OperationView {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
+    ServiceActionCompleted {
+        outcome: super::ServiceOutcome,
+    },
     FileCreated {
         length: u16,
         digest: Digest,
@@ -569,6 +616,23 @@ fn validate_message(v: &Message) -> Result<(), Error> {
                 return Err(Error::InvalidValue);
             }
             checked_end(*offset, usize::from(*length))
+        }
+        Message::Request {
+            request:
+                Request::ProbeReadiness {
+                    deadline_ms,
+                    definition_role,
+                    artifact_role,
+                    ..
+                },
+        } => {
+            if !(1..=30_000).contains(deadline_ms)
+                || !["base", "configured", "target"].contains(&definition_role.as_str())
+                || !["base", "target"].contains(&artifact_role.as_str())
+            {
+                return Err(Error::InvalidValue);
+            }
+            Ok(())
         }
         Message::Response { result, .. } => match result {
             Reply::Description {
@@ -810,6 +874,34 @@ mod tests {
                 Os::Linux
             )
             .is_err()
+        );
+    }
+}
+
+/// Immutable config3/store commitment. Component order and domain are protocol constants.
+pub fn integration_manifest_digest(core: Digest, integration: Digest) -> Digest {
+    use sha2::{Digest as _, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"theseus.native_integration_v1.manifest\0");
+    hash.update(core.0);
+    hash.update(integration.0);
+    Digest::from_bytes(hash.finalize().into())
+}
+
+#[cfg(test)]
+mod integration_manifest_tests {
+    use super::*;
+    #[test]
+    fn full_integration_manifest_is_domain_separated_and_ordered() {
+        let core = Digest::parse(&"02".repeat(32)).unwrap();
+        let integration = Digest::parse(&"11".repeat(32)).unwrap();
+        assert_eq!(
+            integration_manifest_digest(core, integration).to_hex(),
+            "cd64ea4df93a58dc89771b1f60cd2b829e3e45e0bdb78650ee6a672cd7971d3c"
+        );
+        assert_ne!(
+            integration_manifest_digest(integration, core),
+            integration_manifest_digest(core, integration)
         );
     }
 }

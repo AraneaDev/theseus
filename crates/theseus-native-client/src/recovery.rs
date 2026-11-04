@@ -44,6 +44,9 @@ impl MutationIdentity {
             v2::Request::Run {
                 lease, operation, ..
             }
+            | v2::Request::ServiceAction {
+                lease, operation, ..
+            }
             | v2::Request::CreateFile {
                 lease, operation, ..
             } => (*lease, *operation),
@@ -52,17 +55,21 @@ impl MutationIdentity {
     }
     fn validate(&self, state: &v2::OperationView) -> Result<(), ClientError> {
         let create = matches!(self.request, v2::Request::CreateFile { .. });
+        let service = matches!(self.request, v2::Request::ServiceAction { .. });
         let valid = match state {
             v2::OperationView::Accepted { operation_kind } => {
                 *operation_kind
-                    == if create {
+                    == if service {
+                        v2::OperationKind::ServiceAction
+                    } else if create {
                         v2::OperationKind::CreateFile
                     } else {
                         v2::OperationKind::Run
                     }
             }
-            v2::OperationView::Running => !create,
+            v2::OperationView::Running => !create && !service,
             v2::OperationView::Finished { outcome } => match outcome {
+                v2::Outcome::ServiceActionCompleted { .. } => service,
                 v2::Outcome::FileCreated { length, digest } => match &self.request {
                     v2::Request::CreateFile { bytes, .. } => {
                         usize::from(*length) == bytes.as_slice().len()
@@ -72,7 +79,9 @@ impl MutationIdentity {
                     _ => false,
                 },
                 v2::Outcome::FileCreateFailed { .. } => create,
-                v2::Outcome::RunCompleted { .. } | v2::Outcome::LaunchFailed { .. } => !create,
+                v2::Outcome::RunCompleted { .. } | v2::Outcome::LaunchFailed { .. } => {
+                    !create && !service
+                }
                 v2::Outcome::NotStarted { .. } => true,
             },
             _ => true,
@@ -151,6 +160,11 @@ impl Recovery {
                             program,
                         } if expected.programs.as_slice().contains(program) => {
                             (*lease, *operation, true)
+                        }
+                        v2::Request::ServiceAction {
+                            lease, operation, ..
+                        } if matches!(expected.profile, v2::HelperProfile::Integration { .. }) => {
+                            (*lease, *operation, false)
                         }
                         v2::Request::CreateFile {
                             lease, operation, ..
@@ -349,6 +363,59 @@ impl Recovery {
                     p.request()
                 }
             }
+            Action::ProbeReadiness {
+                deadline_ms,
+                lease,
+                slot,
+                operation,
+                action_digest,
+                prior_binding_digest,
+                nonce,
+                definition_role,
+                artifact_role,
+            } => {
+                if !matches!(expected.profile, v2::HelperProfile::Integration { .. }) {
+                    return Err(ClientError::Preflight);
+                }
+                v2::Request::ProbeReadiness {
+                    deadline_ms,
+                    lease,
+                    slot,
+                    operation,
+                    action_digest,
+                    prior_binding_digest,
+                    nonce,
+                    definition_role,
+                    artifact_role,
+                }
+            }
+            Action::ServiceAction {
+                lease,
+                operation,
+                slot,
+                prior_binding_digest,
+                action,
+            } => {
+                if !matches!(expected.profile, v2::HelperProfile::Integration { .. }) {
+                    return Err(ClientError::Preflight);
+                }
+                self.mutation(
+                    v2::Request::ServiceAction {
+                        lease,
+                        operation,
+                        slot,
+                        prior_binding_digest,
+                        action,
+                    },
+                    false,
+                )?
+            }
+            Action::InspectService { lease, slot } => {
+                if !matches!(expected.profile, v2::HelperProfile::Integration { .. }) {
+                    return Err(ClientError::Preflight);
+                }
+                v2::Request::InspectService { lease, slot }
+            }
             Action::Run {
                 lease,
                 operation,
@@ -370,7 +437,7 @@ impl Recovery {
                 path,
                 bytes,
             } => {
-                if matches!(expected.profile, v2::HelperProfile::Native { .. }) {
+                if !matches!(expected.profile, v2::HelperProfile::Fixture) {
                     return Err(ClientError::Preflight);
                 }
                 self.mutation(
@@ -1174,6 +1241,20 @@ impl RecoveryImage {
         }
         match self.profile {
             v2::HelperProfile::Fixture => bytes.push(0),
+            v2::HelperProfile::Integration {
+                provider_epoch,
+                core_manifest_digest,
+                integration_manifest_digest,
+            } => {
+                bytes.push(2);
+                for d in [
+                    provider_epoch,
+                    core_manifest_digest,
+                    integration_manifest_digest,
+                ] {
+                    bytes.extend_from_slice(d.to_hex().as_bytes())
+                }
+            }
             v2::HelperProfile::Native { provider_epoch } => {
                 bytes.push(1);
                 bytes.extend_from_slice(provider_epoch.to_hex().as_bytes())
@@ -1191,6 +1272,9 @@ impl RecoveryImage {
         for (index, operation) in self.operations.iter().enumerate() {
             let ids = match &operation.request {
                 v2::Request::Run {
+                    lease, operation, ..
+                }
+                | v2::Request::ServiceAction {
                     lease, operation, ..
                 }
                 | v2::Request::CreateFile {
@@ -1254,6 +1338,14 @@ impl RecoveryImage {
                 .map_err(|_| ClientError::Protocol)?,
         };
         let profile = match input.take(1)?[0] {
+            2 => v2::HelperProfile::Integration {
+                provider_epoch: v2::Digest::parse(input.text(64)?)
+                    .map_err(|_| ClientError::Protocol)?,
+                core_manifest_digest: v2::Digest::parse(input.text(64)?)
+                    .map_err(|_| ClientError::Protocol)?,
+                integration_manifest_digest: v2::Digest::parse(input.text(64)?)
+                    .map_err(|_| ClientError::Protocol)?,
+            },
             0 => v2::HelperProfile::Fixture,
             1 => v2::HelperProfile::Native {
                 provider_epoch: v2::Digest::parse(input.text(64)?)

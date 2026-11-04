@@ -6,6 +6,7 @@ pub mod fs;
 pub mod principal;
 pub mod process;
 mod random;
+pub mod services;
 pub mod stdio;
 pub use random::random_bytes;
 

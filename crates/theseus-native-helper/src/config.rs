@@ -56,6 +56,10 @@ fn io_error(e: io::Error) -> ConfigError {
 #[serde(deny_unknown_fields)]
 struct Config {
     schema: u8,
+    core_manifest_digest: Option<String>,
+    integration_manifest_digest: Option<String>,
+    integration_manifest: Option<v2::IntegrationManifest>,
+    runtime_context: Option<v2::IntegrationRuntimeContext>,
     profile: Option<String>,
     capabilities: Option<Vec<String>>,
     provider_epoch: Option<String>,
@@ -121,7 +125,7 @@ fn parse_bytes(b: &[u8]) -> Result<Config, ConfigError> {
     let c: Config = serde_json::from_slice(b).map_err(|e| ConfigError {
         kind: ConfigErrorKind::Json(e),
     })?;
-    if !matches!(c.schema, 1 | 2)
+    if !matches!(c.schema, 1..=3)
         || !absolute(&c.ledger_root)
         || !absolute(&c.workspace_root)
         || c.programs.is_empty()
@@ -138,7 +142,12 @@ fn parse_bytes(b: &[u8]) -> Result<Config, ConfigError> {
             return Err(invalid());
         }
     } else {
-        if c.profile.as_deref() != Some("native_catalog_v1")
+        if c.profile.as_deref()
+            != Some(if c.schema == 3 {
+                "native_integration_v1"
+            } else {
+                "native_catalog_v1"
+            })
             || c.capabilities.as_ref().is_none_or(|v| {
                 !v.iter()
                     .map(String::as_str)
@@ -181,6 +190,57 @@ fn parse_bytes(b: &[u8]) -> Result<Config, ConfigError> {
                 return Err(invalid());
             }
         }
+    }
+    if c.schema != 3 {
+        let value: serde_json::Value = serde_json::from_slice(b).map_err(|_| invalid())?;
+        if [
+            "core_manifest_digest",
+            "integration_manifest_digest",
+            "integration_manifest",
+            "runtime_context",
+        ]
+        .iter()
+        .any(|k| value.get(k).is_some())
+        {
+            return Err(invalid());
+        }
+    }
+    if c.schema == 3 {
+        let core = v2::Digest::parse(c.core_manifest_digest.as_deref().ok_or_else(invalid)?)
+            .map_err(|_| invalid())?;
+        let integration = v2::Digest::parse(
+            c.integration_manifest_digest
+                .as_deref()
+                .ok_or_else(invalid)?,
+        )
+        .map_err(|_| invalid())?;
+        let manifest = c.integration_manifest.as_ref().ok_or_else(invalid)?;
+        manifest.validate().map_err(|_| invalid())?;
+        if manifest.core_manifest_digest != core.to_hex()
+            || manifest.digest().map_err(|_| invalid())? != integration
+            || v2::integration_manifest_digest(core, integration).to_hex() != c.manifest_digest
+        {
+            return Err(invalid());
+        }
+        let context = c.runtime_context.as_ref().ok_or_else(invalid)?;
+        context.validate().map_err(|_| invalid())?;
+        manifest
+            .validate_context(context, os(&c.os)?)
+            .map_err(|_| invalid())?;
+        if context.binding != c.binding
+            || context.manifest_digest != c.manifest_digest
+            || context.workspace_marker != c.workspace_marker
+            || Some(&context.provider_epoch) != c.provider_epoch.as_ref()
+            || context.integration_manifest_digest != integration.to_hex()
+        {
+            return Err(invalid());
+        }
+    } else if c.core_manifest_digest.is_some()
+        || c.integration_manifest_digest.is_some()
+        || c.integration_manifest.is_some()
+        || c.runtime_context.is_some()
+    {
+        return Err(invalid());
     }
     v2::BindingId::parse(&c.binding).map_err(|_| invalid())?;
     v2::Digest::parse(&c.manifest_digest).map_err(|_| invalid())?;
@@ -232,7 +292,7 @@ fn authority_digest(c: &Config) -> String {
         h.update(b"theseus-native-helper-config-v1\0");
     } else {
         h.update(b"theseus-native-helper-config-v2\0");
-        let profile = c.profile.as_deref().expect("validated native profile");
+        let profile = "native_catalog_v1";
         h.update([profile.len() as u8]);
         h.update(profile.as_bytes());
         for root in [&c.ledger_root, &c.workspace_root] {
@@ -286,7 +346,20 @@ fn authority_digest(c: &Config) -> String {
 /// The supplied manifest_digest is syntax checked but not compared by this helper.
 pub fn config_manifest_digest(bytes: &[u8]) -> Result<v2::Digest, ConfigError> {
     let config = parse_bytes(bytes)?;
-    v2::Digest::parse(&authority_digest(&config)).map_err(|_| invalid())
+    let core = v2::Digest::parse(&authority_digest(&config)).map_err(|_| invalid())?;
+    if config.schema == 3 {
+        Ok(v2::integration_manifest_digest(
+            core,
+            config
+                .integration_manifest
+                .as_ref()
+                .ok_or_else(invalid)?
+                .digest()
+                .map_err(|_| invalid())?,
+        ))
+    } else {
+        Ok(core)
+    }
 }
 /// Load a bounded, explicit regular config; verify authority before opening roots.
 /// UTF-8 paths/argv are this CLI profile's restriction, not a native API restriction.
@@ -310,7 +383,12 @@ pub fn load_config(path: &Path) -> Result<Invocation, ConfigError> {
         .read_to_end(&mut b)
         .map_err(io_error)?;
     let c = parse_bytes(&b)?;
-    if authority_digest(&c) != c.manifest_digest || os(&c.os)? != crate::invocation::host_os() {
+    if (if c.schema == 3 {
+        Some(authority_digest(&c)) != c.core_manifest_digest
+    } else {
+        authority_digest(&c) != c.manifest_digest
+    }) || os(&c.os)? != crate::invocation::host_os()
+    {
         return Err(invalid());
     }
     let expected = StoreBinding {
@@ -319,7 +397,7 @@ pub fn load_config(path: &Path) -> Result<Invocation, ConfigError> {
         workspace_marker: v2::WorkspaceMarker::parse(&c.workspace_marker).map_err(|_| invalid())?,
         os: os(&c.os)?,
     };
-    let provider_epoch = if c.schema == 2 {
+    let provider_epoch = if c.schema >= 2 {
         Some(
             v2::Digest::parse(c.provider_epoch.as_deref().ok_or_else(invalid)?)
                 .map_err(|_| invalid())?,
@@ -372,9 +450,32 @@ pub fn load_config(path: &Path) -> Result<Invocation, ConfigError> {
             catalog,
         )
     };
-    result.map_err(|e| ConfigError {
+    let mut result = result.map_err(|e| ConfigError {
         kind: ConfigErrorKind::Invocation(e),
-    })
+    })?;
+    if c.schema == 3 {
+        result.profile = v2::HelperProfile::Integration {
+            provider_epoch: provider_epoch.ok_or_else(invalid)?,
+            core_manifest_digest: v2::Digest::parse(
+                c.core_manifest_digest.as_deref().ok_or_else(invalid)?,
+            )
+            .map_err(|_| invalid())?,
+            integration_manifest_digest: v2::Digest::parse(
+                c.integration_manifest_digest
+                    .as_deref()
+                    .ok_or_else(invalid)?,
+            )
+            .map_err(|_| invalid())?,
+        };
+        result.integration = Some(Box::new(crate::integration::service::ServiceConfig {
+            manifest: c.integration_manifest.ok_or_else(invalid)?,
+            context: c.runtime_context.ok_or_else(invalid)?,
+        }));
+    }
+    Ok(result)
+    /*result.map_err(|e| ConfigError {
+        kind: ConfigErrorKind::Invocation(e),
+    })*/
 }
 #[cfg(test)]
 mod tests {

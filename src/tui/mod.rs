@@ -404,7 +404,7 @@ impl Signals {
 enum Work {
     Native(
         Box<(
-            crate::native::recipe::ValidatedNativeRecipe,
+            engine::domain::SelectedRecipe,
             engine::domain::NativeRunOptions,
             crate::native::launch::LaunchAuthority,
         )>,
@@ -429,15 +429,15 @@ impl Work {
         match self {
             Self::Native(input) => {
                 let (recipe, options, launch) = *input;
-                engine::run_selected(
-                    &engine::domain::SelectedRecipe::Native(recipe),
-                    engine::domain::SelectedRunOptions::Native(options),
-                    Some(&launch),
-                    token,
-                    |e| {
-                        let _ = events.try_send(WorkEvent::Run(e));
-                    },
-                )
+                let options =
+                    if matches!(recipe, engine::domain::SelectedRecipe::NativeIntegration(_)) {
+                        engine::domain::SelectedRunOptions::NativeIntegration(options)
+                    } else {
+                        engine::domain::SelectedRunOptions::Native(options)
+                    };
+                engine::run_selected(&recipe, options, Some(&launch), token, |e| {
+                    let _ = events.try_send(WorkEvent::Run(e));
+                })
                 .map(|result| WorkResult::Native(Box::new(result)))
             }
             Self::Run(recipe, options) => engine::run(&recipe, options, token, |e| {
@@ -549,10 +549,14 @@ fn complete_work(app: &mut App, result: Result<WorkResult>) -> Result<()> {
     app.active = false;
     match result {
         Ok(WorkResult::Native(result)) => {
-            let engine::domain::StoredRun::Native(report) = result.report else {
-                anyhow::bail!("native worker returned another backend");
-            };
-            app.set_native_report(report, result.report_path.parent().unwrap().to_path_buf());
+            let root = result.report_path.parent().unwrap().to_path_buf();
+            match result.report {
+                engine::domain::StoredRun::Native(report) => app.set_native_report(report, root),
+                engine::domain::StoredRun::NativeIntegration(report) => {
+                    app.set_integration_report(report, root)
+                }
+                _ => anyhow::bail!("native worker returned another backend"),
+            }
             app.status = format!("Finished | {}", result.report_path.display());
         }
         Ok(WorkResult::Run(result)) => {

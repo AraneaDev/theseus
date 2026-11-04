@@ -6,14 +6,18 @@ use super::{
     range_writer::RangeWriter,
     types::*,
 };
+use crate::native::integration::model::{
+    IntegrationPredicate, NativeReportVersion, ServicePredicate,
+};
 use crate::{native::model::*, report::ReportStore};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 #[derive(Debug)]
 pub(super) struct Snapshot {
     pub revision: String,
-    pub report: NativeReport,
+    pub report: NativeReportVersion,
     pub sampled_hint: u64,
+    readiness_probes: Vec<crate::native::integration::model::ReadinessProbeRecord>,
 }
 pub(super) fn load(store: &ReportStore, hint: u64) -> Result<Snapshot, QueryError> {
     crate::native::storage::require_family(
@@ -26,19 +30,70 @@ pub(super) fn load(store: &ReportStore, hint: u64) -> Result<Snapshot, QueryErro
     let bytes = store
         .read_bytes(crate::native::model::REPORT_FILENAME)
         .map_err(|e| QueryError::new(ErrorCode::IoError, e))?;
-    let report =
-        NativeReport::decode(&bytes).map_err(|e| QueryError::new(ErrorCode::EvidenceInvalid, e))?;
-    crate::native::storage::validate_report(&report)
-        .map_err(|e| QueryError::new(ErrorCode::EvidenceInvalid, e))?;
+    let schema = crate::strict_json::parse(
+        std::str::from_utf8(&bytes)
+            .map_err(|e| QueryError::new(ErrorCode::EvidenceInvalid, e.into()))?,
+    )
+    .map_err(|e| QueryError::new(ErrorCode::EvidenceInvalid, e.into()))?
+    .get("schema")
+    .and_then(serde_json::Value::as_u64)
+    .ok_or_else(|| error(ErrorCode::EvidenceInvalid))?;
+    let (report, readiness_probes, journal_bytes) = match schema {
+        1 => {
+            let r = NativeReport::decode(&bytes)
+                .map_err(|e| QueryError::new(ErrorCode::EvidenceInvalid, e))?;
+            crate::native::storage::validate_report(&r)
+                .map_err(|e| QueryError::new(ErrorCode::EvidenceInvalid, e))?;
+            (NativeReportVersion::CatalogV1(r), Vec::new(), None)
+        }
+        2 => {
+            let before = store
+                .read_bytes(crate::native::model::JOURNAL_FILENAME)
+                .map_err(|e| QueryError::new(ErrorCode::IoError, e))?;
+            let (r, j) = crate::native::storage::load_native_versioned(store)
+                .map_err(|e| QueryError::new(ErrorCode::EvidenceInvalid, e))?;
+            let crate::native::integration::model::NativeJournalVersion::IntegrationV2(j) = j
+            else {
+                return Err(error(ErrorCode::EvidenceInvalid));
+            };
+            let after = store
+                .read_bytes(crate::native::model::JOURNAL_FILENAME)
+                .map_err(|e| QueryError::new(ErrorCode::IoError, e))?;
+            if before != after {
+                return Err(error(ErrorCode::RevisionChanged));
+            }
+            (r, j.readiness_probes, Some(before))
+        }
+        _ => return Err(error(ErrorCode::EvidenceInvalid)),
+    };
+    let after = store
+        .read_bytes(crate::native::model::REPORT_FILENAME)
+        .map_err(|e| QueryError::new(ErrorCode::IoError, e))?;
+    if bytes != after {
+        return Err(error(ErrorCode::RevisionChanged));
+    }
+    let revision = if let Some(journal) = journal_bytes {
+        let mut hash = Sha256::new();
+        hash.update(b"theseus.integration.evidence\0");
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(&bytes);
+        hash.update((journal.len() as u64).to_be_bytes());
+        hash.update(&journal);
+        format!("{:x}", hash.finalize())
+    } else {
+        format!("{:x}", Sha256::digest(&bytes))
+    };
     Ok(Snapshot {
-        revision: format!("{:x}", Sha256::digest(&bytes)),
+        revision,
         report,
         sampled_hint: hint,
+        readiness_probes,
     })
 }
 #[derive(Serialize)]
 #[serde(untagged)]
 enum Detail<'a> {
+    Value(serde_json::Value),
     Header {
         kind: &'a str,
         schema: u32,
@@ -71,27 +126,54 @@ struct Record<'a> {
     kind: RecordKind,
     detail: Detail<'a>,
 }
-fn records(report: &NativeReport) -> impl Iterator<Item = Record<'_>> {
+fn records(snapshot: &Snapshot) -> impl Iterator<Item = Record<'_>> {
+    let report = &snapshot.report;
+    let (kind, schema, run_id, recipe_digest, identities, provider_claims, failures) = match report
+    {
+        NativeReportVersion::CatalogV1(r) => (
+            &r.kind,
+            r.schema,
+            &r.run_id,
+            &r.recipe_digest,
+            &r.identities,
+            &r.provider_claims,
+            &r.failures,
+        ),
+        NativeReportVersion::IntegrationV2(r) => (
+            &r.kind,
+            r.schema,
+            &r.run_id,
+            &r.recipe_digest,
+            &r.catalog.identities,
+            &r.catalog.provider_claims,
+            &r.catalog.failures,
+        ),
+    };
     let header = std::iter::once(Record {
         id: "run".into(),
         kind: RecordKind::RunHeader,
-        detail: Detail::Header {
-            kind: &report.kind,
-            schema: report.schema,
-            run_id: &report.run_id,
-            recipe_digest: &report.recipe_digest,
-            outcome: report.outcome,
-            identities: &report.identities,
-            provider_claims: &report.provider_claims,
+        detail: match report {
+            NativeReportVersion::CatalogV1(_) => Detail::Header {
+                kind,
+                schema,
+                run_id,
+                recipe_digest,
+                outcome: report.consumer_outcome(),
+                identities,
+                provider_claims,
+            },
+            NativeReportVersion::IntegrationV2(r) => Detail::Value(
+                serde_json::json!({"kind":r.kind,"schema":r.schema,"profile":r.profile,"run_id":r.run_id,"recipe_digest":r.recipe_digest,"core_recipe_digest":r.core_recipe_digest,"core_manifest_digest":r.core_manifest_digest,"integration_manifest_digest":r.integration_manifest_digest,"manifest_digest":r.manifest_digest,"compiled_requirements_digest":r.compiled_requirements_digest,"requirements":r.requirements,"selected_scenarios":r.selected_scenarios,"identities":r.catalog.identities,"provider_claims":r.catalog.provider_claims,"outcome":r.outcome}),
+            ),
         },
     });
-    let errors = report.failures.iter().enumerate().map(|(i, e)| Record {
+    let errors = failures.iter().enumerate().map(|(i, e)| Record {
         id: format!("error/{i}"),
         kind: RecordKind::Error,
         detail: Detail::Error(e),
     });
     let scenarios = report
-        .scenarios
+        .consumer_scenarios()
         .iter()
         .enumerate()
         .flat_map(|(s, scenario)| {
@@ -150,19 +232,137 @@ fn records(report: &NativeReport) -> impl Iterator<Item = Record<'_>> {
                 });
             one.chain(stages)
         });
-    header.chain(errors).chain(scenarios)
+    let mut integration = Vec::new();
+    if let NativeReportVersion::IntegrationV2(r) = report {
+        let mut add = |prefix: &str, kind, value| {
+            let index = integration
+                .iter()
+                .filter(|record: &&Record<'_>| record.id.starts_with(prefix))
+                .count();
+            integration.push(Record {
+                id: format!("{prefix}{index}"),
+                kind,
+                detail: Detail::Value(value),
+            });
+        };
+        for scenario in &r.integrations {
+            for service in &scenario.services {
+                for observation in &service.observations {
+                    add(
+                        "service/",
+                        RecordKind::Service,
+                        serde_json::json!({"scenario_id":scenario.scenario_id,"slot":service.slot,"observation":observation}),
+                    );
+                }
+                for action in &service.actions {
+                    add(
+                        "service/",
+                        RecordKind::Service,
+                        serde_json::json!({"scenario_id":scenario.scenario_id,"slot":service.slot,"action":action}),
+                    );
+                }
+            }
+            for desktop in &scenario.desktops {
+                for observation in &desktop.observations {
+                    add(
+                        "desktop/",
+                        RecordKind::Desktop,
+                        serde_json::json!({"scenario_id":scenario.scenario_id,"slot":desktop.slot,"observation":observation}),
+                    );
+                }
+                for action in &desktop.actions {
+                    add(
+                        "desktop/",
+                        RecordKind::Desktop,
+                        serde_json::json!({"scenario_id":scenario.scenario_id,"slot":desktop.slot,"action":action}),
+                    );
+                }
+            }
+            for check in &scenario.checks {
+                add(
+                    "integration_check/",
+                    RecordKind::IntegrationCheck,
+                    serde_json::json!(check),
+                );
+                if matches!(
+                    check.predicate,
+                    IntegrationPredicate::Service(ServicePredicate::ApplicationReady)
+                        | IntegrationPredicate::ApplicationReady
+                ) {
+                    add(
+                        "readiness/",
+                        RecordKind::Readiness,
+                        crate::native::integration::view::readiness_fact(r, check)
+                            .expect("typed readiness evidence serializes"),
+                    );
+                }
+            }
+            add(
+                "integration_disposition/",
+                RecordKind::IntegrationDisposition,
+                serde_json::json!({"scenario_id":scenario.scenario_id,"dispositions":scenario.dispositions}),
+            );
+        }
+    }
+    for probe in &snapshot.readiness_probes {
+        let index = integration
+            .iter()
+            .filter(|r| r.id.starts_with("readiness/"))
+            .count();
+        integration.push(Record {
+            id: format!("readiness/{index}"),
+            kind: RecordKind::Readiness,
+            detail: Detail::Value(crate::native::integration::view::readiness_probe_fact(
+                probe,
+            )),
+        });
+    }
+    header.chain(errors).chain(scenarios).chain(integration)
 }
-fn select(report: &NativeReport, selector: &EvidenceSelector) -> Result<String, QueryError> {
+/// Inspect the exact saved projections in fixture assertions without importing a tool handle.
+#[cfg(feature = "native-integration-test-support")]
+pub(crate) fn fixture_saved_projection(
+    store: &ReportStore,
+) -> Result<serde_json::Value, QueryError> {
+    let snapshot = load(store, 0)?;
+    let projection = super::status_projection::project_native_snapshot(&snapshot)?;
+    let records = records(&snapshot).map(|record| {
+        Ok(serde_json::json!({"record_id":record.id,"record_kind":record.kind,"detail":serde_json::to_value(record.detail).map_err(|e|QueryError::new(ErrorCode::EvidenceInvalid,e.into()))?}))
+    }).collect::<Result<Vec<_>,QueryError>>()?;
+    Ok(serde_json::json!({"saved":projection.saved,"guest":projection.guest,"records":records}))
+}
+fn select(report: &NativeReportVersion, selector: &EvidenceSelector) -> Result<String, QueryError> {
     Ok(match selector {
         EvidenceSelector::Root(s) => match s.collection {
             RootCollection::Run => "run".into(),
             RootCollection::Scenarios => "s/".into(),
             RootCollection::Errors => "error/".into(),
+            RootCollection::Services if matches!(report, NativeReportVersion::IntegrationV2(_)) => {
+                "service/".into()
+            }
+            RootCollection::Readiness
+                if matches!(report, NativeReportVersion::IntegrationV2(_)) =>
+            {
+                "readiness/".into()
+            }
+            RootCollection::IntegrationChecks
+                if matches!(report, NativeReportVersion::IntegrationV2(_)) =>
+            {
+                "integration_check/".into()
+            }
+            RootCollection::IntegrationDispositions
+                if matches!(report, NativeReportVersion::IntegrationV2(_)) =>
+            {
+                "integration_disposition/".into()
+            }
+            RootCollection::Desktop if matches!(report, NativeReportVersion::IntegrationV2(_)) => {
+                "desktop/".into()
+            }
             _ => return Err(error(ErrorCode::InvalidArguments)),
         },
         EvidenceSelector::Scenario(s) => {
             let i = report
-                .scenarios
+                .consumer_scenarios()
                 .iter()
                 .position(|r| r.id == s.scenario_id)
                 .ok_or_else(|| error(ErrorCode::UnknownRecord))?;
@@ -173,14 +373,14 @@ fn select(report: &NativeReport, selector: &EvidenceSelector) -> Result<String, 
         }
         EvidenceSelector::Stage(s) => {
             let i = report
-                .scenarios
+                .consumer_scenarios()
                 .iter()
                 .position(|r| r.id == s.scenario_id)
                 .ok_or_else(|| error(ErrorCode::UnknownRecord))?;
             let t = s.stage_index.get();
             if usize::try_from(t)
                 .ok()
-                .and_then(|t| report.scenarios[i].stages.get(t))
+                .and_then(|t| report.consumer_scenarios()[i].stages.get(t))
                 .is_none()
             {
                 return Err(error(ErrorCode::UnknownRecord));
@@ -197,6 +397,10 @@ fn select(report: &NativeReport, selector: &EvidenceSelector) -> Result<String, 
         _ => return Err(error(ErrorCode::InvalidArguments)),
     })
 }
+
+#[cfg(all(test, feature = "native-integration-test-support"))]
+#[path = "../../tests/support/native_service_views.rs"]
+mod service_view_fixture_assertions;
 fn selected(id: &str, prefix: &str) -> bool {
     if prefix == "run" {
         id == prefix
@@ -232,7 +436,7 @@ pub(super) fn evidence(
         .map_err(error)?;
     let data = match &args.selector {
         EvidenceSelector::Record(s) => {
-            let record = records(&snapshot.report)
+            let record = records(snapshot)
                 .find(|r| r.id == s.record_id.as_str())
                 .ok_or_else(|| error(ErrorCode::UnknownRecord))?;
             let mut counter = RangeWriter::new(0, 0);
@@ -269,7 +473,7 @@ pub(super) fn evidence(
         EvidenceSelector::Log(selector) => {
             let command = snapshot
                 .report
-                .scenarios
+                .consumer_scenarios()
                 .iter()
                 .flat_map(|s| s.stages.iter())
                 .flat_map(|s| s.commands.iter())
@@ -329,14 +533,14 @@ pub(super) fn evidence(
         }
         selector => {
             let prefix = select(&snapshot.report, selector)?;
-            let total = records(&snapshot.report)
+            let total = records(snapshot)
                 .filter(|r| selected(&r.id, &prefix))
                 .count() as u64;
             if let Some(c) = decoded {
                 c.validate(&cursor, total).map_err(error)?;
                 cursor = c;
             }
-            let summaries = records(&snapshot.report)
+            let summaries = records(snapshot)
                 .filter(|r| selected(&r.id, &prefix))
                 .skip(cursor.next_position as usize)
                 .take(usize::from(cursor.requested_limit))
@@ -485,5 +689,54 @@ mod tests {
         assert_ne!(first.revision, load(&store, 0).unwrap().revision);
         std::fs::write(store.report_path(), b"{}").unwrap();
         assert!(load(&store, 0).is_err());
+    }
+    #[test]
+    fn integration_readiness_uses_paged_records_and_unknown_cleanup_survives_reset() {
+        let mut report = crate::native::integration::view::tests::report();
+        let complete = || Disposition::Complete {
+            receipt: "provider disposed original owner".into(),
+        };
+        report.catalog.scenarios[0].dispositions = NativeDispositions {
+            local: complete(),
+            remote: complete(),
+            release: complete(),
+            reset: complete(),
+        };
+        let snapshot = Snapshot {
+            revision: "c".repeat(64),
+            report: NativeReportVersion::IntegrationV2(report),
+            sampled_hint: 11,
+            readiness_probes: vec![],
+        };
+        let projection =
+            super::super::status_projection::project_native_snapshot(&snapshot).unwrap();
+        assert_eq!(projection.guest, GuestCleanup::Unknown);
+        assert_eq!(projection.saved.schema_version, 2);
+        assert_eq!(projection.saved.counts.incomplete_checks.get(), 1);
+        let integration = projection.saved.integration.unwrap();
+        assert_eq!(integration.helper_worker.unknown, 1);
+        assert_eq!(integration.registration.unknown, 1);
+        let temp = tempfile::tempdir().unwrap();
+        let store = report::create(&temp.path().join("run")).unwrap();
+        let mut args: EvidenceArgs = serde_json::from_value(serde_json::json!({"server_instance":"a".repeat(32),"handle":format!("{}:1","a".repeat(32)),"selector":{"kind":"catalog","collection":"readiness"},"limit":1})).unwrap();
+        let EvidenceData::Catalog(page) = evidence(&store, &snapshot, &args, &reply()).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].record_kind, RecordKind::Readiness);
+        args.selector = EvidenceSelector::Record(RecordSelector {
+            kind: RecordSelectorKind::Record,
+            record_id: page.records[0].record_id.clone(),
+        });
+        args.revision = Some(Revision::parse(&snapshot.revision).unwrap());
+        args.limit = Some(UInt::new(4096).unwrap());
+        let EvidenceData::Record(page) = evidence(&store, &snapshot, &args, &reply()).unwrap()
+        else {
+            panic!()
+        };
+        let check: serde_json::Value = serde_json::from_slice(&page.bytes).unwrap();
+        assert_eq!(check["outcome"], "incomplete");
+        assert_eq!(check["origin"], "sut_postcondition");
     }
 }

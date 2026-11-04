@@ -213,14 +213,20 @@ Theseus observes it and performs only declared Start/Stop rehearsals.
   against an explicitly labelled private model, including saved TUI/MCP evidence.
   Eight CLI lifecycle/failure cases and the fresh MCP context pass locally.
 - [ ] Exercise the compiled test installer and a real disposable systemd manager.
-- [ ] Independently review and qualify the complete systemd slice.
+- [x] Independently review the systemd core, consumers and private-model slice;
+  all core and consumer findings are closed. Real-manager acceptance stays pending.
 - [x] Implement additive launchd/SCM contracts and shared helper integration,
   preserving the existing systemd and catalog wire formats. Focused shared and
   protocol tests and strict cross-platform compile checks pass locally.
 - [x] Implement macOS peer-authenticated local socket and Windows first-instance
   named-pipe readiness source with retained pending I/O ownership.
-- [ ] Resolve independent platform review findings; qualify launchd/SCM source.
-- [ ] Complete compiled native launchd/SCM installers and service applications.
+- [x] Resolve independent platform adapter review findings, including original
+  launchd file identity, native command results, SCM state and pipe admission,
+  and retained Windows diagnostics. Native execution remains a separate gate.
+- [x] Implement compiled native launchd/SCM installers and service applications;
+  fixture contract tests and all-platform compilation pass locally.
+- [ ] Complete and review native receipt/setup fixtures and exact Windows ACL
+  qualification, then exercise the real native product paths.
 - [ ] Qualify actual launchd format/domain and SCM rights, lifecycle and deletion
   behavior on native OS runners. Cross-compilation does not satisfy this gate.
 - [ ] Add ordinary upgrade/reinstall and original-identity service recovery.

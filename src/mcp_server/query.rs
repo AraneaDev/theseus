@@ -49,6 +49,7 @@ pub(crate) enum QueryValue {
     Inspect(InspectData),
     Validated(ValidatedRecipe),
     ValidatedNative(crate::native::recipe::ValidatedNativeRecipe),
+    ValidatedIntegration(Box<crate::native::integration::recipe::ValidatedIntegrationRecipe>),
     Refreshed(SavedProjection),
     Evidence(EvidenceData),
 }
@@ -303,6 +304,7 @@ pub(crate) fn validate_selected_start(
     let digest = match &selected {
         SelectedRecipe::Docker(r) => &r.digest,
         SelectedRecipe::Native(r) => &r.digest,
+        SelectedRecipe::NativeIntegration(r) => &r.digest,
     };
     if digest != args.recipe_digest.as_str() {
         return Err(super::roots::error(ErrorCode::RecipeChanged));
@@ -326,13 +328,28 @@ pub(crate) fn validate_selected_start(
                     theseus_native_protocol::v2::Os::Windows
                 }
             };
-            if launch.binding().os != os
+            if launch.integration_components().is_some()
+                || launch.binding().os != os
                 || launch.binding().manifest_digest.to_hex() != recipe.recipe.manifest_digest
             {
                 return Err(super::roots::error(ErrorCode::RecipeInvalid));
             }
             recipe
                 .validate_selection(&args.scenarios, &recipe.recipe.limits)
+                .map_err(|e| QueryError::new(ErrorCode::RecipeInvalid, e))?;
+        }
+        SelectedRecipe::NativeIntegration(recipe) => {
+            if !args.profiles.is_empty() || args.pull {
+                return Err(super::roots::error(ErrorCode::InvalidArguments));
+            }
+            let launch = roots
+                .native_target
+                .as_ref()
+                .ok_or_else(|| super::roots::error(ErrorCode::InvalidArguments))?;
+            recipe
+                .validate_selection(&args.scenarios, &recipe.core.recipe.limits)
+                .map_err(|e| QueryError::new(ErrorCode::RecipeInvalid, e))?;
+            crate::native::integration::view::validate_authority(recipe, launch)
                 .map_err(|e| QueryError::new(ErrorCode::RecipeInvalid, e))?;
         }
     }
@@ -362,6 +379,9 @@ fn execute(
                 }
                 crate::engine::domain::SelectedRecipe::Native(recipe) => {
                     Ok(QueryValue::ValidatedNative(recipe))
+                }
+                crate::engine::domain::SelectedRecipe::NativeIntegration(recipe) => {
+                    Ok(QueryValue::ValidatedIntegration(Box::new(recipe)))
                 }
             }
         }

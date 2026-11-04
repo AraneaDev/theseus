@@ -43,6 +43,12 @@ impl LedgerView {
             os,
             ..
         }
+        | Entry::IntegrationHeader {
+            binding,
+            manifest_digest,
+            os,
+            ..
+        }
         | Entry::NativeHeader {
             binding,
             manifest_digest,
@@ -68,14 +74,18 @@ impl LedgerView {
             }
             let n = super::encode(r)?.len();
             match r.entry() {
-                Entry::Header { .. } | Entry::NativeHeader { .. } => {
+                Entry::Header { .. }
+                | Entry::NativeHeader { .. }
+                | Entry::IntegrationHeader { .. } => {
                     if i != 0 {
                         return Err(LedgerError::InvalidTransition);
                     }
                 }
                 Entry::NativeAuthorityRevoked { lease, reason } => {
-                    if !matches!(records[0].entry(), Entry::NativeHeader { .. })
-                        || active.is_some()
+                    if !matches!(
+                        records[0].entry(),
+                        Entry::NativeHeader { .. } | Entry::IntegrationHeader { .. }
+                    ) || active.is_some()
                         || v.authority_failure.is_some()
                     {
                         return Err(LedgerError::InvalidTransition);
@@ -98,7 +108,9 @@ impl LedgerView {
                 } => {
                     v.check_lease(*lease)
                         .map_err(|_| LedgerError::InvalidTransition)?;
-                    if v.authority_failure.is_some()
+                    if (*operation_kind == OperationKind::ServiceAction
+                        && !matches!(records[0].entry(), Entry::IntegrationHeader { .. }))
+                        || v.authority_failure.is_some()
                         || active.is_some()
                         || v.operations.iter().any(|o| o.operation == *operation)
                     {
@@ -135,6 +147,9 @@ impl LedgerView {
                             ) | (
                                 OperationKind::Run,
                                 Outcome::RunCompleted { .. } | Outcome::LaunchFailed { .. }
+                            ) | (
+                                OperationKind::ServiceAction,
+                                Outcome::ServiceActionCompleted { .. }
                             ) | (_, Outcome::NotStarted { .. })
                         )
                     {
@@ -253,6 +268,9 @@ impl LedgerView {
             Request::Run {
                 lease, operation, ..
             } => (*lease, *operation, OperationKind::Run),
+            Request::ServiceAction {
+                lease, operation, ..
+            } => (*lease, *operation, OperationKind::ServiceAction),
             _ => return Err(RefusalCode::InvalidRequest),
         };
         self.check_lease(lease)?;

@@ -1,6 +1,15 @@
 //! Retained publication authority. Tokens can be minted only after a successful save.
 use super::domain::{StoredJournal, StoredRun};
-use crate::{native::model::*, report::ReportStore};
+use crate::{
+    native::{
+        integration::model::{
+            IntegrationActionRecord, IntegrationOutcome, IntegrationRequest,
+            IntegrationResourceRecord,
+        },
+        model::*,
+    },
+    report::ReportStore,
+};
 use anyhow::{Result, bail, ensure};
 use theseus_native_helper_store::PreparedAcquire;
 
@@ -44,6 +53,16 @@ impl PublishedCommand {
     }
 }
 
+/// A saved integration action is the sole authority to submit that exact request.
+pub struct PublishedIntegrationAction {
+    action: IntegrationActionRecord,
+}
+impl PublishedIntegrationAction {
+    pub fn into_action(self) -> IntegrationActionRecord {
+        self.action
+    }
+}
+
 pub struct PublishedRelease {
     release: NativeRelease,
 }
@@ -58,6 +77,16 @@ pub struct RunProjector<'a> {
     report: StoredRun,
     journal: StoredJournal,
 }
+/// Borrow only shared native fields. No compatibility journal is synthesized,
+/// and saves still validate/write the actual versioned envelope.
+struct NativeJournalFields<'a> {
+    launch_fingerprint: &'a mut Option<String>,
+    ownership: &'a mut Vec<NativeResource>,
+    operations: &'a mut Vec<NativeOperation>,
+    provider_calls: &'a mut Vec<NativeProviderCall>,
+    releases: &'a mut Vec<NativeRelease>,
+    recovery_attempts: &'a mut Vec<NativeRecoveryAttempt>,
+}
 impl<'a> RunProjector<'a> {
     pub fn new(store: &'a ReportStore, report: StoredRun, journal: StoredJournal) -> Result<Self> {
         ensure!(
@@ -65,12 +94,19 @@ impl<'a> RunProjector<'a> {
                 (&report, &journal),
                 (StoredRun::Docker(_), StoredJournal::Docker(_))
                     | (StoredRun::Native(_), StoredJournal::Native(_))
+                    | (
+                        StoredRun::NativeIntegration(_),
+                        StoredJournal::NativeIntegration(_)
+                    )
             ),
             "report/journal backend mismatch"
         );
         let (report_id, journal_id) = match (&report, &journal) {
             (StoredRun::Docker(r), StoredJournal::Docker(j)) => (&r.run_id, &j.run_id),
             (StoredRun::Native(r), StoredJournal::Native(j)) => (&r.run_id, &j.run_id),
+            (StoredRun::NativeIntegration(r), StoredJournal::NativeIntegration(j)) => {
+                (&r.run_id, &j.run_id)
+            }
             _ => unreachable!("backend match checked"),
         };
         ensure!(
@@ -95,6 +131,13 @@ impl<'a> RunProjector<'a> {
     pub fn report_mut(&mut self) -> &mut StoredRun {
         &mut self.report
     }
+    pub(crate) fn catalog_scenarios_mut(&mut self) -> Result<&mut Vec<NativeScenario>> {
+        match &mut self.report {
+            StoredRun::Native(report) => Ok(&mut report.scenarios),
+            StoredRun::NativeIntegration(report) => Ok(&mut report.catalog.scenarios),
+            _ => bail!("native catalog projection requires native report"),
+        }
+    }
     pub fn into_parts(self) -> (StoredRun, StoredJournal) {
         (self.report, self.journal)
     }
@@ -105,6 +148,7 @@ impl<'a> RunProjector<'a> {
                 r.validate()?;
                 self.store.atomic_json(REPORT_FILENAME, r)
             }
+            StoredRun::NativeIntegration(r) => self.store.save_native_integration_report(r),
         }
     }
     pub fn save_journal(&self) -> Result<()> {
@@ -114,11 +158,27 @@ impl<'a> RunProjector<'a> {
                 j.validate()?;
                 self.store.atomic_json(JOURNAL_FILENAME, j)
             }
+            StoredJournal::NativeIntegration(j) => self.store.save_native_integration_journal(j),
         }
     }
-    fn native_journal(&mut self) -> Result<&mut NativeJournal> {
+    fn native_journal(&mut self) -> Result<NativeJournalFields<'_>> {
         match &mut self.journal {
-            StoredJournal::Native(j) => Ok(j),
+            StoredJournal::Native(j) => Ok(NativeJournalFields {
+                launch_fingerprint: &mut j.launch_fingerprint,
+                ownership: &mut j.ownership,
+                operations: &mut j.operations,
+                provider_calls: &mut j.provider_calls,
+                releases: &mut j.releases,
+                recovery_attempts: &mut j.recovery_attempts,
+            }),
+            StoredJournal::NativeIntegration(j) => Ok(NativeJournalFields {
+                launch_fingerprint: &mut j.launch_fingerprint,
+                ownership: &mut j.ownership,
+                operations: &mut j.operations,
+                provider_calls: &mut j.provider_calls,
+                releases: &mut j.releases,
+                recovery_attempts: &mut j.recovery_attempts,
+            }),
             _ => bail!("native publication requires native journal"),
         }
     }
@@ -129,7 +189,7 @@ impl<'a> RunProjector<'a> {
             j.launch_fingerprint.is_none() && j.ownership.is_empty() && j.provider_calls.is_empty(),
             "launch already bound or effects started"
         );
-        j.launch_fingerprint = Some(fingerprint.to_owned());
+        *j.launch_fingerprint = Some(fingerprint.to_owned());
         self.save_journal()
     }
     /// Retain ownership before even invoking the provider. Unknown replies keep this record.
@@ -324,8 +384,258 @@ impl<'a> RunProjector<'a> {
             "new command must retain unknown disposition"
         );
         j.operations.push(operation.clone());
+        if let StoredJournal::NativeIntegration(j) = &mut self.journal {
+            // Link the original SUT install publication to the prior observed
+            // vacancy. Preserve the immutable first snapshot and append history.
+            if matches!(
+                operation.command.program,
+                CatalogProgram::InstallBase | CatalogProgram::InstallTarget
+            ) {
+                for resource in j
+                    .integration_ownership
+                    .iter_mut()
+                    .filter(|r| r.key.ownership_id == operation.ownership_id)
+                {
+                    let prior = resource
+                        .binding_history
+                        .last()
+                        .unwrap_or(&resource.initial_binding);
+                    if prior.basis
+                        == crate::native::integration::model::BindingBasis::VacantRegistration
+                        && prior.original_action.is_none()
+                    {
+                        let mut linked = prior.clone();
+                        linked.original_action = Some(operation.operation_id.clone());
+                        resource.binding_history.push(linked);
+                    }
+                }
+            }
+        }
         self.save_journal()?;
         Ok(PublishedCommand { operation })
+    }
+    pub fn publish_integration_resource(
+        &mut self,
+        record: IntegrationResourceRecord,
+    ) -> Result<()> {
+        let StoredJournal::NativeIntegration(j) = &mut self.journal else {
+            bail!("integration publication requires schema2 journal")
+        };
+        ensure!(
+            j.ownership
+                .iter()
+                .any(|owner| owner.ownership_id == record.key.ownership_id
+                    && owner.scenario_id == record.key.scenario_id
+                    && matches!(owner.ownership, NativeOwnership::Acquired { .. })),
+            "integration resource lacks original acquired owner"
+        );
+        ensure!(
+            record.manifest_digest == j.manifest_digest,
+            "integration resource manifest mismatch"
+        );
+        record.key.slot.validate()?;
+        record.disposition.validate()?;
+        crate::native::model::digest(&record.current_binding_digest)?;
+        if let Some(old) = j
+            .integration_ownership
+            .iter_mut()
+            .find(|old| old.key == record.key)
+        {
+            ensure!(
+                old.kind == record.kind
+                    && old.manifest_digest == record.manifest_digest
+                    && old.initial_binding == record.initial_binding,
+                "integration publication replaced original resource"
+            );
+            ensure!(
+                old.revocation.is_none() || old.revocation == record.revocation,
+                "integration revocation is sticky"
+            );
+            ensure!(
+                record.binding_history.starts_with(&old.binding_history),
+                "integration binding history was replaced"
+            );
+            *old = record;
+        } else {
+            j.integration_ownership.push(record);
+        }
+        self.save_journal()
+    }
+    pub fn publish_integration_action(
+        &mut self,
+        resource: &PublishedResource,
+        action: IntegrationActionRecord,
+    ) -> Result<PublishedIntegrationAction> {
+        let StoredJournal::NativeIntegration(j) = &mut self.journal else {
+            bail!("integration publication requires schema2 journal")
+        };
+        let owner = j
+            .ownership
+            .iter()
+            .find(|o| o.ownership_id == action.ownership_id)
+            .ok_or_else(|| anyhow::anyhow!("integration action lacks original owner"))?;
+        ensure!(
+            owner == &resource.resource
+                && matches!(&owner.ownership, NativeOwnership::Acquired{lease,..} if lease == &action.lease),
+            "integration action original lease mismatch"
+        );
+        let registration = j
+            .integration_ownership
+            .iter()
+            .find(|r| r.key.ownership_id == action.ownership_id && r.key.slot == action.slot)
+            .ok_or_else(|| anyhow::anyhow!("integration action lacks published resource"))?;
+        ensure!(
+            registration.revocation.is_none()
+                && registration.current_binding_digest == action.prior_binding_digest,
+            "integration binding revoked or changed"
+        );
+        let (lease, operation, slot, prior) = match &action.request {
+            IntegrationRequest::Service {
+                lease,
+                operation,
+                slot,
+                prior_binding_digest,
+                ..
+            }
+            | IntegrationRequest::Desktop {
+                lease,
+                operation,
+                slot,
+                prior_binding_digest,
+                ..
+            } => (lease, operation, slot, prior_binding_digest),
+        };
+        ensure!(
+            lease == &action.lease
+                && operation == &action.operation
+                && slot == &action.slot
+                && prior == &action.prior_binding_digest,
+            "integration request identity mismatch"
+        );
+        crate::native::model::hex(&action.operation, 32)?;
+        crate::native::model::digest(&action.request_digest)?;
+        ensure!(
+            theseus_native_protocol::v2::request_digest(&action.request.wire()?)?.to_hex()
+                == action.request_digest,
+            "integration request digest mismatch"
+        );
+        if matches!(action.request, IntegrationRequest::Service { .. }) {
+            ensure!(
+                action.broker_identity.is_none(),
+                "service action cannot borrow desktop broker authority"
+            );
+        }
+        ensure!(
+            matches!(action.completion, Disposition::Unknown { .. }) && action.terminal.is_none(),
+            "new integration action requires unknown disposition"
+        );
+        ensure!(
+            !j.integration_actions
+                .iter()
+                .any(|a| a.lease == action.lease && a.operation == action.operation)
+                && !j
+                    .operations
+                    .iter()
+                    .any(|o| o.lease == action.lease && o.operation_id == action.operation),
+            "operation already published; query original identity instead"
+        );
+        j.integration_actions.push(action.clone());
+        self.save_journal()?;
+        Ok(PublishedIntegrationAction { action })
+    }
+    pub fn record_integration_completion(
+        &mut self,
+        lease: &str,
+        operation: &str,
+        completion: Disposition,
+        terminal: IntegrationOutcome,
+    ) -> Result<()> {
+        completion.validate()?;
+        let StoredJournal::NativeIntegration(j) = &mut self.journal else {
+            bail!("integration completion requires schema2 journal")
+        };
+        let action = j
+            .integration_actions
+            .iter_mut()
+            .find(|a| a.lease == lease && a.operation == operation)
+            .ok_or_else(|| anyhow::anyhow!("integration action not published"))?;
+        ensure!(
+            action.terminal.as_ref().is_none_or(|old| old == &terminal),
+            "integration terminal outcome changed"
+        );
+        action.completion = completion;
+        action.terminal = Some(terminal);
+        self.save_journal()
+    }
+    pub fn publish_readiness_probe(
+        &mut self,
+        record: crate::native::integration::model::ReadinessProbeRecord,
+    ) -> Result<()> {
+        let StoredJournal::NativeIntegration(j) = &mut self.journal else {
+            bail!("readiness publication requires schema2 journal")
+        };
+        let challenge = &record.challenge;
+        ensure!(j.ownership.iter().any(|owner| owner.ownership_id==challenge.ownership_id && matches!(&owner.ownership,NativeOwnership::Acquired{lease,..} if lease==&challenge.lease)), "readiness challenge lacks original lease");
+        ensure!(
+            j.integration_ownership
+                .iter()
+                .any(|r| r.key.ownership_id == challenge.ownership_id
+                    && r.key.slot == challenge.slot
+                    && r.revocation.is_none()),
+            "readiness challenge lacks unrevoked original resource"
+        );
+        ensure!(
+            (1..=30000).contains(&challenge.deadline_ms)
+                && matches!(record.completion, Disposition::Unknown { .. })
+                && record.observation_ids.is_empty(),
+            "new readiness probe must retain bounded unknown result"
+        );
+        ensure!(
+            !j.readiness_probes
+                .iter()
+                .any(|p| p.challenge.ownership_id == challenge.ownership_id
+                    && p.challenge.operation == challenge.operation
+                    && p.challenge.nonce == challenge.nonce),
+            "readiness challenge already published"
+        );
+        j.readiness_probes.push(record);
+        self.save_journal()
+    }
+    pub fn record_readiness_probe_completion(
+        &mut self,
+        ownership_id: &str,
+        operation: &str,
+        nonce: &str,
+        expectation_digest: &str,
+        observation_ids: Vec<String>,
+        completion: Disposition,
+    ) -> Result<()> {
+        completion.validate()?;
+        let StoredJournal::NativeIntegration(j) = &mut self.journal else {
+            bail!("readiness completion requires schema2 journal")
+        };
+        let probe = j
+            .readiness_probes
+            .iter_mut()
+            .find(|p| {
+                p.challenge.ownership_id == ownership_id
+                    && p.challenge.operation == operation
+                    && p.challenge.nonce == nonce
+                    && p.expectation_digest == expectation_digest
+            })
+            .ok_or_else(|| anyhow::anyhow!("readiness challenge not published"))?;
+        ensure!(
+            !matches!(completion, Disposition::Complete { .. }) || !observation_ids.is_empty(),
+            "readiness completion lacks observations"
+        );
+        ensure!(
+            matches!(probe.completion, Disposition::Unknown { .. })
+                || (probe.completion == completion && probe.observation_ids == observation_ids),
+            "readiness terminal result changed"
+        );
+        probe.observation_ids = observation_ids;
+        probe.completion = completion;
+        self.save_journal()
     }
     pub fn revoke_catalog(
         &mut self,
@@ -546,5 +856,181 @@ impl<'a> RunProjector<'a> {
         );
         release.completion = completion;
         self.save_journal()
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::{
+        model::ScenarioKind,
+        native::integration::{ValidatedIntegrationRecipe, model::*},
+    };
+    fn setup(
+        store: &ReportStore,
+    ) -> (
+        RunProjector<'_>,
+        PublishedResource,
+        IntegrationResourceRecord,
+    ) {
+        let recipe = ValidatedIntegrationRecipe::decode(
+            include_bytes!("../../examples/native/service-recipe.example.json"),
+            "recipe.json".into(),
+        )
+        .unwrap();
+        let report =
+            NativeIntegrationReport::new("run".into(), &recipe, vec![ScenarioKind::Clean]).unwrap();
+        let mut journal =
+            NativeIntegrationJournal::new("run".into(), &recipe, vec![ScenarioKind::Clean])
+                .unwrap();
+        journal.launch_fingerprint = Some("01".repeat(32));
+        let resource = NativeResource {
+            scenario_id: "clean".into(),
+            ownership_id: "owner".into(),
+            catalog_authority: NativeCatalogAuthority::Valid,
+            ownership: NativeOwnership::Acquired {
+                prepared: NativeIntent {
+                    intent: "01".repeat(16),
+                    binding: "02".repeat(16),
+                    manifest_digest: recipe.full_manifest_digest().unwrap(),
+                    workspace_marker: "03".repeat(16),
+                    reset_epoch: "04".repeat(32),
+                    publication_scope: "file_and_directory_synced".into(),
+                },
+                lease: "05".repeat(16),
+            },
+        };
+        journal.ownership.push(resource.clone());
+        let binding = ResourceBindingSnapshot {
+            digest: "06".repeat(32),
+            basis: BindingBasis::VacantRegistration,
+            evidence_ids: vec!["absence-observation".into()],
+            definition: None,
+            artifact_commitment: recipe.core.artifact_commitment().unwrap().to_hex(),
+            namespace_or_session_receipt_digest: "07".repeat(32),
+            original_action: None,
+        };
+        let record = IntegrationResourceRecord {
+            key: IntegrationResourceKey {
+                scenario_id: "clean".into(),
+                ownership_id: "owner".into(),
+                slot: ResourceSlot::new("service").unwrap(),
+            },
+            kind: IntegrationResourceKind::Service,
+            manifest_digest: recipe.full_manifest_digest().unwrap(),
+            initial_binding: binding.clone(),
+            binding_history: vec![binding.clone()],
+            current_binding_digest: binding.digest,
+            revocation: None,
+            disposition: Disposition::Unknown {
+                reason: "registration pending".into(),
+            },
+        };
+        (
+            RunProjector::new(
+                store,
+                StoredRun::NativeIntegration(report),
+                StoredJournal::NativeIntegration(journal),
+            )
+            .unwrap(),
+            PublishedResource { resource },
+            record,
+        )
+    }
+    fn action(
+        resource: &PublishedResource,
+        registration: &IntegrationResourceRecord,
+    ) -> IntegrationActionRecord {
+        let NativeOwnership::Acquired { lease, .. } = &resource.resource.ownership else {
+            unreachable!()
+        };
+        let request = IntegrationRequest::Service {
+            lease: lease.clone(),
+            operation: "08".repeat(16),
+            slot: registration.key.slot.clone(),
+            prior_binding_digest: registration.current_binding_digest.clone(),
+            control: ServiceAction::Start,
+        };
+        IntegrationActionRecord {
+            ownership_id: resource.resource.ownership_id.clone(),
+            lease: lease.clone(),
+            slot: registration.key.slot.clone(),
+            operation: "08".repeat(16),
+            request_digest: theseus_native_protocol::v2::request_digest(&request.wire().unwrap())
+                .unwrap()
+                .to_hex(),
+            request,
+            prior_binding_digest: registration.current_binding_digest.clone(),
+            broker_identity: None,
+            completion: Disposition::Unknown {
+                reason: "action pending".into(),
+            },
+            terminal: None,
+        }
+    }
+    #[test]
+    fn action_requires_saved_original_binding_and_cannot_change_digest_or_replay() {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::report::create(&root.path().join("run")).unwrap();
+        let (mut p, owner, registration) = setup(&store);
+        let command = action(&owner, &registration);
+        assert!(
+            p.publish_integration_action(&owner, command.clone())
+                .is_err()
+        );
+        p.publish_integration_resource(registration.clone())
+            .unwrap();
+        let mut wrong = command.clone();
+        wrong.request_digest = "09".repeat(32);
+        assert!(p.publish_integration_action(&owner, wrong).is_err());
+        let saved = p
+            .publish_integration_action(&owner, command.clone())
+            .unwrap()
+            .into_action();
+        assert_eq!(saved, command);
+        assert!(p.publish_integration_action(&owner, command).is_err());
+        let StoredJournal::NativeIntegration(journal) = store.load_selected_journal().unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(journal.integration_actions.len(), 1);
+    }
+    #[test]
+    fn save_failure_mints_no_action_authority_and_revocation_is_sticky() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("run");
+        let store = crate::report::create(&path).unwrap();
+        let (mut p, owner, mut registration) = setup(&store);
+        p.publish_integration_resource(registration.clone())
+            .unwrap();
+        registration.revocation = Some(AuthorityRevocation::WrongObject);
+        p.publish_integration_resource(registration.clone())
+            .unwrap();
+        registration.revocation = None;
+        assert!(
+            p.publish_integration_resource(registration.clone())
+                .is_err()
+        );
+        assert!(
+            p.publish_integration_action(&owner, action(&owner, &registration))
+                .is_err()
+        );
+        let root2 = tempfile::tempdir().unwrap();
+        let path2 = root2.path().join("run");
+        let store2 = crate::report::create(&path2).unwrap();
+        let (mut p2, owner2, registration2) = setup(&store2);
+        p2.publish_integration_resource(registration2.clone())
+            .unwrap();
+        std::fs::rename(
+            path2.join(JOURNAL_FILENAME),
+            path2.join("retained-journal.json"),
+        )
+        .unwrap();
+        std::fs::create_dir(path2.join(JOURNAL_FILENAME)).unwrap();
+        assert!(
+            p2.publish_integration_action(&owner2, action(&owner2, &registration2))
+                .is_err(),
+            "failed publication must never yield submission token"
+        );
     }
 }

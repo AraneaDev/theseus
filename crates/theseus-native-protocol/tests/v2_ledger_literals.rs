@@ -248,7 +248,9 @@ fn independent_literals_decode_to_typed_records_and_encode_separately() {
             Entry::OperationAccepted { .. } => 2,
             Entry::OperationFinished { .. } => 3,
             Entry::LeaseClosed { .. } => 4,
-            Entry::NativeHeader { .. } | Entry::NativeAuthorityRevoked { .. } => {
+            Entry::NativeHeader { .. }
+            | Entry::NativeAuthorityRevoked { .. }
+            | Entry::IntegrationHeader { .. } => {
                 panic!("fixture literal table excludes native records")
             }
         };

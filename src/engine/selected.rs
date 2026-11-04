@@ -57,8 +57,21 @@ pub(crate) fn run_selected_with_parent(
         }
         (SelectedRecipe::Native(recipe), SelectedRunOptions::Native(options)) => run_native(
             recipe,
+            None,
             options,
             launch.ok_or_else(|| anyhow::anyhow!("native launch authority required"))?,
+            cancel,
+            parent,
+            emit,
+        ),
+        (
+            SelectedRecipe::NativeIntegration(recipe),
+            SelectedRunOptions::NativeIntegration(options),
+        ) => run_native(
+            &recipe.core,
+            Some(recipe),
+            options,
+            launch.ok_or_else(|| anyhow::anyhow!("integration launch authority required"))?,
             cancel,
             parent,
             emit,
@@ -363,14 +376,46 @@ pub(super) fn settle_owned(owners: &mut Owners) -> bool {
         }
     }
 }
-fn native_report<'a>(projector: &'a mut RunProjector<'_>) -> &'a mut NativeReport {
+struct CatalogReportMut<'a> {
+    scenarios: &'a mut Vec<NativeScenario>,
+    provider_claims: &'a mut Vec<ProviderReceipt>,
+    failures: &'a mut Vec<String>,
+    outcome: &'a mut RunOutcome,
+}
+fn native_report<'a>(projector: &'a mut RunProjector<'_>) -> CatalogReportMut<'a> {
     match projector.report_mut() {
-        StoredRun::Native(r) => r,
+        StoredRun::Native(r) => CatalogReportMut {
+            scenarios: &mut r.scenarios,
+            provider_claims: &mut r.provider_claims,
+            failures: &mut r.failures,
+            outcome: &mut r.outcome,
+        },
+        StoredRun::NativeIntegration(r) => CatalogReportMut {
+            scenarios: &mut r.catalog.scenarios,
+            provider_claims: &mut r.catalog.provider_claims,
+            failures: &mut r.catalog.failures,
+            outcome: &mut r.catalog.outcome,
+        },
+        _ => unreachable!(),
+    }
+}
+fn native_ownership<'a>(projector: &'a RunProjector<'_>) -> &'a [NativeResource] {
+    match projector.journal() {
+        StoredJournal::Native(j) => &j.ownership,
+        StoredJournal::NativeIntegration(j) => &j.ownership,
+        _ => unreachable!(),
+    }
+}
+fn native_provider_calls<'a>(projector: &'a RunProjector<'_>) -> &'a [NativeProviderCall] {
+    match projector.journal() {
+        StoredJournal::Native(j) => &j.provider_calls,
+        StoredJournal::NativeIntegration(j) => &j.provider_calls,
         _ => unreachable!(),
     }
 }
 fn run_native(
     recipe: &crate::native::recipe::ValidatedNativeRecipe,
+    integration: Option<&crate::native::integration::ValidatedIntegrationRecipe>,
     options: NativeRunOptions,
     launch: &LaunchAuthority,
     cancel: CancellationToken,
@@ -383,11 +428,30 @@ fn run_native(
         crate::native::recipe::NativeOs::Macos => v2::Os::Macos,
         crate::native::recipe::NativeOs::Windows => v2::Os::Windows,
     };
-    ensure!(
-        os == launch.binding().os
-            && recipe.recipe.manifest_digest == launch.binding().manifest_digest.to_hex(),
-        "native recipe exceeds immutable launch ceiling"
-    );
+    if let Some(integration) = integration {
+        ensure!(
+            integration.recipe.integrations.service.is_some()
+                && integration.recipe.integrations.desktop.is_none(),
+            "integration profile requires supplied service authority; desktop session capability is unavailable"
+        );
+        let (core, integration_m) = launch
+            .integration_components()
+            .ok_or_else(|| anyhow::anyhow!("integration helper profile required"))?;
+        ensure!(
+            os == launch.binding().os
+                && recipe.recipe.manifest_digest == core.to_hex()
+                && integration.integration_manifest_digest == integration_m
+                && integration.full_manifest_digest()? == launch.binding().manifest_digest.to_hex(),
+            "integration recipe exceeds immutable launch ceiling"
+        );
+    } else {
+        ensure!(
+            os == launch.binding().os
+                && launch.integration_components().is_none()
+                && recipe.recipe.manifest_digest == launch.binding().manifest_digest.to_hex(),
+            "native recipe exceeds immutable launch ceiling"
+        );
+    }
     let provider = launch.provider_factory()?;
     let id = format!("native-{}", nonce()?);
     let store = match parent {
@@ -406,11 +470,28 @@ fn run_native(
         failures: vec![],
         outcome: RunOutcome::Incomplete,
     };
-    let mut projector = RunProjector::new(
-        &store,
-        StoredRun::Native(report),
-        StoredJournal::Native(NativeJournal::new(id)),
-    )?;
+    let (selected_report, selected_journal) = if let Some(integration) = integration {
+        (
+            StoredRun::NativeIntegration(crate::native::integration::NativeIntegrationReport::new(
+                id.clone(),
+                integration,
+                options.scenarios.clone(),
+            )?),
+            StoredJournal::NativeIntegration(
+                crate::native::integration::NativeIntegrationJournal::new(
+                    id.clone(),
+                    integration,
+                    options.scenarios.clone(),
+                )?,
+            ),
+        )
+    } else {
+        (
+            StoredRun::Native(report),
+            StoredJournal::Native(NativeJournal::new(id)),
+        )
+    };
+    let mut projector = RunProjector::new(&store, selected_report, selected_journal)?;
     projector.bind_launch(&launch.view().fingerprint)?;
     let mut intent_store = store.intent_store()?;
     let mut owners = Owners {
@@ -445,6 +526,31 @@ fn run_native(
                 outcome: RunOutcome::Incomplete,
                 dispositions: NativeDispositions::default(),
             });
+        if let StoredRun::NativeIntegration(report) = projector.report_mut() {
+            report
+                .integrations
+                .push(crate::native::integration::IntegrationScenarioEvidence {
+                    scenario_id: scenario_id.clone(),
+                    ownership_id: ownership_id.clone(),
+                    services: vec![],
+                    desktops: vec![],
+                    checks: vec![],
+                    dispositions: crate::native::integration::IntegrationDispositions {
+                        helper_worker: Disposition::NotStarted,
+                        registration: Disposition::NotStarted,
+                        manager_action: Disposition::NotStarted,
+                        broker: Disposition::Complete {
+                            receipt: "no desktop broker required".into(),
+                        },
+                        primary: Disposition::Complete {
+                            receipt: "no owned primary required".into(),
+                        },
+                        descendant_scope: Disposition::Complete {
+                            receipt: "no owned descendant scope required".into(),
+                        },
+                    },
+                });
+        }
         projector.save_report()?;
         event(
             &mut owners,
@@ -487,7 +593,15 @@ fn run_native(
                     .provider_claims
                     .push(receipt.clone());
                 let active_launch = launch.with_baseline(&baseline)?;
-                validate_preparation(&active_launch, &baseline, recipe)?;
+                if let Some(integration) = integration {
+                    crate::native::transport::validate_integration_preparation(
+                        &active_launch,
+                        &baseline,
+                        integration,
+                    )?;
+                } else {
+                    validate_preparation(&active_launch, &baseline, recipe)?;
+                }
                 provider_prepared = true;
                 match NativeSession::start_prepared(
                     &active_launch,
@@ -508,6 +622,13 @@ fn run_native(
                     .as_ref()
                     .unwrap()
                     .validate_artifacts(recipe)?;
+                if integration.is_some() {
+                    owners
+                        .session
+                        .as_ref()
+                        .unwrap()
+                        .validate_integration_context(&active_launch, &ownership_id)?;
+                }
                 let prepared = intent_store.prepare(IntentRecord {
                     intent: v2::IntentId::parse(&nonce()?)?,
                     binding: active_launch.binding().binding,
@@ -557,7 +678,15 @@ fn run_native(
             driver.set_cancellation(cancel.clone());
             match catch_unwind(AssertUnwindSafe(|| {
                 driver.set_limits(&options.limits)?;
-                driver.run(kind)
+                if let Some(integration) = integration {
+                    crate::native::integration::driver::IntegrationDriver::new(
+                        &mut driver,
+                        integration,
+                    )
+                    .run(kind)
+                } else {
+                    driver.run(kind)
+                }
             })) {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => owners.errors.push(e),
@@ -631,14 +760,10 @@ fn run_native(
         let mut reset_complete = !provider_started;
         // Even an unknown preparation/acquisition is disposed by original owner identity.
         if local_complete && provider_started {
-            let original = match projector.journal() {
-                StoredJournal::Native(j) => j
-                    .ownership
-                    .iter()
-                    .find(|r| r.ownership_id == ownership_id)
-                    .cloned(),
-                _ => None,
-            };
+            let original = native_ownership(&projector)
+                .iter()
+                .find(|r| r.ownership_id == ownership_id)
+                .cloned();
             if let Some(original) = original {
                 owners.pending_cleanup = true;
                 let reset = catch_unwind(AssertUnwindSafe(|| -> Result<ProviderReceipt> {
@@ -649,14 +774,10 @@ fn run_native(
                         let receipt = owners.provider.as_mut().unwrap().query(prepare)?.ok_or_else(|| anyhow::anyhow!("original provider preparation remains unknown; no new disposition identity authorized"))?;
                         v2::Digest::parse(&receipt.reset_epoch)?;
                         validate_baseline(launch, prepare, receipt.clone())?;
-                        let known = match projector.journal() {
-                            StoredJournal::Native(journal) => journal
-                                .provider_calls
-                                .iter()
-                                .find(|call| &call.invocation == prepare)
-                                .and_then(|call| call.receipt.clone()),
-                            _ => None,
-                        };
+                        let known = native_provider_calls(&projector)
+                            .iter()
+                            .find(|call| &call.invocation == prepare)
+                            .and_then(|call| call.receipt.clone());
                         if let Some(known) = known {
                             ensure!(
                                 known == receipt,
@@ -667,15 +788,11 @@ fn run_native(
                             projector.record_provider_receipt(prepare, receipt)?;
                         }
                     }
-                    let original = match projector.journal() {
-                        StoredJournal::Native(journal) => journal
-                            .ownership
-                            .iter()
-                            .find(|owner| owner.ownership_id == original.ownership_id)
-                            .cloned()
-                            .expect("original preparing owner retained"),
-                        _ => unreachable!(),
-                    };
+                    let original = native_ownership(&projector)
+                        .iter()
+                        .find(|owner| owner.ownership_id == original.ownership_id)
+                        .cloned()
+                        .expect("original preparing owner retained");
                     let invocation = invocation(launch, &original, ProviderAction::Dispose)?;
                     let saved = projector.publish_provider(original, invocation.clone())?;
                     native_report(&mut projector)
@@ -769,7 +886,36 @@ fn run_native(
                 .failures
                 .push("native execution panicked; original payload retained".into());
         }
-        report.outcome = RunOutcome::aggregate(report.scenarios.iter().map(|s| s.outcome));
+        *report.outcome = RunOutcome::aggregate(report.scenarios.iter().map(|s| s.outcome));
+        if let StoredRun::NativeIntegration(report) = projector.report_mut() {
+            let evidence = report.integrations.last_mut().unwrap();
+            evidence.dispositions.helper_worker = if all_local {
+                Disposition::Complete {
+                    receipt: "original helper worker and transport joined".into(),
+                }
+            } else {
+                Disposition::Unknown {
+                    reason: "helper worker original owners retained".into(),
+                }
+            };
+            let sut_failed = evidence
+                .checks
+                .iter()
+                .any(|c| c.outcome == crate::model::CheckOutcome::Failed);
+            let integration_outcome = if sut_failed {
+                RunOutcome::Failed
+            } else if evidence
+                .checks
+                .iter()
+                .any(|c| c.outcome != crate::model::CheckOutcome::Passed)
+                || !evidence.dispositions.complete()
+            {
+                RunOutcome::Incomplete
+            } else {
+                RunOutcome::Passed
+            };
+            report.outcome = RunOutcome::aggregate([report.catalog.outcome, integration_outcome]);
+        }
         if let Err(e) = projector.save_report() {
             owners.errors.push(e)
         }
@@ -788,7 +934,10 @@ fn run_native(
         owners.preparation = None;
     }
     if cancel.is_cancelled() {
-        native_report(&mut projector).outcome = RunOutcome::Cancelled;
+        if let StoredRun::NativeIntegration(report) = projector.report_mut() {
+            report.outcome = RunOutcome::Cancelled;
+        }
+        *native_report(&mut projector).outcome = RunOutcome::Cancelled;
     }
     if let Err(e) = projector.save_report() {
         owners.errors.push(e)

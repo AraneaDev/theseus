@@ -54,9 +54,16 @@ pub fn load_recipe(path: &Path) -> Result<SelectedRecipe> {
 pub fn decode_recipe(bytes: &[u8], path: PathBuf) -> Result<SelectedRecipe> {
     // JSON is the explicit native namespace; malformed JSON cannot fall through to TOML.
     if bytes.iter().copied().find(|b| !b.is_ascii_whitespace()) == Some(b'{') {
-        Ok(SelectedRecipe::Native(ValidatedNativeRecipe::decode(
-            bytes, path,
-        )?))
+        let value = crate::strict_json::parse(std::str::from_utf8(bytes)?)?;
+        if value.get("schema").and_then(serde_json::Value::as_u64) == Some(2) {
+            Ok(SelectedRecipe::NativeIntegration(
+                super::integration::ValidatedIntegrationRecipe::decode(bytes, path)?,
+            ))
+        } else {
+            Ok(SelectedRecipe::Native(ValidatedNativeRecipe::decode(
+                bytes, path,
+            )?))
+        }
     } else {
         Ok(SelectedRecipe::Docker(crate::recipe::parse_bytes(
             &path, bytes,
@@ -94,7 +101,10 @@ pub fn load_run(path: &Path) -> Result<StoredRun> {
         ensure!(
             !matches!(
                 (&run, name),
-                (StoredRun::Native(_), "report.json") | (StoredRun::Docker(_), REPORT_FILENAME)
+                (
+                    StoredRun::Native(_) | StoredRun::NativeIntegration(_),
+                    "report.json"
+                ) | (StoredRun::Docker(_), REPORT_FILENAME)
             ),
             "artifact filename/family mismatch"
         );
@@ -112,8 +122,10 @@ pub fn load_journal(path: &Path) -> Result<StoredJournal> {
     ensure!(
         !matches!(
             (&journal, path.file_name().and_then(|n| n.to_str())),
-            (StoredJournal::Native(_), Some("journal.json"))
-                | (StoredJournal::Docker(_), Some(JOURNAL_FILENAME))
+            (
+                StoredJournal::Native(_) | StoredJournal::NativeIntegration(_),
+                Some("journal.json")
+            ) | (StoredJournal::Docker(_), Some(JOURNAL_FILENAME))
         ),
         "journal filename/family mismatch"
     );
@@ -236,4 +248,47 @@ pub(crate) fn ensure_legacy_namespace(bytes: &[u8]) -> Result<()> {
     serde::de::Deserializer::deserialize_map(&mut decoder, Legacy)?;
     decoder.end()?;
     Ok(())
+}
+
+/// Decode both native artifacts before returning either selected envelope.
+pub fn load_native_versioned(
+    store: &crate::report::ReportStore,
+) -> Result<(
+    super::integration::NativeReportVersion,
+    super::integration::NativeJournalVersion,
+)> {
+    use super::integration::*;
+    require_family(store.artifact_family()?, ArtifactFamily::Native)?;
+    let report = store.read_bytes(REPORT_FILENAME)?;
+    let journal = store.read_bytes(JOURNAL_FILENAME)?;
+    let version = |bytes: &[u8]| -> Result<u64> {
+        let value = crate::strict_json::parse(std::str::from_utf8(bytes)?)?;
+        value
+            .get("schema")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("missing native schema"))
+    };
+    let schema = version(&report)?;
+    ensure!(schema == version(&journal)?, "mixed native schema pair");
+    match schema {
+        1 => {
+            let r = NativeReport::decode(&report)?;
+            let j = NativeJournal::decode(&journal)?;
+            ensure!(r.run_id == j.run_id, "native run identity mismatch");
+            Ok((
+                NativeReportVersion::CatalogV1(r),
+                NativeJournalVersion::CatalogV1(j),
+            ))
+        }
+        2 => {
+            let r = NativeIntegrationReport::decode(&report)?;
+            let j = NativeIntegrationJournal::decode(&journal)?;
+            super::integration::model::validate_pair(&r, &j)?;
+            Ok((
+                NativeReportVersion::IntegrationV2(r),
+                NativeJournalVersion::IntegrationV2(j),
+            ))
+        }
+        _ => bail!("unsupported native schema"),
+    }
 }

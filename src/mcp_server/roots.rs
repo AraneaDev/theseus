@@ -111,7 +111,10 @@ pub(crate) fn read_recipe(
 ) -> Result<crate::recipe::ValidatedRecipe, QueryError> {
     match read_selected_recipe(roots, path)? {
         crate::engine::domain::SelectedRecipe::Docker(recipe) => Ok(recipe),
-        crate::engine::domain::SelectedRecipe::Native(_) => Err(error(ErrorCode::RecipeInvalid)),
+        crate::engine::domain::SelectedRecipe::Native(_)
+        | crate::engine::domain::SelectedRecipe::NativeIntegration(_) => {
+            Err(error(ErrorCode::RecipeInvalid))
+        }
     }
 }
 pub(crate) fn read_selected_recipe(

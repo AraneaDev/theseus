@@ -17,19 +17,28 @@ use anyhow::{Result, bail};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
+// Frozen closed metadata sum; variants carry schema DTOs, never native owners.
+#[allow(clippy::large_enum_variant)]
 pub enum SelectedRecipe {
     Docker(ValidatedRecipe),
     Native(ValidatedNativeRecipe),
+    NativeIntegration(crate::native::integration::ValidatedIntegrationRecipe),
 }
 #[derive(Debug, Clone)]
+// Frozen closed metadata sum; variants carry schema DTOs, never native owners.
+#[allow(clippy::large_enum_variant)]
 pub enum StoredRun {
     Docker(RunReport),
     Native(NativeReport),
+    NativeIntegration(crate::native::integration::NativeIntegrationReport),
 }
 #[derive(Debug, Clone)]
+// Frozen closed metadata sum; variants carry schema DTOs, never native owners.
+#[allow(clippy::large_enum_variant)]
 pub enum StoredJournal {
     Docker(RunJournal),
     Native(NativeJournal),
+    NativeIntegration(crate::native::integration::NativeIntegrationJournal),
 }
 #[derive(Debug, Clone)]
 pub struct NativeRunOptions {
@@ -37,10 +46,12 @@ pub struct NativeRunOptions {
     pub scenarios: Vec<ScenarioKind>,
     pub limits: NativeRunLimits,
 }
+pub type NativeIntegrationRunOptions = NativeRunOptions;
 #[derive(Debug, Clone)]
 pub enum SelectedRunOptions {
     Docker(RunOptions),
     Native(NativeRunOptions),
+    NativeIntegration(NativeIntegrationRunOptions),
 }
 pub struct SelectedRunResult {
     pub report: StoredRun,
@@ -95,6 +106,16 @@ pub struct LifecyclePlan {
 impl LifecyclePlan {
     pub fn compile_step(&self, scenario: &ScenarioPlan, step: StepName) -> Result<StageCommand> {
         match (&self.recipe, scenario.role) {
+            (SelectedRecipe::NativeIntegration(recipe), LifecycleRole::NativeCurrentAccount) => {
+                recipe
+                    .core
+                    .recipe
+                    .steps
+                    .get(&step)
+                    .cloned()
+                    .map(StageCommand::Native)
+                    .ok_or_else(|| anyhow::anyhow!("missing integration step {step}"))
+            }
             (SelectedRecipe::Native(recipe), LifecycleRole::NativeCurrentAccount) => recipe
                 .recipe
                 .steps
@@ -155,12 +176,27 @@ pub fn compile(recipe: &SelectedRecipe, selection: &SelectedRunOptions) -> Resul
                 })
                 .collect()
         }
+        (
+            SelectedRecipe::NativeIntegration(recipe),
+            SelectedRunOptions::NativeIntegration(options),
+        ) => {
+            recipe.validate_selection(&options.scenarios, &options.limits)?;
+            options
+                .scenarios
+                .iter()
+                .map(|kind| ScenarioPlan {
+                    kind: *kind,
+                    role: LifecycleRole::NativeCurrentAccount,
+                })
+                .collect()
+        }
         _ => bail!("recipe/options backend mismatch"),
     };
     Ok(LifecyclePlan {
         source_digest: match recipe {
             SelectedRecipe::Docker(r) => r.digest.clone(),
             SelectedRecipe::Native(r) => r.digest.clone(),
+            SelectedRecipe::NativeIntegration(r) => r.digest.clone(),
         },
         scenarios,
         recipe: recipe.clone(),

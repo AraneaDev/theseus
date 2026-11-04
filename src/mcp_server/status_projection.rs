@@ -42,6 +42,7 @@ pub(crate) fn saved_view(snapshot: &ReportSnapshot) -> Result<SavedView, QueryEr
         .filter(|v| (1..=8).contains(v))
         .ok_or_else(|| error(ErrorCode::EvidenceInvalid))?;
     Ok(SavedView {
+        integration: None,
         native_dispositions: None,
         revision: Revision::parse(&snapshot.revision)
             .map_err(|_| error(ErrorCode::EvidenceInvalid))?,
@@ -117,30 +118,22 @@ mod tests;
 pub(super) fn project_native_snapshot(
     snapshot: &super::native_evidence::Snapshot,
 ) -> Result<SavedProjection, QueryError> {
-    use crate::{model::CheckOutcome, native::model::Disposition};
+    use crate::native::{integration::model::NativeReportVersion, model::Disposition};
     let report = &snapshot.report;
-    let mut total = ResultCounts::default();
-    for scenario in &report.scenarios {
-        for stage in &scenario.stages {
-            total.commands += stage.commands.len();
-            for check in &stage.checks {
-                match check.outcome {
-                    CheckOutcome::Passed => total.passed_checks += 1,
-                    CheckOutcome::Failed => total.failed_checks += 1,
-                    CheckOutcome::Incomplete => total.incomplete_checks += 1,
-                    CheckOutcome::Skipped => total.skipped_checks += 1,
-                }
-            }
-        }
-    }
-    let guest = if report.scenarios.iter().any(|s| {
+    let scenarios = report.consumer_scenarios();
+    let total = report.consumer_counts();
+    let integration = match report {
+        NativeReportVersion::IntegrationV2(r) => Some(crate::native::integration::view::summary(r)),
+        _ => None,
+    };
+    let catalog_guest = if scenarios.iter().any(|s| {
         matches!(s.dispositions.remote, Disposition::Failed { .. })
             || matches!(s.dispositions.release, Disposition::Failed { .. })
             || matches!(s.dispositions.reset, Disposition::Failed { .. })
     }) {
         GuestCleanup::Failed
-    } else if !report.scenarios.is_empty()
-        && report.scenarios.iter().all(|s| {
+    } else if !scenarios.is_empty()
+        && scenarios.iter().all(|s| {
             matches!(s.dispositions.remote, Disposition::Complete { .. })
                 && matches!(s.dispositions.release, Disposition::Complete { .. })
                 && matches!(s.dispositions.reset, Disposition::Complete { .. })
@@ -150,11 +143,34 @@ pub(super) fn project_native_snapshot(
     } else {
         GuestCleanup::Unknown
     };
+    let guest = if let Some(summary) = &integration {
+        let flags = [
+            &summary.helper_worker,
+            &summary.registration,
+            &summary.manager_action,
+            &summary.broker,
+            &summary.primary,
+            &summary.descendant_scope,
+        ];
+        if matches!(catalog_guest, GuestCleanup::Failed) || flags.iter().any(|f| f.failed != 0) {
+            GuestCleanup::Failed
+        } else if matches!(catalog_guest, GuestCleanup::Complete)
+            && flags
+                .iter()
+                .all(|f| f.resources != 0 && f.complete == f.resources)
+        {
+            GuestCleanup::Complete
+        } else {
+            GuestCleanup::Unknown
+        }
+    } else {
+        catalog_guest
+    };
     Ok(SavedProjection {
         saved: SavedView {
+            integration,
             native_dispositions: Some(
-                report
-                    .scenarios
+                scenarios
                     .iter()
                     .map(|s| {
                         let view = |d: &Disposition| match d {
@@ -181,8 +197,12 @@ pub(super) fn project_native_snapshot(
             ),
             revision: Revision::parse(&snapshot.revision)
                 .map_err(|_| error(ErrorCode::EvidenceInvalid))?,
-            schema_version: 1,
-            outcome: report.outcome,
+            schema_version: if matches!(report, NativeReportVersion::IntegrationV2(_)) {
+                2
+            } else {
+                1
+            },
+            outcome: report.consumer_outcome(),
             counts: counts(&total)?,
             finished_at: None,
         },

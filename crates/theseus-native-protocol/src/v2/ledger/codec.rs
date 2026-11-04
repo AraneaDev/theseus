@@ -45,6 +45,43 @@ impl Serialize for EntryRef<'_> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let mut m = s.serialize_map(None)?;
         match self.0 {
+            Entry::IntegrationHeader {
+                artifact_commitment,
+                binding,
+                manifest_digest,
+                workspace_marker,
+                os,
+                provider_epoch,
+                core_manifest_digest,
+                integration_manifest_digest,
+                context_digest,
+                ownership_id,
+            } => {
+                m.serialize_entry("kind", "integration_header")?;
+                m.serialize_entry("artifact_commitment", &artifact_commitment.to_hex())?;
+                m.serialize_entry("profile", "native_integration_v1")?;
+                m.serialize_entry("binding", &binding.to_hex())?;
+                m.serialize_entry("manifest_digest", &manifest_digest.to_hex())?;
+                m.serialize_entry("workspace_marker", &workspace_marker.to_hex())?;
+                m.serialize_entry(
+                    "os",
+                    match os {
+                        Os::Linux => "linux",
+                        Os::Macos => "macos",
+                        Os::Windows => "windows",
+                    },
+                )?;
+                m.serialize_entry("provider_epoch", &provider_epoch.to_hex())?;
+                m.serialize_entry("core_manifest_digest", &core_manifest_digest.to_hex())?;
+                m.serialize_entry(
+                    "integration_manifest_digest",
+                    &integration_manifest_digest.to_hex(),
+                )?;
+                m.serialize_entry("context_digest", &context_digest.to_hex())?;
+                m.serialize_entry("ownership_id", ownership_id)?;
+                m.serialize_entry("capabilities", &IntegrationCapabilities::NAMES)?;
+                m.serialize_entry("durability", "file_flushed_process_crash")?;
+            }
             Entry::NativeAuthorityRevoked { lease, reason } => {
                 m.serialize_entry("kind", "native_authority_revoked")?;
                 m.serialize_entry("lease", &lease.to_hex())?;
@@ -124,6 +161,7 @@ impl Serialize for EntryRef<'_> {
                     match operation_kind {
                         OperationKind::CreateFile => "create_file",
                         OperationKind::Run => "run",
+                        OperationKind::ServiceAction => "service_action",
                     },
                 )?;
             }
@@ -164,7 +202,10 @@ pub fn encode(r: &Record) -> Result<Vec<u8>, LedgerError> {
 }
 /// Domain separated digest of a canonical mutating request. No authorization is implied.
 pub fn request_digest(v: &Request) -> Result<Digest, Error> {
-    if !matches!(v, Request::CreateFile { .. } | Request::Run { .. }) {
+    if !matches!(
+        v,
+        Request::CreateFile { .. } | Request::Run { .. } | Request::ServiceAction { .. }
+    ) {
         return Err(Error::InvalidValue);
     }
     let mut w = CappedWriter::<{ v2::MAX_BODY_BYTES }>::new();
@@ -254,6 +295,47 @@ fn decode(b: &[u8], hash: &[u8; 32]) -> Result<Record, LedgerError> {
                 _ => return Err(LedgerError::InvalidRecord),
             },
         },
+        "integration_header" => {
+            e.literal("profile", "native_integration_v1")?;
+            if e.take("capabilities")? != serde_json::json!(IntegrationCapabilities::NAMES) {
+                return Err(LedgerError::InvalidRecord);
+            }
+            let binding = scalar(BindingId::parse(&e.text("binding")?))?;
+            let manifest_digest = scalar(Digest::parse(&e.text("manifest_digest")?))?;
+            let workspace_marker = scalar(WorkspaceMarker::parse(&e.text("workspace_marker")?))?;
+            let provider_epoch = scalar(Digest::parse(&e.text("provider_epoch")?))?;
+            let core_manifest_digest = scalar(Digest::parse(&e.text("core_manifest_digest")?))?;
+            let integration_manifest_digest =
+                scalar(Digest::parse(&e.text("integration_manifest_digest")?))?;
+            let context_digest = scalar(Digest::parse(&e.text("context_digest")?))?;
+            let ownership_id = e.text("ownership_id")?;
+            if v2::integration_manifest_digest(core_manifest_digest, integration_manifest_digest)
+                != manifest_digest
+                || ownership_id.is_empty()
+                || ownership_id.len() > 128
+            {
+                return Err(LedgerError::InvalidRecord);
+            }
+            let os = match e.text("os")?.as_str() {
+                "linux" => Os::Linux,
+                "macos" => Os::Macos,
+                "windows" => Os::Windows,
+                _ => return Err(LedgerError::InvalidRecord),
+            };
+            e.literal("durability", "file_flushed_process_crash")?;
+            Entry::IntegrationHeader {
+                artifact_commitment: scalar(Digest::parse(&e.text("artifact_commitment")?))?,
+                binding,
+                manifest_digest,
+                workspace_marker,
+                os,
+                provider_epoch,
+                core_manifest_digest,
+                integration_manifest_digest,
+                context_digest,
+                ownership_id,
+            }
+        }
         "native_header" => {
             e.literal("profile", "native_catalog_v1")?;
             if e.take("capabilities")? != serde_json::json!(NativeCapabilities::NAMES) {
@@ -309,6 +391,7 @@ fn decode(b: &[u8], hash: &[u8; 32]) -> Result<Record, LedgerError> {
             operation_kind: match e.text("operation_kind")?.as_str() {
                 "create_file" => OperationKind::CreateFile,
                 "run" => OperationKind::Run,
+                "service_action" => OperationKind::ServiceAction,
                 _ => return Err(LedgerError::InvalidRecord),
             },
         },

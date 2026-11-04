@@ -54,6 +54,10 @@ impl<'a, 's> NativeDriver<'a, 's> {
         self.cancel = cancel;
     }
     pub fn run(&mut self, kind: ScenarioKind) -> Result<()> {
+        self.prepare(kind)?;
+        common::run_common(self, kind)
+    }
+    pub(crate) fn prepare(&mut self, kind: ScenarioKind) -> Result<()> {
         self.session.validate_artifacts(self.recipe)?;
         self.scenario_kind = Some(kind);
         let observations = self.capture()?;
@@ -73,15 +77,15 @@ impl<'a, 's> NativeDriver<'a, 's> {
             native_files: observations,
             failures: vec![],
         })?;
-        common::run_common(self, kind)
+        Ok(())
     }
-    fn lease(&self) -> Result<v2::LeaseId> {
+    pub(crate) fn lease(&self) -> Result<v2::LeaseId> {
         match &self.resource.resource().ownership {
             NativeOwnership::Acquired { lease, .. } => Ok(v2::LeaseId::parse(lease)?),
             _ => bail!("native driver requires published acquired resource"),
         }
     }
-    fn wait_reply(&mut self, id: theseus_native_client::RequestId) -> Result<v2::Reply> {
+    pub(crate) fn wait_reply(&mut self, id: theseus_native_client::RequestId) -> Result<v2::Reply> {
         let end = Instant::now() + Duration::from_secs(self.limits.inspection_seconds);
         loop {
             ensure!(
@@ -96,11 +100,16 @@ impl<'a, 's> NativeDriver<'a, 's> {
             }
         }
     }
-    fn execute(&mut self, command: CatalogCommand) -> Result<NativeCommandEvidence> {
+    pub(crate) fn reserve_operation(&mut self) -> Result<()> {
         ensure!(
             self.operation_count < self.limits.max_operations,
             "native operation budget exhausted before effect"
         );
+        self.operation_count += 1;
+        Ok(())
+    }
+    fn execute(&mut self, command: CatalogCommand) -> Result<NativeCommandEvidence> {
+        self.reserve_operation()?;
         let lease = self.lease()?;
         let mut bytes = [0; 16];
         theseus_host::random_bytes(&mut bytes)?;
@@ -120,7 +129,6 @@ impl<'a, 's> NativeDriver<'a, 's> {
                 reason: "published; completion unproved".into(),
             },
         };
-        self.operation_count += 1;
         let saved = self
             .projector
             .publish_command(&self.resource, op)?
@@ -355,14 +363,13 @@ impl<'a, 's> NativeDriver<'a, 's> {
     }
     fn record_stage(&mut self, stage: NativeStage) -> Result<()> {
         let owner = &self.resource.resource().ownership_id;
-        if let crate::engine::domain::StoredRun::Native(report) = self.projector.report_mut() {
-            let scenario = report
-                .scenarios
-                .iter_mut()
-                .find(|s| &s.ownership_id == owner)
-                .ok_or_else(|| anyhow::anyhow!("native report scenario missing"))?;
-            scenario.stages.push(stage);
-        }
+        let scenario = self
+            .projector
+            .catalog_scenarios_mut()?
+            .iter_mut()
+            .find(|s| &s.ownership_id == owner)
+            .ok_or_else(|| anyhow::anyhow!("native report scenario missing"))?;
+        scenario.stages.push(stage);
         self.projector.save_report()
     }
 }

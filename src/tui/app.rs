@@ -108,6 +108,29 @@ impl App {
         self.root = root;
         self.view_revision = self.view_revision.wrapping_add(1);
     }
+    pub fn integration_offline(
+        report: crate::native::integration::model::NativeIntegrationReport,
+        root: PathBuf,
+    ) -> Self {
+        let mut app = Self::offline(RunReport::new("unused"), root);
+        app.report = None;
+        app.native = Some(super::native::NativeView::integration_offline(report));
+        app.status = "Offline native integration report".into();
+        app
+    }
+    pub fn set_integration_report(
+        &mut self,
+        report: crate::native::integration::model::NativeIntegrationReport,
+        root: PathBuf,
+    ) {
+        if let Some(view) = &mut self.native {
+            view.set_integration_report(report);
+        } else {
+            self.native = Some(super::native::NativeView::integration_offline(report));
+        }
+        self.root = root;
+        self.view_revision = self.view_revision.wrapping_add(1);
+    }
     pub fn native_preview(text: String) -> Self {
         let mut app = Self::offline(RunReport::new("unused"), PathBuf::new());
         app.report = None;

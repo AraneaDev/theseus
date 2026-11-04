@@ -230,6 +230,9 @@ impl Dispatcher {
             }
             | v2::Request::CreateFile {
                 lease, operation, ..
+            }
+            | v2::Request::ServiceAction {
+                lease, operation, ..
             } => {
                 if self.cache.live.as_ref().is_some_and(|l| {
                     l.key.lease == *lease && l.key.operation == *operation && l.terminal.is_some()
@@ -248,9 +251,12 @@ impl Dispatcher {
                 let flag = Arc::new(AtomicBool::new(false));
                 let (grant, start) = start_pair(key, sequence);
                 let is_file = matches!(request, v2::Request::CreateFile { .. });
+                let is_service = matches!(request, v2::Request::ServiceAction { .. });
                 self.cache.begin_kind(
                     key,
-                    if is_file {
+                    if is_service {
+                        v2::OperationKind::ServiceAction
+                    } else if is_file {
                         v2::OperationKind::CreateFile
                     } else {
                         v2::OperationKind::Run
@@ -266,7 +272,14 @@ impl Dispatcher {
                     requires_accepted: false,
                     terminal_admitted: false,
                 });
-                if is_file {
+                if is_service {
+                    WorkerCommand::ServiceAction {
+                        request,
+                        ticket,
+                        cancel: CancelToken { key, flag },
+                        start,
+                    }
+                } else if is_file {
                     WorkerCommand::CreateFile {
                         request,
                         ticket,
@@ -282,6 +295,8 @@ impl Dispatcher {
                     }
                 }
             }
+            v2::Request::ProbeReadiness { .. } => WorkerCommand::ProbeReadiness { request, ticket },
+            v2::Request::InspectService { .. } => WorkerCommand::InspectService { request, ticket },
             v2::Request::ReadFile { .. } => WorkerCommand::ReadFile { request, ticket },
             v2::Request::InspectFile { .. } | v2::Request::InspectNativeFile { .. } => {
                 WorkerCommand::InspectFile { request, ticket }
@@ -305,8 +320,11 @@ impl Dispatcher {
                     WorkerCommand::Acquire { ticket, .. }
                     | WorkerCommand::Release { ticket, .. }
                     | WorkerCommand::ReadFile { ticket, .. }
-                    | WorkerCommand::InspectFile { ticket, .. } => ticket,
-                    WorkerCommand::Run { ticket, .. }
+                    | WorkerCommand::InspectFile { ticket, .. }
+                    | WorkerCommand::InspectService { ticket, .. }
+                    | WorkerCommand::ProbeReadiness { ticket, .. } => ticket,
+                    WorkerCommand::ServiceAction { ticket, .. }
+                    | WorkerCommand::Run { ticket, .. }
                     | WorkerCommand::CreateFile { ticket, .. } => {
                         self.active = None;
                         self.barrier = None;
@@ -439,7 +457,9 @@ impl Dispatcher {
             &pending.reply,
             v2::Reply::Operation {
                 state: v2::OperationView::Accepted {
-                    operation_kind: v2::OperationKind::Run | v2::OperationKind::CreateFile
+                    operation_kind: v2::OperationKind::Run
+                        | v2::OperationKind::CreateFile
+                        | v2::OperationKind::ServiceAction
                 },
                 ..
             }
@@ -662,6 +682,19 @@ mod tests {
         }
     }
     fn ready() -> (Dispatcher, WorkerPorts, [DataPermit; 4]) {
+        ready_with(v2::Reply::Description {
+            binding: v2::BindingId::from_bytes([1; 16]),
+            manifest_digest: v2::Digest::from_bytes([2; 32]),
+            workspace_marker: v2::WorkspaceMarker::from_bytes([3; 16]),
+            os: v2::Os::Linux,
+            helper_principal: v2::Principal::Posix {
+                effective_uid: 1,
+                effective_gid: 1,
+            },
+            programs: v2::ProgramList::new(vec![v2::ProgramId::new("probe").unwrap()]).unwrap(),
+        })
+    }
+    fn ready_with(description: v2::Reply) -> (Dispatcher, WorkerPorts, [DataPermit; 4]) {
         let (ports, worker, controls, data) = channels();
         let mut d = Dispatcher::new(ports, controls);
         incoming(
@@ -675,18 +708,7 @@ mod tests {
         worker
             .events
             .try_send(WorkerEvent::CacheUpdate(CachePatch::Initialized {
-                description: v2::Reply::Description {
-                    binding: v2::BindingId::from_bytes([1; 16]),
-                    manifest_digest: v2::Digest::from_bytes([2; 32]),
-                    workspace_marker: v2::WorkspaceMarker::from_bytes([3; 16]),
-                    os: v2::Os::Linux,
-                    helper_principal: v2::Principal::Posix {
-                        effective_uid: 1,
-                        effective_gid: 1,
-                    },
-                    programs: v2::ProgramList::new(vec![v2::ProgramId::new("probe").unwrap()])
-                        .unwrap(),
-                },
+                description,
                 lease: Some((
                     v2::IntentId::from_bytes([4; 16]),
                     v2::LeaseId::from_bytes([5; 16]),
@@ -709,6 +731,130 @@ mod tests {
         d.response_quantum().unwrap();
         flush(&mut d);
         (d, worker, data)
+    }
+    fn integration_description() -> v2::Reply {
+        let core = v2::Digest::from_bytes([2; 32]);
+        let manifest:v2::IntegrationManifest=serde_json::from_value(serde_json::json!({"schema":1,"core_manifest_digest":core.to_hex(),"readiness":null,"service_authority":{"kind":"systemd","slot":"fixture_service","scope":"user","bus_endpoint":{"kind":"unix_path","path":"/fixture/bus"},"qualification":{"manager":"systemd","version":"fixture","api_profile":"systemd_dbus_private_v1","features":["unit_properties","start_stop","manager_reload"],"receipt_sha256":"11".repeat(32)},"namespace":{"kind":"exclusive_owned_registration","slot":"fixture_service","unit_load_roots":["/fixture/units"],"dropins":"forbidden","provider_context":"private"},"manager_context":{"kind":"whole_private","slot":"private_manager","sut_allowed_actions":["daemon_reload"],"rehearsal_allowed_actions":[],"provider_receipt_required":true},"expected_peer_uid":1,"expected_manager_uid":1,"definition_root":"/fixture/units","unit":"fixture.service","managed_by":"installer","sut_effects":["registration","configuration","removal","daemon_reload"],"allowed_actions":["inspect","start","stop"]},"definitions":[{"role":"configured","artifact":"target","executable":"/fixture/reader","arguments":["/fixture/reader"],"environment":[],"working_directory":"/fixture","definition_sha256":"22".repeat(32)}],"artifact_slots":[],"readiness_protocol":"theseus_fixture_ready_v1","desktop_capabilities":[]})).unwrap();
+        let integration = manifest.digest().unwrap();
+        v2::Reply::IntegrationDescription {
+            description: Box::new(v2::IntegrationDescription {
+                native: v2::NativeDescription {
+                    binding: v2::BindingId::from_bytes([1; 16]),
+                    manifest_digest: v2::integration_manifest_digest(core, integration),
+                    workspace_marker: v2::WorkspaceMarker::from_bytes([3; 16]),
+                    os: v2::Os::Linux,
+                    helper_principal: v2::Principal::Posix {
+                        effective_uid: 1,
+                        effective_gid: 1,
+                    },
+                    programs: v2::ProgramList::new(
+                        [
+                            "check_base",
+                            "check_data",
+                            "check_target",
+                            "configure",
+                            "exercise",
+                            "install_base",
+                            "install_target",
+                            "uninstall",
+                        ]
+                        .into_iter()
+                        .map(|id| v2::ProgramId::new(id).unwrap())
+                        .collect(),
+                    )
+                    .unwrap(),
+                    capabilities: v2::NativeCapabilities,
+                    provider_epoch: v2::Digest::from_bytes([4; 32]),
+                    artifact_commitment: v2::Digest::from_bytes([5; 32]),
+                    build: v2::Provenance::Unavailable {
+                        reason: "fixture".into(),
+                    },
+                    os_build: v2::Provenance::Unavailable {
+                        reason: "fixture".into(),
+                    },
+                },
+                core_manifest_digest: core,
+                integration_manifest_digest: integration,
+                capabilities: v2::IntegrationCapabilities,
+                context_digest: v2::Digest::from_bytes([6; 32]),
+                ownership_id: "fixture-owner".into(),
+                namespace_receipt_digest: v2::Digest::from_bytes([7; 32]),
+                manifest: Box::new(manifest),
+            }),
+        }
+    }
+    #[test]
+    fn service_acceptance_is_admitted_before_exact_start_grant_and_cached_cancel_stays_responsive()
+    {
+        let (mut d, w, _) = ready_with(integration_description());
+        let lease = v2::LeaseId::from_bytes([5; 16]);
+        let operation = v2::OperationId::from_bytes([6; 16]);
+        incoming(
+            &mut d,
+            2,
+            v2::Message::Request {
+                request: v2::Request::ServiceAction {
+                    lease,
+                    operation,
+                    slot: v2::ResourceSlot::new("fixture_service").unwrap(),
+                    prior_binding_digest: v2::Digest::from_bytes([8; 32]),
+                    action: v2::ServiceAction::Start,
+                },
+            },
+        );
+        let WorkerCommand::ServiceAction {
+            ticket,
+            cancel,
+            start,
+            ..
+        } = w.commands.try_recv().ok().unwrap()
+        else {
+            panic!("expected service action")
+        };
+        let key = cancel.key;
+        let flag = cancel.flag.clone();
+        let now = std::time::Instant::now();
+        w.events
+            .try_send(WorkerEvent::CacheUpdate(CachePatch::Phase {
+                key,
+                kind: v2::OperationKind::ServiceAction,
+                phase: LivePhase::Accepted,
+                accepted_at: Some(now),
+                deadline: Some(now + std::time::Duration::from_secs(30)),
+            }))
+            .ok()
+            .unwrap();
+        d.event_quantum().unwrap();
+        w.events
+            .try_send(WorkerEvent::ResponseReady {
+                ticket,
+                reply: v2::Reply::Operation {
+                    lease,
+                    operation,
+                    state: v2::OperationView::Accepted {
+                        operation_kind: v2::OperationKind::ServiceAction,
+                    },
+                },
+                start_key: Some(key),
+            })
+            .ok()
+            .unwrap();
+        d.event_quantum().unwrap();
+        assert!(matches!(start.poll(), StartState::Waiting));
+        assert!(d.response_quantum().unwrap());
+        assert!(matches!(start.poll(), StartState::Granted));
+        assert_eq!(d.frames.len(), 1);
+        flush(&mut d);
+        incoming(
+            &mut d,
+            3,
+            v2::Message::Request {
+                request: v2::Request::Cancel { lease, operation },
+            },
+        );
+        assert!(flag.load(Ordering::Acquire));
+        assert!(w.commands.try_recv().is_err());
+        assert!(d.response_quantum().unwrap());
     }
     fn run(d: &mut Dispatcher, w: &WorkerPorts) -> (RunKey, StartWatch) {
         incoming(

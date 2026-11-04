@@ -12,6 +12,7 @@ description = "Installation lifecycle workbench with Docker evidence and a termi
 
 [features]
 native-catalog-test-support = []
+native-integration-test-support = []
 mcp-test-support = ["theseus-host/test-support"]
 
 [[bin]]
@@ -61,3 +62,28 @@ required-features = ["native-catalog-test-support"]
 name = "theseus-native-target-reader"
 path = "src/bin/theseus-native-target-reader.rs"
 required-features = ["native-catalog-test-support"]
+
+[[bin]]
+name = "theseus-native-integration-controller"
+path = "src/bin/theseus-native-integration-controller.rs"
+required-features = ["native-integration-test-support"]
+
+[[bin]]
+name = "theseus-native-service-fixture"
+path = "src/bin/theseus-native-service-fixture.rs"
+required-features = ["native-integration-test-support"]
+
+[[bin]]
+name = "theseus-native-service-base"
+path = "src/bin/theseus-native-service-base.rs"
+required-features = ["native-integration-test-support"]
+
+[[bin]]
+name = "theseus-native-service-target"
+path = "src/bin/theseus-native-service-target.rs"
+required-features = ["native-integration-test-support"]
+
+# Fixture qualification hashes large native images repeatedly. Keep hashing
+# optimized in development/tests so verification does not dominate CI time.
+[profile.dev.package.sha2]
+opt-level = 3

@@ -37,6 +37,7 @@ pub(crate) struct Pump {
     describe: Option<u64>,
     pub(crate) ready: bool,
     pub(crate) artifact_commitment: Option<v2::Digest>,
+    pub(crate) integration_description: Option<v2::IntegrationDescription>,
     started: Instant,
     pub(crate) residual: Vec<u8>,
 }
@@ -53,6 +54,7 @@ impl Pump {
             describe: None,
             ready: false,
             artifact_commitment: None,
+            integration_description: None,
             started: Instant::now(),
             residual: Vec::with_capacity(4096),
         };
@@ -146,6 +148,33 @@ impl Pump {
                         {
                             return Err(ClientError::Preflight);
                         }
+                        self.ready = true;
+                        Some(Event::Ready)
+                    }
+                    v2::Reply::IntegrationDescription { description: d } => {
+                        let b = &expected.binding;
+                        let native = &d.native;
+                        if expected.profile
+                            != (v2::HelperProfile::Integration {
+                                provider_epoch: native.provider_epoch,
+                                core_manifest_digest: d.core_manifest_digest,
+                                integration_manifest_digest: d.integration_manifest_digest,
+                            })
+                            || native.binding != b.binding
+                            || native.manifest_digest != b.manifest_digest
+                            || native.workspace_marker != b.workspace_marker
+                            || native.os != b.os
+                            || native.programs != expected.programs
+                            || v2::integration_manifest_digest(
+                                d.core_manifest_digest,
+                                d.integration_manifest_digest,
+                            ) != native.manifest_digest
+                            || d.capabilities != v2::IntegrationCapabilities
+                        {
+                            return Err(ClientError::Preflight);
+                        }
+                        self.artifact_commitment = Some(native.artifact_commitment);
+                        self.integration_description = Some(*d.clone());
                         self.ready = true;
                         Some(Event::Ready)
                     }

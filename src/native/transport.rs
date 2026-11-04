@@ -1,5 +1,6 @@
 //! Pollable owned local transport. Remote settlement is deliberately separate.
 use super::launch::{LaunchAuthority, LaunchPreparation};
+use sha2::{Digest as _, Sha256};
 use std::time::{Duration, Instant};
 use theseus_native_client::{
     Action, Client, ClientError, ClientMode, Event, Poll, RequestId, StartFailure,
@@ -10,6 +11,47 @@ pub struct NativeSession {
     prepared_intent: Option<theseus_native_helper_store::PreparedAcquire>,
 }
 impl NativeSession {
+    pub fn integration_description(
+        &self,
+    ) -> Option<&theseus_native_protocol::v2::IntegrationDescription> {
+        self.client.integration_description()
+    }
+    /// Bind provider-reported per-instance manager context to the observed helper
+    /// before any acquisition or integration action.
+    pub fn validate_integration_context(
+        &self,
+        launch: &LaunchAuthority,
+        ownership_id: &str,
+    ) -> anyhow::Result<()> {
+        let context = launch
+            .integration_context()
+            .ok_or_else(|| anyhow::anyhow!("original integration context missing"))?;
+        let description = self
+            .client
+            .integration_description()
+            .ok_or_else(|| anyhow::anyhow!("integration description not observed"))?;
+        description
+            .manifest
+            .validate_context(context, launch.binding().os)?;
+        let (core, integration) = launch
+            .integration_components()
+            .ok_or_else(|| anyhow::anyhow!("integration ceiling missing"))?;
+        anyhow::ensure!(
+            context.ownership_id == ownership_id
+                && description.ownership_id == ownership_id
+                && description.context_digest == context.digest()?
+                && description.namespace_receipt_digest
+                    == theseus_native_protocol::v2::Digest::from_bytes(
+                        Sha256::digest(context.namespace_receipt.as_bytes()).into()
+                    )
+                && description.core_manifest_digest == core
+                && description.integration_manifest_digest == integration
+                && launch.integration_service_authority()
+                    == Some(&description.manifest.service_authority),
+            "helper integration context differs from original provider ownership"
+        );
+        Ok(())
+    }
     /// Refuse recipe artifact facts that differ from the authenticated catalog
     /// before acquiring a lease or executing any lifecycle commands.
     pub fn validate_artifacts(
@@ -129,6 +171,42 @@ pub fn validate_preparation(
         recipe.recipe.manifest_digest == launch.binding().manifest_digest.to_hex()
             && baseline.receipt().reset_epoch == launch.provider_epoch().to_hex(),
         "native baseline/recipe differs from launch"
+    );
+    Ok(())
+}
+
+/// Schema2 commits core and integration separately; the provider binds fullM.
+pub fn validate_integration_preparation(
+    launch: &LaunchAuthority,
+    baseline: &super::provider::ValidatedBaseline,
+    recipe: &super::integration::ValidatedIntegrationRecipe,
+) -> anyhow::Result<()> {
+    recipe.recipe.validate()?;
+    let (core, integration) = launch
+        .integration_components()
+        .ok_or_else(|| anyhow::anyhow!("integration preparation requires explicit authority"))?;
+    let expected_os = match recipe.core.recipe.os {
+        super::recipe::NativeOs::Linux => theseus_native_protocol::v2::Os::Linux,
+        super::recipe::NativeOs::Macos => theseus_native_protocol::v2::Os::Macos,
+        super::recipe::NativeOs::Windows => theseus_native_protocol::v2::Os::Windows,
+    };
+    anyhow::ensure!(
+        expected_os == launch.binding().os
+            && core.to_hex() == recipe.core.recipe.manifest_digest
+            && integration == recipe.integration_manifest_digest
+            && launch.binding().manifest_digest.to_hex() == recipe.full_manifest_digest()?
+            && baseline.receipt().manifest_digest == recipe.full_manifest_digest()?
+            && baseline.receipt().reset_epoch == launch.provider_epoch().to_hex(),
+        "integration preparation components, epoch or target OS changed"
+    );
+    let context = launch
+        .integration_context()
+        .ok_or_else(|| anyhow::anyhow!("provider integration context missing"))?;
+    anyhow::ensure!(
+        context.manifest_digest == baseline.receipt().manifest_digest
+            && context.workspace_marker == baseline.receipt().workspace_marker
+            && context.binding == baseline.receipt().binding,
+        "provider integration context differs from baseline"
     );
     Ok(())
 }

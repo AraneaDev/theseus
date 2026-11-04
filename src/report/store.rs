@@ -170,7 +170,24 @@ impl ReportStore {
     pub fn load_selected_report(&self) -> Result<crate::engine::domain::StoredRun> {
         use crate::{engine::domain::StoredRun, native::storage::ArtifactFamily};
         match self.artifact_family()? {
-            ArtifactFamily::Native => Ok(StoredRun::Native(self.load_native_report()?)),
+            ArtifactFamily::Native => {
+                let bytes = self.read_bytes(crate::native::model::REPORT_FILENAME)?;
+                let value = crate::strict_json::parse(std::str::from_utf8(&bytes)?)?;
+                if value.get("schema").and_then(serde_json::Value::as_u64) == Some(1) {
+                    Ok(StoredRun::Native(self.load_native_report()?))
+                } else {
+                    Ok(
+                        match crate::native::storage::load_native_versioned(self)?.0 {
+                            crate::native::integration::NativeReportVersion::CatalogV1(r) => {
+                                StoredRun::Native(r)
+                            }
+                            crate::native::integration::NativeReportVersion::IntegrationV2(r) => {
+                                StoredRun::NativeIntegration(r)
+                            }
+                        },
+                    )
+                }
+            }
             ArtifactFamily::Docker => Ok(StoredRun::Docker(decode_report(
                 &self.read_bytes("report.json")?,
             )?)),
@@ -180,10 +197,49 @@ impl ReportStore {
     pub fn load_selected_journal(&self) -> Result<crate::engine::domain::StoredJournal> {
         use crate::{engine::domain::StoredJournal, native::storage::ArtifactFamily};
         match self.artifact_family()? {
-            ArtifactFamily::Native => Ok(StoredJournal::Native(self.load_native_journal()?)),
+            ArtifactFamily::Native => {
+                let bytes = self.read_bytes(crate::native::model::JOURNAL_FILENAME)?;
+                let value = crate::strict_json::parse(std::str::from_utf8(&bytes)?)?;
+                if value.get("schema").and_then(serde_json::Value::as_u64) == Some(1) {
+                    Ok(StoredJournal::Native(self.load_native_journal()?))
+                } else {
+                    Ok(
+                        match crate::native::storage::load_native_versioned(self)?.1 {
+                            crate::native::integration::NativeJournalVersion::CatalogV1(j) => {
+                                StoredJournal::Native(j)
+                            }
+                            crate::native::integration::NativeJournalVersion::IntegrationV2(j) => {
+                                StoredJournal::NativeIntegration(j)
+                            }
+                        },
+                    )
+                }
+            }
             ArtifactFamily::Docker => Ok(StoredJournal::Docker(self.load_journal()?)),
             _ => bail!("run journal family missing or unsupported"),
         }
+    }
+    pub fn save_native_integration_report(
+        &self,
+        report: &crate::native::integration::NativeIntegrationReport,
+    ) -> Result<()> {
+        report.validate()?;
+        crate::native::storage::require_family(
+            self.artifact_family()?,
+            crate::native::storage::ArtifactFamily::Native,
+        )?;
+        self.atomic_json(crate::native::model::REPORT_FILENAME, report)
+    }
+    pub fn save_native_integration_journal(
+        &self,
+        journal: &crate::native::integration::NativeIntegrationJournal,
+    ) -> Result<()> {
+        journal.validate()?;
+        crate::native::storage::require_family(
+            self.artifact_family()?,
+            crate::native::storage::ArtifactFamily::Native,
+        )?;
+        self.atomic_json(crate::native::model::JOURNAL_FILENAME, journal)
     }
     pub fn root(&self) -> &Path {
         &self.root

@@ -25,11 +25,14 @@ pub(crate) fn inspect(
         .transpose()
         .map_err(error)?;
     let selected = read_selected_recipe(roots, &args.recipe_path)?;
-    let crate::engine::domain::SelectedRecipe::Docker(validated) = selected else {
-        let crate::engine::domain::SelectedRecipe::Native(native) = selected else {
-            unreachable!()
-        };
-        return super::native_inspection::inspect(&native, args, max_run_seconds, reply);
+    let validated = match selected {
+        crate::engine::domain::SelectedRecipe::Docker(r) => r,
+        crate::engine::domain::SelectedRecipe::Native(r) => {
+            return super::native_inspection::inspect(&r, args, max_run_seconds, reply);
+        }
+        crate::engine::domain::SelectedRecipe::NativeIntegration(r) => {
+            return super::native_inspection::inspect_integration(&r, args, max_run_seconds, reply);
+        }
     };
     if args
         .recipe_digest

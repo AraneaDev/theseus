@@ -62,7 +62,7 @@ impl LedgerStore {
             theseus_native_protocol::v2::HelperProfile::Native { provider_epoch },
         )
     }
-    fn open_profile(
+    pub fn open_profile(
         ledger_root: &HostDir,
         workspace_root: &HostDir,
         expected: StoreBinding,
@@ -112,6 +112,25 @@ impl LedgerStore {
             } if profile
                 == (theseus_native_protocol::v2::HelperProfile::Native {
                     provider_epoch: *provider_epoch,
+                })
+                && *binding == expected.binding
+                && *manifest_digest == expected.manifest_digest
+                && *workspace_marker == expected.workspace_marker
+                && *os == expected.os => {}
+            Entry::IntegrationHeader {
+                binding,
+                manifest_digest,
+                workspace_marker,
+                os,
+                provider_epoch,
+                core_manifest_digest,
+                integration_manifest_digest,
+                ..
+            } if profile
+                == (theseus_native_protocol::v2::HelperProfile::Integration {
+                    provider_epoch: *provider_epoch,
+                    core_manifest_digest: *core_manifest_digest,
+                    integration_manifest_digest: *integration_manifest_digest,
                 })
                 && *binding == expected.binding
                 && *manifest_digest == expected.manifest_digest

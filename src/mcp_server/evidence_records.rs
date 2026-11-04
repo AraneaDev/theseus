@@ -114,6 +114,11 @@ impl<'a> Catalog<'a> {
                 RootCollection::Scenarios => Self::Scenarios(&report.scenarios),
                 RootCollection::Artifacts => Self::Artifacts(&report.artifacts),
                 RootCollection::Errors => Self::Errors(String::new(), &report.errors),
+                RootCollection::Services
+                | RootCollection::Readiness
+                | RootCollection::IntegrationChecks
+                | RootCollection::IntegrationDispositions
+                | RootCollection::Desktop => return Err(error(ErrorCode::InvalidArguments)),
             },
             EvidenceSelector::Scenario(s) => {
                 let (index, scenario) = scenario(report, &s.scenario_id)?;

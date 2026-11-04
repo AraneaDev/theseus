@@ -662,36 +662,12 @@ impl NativeReport {
         envelope(&self.kind, self.schema, "theseus_native_report")?;
         text(&self.run_id, 128)?;
         digest(&self.recipe_digest)?;
-        let mut ids = BTreeSet::new();
-        for s in &self.scenarios {
-            text(&s.id, 128)?;
-            text(&s.ownership_id, 128)?;
-            ordinary(s.scenario)?;
-            s.dispositions.local.validate()?;
-            s.dispositions.remote.validate()?;
-            s.dispositions.release.validate()?;
-            s.dispositions.reset.validate()?;
-            ensure!(ids.insert(&s.id), "duplicate native scenario");
-            for stage in &s.stages {
-                text(&stage.name, 128)?;
-                for c in &stage.commands {
-                    c.validate()?;
-                }
-                for o in &stage.native_files {
-                    o.validate()?;
-                }
-                for c in &stage.checks {
-                    text(&c.id, 128)?;
-                    text(&c.detail, 4096)?;
-                }
-            }
-        }
-        for receipt in &self.provider_claims {
-            receipt.validate()?;
-        }
-        for failure in &self.failures {
-            text(failure, 4096)?;
-        }
+        validate_catalog_evidence(
+            &self.scenarios,
+            &self.identities,
+            &self.provider_claims,
+            &self.failures,
+        )?;
         Ok(())
     }
     pub fn decode(bytes: &[u8]) -> Result<Self> {
@@ -767,4 +743,96 @@ fn strict_optional_log<'de, D: serde::Deserializer<'de>>(
             truncated: r.truncated,
         }),
     )
+}
+
+/// Envelope-free native catalog validation shared by strict native schemas.
+pub(crate) fn validate_catalog_evidence(
+    scenarios: &[NativeScenario],
+    identities: &[Provenance<String>],
+    provider_claims: &[ProviderReceipt],
+    failures: &[String],
+) -> Result<()> {
+    let mut ids = BTreeSet::new();
+    for s in scenarios {
+        text(&s.id, 128)?;
+        text(&s.ownership_id, 128)?;
+        ordinary(s.scenario)?;
+        s.dispositions.local.validate()?;
+        s.dispositions.remote.validate()?;
+        s.dispositions.release.validate()?;
+        s.dispositions.reset.validate()?;
+        ensure!(ids.insert(&s.id), "duplicate native scenario");
+        for stage in &s.stages {
+            text(&stage.name, 128)?;
+            for c in &stage.commands {
+                c.validate()?;
+            }
+            for o in &stage.native_files {
+                o.validate()?;
+            }
+            for c in &stage.checks {
+                text(&c.id, 128)?;
+                text(&c.detail, 4096)?;
+            }
+        }
+    }
+    for receipt in provider_claims {
+        receipt.validate()?;
+    }
+    for failure in failures {
+        text(failure, 4096)?;
+    }
+
+    ensure!(scenarios.len() <= 3, "too many native scenarios");
+    let mut kinds = BTreeSet::new();
+    for scenario in scenarios {
+        ensure!(
+            kinds.insert(scenario.scenario),
+            "duplicate native scenario kind"
+        );
+        for stage in &scenario.stages {
+            for failure in &stage.failures {
+                text(failure, 4096)?;
+            }
+            for command in &stage.commands {
+                for log in [&command.stdout_log, &command.stderr_log]
+                    .into_iter()
+                    .flatten()
+                {
+                    ensure!(
+                        log.bytes <= crate::recipe::DEFAULT_LOG_LIMIT,
+                        "native log exceeds bound"
+                    );
+                    let parts = log.path.split('/').collect::<Vec<_>>();
+                    ensure!(
+                        !parts.is_empty()
+                            && parts.first() != Some(&"native-intents")
+                            && parts.iter().all(|p| !p.is_empty()
+                                && !matches!(*p, "." | "..")
+                                && !p.contains(['\\', ':', '\0'])),
+                        "unsafe native log reference"
+                    );
+                }
+            }
+            for check in &stage.checks {
+                for command in &check.command_ids {
+                    text(command, 128)?;
+                }
+            }
+        }
+    }
+    for identity in identities {
+        match identity {
+            Provenance::Observed { value, source } => {
+                text(value, 4096)?;
+                text(source, 4096)?;
+            }
+            Provenance::ProviderReported { value, provider } => {
+                text(value, 4096)?;
+                text(provider, 256)?;
+            }
+            Provenance::Unavailable { reason } => text(reason, 4096)?,
+        }
+    }
+    Ok(())
 }

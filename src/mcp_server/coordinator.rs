@@ -944,6 +944,12 @@ impl<T: Transport> ServerRuntime<T> {
                         generation: completion.generation,
                         result: Ok(recipe),
                     },
+                    Ok(QueryValue::ValidatedIntegration(recipe)) => {
+                        RegistryUpdate::IntegrationValidation {
+                            generation: completion.generation,
+                            result: Ok(*recipe),
+                        }
+                    }
                     Ok(QueryValue::ValidatedNative(recipe)) => RegistryUpdate::NativeValidation {
                         generation: completion.generation,
                         result: Ok(recipe),
@@ -969,7 +975,7 @@ impl<T: Transport> ServerRuntime<T> {
                     };
                     let token = run.token.clone();
                     let spawned = match roots.native_target.clone() {
-                        Some(launch) => EngineWorker::spawn_native(
+                        Some(launch) => EngineWorker::spawn_selected_native(
                             run.handle.clone(),
                             run.recipe,
                             run.options,
@@ -1078,7 +1084,11 @@ impl<T: Transport> ServerRuntime<T> {
                             })
                         })
                     }
-                    Ok(QueryValue::Validated(_) | QueryValue::ValidatedNative(_)) => {
+                    Ok(
+                        QueryValue::Validated(_)
+                        | QueryValue::ValidatedNative(_)
+                        | QueryValue::ValidatedIntegration(_),
+                    ) => {
                         self.fatal(now, "invalid request completion");
                         return;
                     }
@@ -1094,6 +1104,9 @@ impl<T: Transport> ServerRuntime<T> {
                     result: Err(owner), ..
                 }
                 | RegistryUpdate::NativeValidation {
+                    result: Err(owner), ..
+                }
+                | RegistryUpdate::IntegrationValidation {
                     result: Err(owner), ..
                 }
                 | RegistryUpdate::SpawnFailed(owner) => self.owners.push(owner),

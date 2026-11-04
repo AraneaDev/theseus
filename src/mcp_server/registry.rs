@@ -27,7 +27,7 @@ pub(crate) enum AdmissionDecision {
 #[derive(Debug)]
 pub(crate) struct ReadyNativeRun {
     pub handle: Handle,
-    pub recipe: crate::native::recipe::ValidatedNativeRecipe,
+    pub recipe: crate::engine::domain::SelectedRecipe,
     pub options: crate::engine::domain::NativeRunOptions,
     pub token: CancellationToken,
 }
@@ -54,6 +54,10 @@ pub(crate) enum RegistryUpdate {
     NativeValidation {
         generation: u64,
         result: Result<crate::native::recipe::ValidatedNativeRecipe, OwnedError>,
+    },
+    IntegrationValidation {
+        generation: u64,
+        result: Result<crate::native::integration::recipe::ValidatedIntegrationRecipe, OwnedError>,
     },
     ValidationExpired {
         generation: u64,
@@ -98,7 +102,7 @@ struct Entry {
     token: CancellationToken,
     generation: Option<u64>,
     recipe: Option<ValidatedRecipe>,
-    native_recipe: Option<crate::native::recipe::ValidatedNativeRecipe>,
+    native_recipe: Option<crate::engine::domain::SelectedRecipe>,
     dispatch_taken: bool,
     execution_started: bool,
     binding: Option<SavedBinding>,
@@ -395,6 +399,7 @@ impl Registry {
             }
             RegistryUpdate::Validation { generation, .. }
             | RegistryUpdate::NativeValidation { generation, .. }
+            | RegistryUpdate::IntegrationValidation { generation, .. }
             | RegistryUpdate::ValidationExpired { generation, .. } => {
                 entry.view.state == RunState::Validating && entry.generation == Some(*generation)
             }
@@ -445,7 +450,20 @@ impl Registry {
                 entry.generation = None;
                 match result {
                     Ok(recipe) => {
-                        entry.native_recipe = Some(recipe);
+                        entry.native_recipe =
+                            Some(crate::engine::domain::SelectedRecipe::Native(recipe));
+                        entry.view.state = RunState::Admitted;
+                    }
+                    Err(owner) => entry.own_error(&self.instance, RunState::StartError, owner),
+                }
+            }
+            RegistryUpdate::IntegrationValidation { result, .. } => {
+                entry.generation = None;
+                match result {
+                    Ok(recipe) => {
+                        entry.native_recipe = Some(
+                            crate::engine::domain::SelectedRecipe::NativeIntegration(recipe),
+                        );
                         entry.view.state = RunState::Admitted;
                     }
                     Err(owner) => entry.own_error(&self.instance, RunState::StartError, owner),
@@ -534,7 +552,13 @@ impl Registry {
             return None;
         }
         let recipe = entry.native_recipe.take()?;
-        let mut limits = recipe.recipe.limits.clone();
+        let mut limits = match &recipe {
+            crate::engine::domain::SelectedRecipe::Native(r) => r.recipe.limits.clone(),
+            crate::engine::domain::SelectedRecipe::NativeIntegration(r) => {
+                r.core.recipe.limits.clone()
+            }
+            _ => unreachable!(),
+        };
         limits.output_bytes = limits.output_bytes.min(entry.fingerprint.log_limit.get());
         let options = crate::engine::domain::NativeRunOptions {
             output_root: std::path::PathBuf::new(),

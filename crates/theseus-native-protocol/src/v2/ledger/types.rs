@@ -38,6 +38,18 @@ pub enum Disposition {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Entry {
+    IntegrationHeader {
+        artifact_commitment: Digest,
+        binding: BindingId,
+        manifest_digest: Digest,
+        workspace_marker: WorkspaceMarker,
+        os: Os,
+        provider_epoch: Digest,
+        core_manifest_digest: Digest,
+        integration_manifest_digest: Digest,
+        context_digest: Digest,
+        ownership_id: String,
+    },
     NativeAuthorityRevoked {
         lease: LeaseId,
         reason: PrefixAuthorityFailure,
@@ -84,7 +96,13 @@ pub struct Record {
 impl Record {
     pub fn new(index: u16, entry: Entry) -> Result<Self, LedgerError> {
         if usize::from(index) >= super::MAX_RECORDS
-            || (index != 0 && matches!(entry, Entry::Header { .. } | Entry::NativeHeader { .. }))
+            || (index != 0
+                && matches!(
+                    entry,
+                    Entry::Header { .. }
+                        | Entry::NativeHeader { .. }
+                        | Entry::IntegrationHeader { .. }
+                ))
         {
             return Err(LedgerError::InvalidRecord);
         }

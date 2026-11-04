@@ -139,6 +139,7 @@ pub struct OwnedWorkerFailure {
     pub(crate) retained_file: Option<Box<crate::files::FileOwner>>,
     pub(crate) retained_spawn: Option<Box<theseus_host::process::SpawnFailure>>,
     pub(crate) cleanup_errors: [Option<io::Error>; 8],
+    pub(crate) retained_service_errors: Vec<io::Error>,
 }
 pub(crate) enum WorkerCompletion {
     Clean {
@@ -156,6 +157,20 @@ pub(crate) enum WorkerEvent {
     },
 }
 pub(crate) enum WorkerCommand {
+    ProbeReadiness {
+        request: v2::Request,
+        ticket: ResponseTicket,
+    },
+    ServiceAction {
+        request: v2::Request,
+        ticket: ResponseTicket,
+        cancel: CancelToken,
+        start: StartWatch,
+    },
+    InspectService {
+        request: v2::Request,
+        ticket: ResponseTicket,
+    },
     Init(Invocation),
     Acquire {
         request: v2::Request,
@@ -303,11 +318,15 @@ impl OwnedWorkerFailure {
     }
     pub fn cleanup_error_count(&self) -> usize {
         self.cleanup_errors.iter().filter(|e| e.is_some()).count()
+            + self.retained_service_errors.len()
             + usize::from(
                 self.retained_file
                     .as_ref()
                     .is_some_and(|o| o.cleanup_error.is_some()),
             )
+    }
+    pub fn service_errors(&self) -> &[io::Error] {
+        &self.retained_service_errors
     }
     pub fn panic_payload(&self) -> Option<&(dyn std::any::Any + Send + 'static)> {
         match &self.primary {
@@ -397,6 +416,7 @@ mod failure_tests {
             primary: WorkerPrimary::Io(io::Error::other(Hostile)),
             retained_file: None,
             retained_spawn: None,
+            retained_service_errors: vec![],
             cleanup_errors: std::array::from_fn(|_| None),
         };
         assert_eq!(
@@ -419,6 +439,7 @@ mod failure_tests {
             primary: WorkerPrimary::Panic(payload),
             retained_file: None,
             retained_spawn: None,
+            retained_service_errors: vec![],
             cleanup_errors: std::array::from_fn(|_| None),
         };
         assert_eq!(

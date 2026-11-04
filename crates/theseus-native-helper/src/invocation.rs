@@ -12,6 +12,7 @@ pub struct CatalogEntry {
 }
 /// Invocation authority is fixed before peer input. No cwd confinement is implied.
 pub struct Invocation {
+    pub(crate) integration: Option<Box<crate::integration::service::ServiceConfig>>,
     #[cfg(feature = "test-support")]
     pub(crate) fixture: Option<crate::test_support::FixtureControl>,
     pub(crate) ledger_root: PathBuf,
@@ -97,6 +98,7 @@ impl Invocation {
         Ok(Self {
             #[cfg(feature = "test-support")]
             fixture: None,
+            integration: None,
             ledger_root,
             workspace_root,
             expected,

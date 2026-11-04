@@ -23,6 +23,38 @@ pub struct LaunchAuthority {
     provider_name: String,
     baseline_label: String,
     provider_command: Option<NativeCommand>,
+    integration: Option<IntegrationCeiling>,
+    #[cfg(feature = "native-integration-test-support")]
+    fixture_executables: Option<std::sync::Arc<crate::target_authority::FixtureExecutablePins>>,
+}
+#[derive(Clone)]
+struct IntegrationCeiling {
+    core_manifest_digest: v2::Digest,
+    integration_manifest_digest: v2::Digest,
+    service: v2::ServiceAuthority,
+    context: Option<v2::IntegrationRuntimeContext>,
+}
+impl Clone for LaunchAuthority {
+    fn clone(&self) -> Self {
+        Self {
+            command: self.command.clone(),
+            ssh: self.ssh.clone(),
+            binding: StoreBinding {
+                binding: self.binding.binding,
+                manifest_digest: self.binding.manifest_digest,
+                workspace_marker: self.binding.workspace_marker,
+                os: self.binding.os,
+            },
+            epoch: self.epoch,
+            view: self.view.clone(),
+            provider_name: self.provider_name.clone(),
+            baseline_label: self.baseline_label.clone(),
+            provider_command: self.provider_command.clone(),
+            integration: self.integration.clone(),
+            #[cfg(feature = "native-integration-test-support")]
+            fixture_executables: self.fixture_executables.clone(),
+        }
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,6 +99,76 @@ impl LaunchAuthority {
     /// Parses explicit local runtime configuration, never a recipe field.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         ensure!(bytes.len() <= 65536, "launch configuration exceeds bound");
+        let mut value: serde_json::Value = super::model::decode(bytes)?;
+        match value.get("schema").and_then(serde_json::Value::as_u64) {
+            Some(1) => Self::decode_catalog(bytes),
+            Some(2) => {
+                let object = value
+                    .as_object_mut()
+                    .ok_or_else(|| anyhow::anyhow!("expected launch object"))?;
+                ensure!(
+                    object
+                        .remove("helper_profile")
+                        .as_ref()
+                        .and_then(serde_json::Value::as_str)
+                        == Some("native_integration_v1"),
+                    "unsupported integration helper profile"
+                );
+                let digest = |value: Option<serde_json::Value>| -> Result<v2::Digest> {
+                    v2::Digest::parse(
+                        value
+                            .as_ref()
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("required integration manifest component")
+                            })?,
+                    )
+                    .map_err(Into::into)
+                };
+                let core = digest(object.remove("core_manifest_digest"))?;
+                let integration = digest(object.remove("integration_manifest_digest"))?;
+                let service: v2::ServiceAuthority = serde_json::from_value(
+                    object
+                        .remove("service_authority")
+                        .ok_or_else(|| anyhow::anyhow!("explicit service authority required"))?,
+                )?;
+                service.validate()?;
+                ensure!(
+                    matches!(
+                        object.remove("desktop_authority"),
+                        Some(serde_json::Value::Null)
+                    ),
+                    "desktop authority is unsupported by the service-only profile"
+                );
+                object.insert("schema".into(), 1.into());
+                let mut authority = Self::decode_catalog(&serde_json::to_vec(&value)?)?;
+                ensure!(
+                    authority.binding.manifest_digest
+                        == v2::integration_manifest_digest(core, integration),
+                    "integration manifest components differ from full binding"
+                );
+                ensure!(
+                    matches!(
+                        (&service, authority.binding.os),
+                        (v2::ServiceAuthority::Systemd { .. }, v2::Os::Linux)
+                            | (v2::ServiceAuthority::Launchd { .. }, v2::Os::Macos)
+                            | (v2::ServiceAuthority::Scm { .. }, v2::Os::Windows)
+                    ),
+                    "service authority differs from target OS"
+                );
+                authority.view.fingerprint = format!("{:x}", Sha256::digest(bytes));
+                authority.integration = Some(IntegrationCeiling {
+                    core_manifest_digest: core,
+                    integration_manifest_digest: integration,
+                    service,
+                    context: None,
+                });
+                Ok(authority)
+            }
+            _ => anyhow::bail!("unsupported launch schema"),
+        }
+    }
+    fn decode_catalog(bytes: &[u8]) -> Result<Self> {
         let input: LaunchInput = super::model::decode(bytes)?;
         ensure!(
             input.kind == "theseus_native_launch" && input.schema == 1,
@@ -147,6 +249,9 @@ impl LaunchAuthority {
             .map(|b| format!("{b:02x}"))
             .collect();
         Ok(Self {
+            integration: None,
+            #[cfg(feature = "native-integration-test-support")]
+            fixture_executables: None,
             command: None,
             provider_name: input.provider.name,
             baseline_label: input.baseline_label,
@@ -164,6 +269,20 @@ impl LaunchAuthority {
     pub fn view(&self) -> &LaunchView {
         &self.view
     }
+    pub fn integration_components(&self) -> Option<(v2::Digest, v2::Digest)> {
+        self.integration.as_ref().map(|value| {
+            (
+                value.core_manifest_digest,
+                value.integration_manifest_digest,
+            )
+        })
+    }
+    pub fn integration_service_authority(&self) -> Option<&v2::ServiceAuthority> {
+        self.integration.as_ref().map(|value| &value.service)
+    }
+    pub fn integration_context(&self) -> Option<&v2::IntegrationRuntimeContext> {
+        self.integration.as_ref()?.context.as_ref()
+    }
     pub fn expected(&self) -> ExpectedHelper {
         ExpectedHelper {
             binding: StoreBinding {
@@ -179,14 +298,27 @@ impl LaunchAuthority {
                     .collect(),
             )
             .expect("closed catalog"),
-            profile: v2::HelperProfile::Native {
-                provider_epoch: self.epoch,
+            profile: match &self.integration {
+                Some(value) => v2::HelperProfile::Integration {
+                    provider_epoch: self.epoch,
+                    core_manifest_digest: value.core_manifest_digest,
+                    integration_manifest_digest: value.integration_manifest_digest,
+                },
+                None => v2::HelperProfile::Native {
+                    provider_epoch: self.epoch,
+                },
             },
         }
     }
-    #[cfg(feature = "native-catalog-test-support")]
+    #[cfg(any(
+        feature = "native-catalog-test-support",
+        feature = "native-integration-test-support"
+    ))]
     pub fn fixture(command: NativeCommand, binding: StoreBinding, epoch: v2::Digest) -> Self {
         Self {
+            integration: None,
+            #[cfg(feature = "native-integration-test-support")]
+            fixture_executables: None,
             command: Some(command.clone()),
             provider_name: "fixture-provider".into(),
             baseline_label: "inert-preprovisioned-fixture".into(),
@@ -201,6 +333,62 @@ impl LaunchAuthority {
             },
         }
     }
+    #[cfg(feature = "native-integration-test-support")]
+    pub fn fixture_integration(
+        command: NativeCommand,
+        binding: StoreBinding,
+        epoch: v2::Digest,
+        core: v2::Digest,
+        integration: v2::Digest,
+        service: v2::ServiceAuthority,
+    ) -> Result<Self> {
+        service.validate()?;
+        ensure!(
+            binding.manifest_digest == v2::integration_manifest_digest(core, integration),
+            "fixture full manifest differs from integration components"
+        );
+        let mut authority = Self::fixture(command, binding, epoch);
+        authority.view.fingerprint = format!(
+            "{:x}",
+            Sha256::digest(format!(
+                "integration:{}:{}:{}:{}",
+                authority.view.fingerprint,
+                core.to_hex(),
+                integration.to_hex(),
+                serde_json::to_string(&service)?
+            ))
+        );
+        authority.integration = Some(IntegrationCeiling {
+            core_manifest_digest: core,
+            integration_manifest_digest: integration,
+            service,
+            context: None,
+        });
+        Ok(authority)
+    }
+    #[cfg(feature = "native-integration-test-support")]
+    pub fn with_fixture_executable_pins(
+        mut self,
+        pins: std::sync::Arc<crate::target_authority::FixtureExecutablePins>,
+    ) -> Result<Self> {
+        pins.verify()?;
+        ensure!(
+            self.command
+                .as_ref()
+                .is_some_and(|c| pins.contains(std::path::Path::new(&c.program)))
+                && self
+                    .provider_command
+                    .as_ref()
+                    .is_some_and(|c| pins.contains(std::path::Path::new(&c.program))),
+            "fixture commands are not in frozen executable authority"
+        );
+        self.view.fingerprint = format!(
+            "{:x}",
+            Sha256::digest(format!("{}:{}", self.view.fingerprint, pins.commitment()))
+        );
+        self.fixture_executables = Some(pins);
+        Ok(self)
+    }
     pub fn baseline_label(&self) -> &str {
         &self.baseline_label
     }
@@ -208,6 +396,10 @@ impl LaunchAuthority {
         &self.provider_name
     }
     pub fn provider_command(&self) -> Result<NativeCommand> {
+        #[cfg(feature = "native-integration-test-support")]
+        if let Some(pins) = &self.fixture_executables {
+            pins.verify()?;
+        }
         self.provider_command
             .clone()
             .ok_or_else(|| anyhow::anyhow!("fixture provider not configured"))
@@ -215,7 +407,10 @@ impl LaunchAuthority {
     pub fn provider_factory(&self) -> Result<super::provider::CommandProvider> {
         super::provider::CommandProvider::new(self.provider_name.clone(), self.provider_command()?)
     }
-    #[cfg(feature = "native-catalog-test-support")]
+    #[cfg(any(
+        feature = "native-catalog-test-support",
+        feature = "native-integration-test-support"
+    ))]
     pub fn with_fixture_provider(mut self, name: String, command: NativeCommand) -> Result<Self> {
         super::provider::CommandProvider::new(name.clone(), command.clone())?;
         self.provider_name = name;
@@ -231,7 +426,10 @@ impl LaunchAuthority {
         self.provider_command = Some(command);
         Ok(self)
     }
-    #[cfg(feature = "native-catalog-test-support")]
+    #[cfg(any(
+        feature = "native-catalog-test-support",
+        feature = "native-integration-test-support"
+    ))]
     pub fn with_fixture_baseline(mut self, label: String) -> Result<Self> {
         super::model::text(&label, 256)?;
         self.baseline_label = label;
@@ -247,12 +445,42 @@ impl LaunchAuthority {
             "provider baseline belongs to another launch"
         );
         let receipt = baseline.receipt();
-        self.with_identity(
+        let mut result = self.with_identity(
             &receipt.binding,
             &receipt.manifest_digest,
             &receipt.workspace_marker,
             &receipt.reset_epoch,
-        )
+        )?;
+        if result.integration.is_some() {
+            result.bind_integration_context(&receipt.receipt)?;
+        }
+        Ok(result)
+    }
+    fn bind_integration_context(&mut self, bytes: &str) -> Result<()> {
+        ensure!(
+            bytes.len() <= 4096,
+            "integration context receipt exceeds bound"
+        );
+        let context: v2::IntegrationRuntimeContext = super::model::decode(bytes.as_bytes())?;
+        context.validate()?;
+        let integration = self
+            .integration
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("catalog launch has no integration context"))?;
+        ensure!(
+            context.binding == self.binding.binding.to_hex()
+                && context.manifest_digest == self.binding.manifest_digest.to_hex()
+                && context.workspace_marker == self.binding.workspace_marker.to_hex()
+                && context.provider_epoch == self.epoch.to_hex()
+                && context.integration_manifest_digest
+                    == integration.integration_manifest_digest.to_hex(),
+            "provider integration context differs from original binding"
+        );
+        integration
+            .service
+            .validate_context(&context, self.binding.os)?;
+        integration.context = Some(context);
+        Ok(())
     }
     pub fn for_recovery(
         &self,
@@ -295,6 +523,9 @@ impl LaunchAuthority {
             provider_name: self.provider_name.clone(),
             baseline_label: self.baseline_label.clone(),
             provider_command: self.provider_command.clone(),
+            integration: self.integration.clone(),
+            #[cfg(feature = "native-integration-test-support")]
+            fixture_executables: self.fixture_executables.clone(),
         })
     }
     pub fn provider_epoch(&self) -> v2::Digest {
@@ -432,6 +663,186 @@ pub fn openssh_subsystem_argv(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    fn integration_launch_json() -> serde_json::Value {
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("../../examples/native/launch.example.json"))
+                .unwrap();
+        value["schema"] = 2.into();
+        value["helper_profile"] = "native_integration_v1".into();
+        value["core_manifest_digest"] = "02".repeat(32).into();
+        value["integration_manifest_digest"] = "11".repeat(32).into();
+        value["manifest_digest"] =
+            "cd64ea4df93a58dc89771b1f60cd2b829e3e45e0bdb78650ee6a672cd7971d3c".into();
+        value["service_authority"] = serde_json::json!({
+            "kind":"systemd","slot":"service","scope":"user","bus_endpoint":{"kind":"unix_path","path":"/fixture/bus"},
+            "qualification":{"manager":"systemd","version":"262","api_profile":"systemd_dbus_private_v1","features":["unit_properties","start_stop","manager_reload"],"receipt_sha256":"03".repeat(32)},
+            "namespace":{"kind":"exclusive_owned_registration","slot":"service","unit_load_roots":["/fixture/units"],"dropins":"forbidden","provider_context":"private-fixture"},
+            "manager_context":{"kind":"whole_private","slot":"manager","sut_allowed_actions":["daemon_reload"],"rehearsal_allowed_actions":[],"provider_receipt_required":true},
+            "expected_peer_uid":1000,"expected_manager_uid":1000,"definition_root":"/fixture/units","unit":"theseus-fixture.service","managed_by":"installer",
+            "sut_effects":["registration","configuration","removal","daemon_reload"],"allowed_actions":["inspect","start","stop"]
+        });
+        value["desktop_authority"] = serde_json::Value::Null;
+        value
+    }
+    #[cfg(unix)]
+    #[test]
+    fn integration_launch_commits_full_source_and_both_manifest_components() {
+        let value = integration_launch_json();
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let launch = LaunchAuthority::decode(&bytes).unwrap();
+        assert_eq!(
+            launch.view().fingerprint,
+            format!("{:x}", Sha256::digest(&bytes))
+        );
+        assert!(matches!(
+            launch.expected().profile,
+            v2::HelperProfile::Integration { .. }
+        ));
+        for key in [
+            "core_manifest_digest",
+            "integration_manifest_digest",
+            "manifest_digest",
+        ] {
+            let mut wrong = value.clone();
+            wrong[key] = "05".repeat(32).into();
+            assert!(LaunchAuthority::decode(&serde_json::to_vec(&wrong).unwrap()).is_err());
+        }
+        for key in ["helper_profile", "service_authority", "desktop_authority"] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(LaunchAuthority::decode(&serde_json::to_vec(&missing).unwrap()).is_err());
+        }
+        let mut wrong = value;
+        wrong["service_authority"]["bus_endpoint"]["path"] = "unixexec:/bin/false".into();
+        assert!(LaunchAuthority::decode(&serde_json::to_vec(&wrong).unwrap()).is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn integration_context_cannot_replace_static_identity_or_add_unknown_fields() {
+        let mut authority =
+            LaunchAuthority::decode(&serde_json::to_vec(&integration_launch_json()).unwrap())
+                .unwrap();
+        let context = v2::IntegrationRuntimeContext {
+            manager_platform: v2::ManagerPlatform::Systemd,
+            installation_instance_digest: None,
+            kind: "theseus_native_integration_context".into(),
+            schema: 1,
+            ownership_id: "original-owner".into(),
+            binding: authority.binding.binding.to_hex(),
+            manifest_digest: authority.binding.manifest_digest.to_hex(),
+            workspace_marker: authority.binding.workspace_marker.to_hex(),
+            provider_epoch: authority.epoch.to_hex(),
+            integration_manifest_digest: authority.integration_components().unwrap().1.to_hex(),
+            manager_unique_name: ":1.42".into(),
+            namespace_receipt: "private-context-original".into(),
+        };
+        authority
+            .bind_integration_context(&serde_json::to_string(&context).unwrap())
+            .unwrap();
+        assert_eq!(authority.integration_context(), Some(&context));
+        let mut wrong = context.clone();
+        wrong.binding = "09".repeat(16);
+        assert!(
+            authority
+                .bind_integration_context(&serde_json::to_string(&wrong).unwrap())
+                .is_err()
+        );
+        let mut unknown = serde_json::to_value(&context).unwrap();
+        unknown["fallback_bus"] = "user".into();
+        assert!(
+            authority
+                .bind_integration_context(&serde_json::to_string(&unknown).unwrap())
+                .is_err()
+        );
+        assert_eq!(authority.integration_context(), Some(&context));
+    }
+    #[cfg(all(unix, feature = "native-integration-test-support"))]
+    #[test]
+    fn deferred_fixture_execution_rejects_replaced_helper_and_provider_before_effect() {
+        use crate::target_authority::FixtureExecutablePins;
+        use std::{os::unix::fs::PermissionsExt, sync::Arc};
+        for replaced in ["helper", "provider"] {
+            let root = tempfile::tempdir().unwrap();
+            let artifacts = root.path().join("artifacts");
+            std::fs::create_dir(&artifacts).unwrap();
+            let marker = root.path().join("replacement-ran");
+            let body = b"#!/bin/sh\necho replacement > \"$1\"\n";
+            let helper = artifacts.join("helper");
+            let provider = artifacts.join("provider");
+            for path in [&helper, &provider] {
+                std::fs::write(path, body).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500)).unwrap();
+            }
+            std::fs::set_permissions(&artifacts, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let pins = Arc::new(
+                FixtureExecutablePins::retain(
+                    [helper.clone(), provider.clone()]
+                        .into_iter()
+                        .map(|path| {
+                            (
+                                path,
+                                body.len() as u64,
+                                format!("{:x}", Sha256::digest(body)),
+                            )
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+            );
+            let mut provider_command = NativeCommand::new(&provider);
+            provider_command.arg(&marker);
+            provider_command.environment = ChildEnvironment::Replace(vec![]);
+            let authority = LaunchAuthority::fixture_integration(
+                NativeCommand::new(&helper),
+                StoreBinding {
+                    binding: v2::BindingId::from_bytes([1; 16]),
+                    manifest_digest: v2::integration_manifest_digest(
+                        v2::Digest::from_bytes([2; 32]),
+                        v2::Digest::from_bytes([17; 32]),
+                    ),
+                    workspace_marker: v2::WorkspaceMarker::from_bytes([3; 16]),
+                    os: v2::Os::Linux,
+                },
+                v2::Digest::from_bytes([4; 32]),
+                v2::Digest::from_bytes([2; 32]),
+                v2::Digest::from_bytes([17; 32]),
+                serde_json::from_value(integration_launch_json()["service_authority"].clone())
+                    .unwrap(),
+            )
+            .unwrap()
+            .with_fixture_provider("pin-test".into(), provider_command)
+            .unwrap()
+            .with_fixture_executable_pins(pins)
+            .unwrap();
+            assert!(authority.provider_command().is_ok());
+            assert!(authority.provider_factory().is_ok());
+            std::fs::set_permissions(&artifacts, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::rename(
+                artifacts.join(replaced),
+                root.path().join("retained-original-image"),
+            )
+            .unwrap();
+            std::fs::write(artifacts.join(replaced), body).unwrap();
+            std::fs::set_permissions(
+                artifacts.join(replaced),
+                std::fs::Permissions::from_mode(0o500),
+            )
+            .unwrap();
+            std::fs::set_permissions(&artifacts, std::fs::Permissions::from_mode(0o500)).unwrap();
+            assert!(
+                authority.provider_factory().is_err(),
+                "deferred provider setup must not consume replacement image"
+            );
+            let preparation = authority.prepare();
+            assert!(
+                preparation.error().is_some() && preparation.command.is_none(),
+                "deferred helper startup must refuse changed image authority"
+            );
+            assert!(!marker.exists(), "replacement code never executes");
+            std::fs::set_permissions(&artifacts, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
     #[test]
     fn ssh_argv_has_one_literal_subsystem_and_no_config_or_agent_fallback() {
         let p = std::path::Path::new(if cfg!(windows) {
@@ -650,6 +1061,10 @@ impl LaunchAuthority {
             next_cleanup_retry: None,
         };
         let result = (|| -> Result<()> {
+            #[cfg(feature = "native-integration-test-support")]
+            if let Some(pins) = &self.fixture_executables {
+                pins.verify()?;
+            }
             if let Some(command) = &self.command {
                 prepared.command = Some(command.clone());
                 return Ok(());
@@ -972,7 +1387,10 @@ mod qualification_tests {
     }
 }
 
-#[cfg(feature = "native-catalog-test-support")]
+#[cfg(any(
+    feature = "native-catalog-test-support",
+    feature = "native-integration-test-support"
+))]
 fn fixture_command_digest(command: &NativeCommand) -> String {
     let mut h = Sha256::new();
     for value in std::iter::once(&command.program).chain(command.args.iter()) {

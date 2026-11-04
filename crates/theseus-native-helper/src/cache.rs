@@ -101,7 +101,9 @@ impl Cache {
                 if self.description.is_some()
                     || !matches!(
                         description,
-                        v2::Reply::Description { .. } | v2::Reply::NativeDescription { .. }
+                        v2::Reply::Description { .. }
+                            | v2::Reply::NativeDescription { .. }
+                            | v2::Reply::IntegrationDescription { .. }
                     )
                     || operations.len() > v2::MAX_OPERATIONS
                 {
@@ -210,6 +212,9 @@ impl Cache {
             v2::Request::CreateFile {
                 lease, operation, ..
             } => (lease, operation, v2::OperationKind::CreateFile),
+            v2::Request::ServiceAction {
+                lease, operation, ..
+            } => (lease, operation, v2::OperationKind::ServiceAction),
             _ => return None,
         };
         if self.wire_terminals.contains(&(*lease, *operation))

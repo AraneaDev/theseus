@@ -13,6 +13,28 @@ pub struct ExpectedHelper {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RequestId(pub(crate) u64);
 pub enum Action<'a> {
+    ProbeReadiness {
+        deadline_ms: u32,
+        lease: v2::LeaseId,
+        slot: v2::ResourceSlot,
+        operation: v2::OperationId,
+        action_digest: v2::Digest,
+        prior_binding_digest: v2::Digest,
+        nonce: v2::BindingId,
+        definition_role: String,
+        artifact_role: String,
+    },
+    ServiceAction {
+        lease: v2::LeaseId,
+        operation: v2::OperationId,
+        slot: v2::ResourceSlot,
+        prior_binding_digest: v2::Digest,
+        action: v2::ServiceAction,
+    },
+    InspectService {
+        lease: v2::LeaseId,
+        slot: v2::ResourceSlot,
+    },
     Acquire(&'a PreparedAcquire),
     QueryOriginalAcquire(&'a theseus_native_helper_store::VerifiedOriginalIntent),
     RecoverAcquire(&'a PreparedAcquire),
@@ -99,6 +121,15 @@ pub struct StartFailure {
 impl Client {
     /// Catalog artifact facts observed during the validated native handshake.
     /// Unavailable before readiness, after transfer to settlement, or for fixtures.
+    pub fn integration_description(&self) -> Option<&v2::IntegrationDescription> {
+        self.settlement
+            .owner
+            .as_ref()?
+            .pump
+            .as_ref()?
+            .integration_description
+            .as_ref()
+    }
     pub fn artifact_commitment(&self) -> Option<v2::Digest> {
         self.settlement
             .owner

@@ -48,7 +48,7 @@ pub enum Action {
         recipe: PathBuf,
         #[arg(long, value_enum)]
         profile: Option<ProfileSelection>,
-        /// Explicit server/helper target; used only with a native catalog recipe.
+        /// Explicit server/helper target; used only with a native recipe.
         #[arg(long)]
         native_target: Option<PathBuf>,
         /// Display accepted selection without runtime authentication or process creation.
@@ -105,6 +105,20 @@ pub enum ScenarioSelection {
 }
 /// Dispatch interactive and headless interfaces through the shared engine.
 pub fn execute(cli: Cli) -> Result<i32> {
+    execute_inner(cli, &crate::target_authority::ShippingAuthorityLoader)
+}
+/// Explicit dependency injection for separately built trusted fixture controllers.
+#[cfg(feature = "native-integration-test-support")]
+pub fn execute_with_loader(
+    cli: Cli,
+    loader: &dyn crate::target_authority::TargetAuthorityLoader,
+) -> Result<i32> {
+    execute_inner(cli, loader)
+}
+fn execute_inner(
+    cli: Cli,
+    loader: &dyn crate::target_authority::TargetAuthorityLoader,
+) -> Result<i32> {
     let animation = crate::tui::AnimationOptions {
         enabled: !cli.no_animation,
     };
@@ -119,6 +133,7 @@ pub fn execute(cli: Cli) -> Result<i32> {
             &output_root,
             max_run_seconds,
             native_target.as_deref(),
+            loader,
         )),
         None => {
             crate::tui::terminal::require_tty()?;
@@ -130,9 +145,24 @@ pub fn execute(cli: Cli) -> Result<i32> {
                         animation,
                     )
                 }
-                engine::domain::SelectedRecipe::Native(recipe) => {
-                    run_native(recipe, None, false, true, ScenarioSelection::All, animation)
-                }
+                engine::domain::SelectedRecipe::Native(recipe) => run_native(
+                    engine::domain::SelectedRecipe::Native(recipe),
+                    None,
+                    false,
+                    true,
+                    ScenarioSelection::All,
+                    animation,
+                    loader,
+                ),
+                engine::domain::SelectedRecipe::NativeIntegration(recipe) => run_native(
+                    engine::domain::SelectedRecipe::NativeIntegration(recipe),
+                    None,
+                    false,
+                    true,
+                    ScenarioSelection::All,
+                    animation,
+                    loader,
+                ),
             }
         }
         Some(Action::Init) => {
@@ -148,6 +178,11 @@ pub fn execute(cli: Cli) -> Result<i32> {
                     "Valid recipe: {} ({} profiles)",
                     recipe.recipe.name,
                     recipe.recipe.profiles.len()
+                ),
+                engine::domain::SelectedRecipe::NativeIntegration(recipe) => println!(
+                    "Valid native integration recipe: {} ({} scenarios)",
+                    recipe.path.display(),
+                    recipe.core.recipe.scenarios.len()
                 ),
                 engine::domain::SelectedRecipe::Native(recipe) => println!(
                     "Valid native recipe: {} ({} scenarios)",
@@ -175,6 +210,15 @@ pub fn execute(cli: Cli) -> Result<i32> {
                     if !json {
                         return crate::tui::run_with_options(
                             crate::tui::App::native_offline(report, run_directory),
+                            animation,
+                        );
+                    }
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                }
+                engine::domain::StoredRun::NativeIntegration(report) => {
+                    if !json {
+                        return crate::tui::run_with_options(
+                            crate::tui::App::integration_offline(report, run_directory),
                             animation,
                         );
                     }
@@ -280,19 +324,21 @@ pub fn execute(cli: Cli) -> Result<i32> {
                         );
                         Docker::default().cleanup(&run_directory)?
                     }
-                    engine::domain::StoredJournal::Native(_) => {
+                    engine::domain::StoredJournal::Native(_)
+                    | engine::domain::StoredJournal::NativeIntegration(_) => {
                         let path = native_target.as_deref().ok_or_else(|| anyhow::anyhow!(
                             "native cleanup requires --native-target with explicit matching launch authority; saved report endpoints do not authorize recovery"
                         ))?;
-                        let launch = read_native_launch(path)?;
+                        let launch = crate::target_authority::load(path, loader)?;
                         let cancel = CancellationToken::default();
                         let _signals = crate::tui::Signals::register(&cancel)?;
-                        let result = engine::recover_native(store, &launch, cancel, |_| {})?;
+                        let result =
+                            engine::recover_selected_native(store, &launch, cancel, |_| {})?;
                         println!(
                             "{}",
                             crate::tui::safe_text(&format!(
                                 "Recovery report: {}",
-                                result.report_path.display()
+                                result.report_path().display()
                             ))
                         );
                         if !result.complete() {
@@ -321,18 +367,20 @@ pub fn execute(cli: Cli) -> Result<i32> {
             }
             let selected = crate::native::storage::load_recipe(&recipe)?;
             let recipe = match selected {
-                engine::domain::SelectedRecipe::Native(recipe) => {
+                selected @ (engine::domain::SelectedRecipe::Native(_)
+                | engine::domain::SelectedRecipe::NativeIntegration(_)) => {
                     anyhow::ensure!(
                         profile.is_none() && !pull,
                         "Docker profile/pull options do not apply to native recipes"
                     );
                     return run_native(
-                        recipe,
+                        selected,
                         native_target.as_deref(),
                         headless,
                         preview,
                         scenario,
                         animation,
+                        loader,
                     );
                 }
                 engine::domain::SelectedRecipe::Docker(recipe) => recipe,
@@ -398,14 +446,22 @@ pub fn execute(cli: Cli) -> Result<i32> {
     }
 }
 fn run_native(
-    recipe: crate::native::recipe::ValidatedNativeRecipe,
+    selected: engine::domain::SelectedRecipe,
     launch_path: Option<&Path>,
     headless: bool,
     preview: bool,
     scenario: ScenarioSelection,
     animation: crate::tui::AnimationOptions,
+    loader: &dyn crate::target_authority::TargetAuthorityLoader,
 ) -> Result<i32> {
-    let launch = launch_path.map(read_native_launch).transpose()?;
+    let launch = launch_path
+        .map(|path| crate::target_authority::load(path, loader))
+        .transpose()?;
+    let recipe = match &selected {
+        engine::domain::SelectedRecipe::Native(recipe) => recipe,
+        engine::domain::SelectedRecipe::NativeIntegration(recipe) => &recipe.core,
+        _ => anyhow::bail!("native recipe required"),
+    };
     let scenarios = match scenario {
         ScenarioSelection::All => recipe.recipe.scenarios.clone(),
         ScenarioSelection::Clean => vec![ScenarioKind::Clean],
@@ -422,25 +478,46 @@ fn run_native(
         scenarios,
         limits: recipe.recipe.limits.clone(),
     };
-    recipe.validate_selection(&options.scenarios, &options.limits)?;
+    let selected_options = if matches!(
+        selected,
+        engine::domain::SelectedRecipe::NativeIntegration(_)
+    ) {
+        engine::domain::SelectedRunOptions::NativeIntegration(options.clone())
+    } else {
+        engine::domain::SelectedRunOptions::Native(options.clone())
+    };
+    engine::domain::compile(&selected, &selected_options)?;
+    let preview_text = match &selected {
+        engine::domain::SelectedRecipe::NativeIntegration(integration) => format!(
+            "Native integration preview\nProfile: native_integration_v1\nRecipe: {}\nIntegration manifest: {}\nRequirements: {}\n{}",
+            integration.digest,
+            integration.integration_manifest_digest.to_hex(),
+            serde_json::to_string_pretty(&integration.recipe.integrations)?,
+            crate::native::view::preview(recipe, launch.as_ref())?
+        ),
+        _ => crate::native::view::preview(recipe, launch.as_ref())?,
+    };
     if !headless {
-        let mut app = crate::tui::App::native_preview(crate::native::view::preview(
-            &recipe,
-            launch.as_ref(),
-        )?);
+        let mut app = crate::tui::App::native_preview(preview_text.clone());
         if !preview {
-            app.native
-                .as_mut()
-                .unwrap()
-                .set_execution(recipe, options, launch);
+            match selected {
+                engine::domain::SelectedRecipe::Native(recipe) => app
+                    .native
+                    .as_mut()
+                    .unwrap()
+                    .set_execution(recipe, options, launch),
+                engine::domain::SelectedRecipe::NativeIntegration(recipe) => app
+                    .native
+                    .as_mut()
+                    .unwrap()
+                    .set_integration_execution(recipe, options, launch),
+                _ => unreachable!(),
+            }
         }
         return crate::tui::run_with_options(app, animation);
     }
     if preview {
-        println!(
-            "{}",
-            crate::tui::safe_text(&crate::native::view::preview(&recipe, launch.as_ref())?)
-        );
+        println!("{}", crate::tui::safe_text(&preview_text));
         return Ok(0);
     }
     let launch = launch.as_ref().ok_or_else(|| {
@@ -450,42 +527,35 @@ fn run_native(
     })?;
     let cancel = CancellationToken::default();
     let _registration = theseus_host::cancel::CancellationRegistration::install(cancel.flag())?;
-    let result = engine::run_selected(
-        &engine::domain::SelectedRecipe::Native(recipe),
-        engine::domain::SelectedRunOptions::Native(options),
-        Some(launch),
-        cancel,
-        |_| {},
-    )?;
-    let engine::domain::StoredRun::Native(report) = result.report else {
-        anyhow::bail!("native execution returned another backend");
+    let result = engine::run_selected(&selected, selected_options, Some(launch), cancel, |_| {})?;
+    let (outcome, failures) = match result.report {
+        engine::domain::StoredRun::Native(report) => (report.outcome, report.failures),
+        engine::domain::StoredRun::NativeIntegration(report) => {
+            (report.outcome, report.catalog.failures)
+        }
+        _ => anyhow::bail!("native execution returned another backend"),
     };
     println!(
         "Report: {}",
         crate::tui::safe_text(&result.report_path.display().to_string())
     );
-    println!("{}", report.outcome);
-    for failure in &report.failures {
+    println!("{}", outcome);
+    for failure in &failures {
         eprintln!("{}", crate::tui::safe_text(failure));
     }
-    Ok(report.outcome.exit_code())
+    Ok(outcome.exit_code())
 }
-fn read_native_launch(path: &Path) -> Result<crate::native::launch::LaunchAuthority> {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let directory = HostDir::open(parent, RootPolicy::AllComponentsNoFollow)?;
-    let leaf = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow::anyhow!("invalid launch filename"))?;
-    let mut bytes = Vec::new();
-    directory
-        .open_file(&RelativePath::parse(leaf)?)?
-        .take(65537)
-        .read_to_end(&mut bytes)?;
-    crate::native::launch::LaunchAuthority::decode(&bytes)
+/// Load only the strict shipping OpenSSH authority format.
+pub fn read_native_launch(path: &Path) -> Result<crate::native::launch::LaunchAuthority> {
+    crate::target_authority::load(path, &crate::target_authority::ShippingAuthorityLoader)
+}
+/// Read the shipping saved decoder/projections for separately built fixture assertions.
+/// This does not create an MCP admission or grant execution/recovery authority.
+#[cfg(feature = "native-integration-test-support")]
+pub fn fixture_saved_native_projection(directory: &Path) -> Result<serde_json::Value> {
+    let store = report::open_existing(directory)?;
+    crate::mcp_server::native_evidence::fixture_saved_projection(&store)
+        .map_err(|error| error.source)
 }
 fn init() -> Result<()> {
     let mut text = String::from(
@@ -541,6 +611,7 @@ fn serve(
     output_root: &Path,
     max_run_seconds: u64,
     native_target: Option<&Path>,
+    loader: &dyn crate::target_authority::TargetAuthorityLoader,
 ) -> i32 {
     use crate::mcp_server::{
         coordinator::{IDLE_WAIT, ServerRuntime},
@@ -563,7 +634,7 @@ fn serve(
     };
     let roots = Roots::open(project_root, output_root).and_then(|mut roots| {
         roots.native_target = native_target
-            .map(read_native_launch)
+            .map(|path| crate::target_authority::load(path, loader))
             .transpose()
             .map_err(|e| {
                 crate::mcp_server::types::QueryError::new(

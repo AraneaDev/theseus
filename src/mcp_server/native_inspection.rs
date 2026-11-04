@@ -11,6 +11,9 @@ use serde::Serialize;
 #[derive(Serialize)]
 #[serde(untagged)]
 enum Detail<'a> {
+    IntegrationRecipe(&'a crate::native::integration::recipe::NativeIntegrationRecipe),
+    Requirements(&'a crate::native::integration::model::IntegrationRequirements),
+    ServiceCheck(&'a crate::native::integration::model::ServiceCheckRequirement),
     Recipe(&'a crate::native::recipe::NativeRecipe),
     Command(&'a crate::native::model::CatalogCommand),
     Check(&'a crate::native::recipe::NativeCheck),
@@ -24,7 +27,10 @@ struct Record<'a> {
     collection: InspectCollection,
     detail: Detail<'a>,
 }
-fn records(recipe: &ValidatedNativeRecipe) -> impl Iterator<Item = Record<'_>> {
+fn records<'a>(
+    recipe: &'a ValidatedNativeRecipe,
+    integration: Option<&'a crate::native::integration::recipe::ValidatedIntegrationRecipe>,
+) -> impl Iterator<Item = Record<'a>> {
     recipe
         .recipe
         .steps
@@ -74,6 +80,24 @@ fn records(recipe: &ValidatedNativeRecipe) -> impl Iterator<Item = Record<'_>> {
                 detail: Detail::Limits(&recipe.recipe.limits),
             },
         ])
+        .chain(integration.into_iter().flat_map(|integration| {
+            std::iter::once(Record {
+                id: "integration/requirements".into(),
+                kind: RecordKind::NativeRecipe,
+                collection: InspectCollection::Policies,
+                detail: Detail::Requirements(&integration.recipe.integrations),
+            })
+            .chain(integration.recipe.integrations.service.iter().flat_map(
+                |service| {
+                    service.checks.iter().enumerate().map(|(i, c)| Record {
+                        id: format!("integration/check/{i}"),
+                        kind: RecordKind::RecipeCheck,
+                        collection: InspectCollection::Checks,
+                        detail: Detail::ServiceCheck(c),
+                    })
+                },
+            ))
+        }))
 }
 pub(super) fn inspect(
     recipe: &ValidatedNativeRecipe,
@@ -81,10 +105,28 @@ pub(super) fn inspect(
     max: u64,
     reply: &ReplyContext,
 ) -> Result<InspectData, QueryError> {
+    inspect_inner(recipe, None, args, max, reply)
+}
+pub(super) fn inspect_integration(
+    recipe: &crate::native::integration::recipe::ValidatedIntegrationRecipe,
+    args: &InspectArgs,
+    max: u64,
+    reply: &ReplyContext,
+) -> Result<InspectData, QueryError> {
+    inspect_inner(&recipe.core, Some(recipe), args, max, reply)
+}
+fn inspect_inner(
+    recipe: &ValidatedNativeRecipe,
+    integration: Option<&crate::native::integration::recipe::ValidatedIntegrationRecipe>,
+    args: &InspectArgs,
+    max: u64,
+    reply: &ReplyContext,
+) -> Result<InspectData, QueryError> {
+    let digest = integration.map_or(recipe.digest.as_str(), |r| r.digest.as_str());
     if args
         .recipe_digest
         .as_ref()
-        .is_some_and(|d| d.as_str() != recipe.digest)
+        .is_some_and(|d| d.as_str() != digest)
     {
         return Err(error(ErrorCode::RecipeChanged));
     }
@@ -92,9 +134,8 @@ pub(super) fn inspect(
         return Ok(InspectData::NativeOverview(NativeOverviewData {
             kind: NativeOverviewKind::NativeOverview,
             recipe_path: args.recipe_path.clone(),
-            recipe_digest: Digest::parse(&recipe.digest)
-                .map_err(|_| error(ErrorCode::InternalError))?,
-            schema: 1,
+            recipe_digest: Digest::parse(digest).map_err(|_| error(ErrorCode::InternalError))?,
+            schema: if integration.is_some() { 2 } else { 1 },
             os: recipe.recipe.os,
             role: "current_helper_account".into(),
             scenarios: recipe.recipe.scenarios.clone(),
@@ -109,7 +150,7 @@ pub(super) fn inspect(
         .map(|c| CursorRecord::decode(c, &reply.instance))
         .transpose()
         .map_err(error)?;
-    let revision = Revision::parse(&recipe.digest).map_err(|_| error(ErrorCode::InternalError))?;
+    let revision = Revision::parse(digest).map_err(|_| error(ErrorCode::InternalError))?;
     let data = match &args.selector {
         InspectSelector::Catalog {
             profile,
@@ -118,14 +159,14 @@ pub(super) fn inspect(
             if profile.is_some() {
                 return Err(error(ErrorCode::InvalidArguments));
             }
-            let total = records(recipe)
+            let total = records(recipe, integration)
                 .filter(|r| r.collection == *collection)
                 .count() as u64;
             if let Some(c) = decoded {
                 c.validate(&cursor, total).map_err(error)?;
                 cursor = c;
             }
-            let records = records(recipe)
+            let records = records(recipe, integration)
                 .filter(|r| r.collection == *collection)
                 .skip(cursor.next_position as usize)
                 .take(usize::from(cursor.requested_limit))
@@ -157,10 +198,14 @@ pub(super) fn inspect(
                     id: "native_recipe".into(),
                     kind: RecordKind::NativeRecipe,
                     collection: InspectCollection::Policies,
-                    detail: Detail::Recipe(&recipe.recipe),
+                    detail: if let Some(integration) = integration {
+                        Detail::IntegrationRecipe(&integration.recipe)
+                    } else {
+                        Detail::Recipe(&recipe.recipe)
+                    },
                 }
             } else {
-                records(recipe)
+                records(recipe, integration)
                     .find(|r| r.id == record_id.as_str())
                     .ok_or_else(|| error(ErrorCode::UnknownRecord))?
             };

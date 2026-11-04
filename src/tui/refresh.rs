@@ -19,6 +19,7 @@ struct Request {
 enum Loaded {
     Run(Box<crate::model::RunReport>),
     Native(Box<crate::native::model::NativeReport>),
+    Integration(Box<crate::native::integration::model::NativeIntegrationReport>),
     Suite(Box<crate::comparison::LoadedComparison>),
 }
 impl Loaded {
@@ -27,6 +28,9 @@ impl Loaded {
             Kind::Native => match crate::native::storage::load_run(&request.path)? {
                 crate::engine::domain::StoredRun::Native(report) => {
                     Ok(Self::Native(Box::new(report)))
+                }
+                crate::engine::domain::StoredRun::NativeIntegration(report) => {
+                    Ok(Self::Integration(Box::new(report)))
                 }
                 _ => anyhow::bail!("native refresh family mismatch"),
             },
@@ -187,6 +191,7 @@ impl Coordinator {
                 .to_path_buf();
             match completion.result {
                 Ok(Loaded::Native(report)) => app.set_native_report(*report, root),
+                Ok(Loaded::Integration(report)) => app.set_integration_report(*report, root),
                 Ok(Loaded::Run(report)) => app.set_report(*report, root),
                 Ok(Loaded::Suite(document)) => {
                     if let Some(view) = &mut app.comparison {

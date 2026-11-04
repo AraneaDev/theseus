@@ -23,3 +23,5 @@ pub use config::{ConfigError, config_manifest_digest, load_config};
 
 #[cfg(feature = "test-support")]
 pub mod test_support;
+
+mod integration;

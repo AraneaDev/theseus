@@ -55,20 +55,28 @@ impl EngineWorker {
         Self::start(handle, recipe, options, token, output, Docker::default)
     }
 
+    #[cfg(test)]
     pub(crate) fn spawn_native(
         handle: Handle,
-        recipe: crate::native::recipe::ValidatedNativeRecipe,
+        recipe: engine::domain::SelectedRecipe,
+        options: engine::domain::NativeRunOptions,
+        token: CancellationToken,
+        output: Arc<ReportStore>,
+        launch: Arc<crate::native::launch::LaunchAuthority>,
+    ) -> Result<Self, QueryError> {
+        Self::spawn_selected_native(handle, recipe, options, token, output, launch)
+    }
+    pub(crate) fn spawn_selected_native(
+        handle: Handle,
+        recipe: engine::domain::SelectedRecipe,
         mut options: engine::domain::NativeRunOptions,
         token: CancellationToken,
         output: Arc<ReportStore>,
         launch: Arc<crate::native::launch::LaunchAuthority>,
     ) -> Result<Self, QueryError> {
         options.output_root = output.root().to_path_buf();
-        engine::domain::compile(
-            &engine::domain::SelectedRecipe::Native(recipe.clone()),
-            &engine::domain::SelectedRunOptions::Native(options.clone()),
-        )
-        .map_err(failure)?;
+        engine::domain::compile(&recipe, &native_options(&recipe, options.clone()))
+            .map_err(failure)?;
         let bindings = Arc::new(Mutex::new(Bindings::default()));
         let worker_bindings = bindings.clone();
         let worker_handle = handle.clone();
@@ -421,12 +429,22 @@ fn execute<E: Environment>(
         }
     }
 }
+fn native_options(
+    recipe: &engine::domain::SelectedRecipe,
+    options: engine::domain::NativeRunOptions,
+) -> engine::domain::SelectedRunOptions {
+    if matches!(recipe, engine::domain::SelectedRecipe::NativeIntegration(_)) {
+        engine::domain::SelectedRunOptions::NativeIntegration(options)
+    } else {
+        engine::domain::SelectedRunOptions::Native(options)
+    }
+}
 #[allow(
     clippy::result_large_err,
     reason = "the exact original error owner transfers to the existing worker handoff"
 )]
 fn execute_native(
-    recipe: crate::native::recipe::ValidatedNativeRecipe,
+    recipe: engine::domain::SelectedRecipe,
     options: engine::domain::NativeRunOptions,
     launch: &crate::native::launch::LaunchAuthority,
     token: CancellationToken,
@@ -435,8 +453,8 @@ fn execute_native(
     let parent = observer.output.clone();
     let result = catch_unwind(AssertUnwindSafe(|| {
         engine::run_selected_with_parent(
-            &engine::domain::SelectedRecipe::Native(recipe),
-            engine::domain::SelectedRunOptions::Native(options),
+            &recipe,
+            native_options(&recipe, options),
             Some(launch),
             token,
             Some(&parent),
@@ -451,27 +469,19 @@ fn execute_native(
         Err(error) => Err(OwnedError::capture(failure(error))),
         Ok(run) => {
             let projection = catch_unwind(AssertUnwindSafe(|| {
-                let engine::domain::StoredRun::Native(report) = &run.report else {
-                    panic!("native engine returned a different backend")
+                let (outcome, counts) = match &run.report {
+                    engine::domain::StoredRun::Native(report) => (
+                        report.outcome,
+                        crate::native::integration::view::catalog_counts(&report.scenarios),
+                    ),
+                    engine::domain::StoredRun::NativeIntegration(report) => (
+                        report.outcome,
+                        crate::native::integration::view::integration_counts(report),
+                    ),
+                    _ => panic!("native engine returned a different backend"),
                 };
-                let mut counts = crate::model::ResultCounts::default();
-                for scenario in &report.scenarios {
-                    for stage in &scenario.stages {
-                        counts.commands += stage.commands.len();
-                        for check in &stage.checks {
-                            match check.outcome {
-                                crate::model::CheckOutcome::Passed => counts.passed_checks += 1,
-                                crate::model::CheckOutcome::Failed => counts.failed_checks += 1,
-                                crate::model::CheckOutcome::Incomplete => {
-                                    counts.incomplete_checks += 1
-                                }
-                                crate::model::CheckOutcome::Skipped => counts.skipped_checks += 1,
-                            }
-                        }
-                    }
-                }
                 FinalSummary {
-                    outcome: report.outcome,
+                    outcome,
                     counts,
                     report_path: run.report_path.clone(),
                     journal_path: run

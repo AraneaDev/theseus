@@ -59,7 +59,18 @@ fn valid_record(value: &str) -> bool {
         ["native", "step", step] => {
             serde_json::from_value::<crate::model::StepName>(Value::String((*step).into())).is_ok()
         }
-        ["native_identity" | "native_disposition", i] => decimal(i),
+        [
+            "native_identity"
+            | "native_disposition"
+            | "service"
+            | "readiness"
+            | "integration_check"
+            | "integration_disposition"
+            | "desktop",
+            i,
+        ] => decimal(i),
+        ["integration", "requirements"] => true,
+        ["integration", "check", i] => decimal(i),
         ["artifact", "base" | "target"] => true,
         ["env" | "observe" | "error" | "artifact", i] | ["s", i] => decimal(i),
         ["artifact", a, "file", b] => decimal(a) && decimal(b),
@@ -443,7 +454,12 @@ named_enum!(RootCollection {
     Run,
     Scenarios,
     Artifacts,
-    Errors
+    Errors,
+    Services,
+    Readiness,
+    IntegrationChecks,
+    IntegrationDispositions,
+    Desktop
 });
 named_enum!(ScenarioCollection {
     Stages,
@@ -706,6 +722,11 @@ named_enum!(Lifetime { ServerProcess });
 named_enum!(Network { None, Bridge });
 named_enum!(Encoding { JsonUtf8 });
 named_enum!(RecordKind {
+    Service,
+    Readiness,
+    IntegrationCheck,
+    IntegrationDisposition,
+    Desktop,
     NativeRecipe,
     NativeFile,
     NativeDisposition,
@@ -759,6 +780,8 @@ pub(crate) struct NativeScenarioDispositions {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SavedView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration: Option<crate::native::integration::view::Summary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_dispositions: Option<Vec<NativeScenarioDispositions>>,
     pub revision: Revision,

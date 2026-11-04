@@ -105,6 +105,16 @@ fn file_boundary(key: RunKey) -> FinalBoundary {
         truncated: false,
     }
 }
+struct PendingService {
+    request: v2::Request,
+    key: RunKey,
+    cancel: CancelToken,
+    start: StartWatch,
+    deadline: Instant,
+    attempted: bool,
+    terminal: Option<v2::OperationView>,
+    published: bool,
+}
 struct Worker {
     ports: WorkerPorts,
     tokens: Vec<DataPermit>,
@@ -114,6 +124,8 @@ struct Worker {
     store: Option<LedgerStore>,
     workspace: Option<HostDir>,
     file: Option<PendingFileRequest>,
+    service: Option<crate::integration::service::ServiceRuntime>,
+    service_action: Option<PendingService>,
     lease: Option<(v2::IntentId, v2::LeaseId, v2::LeaseView)>,
     last_spawn: Option<theseus_host::process::SpawnFailure>,
     active: Option<Active>,
@@ -134,6 +146,8 @@ impl Worker {
             store: None,
             workspace: None,
             file: None,
+            service: None,
+            service_action: None,
             lease: None,
             last_spawn: None,
             active: None,
@@ -160,9 +174,27 @@ impl Worker {
                     primary: WorkerPrimary::Spawn(spawn),
                     retained_file: None,
                     retained_spawn: None,
+                    retained_service_errors: vec![],
                     cleanup_errors: std::array::from_fn(|_| None),
                 });
             }
+        }
+        let service_errors = self
+            .service
+            .as_mut()
+            .map(|s| std::mem::take(&mut s.errors))
+            .unwrap_or_default();
+        if !service_errors.is_empty() {
+            if self.failure.is_none() {
+                self.fail(WorkerPrimary::Io(io::Error::other(
+                    "native service ownership/inspection failed",
+                )));
+            }
+            self.failure
+                .as_mut()
+                .unwrap()
+                .retained_service_errors
+                .extend(service_errors);
         }
         self.retire_file();
         match self.failure.take() {
@@ -189,6 +221,7 @@ impl Worker {
                 primary,
                 retained_file: None,
                 retained_spawn: None,
+                retained_service_errors: vec![],
                 cleanup_errors: std::array::from_fn(|_| None),
             });
         }
@@ -254,6 +287,11 @@ impl Worker {
             {
                 self.fail(primary);
             }
+            if self.service_action.is_some()
+                && let Err(primary) = self.advance_service()
+            {
+                self.fail(primary);
+            }
             if self.failure.is_some() {
                 break;
             }
@@ -264,6 +302,10 @@ impl Worker {
                         .as_ref()
                         .is_none_or(|c| c.terminal.is_some() && c.published)
                 })
+                && self
+                    .service_action
+                    .as_ref()
+                    .is_none_or(|s| s.terminal.is_some() && s.published)
                 && self.pending.is_none()
                 && self.response.is_none()
             {
@@ -290,6 +332,18 @@ impl Worker {
     }
     fn command(&mut self, command: WorkerCommand) -> Result<(), WorkerPrimary> {
         match command {
+            WorkerCommand::ProbeReadiness { request, ticket } => {
+                self.probe_readiness(request, ticket)?
+            }
+            WorkerCommand::ServiceAction {
+                request,
+                ticket,
+                cancel,
+                start,
+            } => self.begin_service(request, ticket, cancel, start)?,
+            WorkerCommand::InspectService { request, ticket } => {
+                self.inspect_service(request, ticket)?
+            }
             WorkerCommand::Init(invocation) => self.initialize(invocation)?,
             WorkerCommand::Acquire { request, ticket } => self.acquire(request, ticket)?,
             WorkerCommand::Run {
@@ -337,6 +391,9 @@ impl Worker {
             return Err(WorkerPrimary::Io(io::Error::other("wrong host OS")));
         }
         let store = match inv.profile {
+            v2::HelperProfile::Integration { .. } => {
+                LedgerStore::open_profile(&ledger, &workspace, expected, inv.profile)
+            }
             v2::HelperProfile::Fixture => LedgerStore::open(&ledger, &workspace, expected),
             v2::HelperProfile::Native { provider_epoch } => {
                 LedgerStore::open_native(&ledger, &workspace, expected, provider_epoch)
@@ -403,7 +460,8 @@ impl Worker {
         };
         let description = match (inv.profile, description) {
             (
-                v2::HelperProfile::Native { provider_epoch },
+                v2::HelperProfile::Native { provider_epoch }
+                | v2::HelperProfile::Integration { provider_epoch, .. },
                 v2::Reply::Description {
                     binding,
                     manifest_digest,
@@ -436,6 +494,65 @@ impl Worker {
                 }),
             },
             (_, description) => description,
+        };
+        let description = if let v2::HelperProfile::Integration {
+            core_manifest_digest,
+            integration_manifest_digest,
+            ..
+        } = inv.profile
+        {
+            let config = inv.integration.as_ref().ok_or_else(|| {
+                WorkerPrimary::Io(io::Error::other("integration context missing"))
+            })?;
+            let context_digest = config
+                .context
+                .digest()
+                .map_err(|e| WorkerPrimary::Io(io::Error::other(e)))?;
+            match store.records()[0].entry() {
+                Entry::IntegrationHeader {
+                    context_digest: stored,
+                    ownership_id,
+                    artifact_commitment,
+                    ..
+                } if *stored == context_digest
+                    && ownership_id == &config.context.ownership_id
+                    && Some(*artifact_commitment) == inv.artifact_commitment => {}
+                _ => {
+                    return Err(WorkerPrimary::Io(io::Error::other(
+                        "integration runtime context differs from original header",
+                    )));
+                }
+            }
+            let v2::Reply::NativeDescription {
+                description: native,
+            } = description
+            else {
+                return Err(WorkerPrimary::Io(io::Error::other(
+                    "integration native description missing",
+                )));
+            };
+            self.service = Some(crate::integration::service::ServiceRuntime::new(
+                config.as_ref().clone(),
+            ));
+            v2::Reply::IntegrationDescription {
+                description: Box::new(v2::IntegrationDescription {
+                    manifest: Box::new(config.manifest.clone()),
+                    namespace_receipt_digest: {
+                        use sha2::{Digest as _, Sha256};
+                        v2::Digest::from_bytes(
+                            Sha256::digest(config.context.namespace_receipt.as_bytes()).into(),
+                        )
+                    },
+                    native: *native,
+                    core_manifest_digest,
+                    integration_manifest_digest,
+                    context_digest,
+                    ownership_id: config.context.ownership_id.clone(),
+                    capabilities: v2::IntegrationCapabilities,
+                }),
+            }
+        } else {
+            description
         };
         self.store = Some(store);
         self.workspace = Some(workspace);
@@ -533,8 +650,12 @@ impl Worker {
         cancel: CancelToken,
         start: StartWatch,
     ) -> Result<(), WorkerPrimary> {
-        if self.active.is_some() || self.file.is_some() {
+        if self.active.is_some() || self.file.is_some() || self.service_action.is_some() {
             self.refuse(ticket, v2::RefusalCode::Busy);
+            return Ok(());
+        }
+        if self.service.as_ref().is_some_and(|s| s.uncertain) {
+            self.refuse(ticket, v2::RefusalCode::OwnershipPending);
             return Ok(());
         }
         let v2::Request::Run {
@@ -760,8 +881,12 @@ impl Worker {
         cancel: CancelToken,
         start: StartWatch,
     ) -> Result<(), WorkerPrimary> {
-        if self.active.is_some() || self.file.is_some() {
+        if self.active.is_some() || self.file.is_some() || self.service_action.is_some() {
             self.refuse(ticket, v2::RefusalCode::Busy);
+            return Ok(());
+        }
+        if self.service.as_ref().is_some_and(|s| s.uncertain) {
+            self.refuse(ticket, v2::RefusalCode::OwnershipPending);
             return Ok(());
         }
         let v2::Request::CreateFile {
@@ -897,7 +1022,7 @@ impl Worker {
     ) -> Result<(), WorkerPrimary> {
         if !matches!(
             self.invocation.as_ref().map(|i| i.profile),
-            Some(v2::HelperProfile::Native { .. })
+            Some(v2::HelperProfile::Native { .. } | v2::HelperProfile::Integration { .. })
         ) {
             self.refuse(ticket, v2::RefusalCode::Unsupported);
             return Ok(());
@@ -978,8 +1103,12 @@ impl Worker {
             self.refuse(ticket, code);
             return Ok(());
         }
-        if self.active.is_some() || self.file.is_some() {
+        if self.active.is_some() || self.file.is_some() || self.service_action.is_some() {
             self.refuse(ticket, v2::RefusalCode::Busy);
+            return Ok(());
+        }
+        if self.service.as_ref().is_some_and(|s| s.uncertain) {
+            self.refuse(ticket, v2::RefusalCode::OwnershipPending);
             return Ok(());
         }
         if matches!(request, v2::Request::InspectNativeFile { .. }) {
@@ -1211,6 +1340,7 @@ impl Worker {
                     primary,
                     retained_file: None,
                     retained_spawn: None,
+                    retained_service_errors: vec![],
                     cleanup_errors: std::array::from_fn(|_| None),
                 });
             }
@@ -1245,8 +1375,12 @@ impl Worker {
         }
     }
     fn release(&mut self, lease: v2::LeaseId, ticket: ResponseTicket) -> Result<(), WorkerPrimary> {
-        if self.active.is_some() || self.file.is_some() {
+        if self.active.is_some() || self.file.is_some() || self.service_action.is_some() {
             self.refuse(ticket, v2::RefusalCode::Busy);
+            return Ok(());
+        }
+        if self.service.as_ref().is_some_and(|s| s.uncertain) {
+            self.refuse(ticket, v2::RefusalCode::OwnershipPending);
             return Ok(());
         }
         let Some((intent, actual, old)) = self.lease.clone() else {
@@ -1259,6 +1393,14 @@ impl Worker {
         }
         if !matches!(old, v2::LeaseView::Held { .. }) {
             self.respond(ticket, v2::Reply::Lease { lease, state: old }, None);
+            return Ok(());
+        }
+        if let Some(service) = &mut self.service
+            && let Err(error) = service.cleanup_readiness()
+        {
+            service.errors.push(error);
+            service.uncertain = true;
+            self.refuse(ticket, v2::RefusalCode::OwnershipPending);
             return Ok(());
         }
         self.append(Entry::LeaseClosed {
@@ -1309,6 +1451,20 @@ impl Worker {
                     self.tokens.push(permit);
                 }
                 Ok(DataReturn::ProducerDrained { key, final_ordinal }) => {
+                    if self
+                        .service_action
+                        .as_ref()
+                        .is_some_and(|p| p.key == key && final_ordinal == 0 && p.published)
+                    {
+                        if let Some(service) = &mut self.service
+                            && let Err(e) = service.retire()
+                        {
+                            service.errors.push(e);
+                            service.uncertain = true;
+                        }
+                        self.service_action = None;
+                        continue;
+                    }
                     if self.file.as_ref().is_some_and(|p| {
                         p.key == Some(key)
                             && final_ordinal == 0
@@ -1571,6 +1727,11 @@ impl Worker {
         Ok(())
     }
     fn finish(&mut self, outcome: v2::Outcome) -> Result<(), WorkerPrimary> {
+        if let (Some(service), Some(program), Some(active)) =
+            (&mut self.service, &self.program, &self.active)
+        {
+            service.note_sut(program, active.key.operation, &outcome);
+        }
         let a = self.active.as_mut().unwrap();
         // Producer boundary freezes before the physical terminal barrier. No client
         // acknowledgment or ProducerDrained participates in this persistence decision.
@@ -1621,7 +1782,8 @@ impl Worker {
         Ok(())
     }
     fn settle_native(&mut self) {
-        if self.prefix_mapping_error.is_some()
+        if self.service.as_ref().is_some_and(|s| s.unsettled())
+            || self.prefix_mapping_error.is_some()
             || self
                 .file
                 .as_ref()
@@ -2950,16 +3112,10 @@ mod private_barrier_tests {
                     WorkerPrimary::Io(io::Error::other(Original(74)))
                 };
                 worker.fail(primary);
-                let join = thread::spawn(move || {
-                    worker.settle_native();
-                    worker.completion()
-                });
-                let deadline = Instant::now() + Duration::from_secs(3);
-                while !join.is_finished() {
-                    assert!(Instant::now() < deadline);
-                    thread::yield_now();
-                }
-                let WorkerCompletion::Failed(f) = join.join().unwrap() else {
+                // Manager owners pin the worker to its creation thread. This
+                // case has only explicitly settled spawn ownership to retire.
+                worker.settle_native();
+                let WorkerCompletion::Failed(f) = worker.completion() else {
                     panic!("failure")
                 };
                 assert_eq!(f.classification(), if store_error { "store" } else { "io" });
@@ -3736,5 +3892,296 @@ mod private_barrier_tests {
             assert!(ports.events.try_recv().is_err());
             assert!(worker.store.is_none());
         }
+    }
+}
+
+impl Worker {
+    fn inspect_service(
+        &mut self,
+        request: v2::Request,
+        ticket: ResponseTicket,
+    ) -> Result<(), WorkerPrimary> {
+        let v2::Request::InspectService { lease, slot } = request else {
+            self.refuse(ticket, v2::RefusalCode::InvalidRequest);
+            return Ok(());
+        };
+        if self.active.is_some() || self.file.is_some() || self.service_action.is_some() {
+            self.refuse(ticket, v2::RefusalCode::Busy);
+            return Ok(());
+        }
+        if self.service.as_ref().is_some_and(|s| s.uncertain) {
+            self.refuse(ticket, v2::RefusalCode::OwnershipPending);
+            return Ok(());
+        }
+        if let Some(code) = self.held_refusal(lease) {
+            self.refuse(ticket, code);
+            return Ok(());
+        }
+        let Some(service) = &mut self.service else {
+            self.refuse(ticket, v2::RefusalCode::Unsupported);
+            return Ok(());
+        };
+        match service.inspect(
+            lease,
+            &slot,
+            Instant::now() + Duration::from_secs(30),
+            &self.ports.stop,
+        ) {
+            Ok(observation) => self.respond(
+                ticket,
+                v2::Reply::ServiceObservation {
+                    lease,
+                    observation: Box::new(observation),
+                },
+                None,
+            ),
+            Err(error) => {
+                service.errors.push(error);
+                self.refuse(ticket, v2::RefusalCode::OwnershipPending);
+            }
+        }
+        Ok(())
+    }
+    fn begin_service(
+        &mut self,
+        request: v2::Request,
+        ticket: ResponseTicket,
+        cancel: CancelToken,
+        start: StartWatch,
+    ) -> Result<(), WorkerPrimary> {
+        if self.service.is_none() {
+            self.refuse(ticket, v2::RefusalCode::Unsupported);
+            return Ok(());
+        }
+        if self.active.is_some() || self.file.is_some() || self.service_action.is_some() {
+            self.refuse(ticket, v2::RefusalCode::Busy);
+            return Ok(());
+        }
+        if self.service.as_ref().is_some_and(|s| s.uncertain) {
+            self.refuse(ticket, v2::RefusalCode::OwnershipPending);
+            return Ok(());
+        }
+        let v2::Request::ServiceAction {
+            lease, operation, ..
+        } = &request
+        else {
+            self.refuse(ticket, v2::RefusalCode::InvalidRequest);
+            return Ok(());
+        };
+        let (lease, operation) = (*lease, *operation);
+        let key = cancel.key;
+        if key.lease != lease || key.operation != operation || start.key() != key {
+            self.refuse(ticket, v2::RefusalCode::InvalidRequest);
+            return Ok(());
+        }
+        if let Some(code) = self.held_refusal(lease) {
+            self.refuse(ticket, code);
+            return Ok(());
+        }
+        let replay = self
+            .store
+            .as_ref()
+            .unwrap()
+            .restart_view()
+            .replay_operation(&request);
+        match replay {
+            Ok(v2::ledger::ReplayDecision::Recorded(view)) => {
+                self.respond(
+                    ticket,
+                    v2::Reply::Operation {
+                        lease,
+                        operation,
+                        state: view,
+                    },
+                    None,
+                );
+                return Ok(());
+            }
+            Err(code) => {
+                self.refuse(ticket, code);
+                return Ok(());
+            }
+            Ok(v2::ledger::ReplayDecision::NotRecorded) => (),
+        }
+        let digest =
+            v2::request_digest(&request).map_err(|e| WorkerPrimary::Io(io::Error::other(e)))?;
+        self.append(Entry::OperationAccepted {
+            lease,
+            operation,
+            request_digest: digest,
+            operation_kind: v2::OperationKind::ServiceAction,
+        })?;
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(30);
+        self.service_action = Some(PendingService {
+            request,
+            key,
+            cancel,
+            start,
+            deadline,
+            attempted: false,
+            terminal: None,
+            published: false,
+        });
+        self.response = Some((
+            ticket,
+            v2::Reply::Operation {
+                lease,
+                operation,
+                state: v2::OperationView::Accepted {
+                    operation_kind: v2::OperationKind::ServiceAction,
+                },
+            },
+            Some(key),
+        ));
+        self.publish(WorkerEvent::CacheUpdate(CachePatch::Phase {
+            key,
+            kind: v2::OperationKind::ServiceAction,
+            phase: LivePhase::Accepted,
+            accepted_at: Some(now),
+            deadline: Some(deadline),
+        }));
+        Ok(())
+    }
+    fn advance_service(&mut self) -> Result<(), WorkerPrimary> {
+        let Some(pending) = &mut self.service_action else {
+            return Ok(());
+        };
+        let key = pending.key;
+        if let Some(view) = &pending.terminal {
+            if !pending.published && self.pending.is_none() {
+                let view = view.clone();
+                pending.published = true;
+                self.publish(WorkerEvent::CacheUpdate(CachePatch::Terminal {
+                    key,
+                    view,
+                    boundary: file_boundary(key),
+                }));
+            }
+            return Ok(());
+        }
+        let stopped = self.stopping
+            || self.ports.stop.load(Ordering::Acquire)
+            || pending.cancel.flag.load(Ordering::Acquire)
+            || matches!(pending.start.poll(), StartState::Aborted);
+        let expired = Instant::now() >= pending.deadline;
+        if !pending.attempted && (stopped || expired) {
+            return self.finish_service(v2::Outcome::NotStarted {
+                reason: if expired {
+                    v2::NotStartedReason::Deadline
+                } else {
+                    v2::NotStartedReason::CancelRequested
+                },
+            });
+        }
+        if !matches!(pending.start.poll(), StartState::Granted) {
+            return Ok(());
+        }
+        if self.stopping || self.ports.stop.load(Ordering::Acquire) {
+            pending.cancel.flag.store(true, Ordering::Release);
+        }
+        let service = self.service.as_mut().unwrap();
+        let result = if pending.attempted {
+            service.poll(pending.deadline, &pending.cancel.flag)
+        } else {
+            pending.attempted = true;
+            service
+                .note_action(&pending.request)
+                .map_err(WorkerPrimary::Io)?;
+            let v2::Request::ServiceAction {
+                slot,
+                prior_binding_digest,
+                action,
+                ..
+            } = &pending.request
+            else {
+                unreachable!()
+            };
+            service.action(
+                slot,
+                *prior_binding_digest,
+                *action,
+                pending.deadline,
+                &pending.cancel.flag,
+            )
+        };
+        match result {
+            Ok(Some(outcome)) => {
+                self.finish_service(v2::Outcome::ServiceActionCompleted { outcome })
+            }
+            Ok(None) => Ok(()),
+            Err(error) => {
+                service.errors.push(error);
+                service.uncertain = true;
+                self.finish_service(v2::Outcome::ServiceActionCompleted {
+                    outcome: v2::ServiceOutcome::Unknown {
+                        reason: "native service action retains unresolved authority".into(),
+                    },
+                })
+            }
+        }
+    }
+    fn finish_service(&mut self, outcome: v2::Outcome) -> Result<(), WorkerPrimary> {
+        let key = self.service_action.as_ref().unwrap().key;
+        self.append(Entry::OperationFinished {
+            lease: key.lease,
+            operation: key.operation,
+            outcome: outcome.clone(),
+        })?;
+        self.service_action.as_mut().unwrap().terminal =
+            Some(v2::OperationView::Finished { outcome });
+        self.advance_service()
+    }
+}
+
+impl Worker {
+    fn probe_readiness(
+        &mut self,
+        request: v2::Request,
+        ticket: ResponseTicket,
+    ) -> Result<(), WorkerPrimary> {
+        let v2::Request::ProbeReadiness {
+            lease, deadline_ms, ..
+        } = &request
+        else {
+            self.refuse(ticket, v2::RefusalCode::InvalidRequest);
+            return Ok(());
+        };
+        let lease = *lease;
+        if self.active.is_some() || self.file.is_some() || self.service_action.is_some() {
+            self.refuse(ticket, v2::RefusalCode::Busy);
+            return Ok(());
+        }
+        if self.service.as_ref().is_some_and(|s| s.uncertain) {
+            self.refuse(ticket, v2::RefusalCode::OwnershipPending);
+            return Ok(());
+        }
+        if let Some(code) = self.held_refusal(lease) {
+            self.refuse(ticket, code);
+            return Ok(());
+        }
+        let Some(service) = &mut self.service else {
+            self.refuse(ticket, v2::RefusalCode::Unsupported);
+            return Ok(());
+        };
+        match service.probe(
+            &request,
+            Instant::now() + Duration::from_millis(u64::from(*deadline_ms)),
+            &self.ports.stop,
+        ) {
+            Ok(observation) => self.respond(
+                ticket,
+                v2::Reply::ReadinessObservation {
+                    lease,
+                    observation: Box::new(observation),
+                },
+                None,
+            ),
+            Err(error) => {
+                service.errors.push(error);
+                self.refuse(ticket, v2::RefusalCode::OwnershipPending);
+            }
+        }
+        Ok(())
     }
 }
