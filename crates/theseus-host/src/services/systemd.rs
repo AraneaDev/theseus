@@ -710,11 +710,20 @@ impl SystemdManager {
             };
             let definition_present = definition_bytes.is_some();
             let unit_file_state = self.unit_file_state(deadline, cancel)?;
+            // LoadUnit, not GetUnit: a real manager garbage-collects an inactive,
+            // unreferenced unit right after the SUT's own LoadUnit (CI5 journal:
+            // "Collecting." 0.6 ms later), so GetUnit would report NoSuchUnit for
+            // an installed registration. LoadUnit reads only the exact unit name
+            // from the original closed unit path; an absent definition yields a
+            // not-found unit (or NoSuchUnit) and is still observed as absent.
+            // Limit: after collection this inspection itself performs the load
+            // (NeedDaemonReload then reads false), so it proves the manager's
+            // current reading of the exact definition, not that the SUT reloaded.
             let mut message = self.bus.method(
                 &self.authority.manager_unique_name,
                 MANAGER_PATH,
                 MANAGER_IFACE,
-                "GetUnit",
+                "LoadUnit",
             )?;
             message.append(&self.authority.unit)?;
             let rpc = self.bus.call(&message, remaining(deadline, cancel)?)?;
@@ -783,7 +792,9 @@ impl SystemdManager {
         }
         let observation = self.inspect(deadline, cancel)?;
         let Some(loaded) = observation.loaded else {
-            return Err(invalid("installed registration not loaded by SUT"));
+            return Err(invalid(
+                "installed registration not loadable by the original manager",
+            ));
         };
         if let Err(error) = self.check_definition(&loaded, definition) {
             self.revoked = true;

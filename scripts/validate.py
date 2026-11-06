@@ -444,6 +444,11 @@ def retain_desktop_evidence(evidence, name, file_limit=4 * 1024 * 1024, total_li
             for file_name in sorted(files):
                 path = pathlib.Path(directory) / file_name
                 try:
+                    # Windows has no O_NOFOLLOW: refuse links/reparse points first.
+                    st = path.lstat()
+                    if stat.S_ISLNK(st.st_mode) or getattr(st, 'st_file_attributes', 0) & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0):
+                        notes.append(f'skipped link {path}')
+                        continue
                     flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_BINARY', 0)
                     descriptor = os.open(path, flags)
                     with os.fdopen(descriptor, 'rb') as reader:
@@ -455,7 +460,11 @@ def retain_desktop_evidence(evidence, name, file_limit=4 * 1024 * 1024, total_li
                     if len(data) > file_limit:
                         notes.append(f'skipped growing {path}')
                         continue
-                    destination = target / str(index) / path.relative_to(source)
+                    # upload-artifact drops hidden files; keep dot-paths visible.
+                    relative = [('dot' + part if part.startswith('.') else part) for part in path.relative_to(source).parts]
+                    if any(part.startswith('dot.') for part in path.relative_to(source).parts):
+                        notes.append(f'renamed component may collide: {path}')
+                    destination = target.joinpath(str(index), *relative)
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     destination.write_bytes(data)
                     total += len(data)

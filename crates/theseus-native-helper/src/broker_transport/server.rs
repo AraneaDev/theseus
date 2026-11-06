@@ -1477,7 +1477,10 @@ impl BrokerServer {
         for identity in originals {
             match self.runtime.cancel(&identity) {
                 Ok(state) => {
-                    done &= if state.native_lifetime.is_some() {
+                    // A declared owned lifetime (Mac original primary) never
+                    // sets legacy `cleanup_complete` (protocol invariant); its
+                    // retirement is the explicit owned-axis predicate.
+                    done &= if state.native_lifetime.is_some() || state.owned_lifetime.is_some() {
                         state.original_retired()
                     } else {
                         state.cleanup_complete

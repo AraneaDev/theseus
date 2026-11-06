@@ -105,8 +105,27 @@ exactly, and several fixtures assumed POSIX paths, long temp names or
 unprivileged handle semantics. macOS ran its six Source-owned desktop cases for
 the first time; all six failed because the desktop fixture's provider dispatch
 was compiled only on Linux. That is fixed and failed desktop steps now retain
-their fixture evidence; macOS execution of the fix is pending. Final corrected-source
-native acceptance, including real-manager execution, remains pending.
+their fixture evidence; macOS execution of the fix is pending.
+
+The [fifth combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42259726780)
+at `10ece71` passed all eight Docker suites. Linux completed the first real
+user-manager qualification and full original cleanup (managed bus stopped over
+the retained private channel, manager joined 0, held cgroup `populated 0`,
+temporary account removed). The first real-manager case then failed because a
+real manager garbage-collects an inactive unreferenced unit immediately after
+the installer's `LoadUnit`, so the product's `GetUnit` observation saw no
+registration; service inspection now uses `LoadUnit` on the exact unit name.
+macOS now completes prepare, broker bind, install, configure, owned activation,
+close and uninstall; the source broker then exited 2 at stop because its settle
+check judged owned (macOS original-primary) lifetimes by the legacy cleanup flag,
+which the protocol never sets for them; owned lifetimes now use the explicit
+owned retirement predicate, pending macOS execution (hidden run directories were
+also dropped from the upload and are now retained under visible names). An owned
+activation that never receives a receipt still cannot settle; no required case
+reaches that path. Windows stopped at a new
+evidence-copy control that followed a symlink without `O_NOFOLLOW`; links and
+reparse points are now refused. Final corrected-source native acceptance remains
+pending.
 
 Keep this queue and the checklists below current as work lands. Record source
 implementation, review, local verification, CI acceptance and merge separately.
