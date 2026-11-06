@@ -7,15 +7,71 @@ use std::{
 };
 use theseus_host::fs::{HostDir, LeafOpenResult, RootPolicy, fingerprint};
 use theseus_native_protocol::v2;
+#[path = "native_desktop_entry.rs"]
+mod installed_entry;
+pub use installed_entry::metadata as native_entry_bytes;
 pub fn entry_bytes(manifest: &v2::IntegrationManifest) -> Result<Vec<u8>> {
-    entry_bytes_for(
+    declared_entry_bytes(
         manifest
             .desktop_executable
             .as_ref()
             .context("desktop executable missing")?,
+        manifest.desktop_owned_entry.as_ref(),
     )
 }
+pub fn current_os() -> v2::Os {
+    if cfg!(target_os = "macos") {
+        v2::Os::Macos
+    } else if cfg!(windows) {
+        v2::Os::Windows
+    } else {
+        v2::Os::Linux
+    }
+}
+pub fn os_name(os: v2::Os) -> &'static str {
+    match os {
+        v2::Os::Linux => "linux",
+        v2::Os::Macos => "macos",
+        v2::Os::Windows => "windows",
+    }
+}
+fn declared_entry_bytes(
+    x: &v2::DesktopExecutable,
+    entry: Option<&v2::OwnedDesktopEntryDefinition>,
+) -> Result<Vec<u8>> {
+    match entry {
+        Some(entry) => native_entry_bytes(entry, x),
+        None => entry_bytes_for(x),
+    }
+}
 fn entry_bytes_for(executable: &v2::DesktopExecutable) -> Result<Vec<u8>> {
+    source_entry_bytes_for_platform(executable, current_os())
+}
+fn source_entry_bytes_for_platform(
+    executable: &v2::DesktopExecutable,
+    os: v2::Os,
+) -> Result<Vec<u8>> {
+    if os != v2::Os::Linux {
+        ensure!(
+            !executable.arguments.is_empty()
+                && executable.arguments.len() <= 16
+                && executable
+                    .arguments
+                    .iter()
+                    .all(|s| s.len() <= 4096 && !s.contains('\0')),
+            "bounded source argv before serialization"
+        );
+        let bytes = serde_json::to_vec(
+            &serde_json::json!({"kind":"theseus_source_owned_entry","schema":1,"os":os_name(os),"argv":executable.arguments}),
+        )?;
+        ensure!(
+            !bytes.is_empty()
+                && bytes.len() <= 65536
+                && executable.arguments.iter().all(|s| !s.contains('\0')),
+            "bounded literal SourceOwned entry"
+        );
+        return Ok(bytes);
+    }
     ensure!(
         executable
             .arguments
@@ -118,7 +174,7 @@ pub fn run(args: &[String]) -> Result<()> {
         serde_json::from_value(config["integration_manifest"].clone())?;
     let context: v2::IntegrationRuntimeContext =
         serde_json::from_value(config["runtime_context"].clone())?;
-    manifest.validate_context(&context, v2::Os::Linux)?;
+    manifest.validate_context(&context, current_os())?;
     let desktop = manifest.desktop.as_ref().context("desktop manifest")?;
     ensure!(
         manifest.desktop_native.is_none()
@@ -148,11 +204,30 @@ pub fn run(args: &[String]) -> Result<()> {
         Path::new(&desktop.entry_root),
         RootPolicy::AllComponentsNoFollow,
     )?;
-    let reader = workspace.join("reader");
-    let entry = Path::new(&desktop.entry_root).join(&desktop.entry);
+    let reader_leaf = if cfg!(windows) {
+        "reader.exe"
+    } else {
+        "reader"
+    };
+    ensure!(
+        manifest.desktop_owned_entry.is_some()
+            || manifest
+                .desktop_executable
+                .as_ref()
+                .context("original executable")?
+                .relative_path
+                == reader_leaf,
+        "exact platform reader leaf"
+    );
+    let reader = workspace.join(reader_leaf);
+    let installed = installed_entry::Layout::new(&manifest)?;
+    let entry = installed
+        .as_ref()
+        .map(|layout| layout.entry().to_owned())
+        .unwrap_or_else(|| Path::new(&desktop.entry_root).join(&desktop.entry));
     let base = std::fs::read(&args[2])?;
     let target = std::fs::read(&args[3])?;
-    let existing = retained_bytes(&root, "reader")?;
+    let existing = retained_bytes(&root, reader_leaf)?;
     let reader_role = match existing.as_deref() {
         Some(bytes) if bytes == base.as_slice() => Some(v2::DesktopArtifactRole::Base),
         Some(bytes) if bytes == target.as_slice() => Some(v2::DesktopArtifactRole::Target),
@@ -201,7 +276,7 @@ pub fn run(args: &[String]) -> Result<()> {
             .as_ref()
             .context("desktop executable")?,
     );
-    let bytes = entry_bytes_for(selected_executable)?;
+    let bytes = declared_entry_bytes(selected_executable, manifest.desktop_owned_entry.as_ref())?;
     let expected = selected.as_ref().map(|d| &d.desktop).unwrap_or(desktop);
     ensure!(
         format!("{:x}", Sha256::digest(&bytes)) == expected.entry_digest,
@@ -209,7 +284,14 @@ pub fn run(args: &[String]) -> Result<()> {
     );
     let mut allowed_entries = vec![entry_bytes(&manifest)?];
     for d in &manifest.desktop_definitions {
-        allowed_entries.push(entry_bytes_for(&d.executable)?);
+        allowed_entries.push(declared_entry_bytes(&d.executable, d.owned_entry.as_ref())?);
+    }
+    if let Some(layout) = &installed {
+        ensure!(
+            !entry_only && args[4] == "none",
+            "native entry fixture has no fault/combined mode"
+        );
+        layout.check_before(existing.as_deref(), &allowed_entries)?;
     }
     match args[0].as_str() {
         "install_base" | "install_target" => {
@@ -267,11 +349,13 @@ pub fn run(args: &[String]) -> Result<()> {
                 }
             } else {
                 ensure!(
-                    retained_bytes(&root, "reader")?.as_deref() == Some(image.as_slice()),
+                    retained_bytes(&root, reader_leaf)?.as_deref() == Some(image.as_slice()),
                     "combined shared reader was not installed by original SUT"
                 );
             }
-            if args[4] != "missing_entry" {
+            if let Some(layout) = &installed {
+                layout.install(image, &bytes, existing.is_none())?;
+            } else if args[4] != "missing_entry" {
                 entries.publish(std::ffi::OsStr::new(&desktop.entry), &mut |f| {
                     f.write_all(&bytes)
                 })?;
@@ -289,9 +373,16 @@ pub fn run(args: &[String]) -> Result<()> {
                         .any(|b| std::fs::read(&entry).as_ref().ok() == Some(b)),
                     "original entry changed before Configure"
                 );
-                entries.publish(std::ffi::OsStr::new(&desktop.entry), &mut |f| {
-                    f.write_all(&bytes)
-                })?;
+                // Legacy Clean already admitted this exact singleton entry at
+                // the installed checkpoint. Keep its original file/mapping;
+                // only a keyed SUT generation may replace committed metadata.
+                if let Some(layout) = &installed {
+                    layout.configure(&bytes)?;
+                } else if !legacy {
+                    entries.publish(std::ffi::OsStr::new(&desktop.entry), &mut |f| {
+                        f.write_all(&bytes)
+                    })?;
+                }
             }
             if !entry_only {
                 root.publish(std::ffi::OsStr::new("data"), &mut |f| {
@@ -308,7 +399,11 @@ pub fn run(args: &[String]) -> Result<()> {
             if args[4] == "leaked_entry" {
                 return Ok(());
             }
-            remove_exact(&entry, &allowed_entries)?;
+            if let Some(layout) = &installed {
+                layout.uninstall(&[base.clone(), target.clone()], &allowed_entries)?;
+            } else {
+                remove_exact(&entry, &allowed_entries)?;
+            }
             if !entry_only {
                 remove_exact(&reader, &[base, target])?;
                 remove_exact(&workspace.join("app"), &[b"theseus fixture app\n".to_vec()])?;
@@ -326,6 +421,194 @@ pub fn run(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_owned_entry_documents_keep_exact_platform_argv_without_native_claims() {
+        let executable = v2::DesktopExecutable {
+            root: r"C:\private fixture".into(),
+            relative_path: "reader.exe".into(),
+            length: 1,
+            sha256: "11".repeat(32),
+            arguments: vec![
+                r"C:\private fixture\reader.exe".into(),
+                "two words".into(),
+                "quote\"and\\slash".into(),
+            ],
+            environment: vec![],
+            working_directory: r"C:\private fixture".into(),
+        };
+        for (os, expected) in [(v2::Os::Macos, "macos"), (v2::Os::Windows, "windows")] {
+            let bytes = source_entry_bytes_for_platform(&executable, os).unwrap();
+            let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(document["kind"], "theseus_source_owned_entry");
+            assert_eq!(document["os"], expected);
+            assert_eq!(document["argv"], serde_json::json!(executable.arguments));
+        }
+        assert!(source_entry_bytes_for_platform(&executable, v2::Os::Linux).is_err());
+        let mut large = executable;
+        large.arguments = vec!["a".repeat(65536)];
+        assert!(source_entry_bytes_for_platform(&large, v2::Os::Windows).is_err());
+        large.arguments = vec!["a\0b".into()];
+        assert!(source_entry_bytes_for_platform(&large, v2::Os::Macos).is_err());
+    }
+    fn configure_fixture(
+        keyed: bool,
+    ) -> (
+        tempfile::TempDir,
+        Vec<String>,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let temp = tempfile::Builder::new()
+            .prefix("th-legacy-configure-")
+            .tempdir()
+            .unwrap();
+        let workspace = temp.path().join("workspace");
+        let entries = temp.path().join("entries");
+        HostDir::create_private(&workspace).unwrap();
+        HostDir::create_private(&entries).unwrap();
+        let base = temp.path().join("base");
+        let target = temp.path().join("target");
+        std::fs::write(&base, b"base-image").unwrap();
+        std::fs::write(&target, b"target-image").unwrap();
+        let image_digest = format!("{:x}", Sha256::digest(b"target-image"));
+        let data_digest = format!("{:x}", Sha256::digest(b"theseus fixture data\n"));
+        let expectation = v2::ReadinessDefinitionExpectation {
+            role: "configured".into(),
+            artifact: "target".into(),
+            artifact_length: 12,
+            artifact_sha256: image_digest.clone(),
+            version_literal: "target\n".into(),
+            data_sha256: data_digest.clone(),
+            configuration_digest: data_digest,
+        };
+        let executable = v2::DesktopExecutable {
+            root: workspace.display().to_string(),
+            relative_path: "reader".into(),
+            length: 12,
+            sha256: image_digest.clone(),
+            arguments: vec![
+                workspace.join("reader").display().to_string(),
+                "configured-marker".into(),
+            ],
+            environment: vec![],
+            working_directory: workspace.display().to_string(),
+        };
+        let bytes = entry_bytes_for(&executable).unwrap();
+        let entry_digest = format!("{:x}", Sha256::digest(&bytes));
+        let mut manifest:v2::IntegrationManifest = serde_json::from_value(serde_json::json!({"schema":1,"core_manifest_digest":"11".repeat(32),"desktop":{"schema":1,"core_manifest_digest":"11".repeat(32),"slot":"desktop","entry_root":entries,"namespace_policy":"exclusive_quiescent","entry":"fixture.desktop","entry_digest":entry_digest,"executable_digest":image_digest,"allowed_modes":["owned_executable"],"ready_endpoint":{"kind":"unix_path","path":"/fixture/ready.sock"},"close_endpoint":{"kind":"unix_path","path":"/fixture/close.sock"},"expectation_digest":expectation.digest().unwrap().to_hex()},"desktop_executable":executable,"desktop_readiness":expectation,"definitions":[],"artifact_slots":[{"slot":"desktop","relative_path":"fixture.desktop","length":bytes.len(),"sha256":entry_digest}],"readiness_protocol":"theseus_fixture_ready_v1","desktop_capabilities":["inspect_desktop","owned_executable","request_close"]})).unwrap();
+        if keyed {
+            let mut initial = manifest
+                .desktop_definition(&v2::DesktopDefinitionKey::CONFIGURED_TARGET)
+                .unwrap();
+            initial.key = v2::DesktopDefinitionKey {
+                role: v2::DesktopDefinitionRole::Target,
+                artifact: v2::DesktopArtifactRole::Target,
+            };
+            initial.executable.arguments[1] = "installed-marker".into();
+            initial.readiness.role = "target".into();
+            initial.desktop.expectation_digest = initial.readiness.digest().unwrap().to_hex();
+            let bytes = entry_bytes_for(&initial.executable).unwrap();
+            initial.entry_length = bytes.len() as u64;
+            initial.desktop.entry_digest = format!("{:x}", Sha256::digest(&bytes));
+            manifest.desktop_definitions.push(initial);
+        }
+        manifest.validate().unwrap();
+        let integration = manifest.digest().unwrap().to_hex();
+        let full = v2::integration_manifest_digest(
+            v2::Digest::parse(&manifest.core_manifest_digest).unwrap(),
+            manifest.digest().unwrap(),
+        )
+        .to_hex();
+        let header = serde_json::json!({"profile":"native_integration_broker_v1","binding":"01".repeat(16),"manifest_digest":full,"workspace_marker":"02".repeat(16),"os":"linux","target_id":"fixture","ownership_id":"03".repeat(16),"provider_epoch":"04".repeat(32),"session_id":"fixture-session","session_epoch":"05".repeat(32),"broker_endpoint":{"kind":"unix_path","path":"/fixture/broker.sock"},"broker_principal":{"kind":"posix","effective_uid":1000,"effective_gid":1000},"helper_principal":{"kind":"posix","effective_uid":1000,"effective_gid":1000},"display":{"kind":"x11","display":":92","authority_file":"/fixture/auth","bus":"/fixture/bus.sock"},"allowed_modes":["owned_executable"]});
+        let context = serde_json::json!({"kind":"theseus_native_integration_context","schema":1,"binding":"01".repeat(16),"manifest_digest":full,"integration_manifest_digest":integration,"workspace_marker":"02".repeat(16),"ownership_id":"03".repeat(16),"provider_epoch":"04".repeat(32),"desktop_broker_header":header});
+        let config = temp.path().join("config.json");
+        let config_value = serde_json::json!({"integration_manifest":manifest,"runtime_context":context,"workspace_root":workspace,"artifacts":{"base":{"length":10,"sha256":format!("{:x}",Sha256::digest(b"base-image"))},"target":{"length":12,"sha256":image_digest}}});
+        std::fs::write(&config, serde_json::to_vec(&config_value).unwrap()).unwrap();
+        let args = vec![
+            "install_target".into(),
+            config.display().to_string(),
+            base.display().to_string(),
+            target.display().to_string(),
+            "none".into(),
+        ];
+        run(&args).unwrap();
+        (
+            temp,
+            args,
+            entries.join("fixture.desktop"),
+            workspace.join("reader"),
+        )
+    }
+
+    #[test]
+    fn legacy_configure_preserves_original_entry_and_reader_mappings() {
+        let (_temp, mut args, entry, reader) = configure_fixture(false);
+        let held_entry = std::fs::File::open(&entry).unwrap();
+        let held_reader = std::fs::File::open(&reader).unwrap();
+        let original_entry = fingerprint(&held_entry).unwrap();
+        let original_reader = fingerprint(&held_reader).unwrap();
+        let original_bytes = std::fs::read(&entry).unwrap();
+        args[0] = "configure".into();
+        run(&args).unwrap();
+        assert_eq!(
+            fingerprint(&std::fs::File::open(&entry).unwrap()).unwrap(),
+            original_entry,
+            "legacy Configure replaced the original admitted entry mapping"
+        );
+        assert_eq!(
+            fingerprint(&held_entry).unwrap(),
+            original_entry,
+            "legacy Configure changed the original held entry"
+        );
+        assert_eq!(
+            fingerprint(&std::fs::File::open(&reader).unwrap()).unwrap(),
+            original_reader
+        );
+        assert_eq!(fingerprint(&held_reader).unwrap(), original_reader);
+        assert_eq!(std::fs::read(&entry).unwrap(), original_bytes);
+        assert_eq!(
+            std::fs::read(reader.parent().unwrap().join("data")).unwrap(),
+            b"theseus fixture data\n"
+        );
+    }
+
+    #[test]
+    fn keyed_configure_publishes_only_its_committed_configured_entry() {
+        let (_temp, mut args, entry, reader) = configure_fixture(true);
+        let before = std::fs::read(&entry).unwrap();
+        let reader_before = fingerprint(&std::fs::File::open(&reader).unwrap()).unwrap();
+        args[0] = "configure".into();
+        run(&args).unwrap();
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&args[1]).unwrap()).unwrap();
+        let manifest: v2::IntegrationManifest =
+            serde_json::from_value(config["integration_manifest"].clone()).unwrap();
+        let after = std::fs::read(&entry).unwrap();
+        assert_ne!(before, after);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&after)),
+            manifest.desktop.as_ref().unwrap().entry_digest
+        );
+        assert_eq!(
+            fingerprint(&std::fs::File::open(&reader).unwrap()).unwrap(),
+            reader_before
+        );
+        assert_eq!(
+            std::fs::read(reader.parent().unwrap().join("data")).unwrap(),
+            b"theseus fixture data\n"
+        );
+    }
+
+    #[test]
+    fn legacy_configure_refuses_foreign_entry_instead_of_adopting_it() {
+        let (_temp, mut args, entry, reader) = configure_fixture(false);
+        std::fs::write(&entry, b"foreign entry").unwrap();
+        args[0] = "configure".into();
+        assert!(run(&args).is_err());
+        assert_eq!(std::fs::read(entry).unwrap(), b"foreign entry");
+        assert!(!reader.parent().unwrap().join("data").exists());
+    }
+
     #[test]
     fn desktop_sut_generation_key_keeps_original_artifact_and_same_tuple_reinstall() {
         use v2::{DesktopArtifactRole as A, DesktopDefinitionKey as K, DesktopDefinitionRole as R};

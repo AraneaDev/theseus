@@ -1,5 +1,10 @@
 //! Test-owned, desktop-only SourceOwnedExecutable context; no display or manager.
 #![allow(dead_code)]
+#[cfg(target_os = "linux")]
+use crate::combined::service_setup::example_inputs;
+#[cfg(not(target_os = "linux"))]
+#[path = "native_example_inputs.rs"]
+mod example_inputs;
 #[path = "native_desktop_installer.rs"]
 pub(crate) mod installer;
 #[path = "native_desktop_provider.rs"]
@@ -88,9 +93,44 @@ impl Drop for BrokerOwner {
     }
 }
 fn handshake(header: &v2::broker::IntegrationBrokerHeader) -> Result<()> {
-    let mut connection = theseus_native_helper::broker_transport::BrokerConnection::connect(header)
-        .map_err(|e| anyhow::anyhow!("source broker startup conversation: {}", e.error()))?;
-    let until = Instant::now() + Duration::from_secs(5);
+    let until = Instant::now() + Duration::from_secs(10);
+    let mut connection = loop {
+        match theseus_native_helper::broker_transport::BrokerConnection::connect(header) {
+            Ok(connection) => break connection,
+            Err(failure) => {
+                let (error, owner) = failure.into_parts();
+                if let Some(mut owner) = owner {
+                    owner.request_stop();
+                    loop {
+                        match owner.poll_settle() {
+                            Ok(true) => break,
+                            Ok(false) | Err(_) if Instant::now() < until => {
+                                thread::sleep(Duration::from_millis(2))
+                            }
+                            _ => {
+                                let _ = Box::leak(owner);
+                                anyhow::bail!(
+                                    "original startup transport remains retained: {error}"
+                                );
+                            }
+                        }
+                    }
+                    return Err(error.into());
+                }
+                ensure!(
+                    Instant::now() < until
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound
+                                | std::io::ErrorKind::ConnectionRefused
+                                | std::io::ErrorKind::WouldBlock
+                        ),
+                    "original source broker startup: {error}"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    };
     let outcome = (|| -> Result<()> {
         while !connection.poll_ready()? {
             ensure!(Instant::now() < until, "original broker handshake deadline");
@@ -161,18 +201,18 @@ impl Operator {
                                         && config["source_parent_eof"] == true,
                                     "exact source original broker context"
                                 );
-                                let v2::LocalEndpoint::UnixPath { path } = &header.broker_endpoint
-                                else {
-                                    anyhow::bail!("source Unix broker endpoint")
-                                };
-                                ensure!(
-                                    !Path::new(path).try_exists()?,
-                                    "no existing broker socket adoption"
-                                );
+                                if let v2::LocalEndpoint::UnixPath { path } =
+                                    &header.broker_endpoint
+                                {
+                                    ensure!(
+                                        !Path::new(path).try_exists()?,
+                                        "no existing broker socket adoption"
+                                    );
+                                }
                                 let mut original = Command::new(&broker)
                                     .args(["serve", "--config"])
                                     .arg(&broker_config)
-                                    .current_dir("/")
+                                    .current_dir(root.parent().context("fixture root")?)
                                     .env_clear()
                                     .stdin(Stdio::piped())
                                     // Parent watch uses the existing strict
@@ -187,16 +227,20 @@ impl Operator {
                                 owner.child = Some(original);
                                 ownership = Some(request.ownership_id.clone());
                                 let until = Instant::now() + Duration::from_secs(10);
-                                while !Path::new(path).try_exists()? {
-                                    ensure!(
-                                        owner.child.as_mut().unwrap().try_wait()?.is_none(),
-                                        "original broker exited before endpoint"
-                                    );
-                                    ensure!(
-                                        Instant::now() < until,
-                                        "original broker startup pending"
-                                    );
-                                    thread::sleep(Duration::from_millis(5));
+                                if let v2::LocalEndpoint::UnixPath { path } =
+                                    &header.broker_endpoint
+                                {
+                                    while !Path::new(path).try_exists()? {
+                                        ensure!(
+                                            owner.child.as_mut().unwrap().try_wait()?.is_none(),
+                                            "original broker exited before endpoint"
+                                        );
+                                        ensure!(
+                                            Instant::now() < until,
+                                            "original broker startup pending"
+                                        );
+                                        thread::sleep(Duration::from_millis(5));
+                                    }
                                 }
                                 handshake(&header)?;
                             }
@@ -253,8 +297,14 @@ impl Operator {
         Ok(())
     }
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DesktopEntryKind {
+    SourceDocument,
+    NativeOwnedEntry,
+}
 pub struct DesktopFixture {
     directory: Option<tempfile::TempDir>,
+    root: PathBuf,
     sockets: Option<tempfile::TempDir>,
     operator: Option<Operator>,
     finished: bool,
@@ -267,23 +317,55 @@ pub struct DesktopFixture {
 }
 impl DesktopFixture {
     pub fn root(&self) -> &Path {
-        self.directory.as_ref().unwrap().path()
+        &self.root
     }
     pub fn new(fault: Fault) -> Result<Self> {
-        Self::new_selected(fault, None)
+        Self::new_selected(fault, None, DesktopEntryKind::SourceDocument)
     }
     pub fn new_ordinary(fault: Fault, scenario: ScenarioKind) -> Result<Self> {
-        Self::new_selected(fault, Some(scenario))
+        Self::new_selected(fault, Some(scenario), DesktopEntryKind::SourceDocument)
     }
-    fn new_selected(fault: Fault, scenario: Option<ScenarioKind>) -> Result<Self> {
-        let directory = tempfile::tempdir()?;
-        let root = directory.path();
-        let sockets = tempfile::Builder::new()
-            .prefix("th-desktop-")
-            .tempdir_in("/tmp")?;
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
-        std::fs::set_permissions(sockets.path(), std::fs::Permissions::from_mode(0o700))?;
+    #[cfg(any(target_os = "macos", windows))]
+    pub fn new_owned_entry_ordinary(scenario: ScenarioKind) -> Result<Self> {
+        Self::new_selected(
+            Fault::None,
+            Some(scenario),
+            DesktopEntryKind::NativeOwnedEntry,
+        )
+    }
+    fn new_selected(
+        fault: Fault,
+        scenario: Option<ScenarioKind>,
+        entry_kind: DesktopEntryKind,
+    ) -> Result<Self> {
+        ensure!(
+            entry_kind == DesktopEntryKind::SourceDocument
+                || cfg!(any(target_os = "macos", windows)),
+            "native owned entry fixture requires native platform"
+        );
+        let temporary = std::env::temp_dir();
+        #[cfg(unix)]
+        let temporary = temporary.canonicalize()?;
+        let directory = tempfile::tempdir_in(temporary)?;
+        let fixture_root = directory.path().join("fixture");
+        HostDir::create_private(&fixture_root)?;
+        let root = fixture_root.as_path();
+        #[cfg(unix)]
+        let sockets = Some(
+            tempfile::Builder::new()
+                .prefix("th-desktop-")
+                .tempdir_in(Path::new("/tmp").canonicalize()?)?,
+        );
+        #[cfg(windows)]
+        let sockets: Option<tempfile::TempDir> = None;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                sockets.as_ref().unwrap().path(),
+                std::fs::Permissions::from_mode(0o700),
+            )?;
+        }
         for leaf in [
             "workspace",
             "ledger",
@@ -305,9 +387,17 @@ impl DesktopFixture {
                 source.is_absolute() && source.is_file(),
                 "absolute source binary pin"
             );
-            let destination = artifacts.join(name);
+            let destination = artifacts.join(if cfg!(windows) {
+                format!("{name}.exe")
+            } else {
+                name.into()
+            });
             std::fs::copy(source, &destination)?;
-            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o500))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o500))?;
+            }
             Ok(destination)
         };
         let helper = copy("THESEUS_NATIVE_DESKTOP_HELPER_BINARY", "helper")?;
@@ -316,9 +406,18 @@ impl DesktopFixture {
         let base = copy("THESEUS_NATIVE_SERVICE_BASE", "base")?;
         let target = copy("THESEUS_NATIVE_SERVICE_TARGET", "target")?;
         let controller = copy("THESEUS_NATIVE_INTEGRATION_CONTROLLER", "controller")?;
-        std::fs::set_permissions(&artifacts, std::fs::Permissions::from_mode(0o500))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&artifacts, std::fs::Permissions::from_mode(0o500))?;
+        }
         let workspace = root.join("workspace");
-        let reader = workspace.join("reader");
+        let reader_leaf = if cfg!(windows) {
+            "reader.exe"
+        } else {
+            "reader"
+        };
+        let reader = workspace.join(reader_leaf);
         let data = workspace.join("data");
         let config_path = root.join("config.json");
         let broker_path = root.join("broker.json");
@@ -345,7 +444,7 @@ impl DesktopFixture {
             );
             programs.push(json!({"id":id,"program":if check{&reader}else{&sut},"args":if check{vec![id.to_owned(),data.display().to_string()]}else{vec![id.to_owned(),config_path.display().to_string(),base.display().to_string(),target.display().to_string(),fault.name().into()]},"environment":{"kind":"replace","entries":[]}}));
         }
-        let mut config = json!({"schema":2,"profile":"native_catalog_v1","capabilities":v2::NativeCapabilities::NAMES,"provider_epoch":epoch.to_hex(),"artifacts":{"base":artifact(&base)?,"target":artifact(&target)?},"ledger_root":root.join("ledger"),"workspace_root":workspace,"binding":binding,"manifest_digest":"00".repeat(32),"workspace_marker":marker,"os":"linux","programs":programs});
+        let mut config = json!({"schema":2,"profile":"native_catalog_v1","capabilities":v2::NativeCapabilities::NAMES,"provider_epoch":epoch.to_hex(),"artifacts":{"base":artifact(&base)?,"target":artifact(&target)?},"ledger_root":root.join("ledger"),"workspace_root":workspace,"binding":binding,"manifest_digest":"00".repeat(32),"workspace_marker":marker,"os":installer::os_name(installer::current_os()),"programs":programs});
         let core = theseus_native_helper::config_manifest_digest(&serde_json::to_vec(&config)?)?;
         let expectation = v2::ReadinessDefinitionExpectation {
             role: "configured".into(),
@@ -359,28 +458,107 @@ impl DesktopFixture {
             data_sha256: format!("{:x}", Sha256::digest(b"theseus fixture data\n")),
             configuration_digest: format!("{:x}", Sha256::digest(b"theseus fixture data\n")),
         };
-        let ready = sockets.path().join("ready.sock");
-        let close = sockets.path().join("close.sock");
-        let endpoint = sockets.path().join("broker.sock");
+        let channel = |name: &str| -> v2::LocalEndpoint {
+            if cfg!(windows) {
+                v2::LocalEndpoint::NamedPipe {
+                    path: format!(r"\\.\pipe\theseus.{}-{name}", &epoch.to_hex()[..24]),
+                }
+            } else {
+                v2::LocalEndpoint::UnixPath {
+                    path: sockets
+                        .as_ref()
+                        .unwrap()
+                        .path()
+                        .join(format!("{name}.sock"))
+                        .display()
+                        .to_string(),
+                }
+            }
+        };
+        let ready = channel("ready");
+        let close = channel("close");
+        let endpoint = channel("broker");
+        let endpoint_text = |endpoint: &v2::LocalEndpoint| match endpoint {
+            v2::LocalEndpoint::UnixPath { path } | v2::LocalEndpoint::NamedPipe { path } => {
+                path.clone()
+            }
+        };
+        let native_entry = entry_kind == DesktopEntryKind::NativeOwnedEntry;
+        let executable_root = if native_entry {
+            root.join("entries")
+        } else {
+            workspace.clone()
+        };
+        let executable_leaf = if native_entry && cfg!(target_os = "macos") {
+            "TheseusOwned.app/Contents/MacOS/reader"
+        } else {
+            reader_leaf
+        };
+        let executable_path = executable_root.join(executable_leaf);
         let executable = v2::DesktopExecutable {
-            root: workspace.display().to_string(),
-            relative_path: "reader".into(),
+            root: executable_root.display().to_string(),
+            relative_path: executable_leaf.into(),
             length: expectation.artifact_length,
             sha256: expectation.artifact_sha256.clone(),
             arguments: vec![
-                reader.display().to_string(),
+                executable_path.display().to_string(),
                 "desktop".into(),
-                ready.display().to_string(),
-                close.display().to_string(),
+                endpoint_text(&ready),
+                endpoint_text(&close),
                 data.display().to_string(),
                 "original-source-desktop".into(),
             ],
             environment: vec![],
-            working_directory: workspace.display().to_string(),
+            working_directory: if native_entry && cfg!(windows) {
+                executable_root.display().to_string()
+            } else {
+                workspace.display().to_string()
+            },
         };
         let mut manifest: v2::IntegrationManifest = serde_json::from_value(
             json!({"schema":1,"core_manifest_digest":core.to_hex(),"service_authority":null,"definitions":[],"readiness":null,"desktop_capabilities":["inspect_desktop","owned_executable","request_close"],"artifact_slots":[],"readiness_protocol":"theseus_fixture_ready_v1","desktop":null,"desktop_executable":executable,"desktop_readiness":expectation}),
         )?;
+        if cfg!(target_os = "macos") {
+            manifest.desktop_owned_lifetime =
+                Some(v2::OwnedDesktopLifetimeDefinition::MacosOriginalPrimaryV1);
+        }
+        if native_entry {
+            manifest.desktop_owned_entry = Some(if cfg!(target_os = "macos") {
+                let mut definition = v2::OwnedDesktopEntryDefinition::MacosBundle {
+                    app_leaf: "TheseusOwned.app".into(),
+                    bundle_identifier: "dev.theseus.owned.fixture".into(),
+                    executable_leaf: "reader".into(),
+                    info_plist: v2::NativeArtifactCommitment {
+                        length: 1,
+                        sha256: "01".repeat(32),
+                    },
+                };
+                let bytes = installer::native_entry_bytes(
+                    &definition,
+                    manifest.desktop_executable.as_ref().unwrap(),
+                )?;
+                if let v2::OwnedDesktopEntryDefinition::MacosBundle { info_plist, .. } =
+                    &mut definition
+                {
+                    info_plist.length = bytes.len() as u64;
+                    info_plist.sha256 = format!("{:x}", Sha256::digest(&bytes));
+                }
+                definition
+            } else {
+                v2::OwnedDesktopEntryDefinition::WindowsShortcut
+            });
+        }
+        let entry_leaf = if native_entry {
+            if cfg!(target_os = "macos") {
+                "TheseusOwned.app"
+            } else {
+                "app.lnk"
+            }
+        } else if cfg!(target_os = "linux") {
+            "theseus-source.desktop"
+        } else {
+            "theseus-source-owned.json"
+        };
         let bytes = installer::entry_bytes(&manifest)?;
         let entry_digest = format!("{:x}", Sha256::digest(&bytes));
         let slot = v2::ResourceSlot::new("desktop")?;
@@ -390,21 +568,21 @@ impl DesktopFixture {
             core_manifest_digest: core.to_hex(),
             slot: slot.clone(),
             entry_root: root.join("entries").display().to_string(),
-            entry: "theseus-source.desktop".into(),
+            entry: entry_leaf.into(),
             entry_digest: entry_digest.clone(),
             executable_digest: expectation.artifact_sha256.clone(),
             allowed_modes: vec![v2::broker::DesktopMode::OwnedExecutable],
-            ready_endpoint: v2::LocalEndpoint::UnixPath {
-                path: ready.display().to_string(),
-            },
-            close_endpoint: v2::LocalEndpoint::UnixPath {
-                path: close.display().to_string(),
-            },
+            ready_endpoint: ready,
+            close_endpoint: close,
             expectation_digest: expectation.digest()?.to_hex(),
         });
         manifest.artifact_slots = vec![v2::IntegrationArtifactSlot {
             slot,
-            relative_path: "theseus-source.desktop".into(),
+            relative_path: manifest
+                .desktop_owned_entry
+                .as_ref()
+                .map(|entry| entry.entry_relative_path(manifest.desktop.as_ref().unwrap()))
+                .unwrap_or_else(|| entry_leaf.into()),
             length: bytes.len() as u64,
             sha256: entry_digest,
         }];
@@ -424,6 +602,8 @@ impl DesktopFixture {
                 ),
             ] {
                 let mut definition = v2::DesktopDefinition {
+                    owned_entry: manifest.desktop_owned_entry.clone(),
+                    owned_lifetime: manifest.desktop_owned_lifetime,
                     key: v2::DesktopDefinitionKey {
                         role,
                         artifact: artifact_role,
@@ -462,12 +642,17 @@ impl DesktopFixture {
         let integration = manifest.digest()?;
         let full = v2::integration_manifest_digest(core, integration);
         let principal = theseus_host::principal::current_principal()?;
-        let theseus_host::principal::CurrentPrincipal::Posix {
-            effective_uid,
-            effective_gid,
-        } = principal
-        else {
-            anyhow::bail!("Linux source principal required")
+        let principal = match principal {
+            theseus_host::principal::CurrentPrincipal::Posix {
+                effective_uid,
+                effective_gid,
+            } => v2::broker::BrokerPrincipal::Posix {
+                effective_uid,
+                effective_gid,
+            },
+            theseus_host::principal::CurrentPrincipal::Windows { token_user_sid } => {
+                v2::broker::BrokerPrincipal::Windows { token_user_sid }
+            }
         };
         let header = v2::broker::IntegrationBrokerHeader {
             linux_gio_qualification: None,
@@ -476,23 +661,20 @@ impl DesktopFixture {
             binding: binding.clone(),
             manifest_digest: full.to_hex(),
             workspace_marker: marker.clone(),
-            os: "linux".into(),
+            os: match installer::current_os() {
+                v2::Os::Linux => "linux",
+                v2::Os::Macos => "macos",
+                v2::Os::Windows => "windows",
+            }
+            .into(),
             target_id: "source-desktop-target".into(),
             ownership_id: "03".repeat(16),
             provider_epoch: epoch.to_hex(),
             session_id: "explicit-source-owned".into(),
             session_epoch: epoch.to_hex(),
-            broker_endpoint: v2::LocalEndpoint::UnixPath {
-                path: endpoint.display().to_string(),
-            },
-            broker_principal: v2::broker::BrokerPrincipal::Posix {
-                effective_uid,
-                effective_gid,
-            },
-            helper_principal: v2::broker::BrokerPrincipal::Posix {
-                effective_uid,
-                effective_gid,
-            },
+            broker_endpoint: endpoint,
+            broker_principal: principal.clone(),
+            helper_principal: principal,
             display: v2::broker::SuppliedDisplay::SourceOwnedHeadless,
             allowed_modes: vec![v2::broker::DesktopMode::OwnedExecutable],
         };
@@ -512,7 +694,7 @@ impl DesktopFixture {
             namespace_receipt: None,
             desktop_broker_header: Some(header.clone()),
         };
-        manifest.validate_context(&context, v2::Os::Linux)?;
+        manifest.validate_context(&context, installer::current_os())?;
         config["schema"] = 3.into();
         config["profile"] = "native_integration_v1".into();
         config["core_manifest_digest"] = core.to_hex().into();
@@ -541,6 +723,8 @@ impl DesktopFixture {
         )?;
         let mut catalog: Value =
             serde_json::from_str(include_str!("../../examples/native/recipe.json"))?;
+        catalog["os"] = installer::os_name(installer::current_os()).into();
+        catalog["leaves"]["reader"] = reader_leaf.into();
         catalog["manifest_digest"] = core.to_hex().into();
         catalog["base"] = artifact(&base)?;
         catalog["target"] = artifact(&target)?;
@@ -607,7 +791,11 @@ impl DesktopFixture {
                     protocol: ReadyProtocol::TheseusFixtureReadyV1,
                     deadline_ms: 30000,
                 },
-                lifetime: LifetimeRequirement::OwnedProcessTreeSettled,
+                lifetime: if cfg!(target_os = "macos") {
+                    LifetimeRequirement::OwnedPrimaryExited
+                } else {
+                    LifetimeRequirement::OwnedProcessTreeSettled
+                },
             }),
         };
         write(
@@ -624,13 +812,15 @@ impl DesktopFixture {
         let graph = root.join("graph.json");
         write(
             &graph,
-            &json!({"kind":"theseus_native_integration_fixture_graph","schema":1,"launch":pin(&launch)?,"controller":pin(&controller)?,"base":pin(&base)?,"target":pin(&target)?,"helper":pin(&helper)?,"config":pin(&config_path)?,"provider":pin(&sut)?,"provider_template":pin(&template)?,"provider_root":root.join("provider"),"binding":binding,"manifest_digest":full.to_hex(),"workspace_marker":marker,"provider_epoch":epoch.to_hex(),"core_manifest_digest":core.to_hex(),"integration_manifest_digest":integration.to_hex(),"service_authority":null,"desktop_authority":header.authority(),"source_mode":"source_owned_desktop","broker":pin(&broker)?,"broker_config":pin(&broker_path)?}),
+            &json!({"kind":"theseus_native_integration_fixture_graph","schema":1,"recipe":pin(&recipe.path)?,"launch":pin(&launch)?,"controller":pin(&controller)?,"base":pin(&base)?,"target":pin(&target)?,"helper":pin(&helper)?,"config":pin(&config_path)?,"provider":pin(&sut)?,"provider_template":pin(&template)?,"provider_root":root.join("provider"),"binding":binding,"manifest_digest":full.to_hex(),"workspace_marker":marker,"provider_epoch":epoch.to_hex(),"core_manifest_digest":core.to_hex(),"integration_manifest_digest":integration.to_hex(),"service_authority":null,"desktop_authority":header.authority(),"source_mode":"source_owned_desktop","broker":pin(&broker)?,"broker_config":pin(&broker_path)?}),
         )?;
+        example_inputs::capture(root)?;
         let operator = Operator::start(root.join("provider"), broker, broker_path);
         let output = root.join(".theseus-runs");
         Ok(Self {
             directory: Some(directory),
-            sockets: Some(sockets),
+            root: fixture_root,
+            sockets,
             operator: Some(operator),
             finished: false,
             controller,
@@ -658,7 +848,8 @@ impl Drop for DesktopFixture {
             eprintln!("original desktop broker cleanup uncertain: {error:#}");
         }
         if let Some(root) = self.directory.take() {
-            eprintln!("retained desktop fixture: {}", root.keep().display());
+            let _ = root.keep();
+            eprintln!("retained desktop fixture: {}", self.root.display());
         }
         if let Some(root) = self.sockets.take() {
             eprintln!("retained desktop endpoints: {}", root.keep().display());
@@ -762,6 +953,43 @@ pub fn assert_saved_views(report: &NativeIntegrationReport, directory: &Path) ->
     else {
         anyhow::bail!("paired journal")
     };
+    if report.outcome == theseus::model::RunOutcome::Passed {
+        ensure!(
+            journal.releases.len() == journal.ownership.len()
+                && !journal.releases.is_empty()
+                && journal.releases.iter().all(|r| matches!(
+                    r.completion,
+                    theseus::native::model::Disposition::Complete { .. }
+                )),
+            "actual original helper Release must complete"
+        );
+        for integration in &report.integrations {
+            if integration.desktops.iter().any(|desktop| {
+                desktop.observations.iter().any(|observation| {
+                    observation
+                        .broker_state
+                        .as_ref()
+                        .is_some_and(|state| state.owned_lifetime.is_some())
+                })
+            }) {
+                ensure!(
+                    integration.owned_lifetime.is_some(),
+                    "explicit original owned lifetime must reach the scenario projection"
+                );
+            }
+            if let Some(owned) = &integration.owned_lifetime {
+                ensure!(
+                    owned.state.descendants == v2::broker::OwnedTreeState::Unavailable
+                        && matches!(
+                            integration.dispositions.descendant_scope,
+                            theseus::native::model::Disposition::NotStarted
+                        ),
+                    "Mac structural tree unavailability stays separate from completion"
+                );
+                ensure!(public["records"].as_array().context("public records")?.iter().any(|row| row["detail"]["observation"]["broker_state"]["owned_lifetime"]["descendants"] == "unavailable"), "saved public observations retain unavailable tree fact");
+            }
+        }
+    }
     let public_bytes = serde_json::to_string(&public)?;
     fn private_nonces(value: &Value, result: &mut Vec<String>) {
         match value {
@@ -822,6 +1050,16 @@ pub fn assert_saved_views(report: &NativeIntegrationReport, directory: &Path) ->
                 crossterm::event::KeyCode::Right,
                 crossterm::event::KeyModifiers::NONE,
             ),
+        );
+    }
+    if report
+        .integrations
+        .iter()
+        .any(|scenario| scenario.owned_lifetime.is_some())
+    {
+        ensure!(
+            rendered.to_ascii_lowercase().contains("unavailable"),
+            "TUI retains explicit unavailable owned descendant capability"
         );
     }
     std::fs::write(directory.join("desktop-tui-render.raw"), &rendered)?;

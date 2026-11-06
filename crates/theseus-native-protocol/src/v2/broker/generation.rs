@@ -131,7 +131,7 @@ impl DesktopRequest {
     }
 }
 
-mod program_wire {
+pub(super) mod program_wire {
     use super::ProgramId;
     use serde::{Deserialize, Deserializer, Serializer};
     pub fn serialize<S: Serializer>(program: &ProgramId, serializer: S) -> Result<S::Ok, S::Error> {
@@ -174,6 +174,7 @@ impl super::BrokerLedgerView {
             mode,
             entry_digest,
             expectation_digest,
+            owned_lifetime,
             transition,
             ..
         } = &request.action
@@ -190,6 +191,7 @@ impl super::BrokerLedgerView {
         if !definition.desktop.allowed_modes.contains(mode)
             || definition.desktop.entry_digest != *entry_digest
             || definition.desktop.expectation_digest != *expectation_digest
+            || definition.owned_lifetime != *owned_lifetime
         {
             return Err(Error::InvalidValue);
         }
@@ -235,6 +237,21 @@ impl super::BrokerLedgerView {
             a.request.slot == request.slot
                 && matches!(a.request.action, DesktopAction::Activate { .. })
         });
+        if let Some(previous) = previous
+            && let (
+                DesktopAction::Activate {
+                    owned_lifetime: old,
+                    ..
+                },
+                DesktopAction::Activate {
+                    owned_lifetime: next,
+                    ..
+                },
+            ) = (&previous.request.action, &request.action)
+            && old != next
+        {
+            return Err(Error::InvalidValue);
+        }
         match request.transition() {
             None if previous.is_none() => Ok(()),
             Some(transition) => {

@@ -16,6 +16,31 @@ fn expected_settled_descendants() -> DescendantScope {
     }
 }
 #[test]
+fn owned_primary_backend_requires_actual_mac_not_only_declared_kind() {
+    let actual = session();
+    assert_eq!(
+        OwnedExecutable::validate_original_primary_backend(&actual).is_ok(),
+        cfg!(target_os = "macos")
+    );
+    #[cfg(unix)]
+    {
+        let binding = actual.binding().clone();
+        let forged = BoundSession::admit(
+            SessionAuthority {
+                kind: DesktopKind::MacOs,
+                binding: binding.clone(),
+                allowed_modes: vec![DesktopMode::OwnedExecutable],
+            },
+            &binding,
+        )
+        .unwrap();
+        assert_eq!(
+            OwnedExecutable::validate_original_primary_backend(&forged).is_ok(),
+            cfg!(target_os = "macos")
+        );
+    }
+}
+#[test]
 fn required_owned_tree_capability_is_unavailable_on_macos_before_any_spawn() {
     assert_eq!(
         OwnedExecutable::owned_process_tree_available(),
@@ -494,6 +519,14 @@ fn actual_lifetime(mode: &str) {
     .unwrap();
     #[cfg(not(target_os = "linux"))]
     let mut owner = OwnedExecutable::spawn(session(), &command, binding(), ready, close).unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        let proof = owner.owned_lifetime_proof().unwrap();
+        assert_eq!(proof.primary(), OriginalOwnedPrimary::Running);
+        assert!(!proof.local_retired());
+        assert_eq!(proof.binding().ready, binding().ready);
+        assert_eq!(proof.session(), session().binding());
+    }
     let cancel = AtomicBool::new(false);
     if mode == "backpressure" {
         let pending = owner
@@ -665,6 +698,21 @@ fn actual_lifetime(mode: &str) {
         expected_settled_descendants()
     );
     assert!(owner.observation().local_cleanup_complete);
+    #[cfg(target_os = "macos")]
+    {
+        let proof = owner.owned_lifetime_proof().unwrap();
+        assert_eq!(proof.primary(), OriginalOwnedPrimary::Exited);
+        assert_eq!(proof.local_retired(), !proof.uncertain());
+        // A raw missing child and cached status cannot stand in for the receipt.
+        let original_retirement = owner.primary_retirement.take();
+        assert!(!owner.owned_lifetime_proof().unwrap().local_retired());
+        owner.primary_retirement = original_retirement;
+        assert!(owner.observe_session(None).is_err());
+        let revoked = owner.owned_lifetime_proof().unwrap();
+        assert!(revoked.uncertain());
+        assert_eq!(revoked.primary(), OriginalOwnedPrimary::Exited);
+        assert!(!revoked.local_retired());
+    }
     #[cfg(target_os = "linux")]
     if mode == "lingering-child" || mode == "escaped-child" {
         assert!(owner.scope.as_ref().unwrap().reaped_descendants() >= 1);

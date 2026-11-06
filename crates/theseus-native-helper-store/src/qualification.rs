@@ -173,7 +173,7 @@ impl LedgerStore {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = attestation;
-            return Err(StoreError::BindingMismatch);
+            Err(StoreError::BindingMismatch)
         }
         #[cfg(target_os = "linux")]
         {

@@ -113,6 +113,61 @@ impl std::fmt::Display for ExecutableStartFailure {
 }
 impl std::error::Error for ExecutableStartFailure {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OriginalOwnedPrimary {
+    Running,
+    Exited,
+    Unknown,
+}
+/// Borrowed facts from this exact original owner, never deserialized authority.
+pub struct OwnedLifetimeProof<'a> {
+    original: &'a OwnedExecutable,
+}
+impl OwnedLifetimeProof<'_> {
+    pub fn binding(&self) -> &ExecutableBinding {
+        &self.original.binding
+    }
+    pub fn session(&self) -> &SessionBinding {
+        self.original.session.binding()
+    }
+    pub fn uncertain(&self) -> bool {
+        self.original.session.is_revoked()
+            || !self.original.errors.is_empty()
+            || self.original.errors_truncated
+            || self.original.original_peer_pid.is_none()
+    }
+    pub fn primary(&self) -> OriginalOwnedPrimary {
+        if self.original.primary_exited {
+            OriginalOwnedPrimary::Exited
+        } else if self.uncertain() {
+            OriginalOwnedPrimary::Unknown
+        } else {
+            OriginalOwnedPrimary::Running
+        }
+    }
+    pub fn local_retired(&self) -> bool {
+        #[cfg(unix)]
+        {
+            let original = self.original;
+            !self.uncertain()
+                && original.observation().local_cleanup_complete
+                && original.primary_exited
+                && original
+                    .original_peer_pid
+                    .zip(original.status)
+                    .is_some_and(|(pid, status)| {
+                        original
+                            .primary_retirement
+                            .as_ref()
+                            .is_some_and(|proof| proof.matches(pid, status))
+                    })
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+}
 pub struct OwnedExecutable {
     #[cfg(target_os = "linux")]
     scope: Option<super::scope::DedicatedBrokerScope>,
@@ -131,6 +186,8 @@ pub struct OwnedExecutable {
     primary_exited: bool,
     descendants: DescendantScope,
     status: Option<ExitStatus>,
+    #[cfg(unix)]
+    primary_retirement: Option<crate::process::OriginalChildRetirement>,
     errors: Vec<io::Error>,
     errors_truncated: bool,
 }
@@ -147,6 +204,28 @@ impl OwnedExecutable {
     /// required owned-tree contract before any launch when this is false.
     pub const fn owned_process_tree_available() -> bool {
         cfg!(any(target_os = "linux", windows))
+    }
+    /// Admission only. Structural Mac capability never creates an owner or
+    /// waives a real Linux scope/Windows job. Retirement needs the borrowed proof.
+    pub fn validate_original_primary_backend(session: &BoundSession) -> io::Result<()> {
+        if !cfg!(target_os = "macos") || session.kind() != DesktopKind::MacOs {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "original primary-only owned backend is macOS only",
+            ));
+        }
+        session
+            .authorize(DesktopMode::OwnedExecutable)
+            .map_err(Into::into)
+    }
+    pub fn owned_lifetime_proof(&self) -> io::Result<OwnedLifetimeProof<'_>> {
+        if !cfg!(target_os = "macos") || self.session.kind() != DesktopKind::MacOs {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "original primary-only owned proof is macOS only",
+            ));
+        }
+        Ok(OwnedLifetimeProof { original: self })
     }
     pub fn spawn(
         session: BoundSession,
@@ -212,6 +291,8 @@ impl OwnedExecutable {
             primary_exited: false,
             descendants: DescendantScope::NotCreated,
             status: None,
+            #[cfg(unix)]
+            primary_retirement: None,
             errors: Vec::new(),
             errors_truncated: false,
         };
@@ -589,6 +670,10 @@ impl OwnedExecutable {
             }
             match joined {
                 Ok(Some(status)) => {
+                    #[cfg(unix)]
+                    {
+                        self.primary_retirement = child.retirement_witness();
+                    }
                     self.status = Some(status);
                     self.primary_exited = true;
                     self.child = None;

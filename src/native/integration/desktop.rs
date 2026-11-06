@@ -147,9 +147,35 @@ pub(crate) fn validate_admission(
             && header.allowed_modes == [mode],
         "desktop authority/requirements differ"
     );
+    if let Some(entry) = &manifest.desktop_owned_entry {
+        ensure!(
+            mode == broker::DesktopMode::OwnedExecutable && entry.os() == header.os,
+            "owned native entry differs from selected mode/platform"
+        );
+    }
+    if let Some(owned) = manifest.desktop_owned_lifetime {
+        owned.validate_platform(&header.os)?;
+        ensure!(
+            mode == broker::DesktopMode::OwnedExecutable
+                && requirement.lifetime == LifetimeRequirement::OwnedPrimaryExited,
+            "owned lifetime differs from the selected exact requirement"
+        );
+    } else {
+        ensure!(
+            header.os != "macos" || mode != broker::DesktopMode::OwnedExecutable,
+            "OwnedExecutable lifetime on macOS requires the committed original-primary declaration; choose NativeActivation for manager-instance termination"
+        );
+    }
+    #[cfg(feature = "native-integration-test-support")]
+    let source_headless = header.display == broker::SuppliedDisplay::SourceOwnedHeadless;
+    #[cfg(not(feature = "native-integration-test-support"))]
+    let source_headless = false;
     ensure!(
-        header.os != "macos" || mode != broker::DesktopMode::OwnedExecutable,
-        "product cannot qualify OwnedExecutable lifetime on macOS; choose NativeActivation with manager-instance termination"
+        mode != broker::DesktopMode::OwnedExecutable
+            || header.os == "linux"
+            || source_headless
+            || manifest.desktop_owned_entry.is_some(),
+        "interactive owned execution requires exact native entry declaration before acquisition"
     );
     if let Some(native) = &manifest.desktop_native {
         ensure!(
@@ -855,6 +881,7 @@ impl<'a, 'b, 's> DesktopDriver<'a, 'b, 's> {
             slot: desktop.slot.clone(),
             prior_binding_digest: self.hooks.entry.as_ref().unwrap().binding_digest.clone(),
             action: broker::DesktopAction::Activate {
+                owned_lifetime: self.hooks.manifest.desktop_owned_lifetime,
                 transition,
                 mode: self.hooks.mode,
                 entry_digest: desktop.entry_digest.clone(),
@@ -874,13 +901,24 @@ impl<'a, 'b, 's> DesktopDriver<'a, 'b, 's> {
         self.hooks.close = Some(request.close_request()?);
         self.hooks.activation = Some(request.clone());
         if self.hooks.mode == broker::DesktopMode::OwnedExecutable {
+            let explicit_owned = self.hooks.manifest.desktop_owned_lifetime.is_some();
             let evidence = self.evidence()?;
             evidence.dispositions.primary = Disposition::Unknown {
                 reason: "current original primary unproved".into(),
             };
-            evidence.dispositions.descendant_scope = Disposition::Unknown {
-                reason: "current original descendant scope unproved".into(),
-            };
+            if explicit_owned {
+                ensure!(
+                    matches!(
+                        evidence.dispositions.descendant_scope,
+                        Disposition::NotStarted
+                    ),
+                    "owned unavailable tree cannot clear historical uncertainty"
+                );
+            } else {
+                evidence.dispositions.descendant_scope = Disposition::Unknown {
+                    reason: "current original descendant scope unproved".into(),
+                };
+            }
         } else if self.hooks.requirement.lifetime == LifetimeRequirement::OwnedPrimaryExited {
             self.evidence()?.dispositions.primary = Disposition::Unknown {
                 reason: "current original native primary unproved".into(),
@@ -891,6 +929,11 @@ impl<'a, 'b, 's> DesktopDriver<'a, 'b, 's> {
     }
     fn validate_state(&self, state: &broker::BrokerState) -> Result<()> {
         state.validate()?;
+        ensure!(
+            state.owned_lifetime.as_ref().map(|s| s.definition)
+                == self.hooks.manifest.desktop_owned_lifetime,
+            "original owned lifetime differs from committed manifest declaration"
+        );
         if let Some(native) = &self.hooks.manifest.desktop_native {
             let observed = state
                 .native_lifetime
@@ -1152,7 +1195,9 @@ impl<'a, 'b, 's> DesktopDriver<'a, 'b, 's> {
                 }
             } else {
                 IntegrationProvenance::Unavailable {
-                    reason: "original descendant scope unproved".into(),
+                    reason: if state.owned_lifetime.as_ref().is_some_and(|s| s.descendants == broker::OwnedTreeState::Unavailable) {
+                        "original backend has no descendant-tree capability; primary/local retirement is separate"
+                    } else { "original descendant scope unproved" }.into(),
                 }
             },
         };
@@ -1172,6 +1217,40 @@ impl<'a, 'b, 's> DesktopDriver<'a, 'b, 's> {
             .to_hex(),
         };
         let evidence = self.evidence()?;
+        if let Some(owned) = &state.owned_lifetime {
+            ensure!(
+                activation.owned_lifetime_definition() == Some(owned.definition)
+                    && evidence.desktops[0].actions.contains(&original),
+                "owned lifetime changed original activation declaration/digest"
+            );
+            evidence.owned_lifetime = Some(OwnedDesktopLifetimeProjection {
+                original,
+                state: owned.clone(),
+            });
+            evidence.dispositions.primary = if owned.primary == broker::OwnedPrimaryState::Exited {
+                Disposition::Complete {
+                    receipt: "original owned primary exited".into(),
+                }
+            } else {
+                Disposition::Unknown {
+                    reason: "original owned primary exit unproved".into(),
+                }
+            };
+            if owned.descendants == broker::OwnedTreeState::Unavailable {
+                ensure!(
+                    matches!(
+                        evidence.dispositions.descendant_scope,
+                        Disposition::NotStarted
+                    ),
+                    "owned unavailable tree cannot clear historical uncertainty"
+                );
+            } else {
+                evidence.dispositions.descendant_scope = Disposition::Unknown {
+                    reason: "original owned descendant uncertainty retained".into(),
+                };
+            }
+            return self.record_observation(bound);
+        }
         if let Some(native) = &state.native_lifetime {
             ensure!(
                 evidence.desktops[0].actions.contains(&original),
@@ -1557,11 +1636,14 @@ mod combined_registration_tests {
 #[path = "desktop_admission_tests.rs"]
 mod native_ordinary_admission_tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native-integration-test-support"))]
 mod macos_owned_admission_tests {
     use super::*;
-    #[test]
-    fn macos_owned_primary_admission_refuses_without_changing_other_platforms() {
+    fn owned_fixture() -> (
+        ValidatedIntegrationRecipe,
+        v2::IntegrationManifest,
+        serde_json::Value,
+    ) {
         let mut recipe = ValidatedIntegrationRecipe::decode(
             include_bytes!("../../../examples/native/service-recipe.example.json"),
             "pure-recipe.json".into(),
@@ -1582,6 +1664,11 @@ mod macos_owned_admission_tests {
         recipe.core.recipe.target.sha256 = "33".repeat(32);
         let manifest = readiness_role_review_tests::manifest("target", "target");
         let raw = serde_json::json!({"profile":"native_integration_broker_v1","binding":"01".repeat(16),"manifest_digest":"11".repeat(32),"workspace_marker":"02".repeat(16),"os":"linux","target_id":"fixture","ownership_id":"03".repeat(16),"provider_epoch":"04".repeat(32),"session_id":"supplied","session_epoch":"05".repeat(32),"broker_endpoint":{"kind":"unix_path","path":"/fixture/broker.sock"},"broker_principal":{"kind":"posix","effective_uid":1000,"effective_gid":1000},"helper_principal":{"kind":"posix","effective_uid":1000,"effective_gid":1000},"display":{"kind":"x11","display":":92","authority_file":"/fixture/auth","bus":"/fixture/bus.sock"},"allowed_modes":["owned_executable"]});
+        (recipe, manifest, raw)
+    }
+    #[test]
+    fn macos_owned_primary_admission_refuses_without_changing_other_platforms() {
+        let (mut recipe, manifest, raw) = owned_fixture();
         for os in ["linux", "windows", "macos"] {
             let mut raw = raw.clone();
             raw["os"] = os.into();
@@ -1589,9 +1676,9 @@ mod macos_owned_admission_tests {
                 raw["display"] = serde_json::json!({"kind":"mac_os_gui","domain":"gui/1000"});
             }
             if os == "windows" {
-                raw["display"] = serde_json::json!({"kind":"windows_interactive","session_id":1,"window_station":"WinSta0","desktop":"Default"});
+                raw["display"] = serde_json::json!({"kind":"source_owned_headless"});
                 raw["broker_endpoint"] =
-                    serde_json::json!({"kind":"named_pipe","path":"theseus-fixture"});
+                    serde_json::json!({"kind":"named_pipe","path":r"\\.\pipe\theseus.fixture"});
                 for key in ["broker_principal", "helper_principal"] {
                     raw[key] =
                         serde_json::json!({"kind":"windows","token_user_sid":"S-1-5-21-1000"});
@@ -1633,5 +1720,53 @@ mod macos_owned_admission_tests {
                 broker::DesktopMode::NativeActivation
             );
         }
+    }
+
+    #[test]
+    fn explicit_owned_primary_declaration_is_required_and_platform_bound() {
+        let (recipe, mut manifest, raw) = owned_fixture();
+        manifest.desktop_owned_lifetime =
+            Some(broker::OwnedDesktopLifetimeDefinition::MacosOriginalPrimaryV1);
+        for os in ["macos", "linux"] {
+            let mut raw = raw.clone();
+            raw["os"] = os.into();
+            if os == "macos" {
+                raw["display"] = serde_json::json!({"kind":"source_owned_headless"});
+            }
+            let header: broker::IntegrationBrokerHeader = serde_json::from_value(raw).unwrap();
+            let selected = validate_admission(&recipe, &manifest, &header, ScenarioKind::Clean);
+            if os == "macos" {
+                assert_eq!(selected.unwrap(), broker::DesktopMode::OwnedExecutable);
+            } else {
+                assert!(
+                    selected.is_err(),
+                    "Mac declaration cannot grant another platform authority"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn interactive_owned_windows_requires_native_entry_declaration() {
+        let (recipe, manifest, mut raw) = owned_fixture();
+        raw["os"] = "windows".into();
+        raw["display"] = serde_json::json!({"kind":"windows_interactive","session_id":1,"window_station":"WinSta0","desktop":"Default"});
+        let slash = char::from(92);
+        let pipe = format!("{slash}{slash}.{slash}pipe{slash}theseus.fixture");
+        raw["broker_endpoint"] = serde_json::json!({"kind":"named_pipe","path":pipe});
+        for key in ["broker_principal", "helper_principal"] {
+            raw[key] = serde_json::json!({"kind":"windows","token_user_sid":"S-1-5-21-1000"});
+        }
+        let header: broker::IntegrationBrokerHeader = serde_json::from_value(raw.clone()).unwrap();
+        assert!(
+            validate_admission(&recipe, &manifest, &header, ScenarioKind::Clean).is_err(),
+            "pinned source bytes are not actual native shortcut qualification"
+        );
+        raw["display"] = serde_json::json!({"kind":"source_owned_headless"});
+        let source: broker::IntegrationBrokerHeader = serde_json::from_value(raw).unwrap();
+        assert_eq!(
+            validate_admission(&recipe, &manifest, &source, ScenarioKind::Clean).unwrap(),
+            broker::DesktopMode::OwnedExecutable
+        );
     }
 }

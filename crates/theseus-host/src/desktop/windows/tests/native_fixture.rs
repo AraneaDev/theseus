@@ -2,53 +2,8 @@
 use super::*;
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
-fn put32(data: &mut [u8], offset: usize, value: u32) {
-    data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-}
-fn string_data(data: &mut Vec<u8>, value: &str) {
-    let units: Vec<u16> = value.encode_utf16().collect();
-    data.extend((units.len() as u16).to_le_bytes());
-    for unit in units {
-        data.extend(unit.to_le_bytes());
-    }
-}
 fn fixture_link(target: &str, cwd: &str, args: &str) -> Vec<u8> {
-    let mut data = vec![0u8; 76];
-    put32(&mut data, 0, 76);
-    data[4..20].copy_from_slice(&[1, 20, 2, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 70]);
-    put32(&mut data, 20, 0xb2);
-    put32(&mut data, 60, 1);
-    let mut info = vec![0u8; 36];
-    put32(&mut info, 4, 36);
-    put32(&mut info, 8, 1);
-    put32(&mut info, 12, 36);
-    let mut volume = vec![0u8; 17];
-    put32(&mut volume, 0, 17);
-    put32(&mut volume, 4, 3);
-    put32(&mut volume, 12, 16);
-    info.extend(volume);
-    let offset = info.len() as u32;
-    put32(&mut info, 16, offset);
-    info.extend(target.as_bytes());
-    info.push(0);
-    let offset = info.len() as u32;
-    put32(&mut info, 24, offset);
-    info.push(0);
-    let offset = info.len() as u32;
-    put32(&mut info, 28, offset);
-    for unit in target.encode_utf16().chain(Some(0)) {
-        info.extend(unit.to_le_bytes());
-    }
-    let offset = info.len() as u32;
-    put32(&mut info, 32, offset);
-    info.extend([0, 0]);
-    let length = info.len() as u32;
-    put32(&mut info, 0, length);
-    data.extend(info);
-    string_data(&mut data, cwd);
-    string_data(&mut data, args);
-    data.extend([0; 4]);
-    data
+    super::super::fixture::encode_link(target, cwd, args).unwrap()
 }
 fn commitment(data: &[u8]) -> ArtifactCommitment {
     ArtifactCommitment {
@@ -88,8 +43,14 @@ fn windows_shortcut_native_com_parser_and_retained_pins_are_actual() {
     assert!(fs::write(temp.path().join("app.lnk"), b"replaced").is_err());
     assert!(fs::remove_file(temp.path().join("fixture.exe")).is_err());
     assert!(fs::rename(temp.path(), temp.path().with_extension("moved")).is_err());
-    drop(admitted);
+    let apartment = match admitted.retire_original() {
+        Ok(apartment) => apartment,
+        Err(_) => panic!("original thread parser retirement failed"),
+    };
+    fs::write(temp.path().join("app.lnk"), b"authorized replacement").unwrap();
     fs::remove_file(temp.path().join("app.lnk")).unwrap();
+    fs::remove_file(temp.path().join("fixture.exe")).unwrap();
+    apartment.pump_once().unwrap();
 }
 #[test]
 fn windows_shortcut_native_com_rejects_changed_target_before_activation() {

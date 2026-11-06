@@ -368,6 +368,15 @@ pub enum Message {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
+    InspectOwnedEntry {
+        lease: LeaseId,
+        slot: super::ResourceSlot,
+        generation: Option<super::broker::DesktopActivationTransition>,
+        sut: Option<Box<super::broker::DesktopSutRunWitness>>,
+    },
+    PrepareOwnedEntry {
+        preparation: Box<super::broker::EntryPreparation>,
+    },
     BrokerBind {
         original: Box<super::broker::BrokerBind>,
     },
@@ -468,6 +477,9 @@ pub enum Request {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reply {
+    OwnedEntryPrepared {
+        preparation: Box<super::broker::EntryPreparation>,
+    },
     BrokerDescription {
         header: Box<super::broker::IntegrationBrokerHeader>,
     },
@@ -652,6 +664,25 @@ fn checked_end(offset: u64, length: usize) -> Result<(), Error> {
 fn validate_message(v: &Message) -> Result<(), Error> {
     match v {
         Message::Request {
+            request: Request::PrepareOwnedEntry { preparation },
+        } => preparation.validate(),
+        Message::Request {
+            request: Request::InspectOwnedEntry {
+                generation, sut, ..
+            },
+        } => {
+            if let Some(sut) = sut {
+                sut.validate()?;
+            }
+            if let Some(generation) = generation {
+                generation.validate()?;
+                if Some(&generation.sut) != sut.as_deref() {
+                    return Err(Error::InvalidValue);
+                }
+            }
+            Ok(())
+        }
+        Message::Request {
             request: Request::BrokerBind { original } | Request::QueryBrokerBind { original },
         } => original.validate(),
         Message::Request {
@@ -708,6 +739,7 @@ fn validate_message(v: &Message) -> Result<(), Error> {
                 },
         } => generation.validate(),
         Message::Response { result, .. } => match result {
+            Reply::OwnedEntryPrepared { preparation } => preparation.validate(),
             Reply::BrokerDescription { header } => header.validate(),
             Reply::BrokerBinding { receipt } => receipt.validate(),
             Reply::DesktopState { identity, state } => {

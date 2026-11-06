@@ -215,7 +215,27 @@ fn output(buffer: &[u16]) -> io::Result<String> {
     }
     String::from_utf16(&buffer[..len]).map_err(|_| invalid("non Unicode native shortcut string"))
 }
+pub struct ShortcutRetireFailure {
+    pub error: io::Error,
+    pub owner: AdmittedShortcut,
+}
 impl AdmittedShortcut {
+    /// Consume only this original read-only parser proof on its original thread.
+    /// The caller must establish its original no-effect/retired process barrier.
+    pub fn retire_original(self) -> Result<ComApartment, Box<ShortcutRetireFailure>> {
+        if let Err(error) = self.apartment.check() {
+            return Err(Box::new(ShortcutRetireFailure { error, owner: self }));
+        }
+        let Self {
+            retained,
+            _link,
+            apartment,
+            _thread,
+        } = self;
+        drop(_link);
+        drop(retained);
+        Ok(apartment)
+    }
     pub fn pump_once(&self) -> io::Result<()> {
         self.apartment.pump_once()
     }

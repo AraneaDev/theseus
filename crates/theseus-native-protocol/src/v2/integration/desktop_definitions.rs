@@ -59,6 +59,10 @@ pub struct DesktopDefinition {
     pub readiness: ReadinessDefinitionExpectation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native: Option<NativeDesktopDefinition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_lifetime: Option<super::OwnedDesktopLifetimeDefinition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_entry: Option<super::OwnedDesktopEntryDefinition>,
 }
 impl DesktopDefinition {
     pub fn validate(&self) -> Result<(), Error> {
@@ -75,6 +79,18 @@ impl DesktopDefinition {
         {
             return Err(Error::InvalidValue);
         }
+        if let Some(owned) = self.owned_lifetime {
+            owned.validate_mode(&self.desktop.allowed_modes)?;
+            if self.native.is_some() {
+                return Err(Error::InvalidValue);
+            }
+        }
+        if let Some(entry) = &self.owned_entry {
+            entry.validate(&self.desktop, &self.executable, self.entry_length)?;
+            if self.native.is_some() || self.owned_lifetime.is_some() && entry.os() != "macos" {
+                return Err(Error::InvalidValue);
+            }
+        }
         match &self.native {
             Some(native) => {
                 native.validate(&self.desktop, &self.executable)?;
@@ -90,6 +106,15 @@ impl DesktopDefinition {
             None => {}
         }
         Ok(())
+    }
+    pub fn entry_relative_path(&self) -> String {
+        if let Some(native) = &self.native {
+            native.entry_relative_path(&self.desktop)
+        } else if let Some(entry) = &self.owned_entry {
+            entry.entry_relative_path(&self.desktop)
+        } else {
+            self.desktop.entry.clone()
+        }
     }
     pub fn digest(&self) -> Result<Digest, Error> {
         use sha2::{Digest as _, Sha256};
@@ -136,6 +161,12 @@ impl DesktopDefinition {
             _ => false,
         };
         native_startup
+            && match (&self.owned_entry, &other.owned_entry) {
+                (Some(a), Some(b)) => a.same_namespace(b),
+                (None, None) => true,
+                _ => false,
+            }
+            && self.owned_lifetime == other.owned_lifetime
             && (self.native.is_none()
                 || self.executable.environment == other.executable.environment)
             && self.desktop.core_manifest_digest == other.desktop.core_manifest_digest
@@ -186,6 +217,8 @@ impl IntegrationManifest {
             executable: self.desktop_executable.clone().ok_or(Error::InvalidValue)?,
             readiness: self.desktop_readiness.clone().ok_or(Error::InvalidValue)?,
             native: self.desktop_native.clone(),
+            owned_lifetime: self.desktop_owned_lifetime,
+            owned_entry: self.desktop_owned_entry.clone(),
         })
     }
     pub(super) fn validate_desktop_definitions(&self) -> Result<(), Error> {

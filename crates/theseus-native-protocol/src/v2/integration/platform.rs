@@ -673,6 +673,33 @@ impl IntegrationManifest {
             (None, None) => {}
             _ => return Err(Error::InvalidValue),
         }
+        if let Some(owned) = self.desktop_owned_lifetime {
+            if os != super::super::Os::Macos {
+                return Err(Error::InvalidValue);
+            }
+            owned.validate_platform(
+                &context
+                    .desktop_broker_header
+                    .as_ref()
+                    .ok_or(Error::InvalidValue)?
+                    .os,
+            )?;
+        }
+        if let Some(entry) = &self.desktop_owned_entry {
+            let expected = match os {
+                super::super::Os::Linux => "linux",
+                super::super::Os::Macos => "macos",
+                super::super::Os::Windows => "windows",
+            };
+            if entry.os() != expected
+                || context
+                    .desktop_broker_header
+                    .as_ref()
+                    .is_none_or(|h| h.os != entry.os())
+            {
+                return Err(Error::InvalidValue);
+            }
+        }
         if let Some(native) = &self.desktop_native {
             let expected = match os {
                 super::super::Os::Linux => "linux",

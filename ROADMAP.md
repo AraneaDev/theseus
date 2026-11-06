@@ -1,6 +1,6 @@
 # Theseus roadmap
 
-Last updated: **2026-11-04**. This is the maintained progress tracker for the
+Last updated: **2026-11-06**. This is the maintained progress tracker for the
 remaining roadmap. Update the relevant checklist, current work and acceptance
 status whenever a milestone is implemented, reviewed, tested or merged.
 
@@ -42,9 +42,16 @@ backend. A native controller is distinct from a native guest adapter.
    acceptance is wired into the three-OS CI jobs, with execution still pending.
 3. Native activation and ordinary/combined admission source reviews are closed;
    keep primary, manager-instance and descendant lifetime guarantees explicit.
-4. Finish generated-example validation and the final source-pinned acceptance
-   inventory. Owned ordinary/combined CLI/MCP and recovery local gates pass.
-5. Run one combined CI batch, resolve failures and merge accepted work to `main`.
+4. Windows retained-entry retirement is implemented, locally checked and
+   independently reviewed. Original parser handles settle before mutating SUT
+   commands; failed or uncertain retirement stays quarantined. Native execution
+   remains required in the combined CI batch.
+5. Finish generated-example validation and the final source-pinned acceptance
+   inventory. The independent original recipe pin now passes focused capture,
+   export and decoder checks, and independent review is closed. A fresh compiled
+   export remains pending.
+   Owned ordinary/combined CLI/MCP and recovery local gates pass.
+6. Run one combined CI batch, resolve failures and merge accepted work to `main`.
 
 Keep this queue and the checklists below current as work lands. Record source
 implementation, review, local verification, CI acceptance and merge separately.
@@ -268,6 +275,9 @@ Theseus observes it and performs only declared Start/Stop rehearsals.
   Two actual IPC regressions verify partial-response scheduling, original
   deadlines, cancellation and terminal-cache behavior. This proves the explicitly
   labelled owned headless source path; native OS and GUI activation remain gates.
+  A later clean-checkpoint run exposed legacy Configure replacing identical entry
+  bytes. A fixture-only identity-preserving fix and pre-Prepare input snapshots
+  pass focused controls; fresh final-source runtime/export validation is pending.
 - [x] Implement and independently review Linux GIO, macOS AppKit and Windows
   Shell Host adapter source. All three review findings are closed; focused
   desktop tests and strict Linux/macOS/Windows Rust lint checks pass locally.
@@ -282,11 +292,19 @@ Theseus observes it and performs only declared Start/Stop rehearsals.
   admission before Acquire; this product seam and native ordinary/combined
   capability admission are independently reviewed. Missing original qualification
   still refuses. No actual SDK/graphical execution is claimed.
-- [ ] Add an explicit macOS OwnedExecutable primary-only retirement contract.
-  The product currently refuses this mode before execution: local primary exit
-  cannot satisfy the current broker's descendant settlement/release barrier.
-  Host primary-exit tests do not qualify whole-product completion. Keep native
-  AppKit manager-instance lifetime separate; never relabel unknown descendants.
+- [ ] Finish integrated acceptance of the explicit macOS owned-primary contract.
+  Protocol/store and Host/broker source reviews are closed; product/report
+  integration passes 61 focused integration and 26 recovery tests; its source
+  reviews are closed. Primary/local retirement stays separate from unavailable
+  tree authority. Fresh same-source compiled acceptance remains pending.
+  Portable six-case Source-owned fixtures are required on all three native jobs.
+- [ ] Accept genuine installed owned entries on macOS and Windows. Separate
+  bundle/shortcut declarations and retained CF/COM adapters are source-reviewed;
+  three required ordinary product cases let only the pinned SUT create/remove
+  the real entry and second pinned executable. The Windows pre-SUT retirement
+  barrier is implemented and independently reviewed; original parser handles
+  retire before replacement, with durable quarantine on failure.
+  Native execution is still pending.
 - [ ] Qualify native SDK builds and platform test execution. The AppKit bridge
   requires a native macOS build with the Apple SDK. Real supplied graphical
   sessions remain a separate external acceptance row.
@@ -323,8 +341,11 @@ exercise the full compiled product path; they do not qualify a real manager.
 
 ## Final acceptance and merge
 
-- [ ] Complete remaining implementation and independent reviews locally.
-- [ ] Run focused local checks during development; defer full repeated batches
+- [x] Complete remaining implementation and independent reviews locally.
+  The final original-recipe pin and Windows entry-retirement findings are closed.
+  Workspace all-target/all-feature lint and formatting, focused protocol/helper
+  tests, default shipping compilation and macOS/Windows metadata checks pass.
+- [x] Run focused local checks during development; defer full repeated batches
   until the implementation is ready.
 - [ ] Run one combined same-source Linux/macOS/Windows native CI batch plus all
   eight existing Docker suites; investigate failures before rerunning.

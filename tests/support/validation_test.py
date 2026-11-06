@@ -861,6 +861,55 @@ class ValidationTests(unittest.TestCase):
             self.assertGreaterEqual(desktop.kwargs['timeout'], 300)
             self.assertLessEqual(desktop.kwargs['timeout'], 900)
 
+    def test_every_native_os_requires_source_desktop_product_cases_and_nonzero_execution(self):
+        identity = {'source_sha': 'a' * 40, 'dirty': False}
+        metadata = dict(identity)
+        for key in ('helper_production', 'helper_fixture', 'desktop_broker_fixture',
+                    *validation.INTEGRATION_ARTIFACTS, *validation.INTEGRATION_TEST_ARTIFACTS):
+            metadata[key] = {'path': '/private/pinned/' + key, 'sha256': 'b' * 64, 'length': 12}
+        for system, target in [('Linux', 'x86_64-unknown-linux-gnu'), ('Darwin', 'aarch64-apple-darwin'), ('Windows', 'x86_64-pc-windows-msvc')]:
+            with self.subTest(system=system), tempfile.TemporaryDirectory() as temp:
+                runner = validation.Runner(pathlib.Path(temp))
+                runner.host = target
+                with patch.object(validation, 'load_pinned', return_value=metadata), patch.object(validation, 'verify_integration_tests'), patch.object(validation, 'source_identity', return_value=identity), patch.object(validation.platform, 'system', return_value=system), patch.object(runner, 'run') as run:
+                    validation.native(runner, 'integration')
+                desktop = [call for call in run.call_args_list if call.args[0] == 'source-desktop-product']
+                self.assertEqual(len(desktop), 1, 'every native OS must execute its actual owned product suite')
+                call = desktop[0]
+                self.assertTrue(call.kwargs['require_tests'])
+                self.assertEqual(len(call.kwargs['required_cases']), 6)
+                self.assertIn('source_desktop_clean_uses_original_broker_child_and_public_cli_saved_views', call.kwargs['required_cases'])
+                self.assertIn('source_desktop_ordinary_fresh_six_tool_mcp_keeps_exact_generations_and_saved_views', call.kwargs['required_cases'])
+                self.assertEqual(call.args[1][0], metadata['native_desktop']['path'])
+                self.assertLessEqual(call.kwargs['timeout'], 900)
+
+    def test_genuine_owned_entry_cases_are_required_only_on_mac_and_windows(self):
+        identity = {'source_sha': 'a' * 40, 'dirty': False}
+        metadata = dict(identity)
+        for key in ('helper_production', 'helper_fixture', 'desktop_broker_fixture',
+                    *validation.INTEGRATION_ARTIFACTS, *validation.INTEGRATION_TEST_ARTIFACTS):
+            metadata[key] = {'path': '/private/pinned/' + key, 'sha256': 'b' * 64, 'length': 12}
+        for system, target in [('Linux', 'x86_64-unknown-linux-gnu'), ('Darwin', 'aarch64-apple-darwin'), ('Windows', 'x86_64-pc-windows-msvc')]:
+            with self.subTest(system=system), tempfile.TemporaryDirectory() as temp:
+                runner = validation.Runner(pathlib.Path(temp))
+                runner.host = target
+                with patch.object(validation, 'load_pinned', return_value=metadata), patch.object(validation, 'verify_integration_tests'), patch.object(validation, 'source_identity', return_value=identity), patch.object(validation.platform, 'system', return_value=system), patch.object(runner, 'run') as run:
+                    validation.native(runner, 'integration')
+                desktop = [call for call in run.call_args_list if call.args[0] == 'source-owned-native-entry-product']
+                if system == 'Linux':
+                    self.assertEqual(desktop, [])
+                    continue
+                self.assertEqual(len(desktop), 1)
+                call = desktop[0]
+                self.assertTrue(call.kwargs['require_tests'])
+                self.assertEqual(set(call.kwargs['required_cases']), {
+                    'source_owned_native_entry_clean_releases_original_and_preserves_saved_views',
+                    'source_owned_native_entry_upgrade_releases_each_original_generation',
+                    'source_owned_native_entry_reinstall_releases_same_tuple_new_generation',
+                })
+                self.assertEqual(call.args[1][0], metadata['native_desktop']['path'])
+                self.assertLessEqual(call.kwargs['timeout'], 900)
+
     def test_linux_manager_manifest_pins_real_combined_cases_and_source_owners(self):
         metadata = {'source_sha': 'a' * 40, 'dirty': False}
         for key in ('helper_production', 'helper_fixture', 'desktop_broker_fixture',
@@ -933,7 +982,7 @@ class ValidationTests(unittest.TestCase):
                 with patch.object(validation, 'load_pinned', return_value=metadata), patch.object(validation, 'verify_integration_tests') as verify, patch.object(validation, 'source_identity', return_value=identity), patch.object(validation.platform, 'system', return_value=system), patch.object(runner, 'run') as run:
                     validation.native(runner, 'integration')
                 verify.assert_called_once_with(metadata)
-                self.assertEqual(len(run.call_args_list), 4 if system == 'Linux' else 3)
+                self.assertEqual(len(run.call_args_list), 4 if system == 'Linux' else 5)
                 self.assertTrue(all(call.kwargs.get('require_tests') and call.kwargs.get('required_cases') for call in run.call_args_list))
                 manifest = json.loads((runner.evidence / 'native-manager-manifest.json').read_text())
                 self.assertEqual(manifest['build']['target'], host)

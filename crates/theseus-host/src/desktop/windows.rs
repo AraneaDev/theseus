@@ -4,6 +4,8 @@
 use std::io;
 #[cfg(windows)]
 mod com;
+#[cfg(any(test, feature = "desktop-test-support"))]
+pub mod fixture;
 #[cfg(windows)]
 mod native;
 #[cfg(any(windows, test))]
@@ -11,7 +13,7 @@ mod probe;
 #[cfg(windows)]
 mod retained;
 #[cfg(windows)]
-pub use com::{AdmittedShortcut, ComApartment, NativeCode, NativeError};
+pub use com::{AdmittedShortcut, ComApartment, NativeCode, NativeError, ShortcutRetireFailure};
 #[cfg(windows)]
 pub use native::{LifetimeObservation, NativeActivation, NativeLifetime, NativeStartFailure};
 #[cfg(windows)]

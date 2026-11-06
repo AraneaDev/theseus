@@ -166,6 +166,13 @@ impl SessionGuard {
                 let desktop = matches!(self.description.as_ref(),Some(Reply::IntegrationDescription {description}) if description.manifest.desktop.is_some());
                 if matches!(
                     request,
+                    Request::PrepareOwnedEntry { .. } | Request::InspectOwnedEntry { .. }
+                ) && !broker
+                {
+                    return Err(Error::UnexpectedMessage);
+                }
+                if matches!(
+                    request,
                     Request::ServiceAction { .. }
                         | Request::InspectService { .. }
                         | Request::ProbeReadiness { .. }
@@ -350,10 +357,20 @@ impl SessionGuard {
                 }
             }
             (
+                Request::PrepareOwnedEntry { preparation: a },
+                Reply::OwnedEntryPrepared { preparation: b },
+            ) if a == b => {}
+            (
                 Request::InspectDesktop {
                     lease: a,
                     slot,
                     generation,
+                }
+                | Request::InspectOwnedEntry {
+                    lease: a,
+                    slot,
+                    generation,
+                    ..
                 },
                 Reply::DesktopObservation {
                     lease: b,

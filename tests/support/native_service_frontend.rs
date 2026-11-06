@@ -3,19 +3,23 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
-    io::{self, Read, Write},
+    io::{self, Read},
     path::{Path, PathBuf},
-    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio},
+    process::{Command, ExitStatus},
     thread,
     time::{Duration, Instant},
+};
+use theseus_host::process::{
+    ChildEnvironment, HostCleanup, InputMode, NativeCommand, OwnedChild, PipeReader, PipeWriter,
 };
 pub const FRAME: usize = 65536;
 const TRANSCRIPT: usize = 8 * 1024 * 1024;
 pub struct Controller {
-    child: Option<Child>,
-    input: Option<ChildStdin>,
-    output: Option<ChildStdout>,
-    errors: Option<ChildStderr>,
+    child: Option<OwnedChild>,
+    child_status: Option<ExitStatus>,
+    input: Option<PipeWriter>,
+    output: Option<PipeReader>,
+    errors: Option<PipeReader>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub pending: Vec<u8>,
@@ -29,23 +33,45 @@ pub struct Controller {
     pub active: Option<(String, String)>,
     nonblocking: bool,
 }
-fn nonblocking(fd: &impl std::os::fd::AsFd) -> Result<()> {
-    let flags = rustix::fs::fcntl_getfl(fd)?;
-    rustix::fs::fcntl_setfl(fd, flags | rustix::fs::OFlags::NONBLOCK)?;
-    Ok(())
+fn inherited_command(command: &Command) -> NativeCommand {
+    let mut environment = std::env::vars_os().collect::<std::collections::BTreeMap<_, _>>();
+    for (name, value) in command.get_envs() {
+        if let Some(value) = value {
+            environment.insert(name.to_owned(), value.to_owned());
+        } else {
+            environment.remove(name);
+        }
+    }
+    NativeCommand {
+        program: command.get_program().to_owned(),
+        args: command.get_args().map(|s| s.to_owned()).collect(),
+        cwd: command.get_current_dir().map(Path::to_owned),
+        environment: ChildEnvironment::Replace(environment.into_iter().collect()),
+    }
 }
 impl Controller {
     pub fn spawn(command: &mut Command, evidence: &Path, prefix: &'static str) -> Result<Self> {
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let mut owner = Self {
-            input: child.stdin.take(),
-            output: child.stdout.take(),
-            errors: child.stderr.take(),
-            child: Some(child),
+        let acquired =
+            OwnedChild::spawn(&inherited_command(command), InputMode::Pipe).map_err(|failure| {
+                let error = failure.error;
+                if let HostCleanup::Pending(mut pending) = failure.cleanup {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while Instant::now() < deadline {
+                        match pending.try_complete() {
+                            Ok(true) => return anyhow::Error::new(error),
+                            Ok(false) | Err(_) => thread::sleep(Duration::from_millis(2)),
+                        }
+                    }
+                    let _ = Box::leak(Box::new(pending));
+                }
+                anyhow::Error::new(error)
+            })?;
+        let owner = Self {
+            input: acquired.stdin,
+            output: Some(acquired.stdout),
+            errors: Some(acquired.stderr),
+            child: Some(acquired.child),
+            child_status: None,
             stdout: vec![],
             stderr: vec![],
             pending: vec![],
@@ -57,23 +83,19 @@ impl Controller {
             prefix,
             requests: vec![],
             active: None,
-            nonblocking: false,
+            nonblocking: true,
         };
-        nonblocking(owner.input.as_ref().context("controller stdin")?)?;
-        nonblocking(owner.output.as_ref().context("controller stdout")?)?;
-        nonblocking(owner.errors.as_ref().context("controller stderr")?)?;
-        owner.nonblocking = true;
         Ok(owner)
     }
     fn drain(
-        pipe: &mut impl Read,
+        pipe: &mut PipeReader,
         target: &mut Vec<u8>,
         mut duplicate: Option<&mut Vec<u8>>,
         cap: usize,
     ) -> Result<bool> {
         for _ in 0..8 {
             let mut bytes = [0; 8192];
-            match pipe.read(&mut bytes) {
+            match pipe.try_read(&mut bytes) {
                 Ok(0) => return Ok(true),
                 Ok(n) => {
                     ensure!(
@@ -131,7 +153,7 @@ impl Controller {
                 .input
                 .as_mut()
                 .context("controller input closed")?
-                .write(&bytes[sent..])
+                .try_write(&bytes[sent..])
             {
                 Ok(0) => bail!("controller stdin closed"),
                 Ok(n) => sent += n,
@@ -221,18 +243,28 @@ impl Controller {
         }))
     }
     pub fn close_bounded(&mut self, budget: Duration) -> Result<ExitStatus> {
+        if let Some(input) = self.input.as_mut() {
+            input.close()?;
+        }
         self.input.take();
         let deadline = (Instant::now() + budget).min(self.deadline);
         loop {
             self.pump()?;
-            if let Some(status) = self
-                .child
-                .as_mut()
-                .context("controller child owner")?
-                .try_wait()?
-                && self.output_eof
-                && self.errors_eof
-            {
+            if self.child_status.is_none() {
+                let child = self.child.as_mut().context("controller child owner")?;
+                if child.exited_reserved()? && self.output_eof && self.errors_eof {
+                    self.child_status = child.try_reap_and_release()?;
+                }
+            }
+            if let Some(status) = self.child_status {
+                if let Some(output) = self.output.as_mut() {
+                    output.cancel_and_complete()?;
+                }
+                if let Some(errors) = self.errors.as_mut() {
+                    errors.cancel_and_complete()?;
+                }
+                self.output.take();
+                self.errors.take();
                 self.child.take();
                 return Ok(status);
             }
@@ -268,28 +300,39 @@ impl Drop for Controller {
                 }
                 let _ = self.close();
             }
-            self.input.take();
-            if let Some(child) = self.child.as_mut() {
-                if matches!(child.try_wait(), Ok(None)) {
-                    let _ = child.kill();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut complete = false;
+            while Instant::now() < deadline {
+                let input = self.input.as_mut().is_none_or(|p| p.close().is_ok());
+                let output = self
+                    .output
+                    .as_mut()
+                    .is_none_or(|p| p.cancel_and_complete().is_ok());
+                let errors = self
+                    .errors
+                    .as_mut()
+                    .is_none_or(|p| p.cancel_and_complete().is_ok());
+                let child = self.child_status.is_some()
+                    || self.child.as_mut().is_none_or(|c| {
+                        c.terminate_owned().is_ok()
+                            && matches!(c.try_reap_and_release(), Ok(Some(_)))
+                    });
+                if input && output && errors && child {
+                    complete = true;
+                    break;
                 }
-                let deadline = Instant::now() + Duration::from_secs(3);
-                while Instant::now() < deadline {
-                    match child.try_wait() {
-                        Ok(Some(_)) => break,
-                        Ok(None) => thread::sleep(Duration::from_millis(5)),
-                        Err(_) => break,
-                    }
-                }
+                thread::sleep(Duration::from_millis(2));
             }
-            if self
-                .child
-                .as_mut()
-                .is_some_and(|child| !matches!(child.try_wait(), Ok(Some(_))))
-            {
-                // Never silently drop an unjoined original child/pipe owner.
+            if complete {
+                self.input.take();
+                self.output.take();
+                self.errors.take();
+                self.child.take();
+            } else {
+                // Preserve unresolved original job/group and asynchronous endpoint storage.
                 let _ = Box::leak(Box::new((
                     self.child.take(),
+                    self.input.take(),
                     self.output.take(),
                     self.errors.take(),
                 )));
@@ -743,16 +786,19 @@ pub fn normalize(report: &NativeIntegrationReport) -> Result<NormalizedRun> {
     })
 }
 
+#[cfg(target_os = "linux")]
 use std::{
     ffi::OsString,
     fs::File,
     os::unix::fs::{FileTypeExt, MetadataExt},
     path::Component,
 };
+#[cfg(target_os = "linux")]
 const DIRECTORY_FLAGS: rustix::fs::OFlags = rustix::fs::OFlags::RDONLY
     .union(rustix::fs::OFlags::DIRECTORY)
     .union(rustix::fs::OFlags::NOFOLLOW)
     .union(rustix::fs::OFlags::CLOEXEC);
+#[cfg(target_os = "linux")]
 fn retained_directory(path: &Path) -> Result<File> {
     ensure!(
         path.is_absolute(),
@@ -779,10 +825,12 @@ fn retained_directory(path: &Path) -> Result<File> {
     }
     Ok(file)
 }
+#[cfg(target_os = "linux")]
 fn identity(file: &File) -> Result<(u64, u64)> {
     let md = file.metadata()?;
     Ok((md.dev(), md.ino()))
 }
+#[cfg(target_os = "linux")]
 fn socket_leaf(parent: &File, name: &std::ffi::OsStr) -> Result<File> {
     let file = File::from(rustix::fs::openat(
         parent,
@@ -798,6 +846,7 @@ fn socket_leaf(parent: &File, name: &std::ffi::OsStr) -> Result<File> {
 }
 /// Acts only on the supplied whole-private fixture's exact socket name.
 /// Both descriptors stay held; restoration never replaces an unexpected name.
+#[cfg(target_os = "linux")]
 pub struct PrivateEndpointGuard {
     parent: File,
     original: File,
@@ -808,6 +857,7 @@ pub struct PrivateEndpointGuard {
     evidence: PathBuf,
     restored: bool,
 }
+#[cfg(target_os = "linux")]
 impl PrivateEndpointGuard {
     pub fn disable(authority: &v2::ServiceAuthority, evidence: &Path) -> Result<Self> {
         authority.validate()?;
@@ -978,6 +1028,7 @@ impl PrivateEndpointGuard {
         Ok(())
     }
 }
+#[cfg(target_os = "linux")]
 impl Drop for PrivateEndpointGuard {
     fn drop(&mut self) {
         if !self.restored
@@ -991,7 +1042,7 @@ impl Drop for PrivateEndpointGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     fn private_root() -> tempfile::TempDir {
@@ -1133,5 +1184,51 @@ mod tests {
         drop(replacement);
         std::fs::remove_file(&path).unwrap();
         guard.restore().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod portable_command_tests {
+    use super::*;
+    #[test]
+    fn portable_frontend_keeps_literal_argv_cwd_and_inherited_test_environment() {
+        let executable = std::env::current_exe().unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let mut command = Command::new(&executable);
+        command
+            .args(["two words", r"literal\value"])
+            .current_dir(&cwd)
+            .env("THESEUS_FRONTEND_LITERAL", "kept exactly")
+            .env_remove("THESEUS_FRONTEND_REMOVED");
+        let native = inherited_command(&command);
+        assert_eq!(native.program, executable.as_os_str());
+        assert_eq!(
+            native.args,
+            [
+                std::ffi::OsString::from("two words"),
+                std::ffi::OsString::from(r"literal\value")
+            ]
+        );
+        assert_eq!(native.cwd.as_deref(), Some(cwd.as_path()));
+        let ChildEnvironment::Replace(entries) = native.environment else {
+            panic!("explicit snapshot of inherited test environment");
+        };
+        assert!(
+            entries
+                .iter()
+                .any(|(key, value)| key == "THESEUS_FRONTEND_LITERAL" && value == "kept exactly")
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|(key, _)| key == "THESEUS_FRONTEND_REMOVED")
+        );
+        if let Some(value) = std::env::var_os("PATH") {
+            assert!(
+                entries
+                    .iter()
+                    .any(|(key, actual)| key == "PATH" && actual == &value)
+            );
+        }
     }
 }

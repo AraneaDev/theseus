@@ -22,32 +22,6 @@ pub struct Retained {
     native: host::NativeActivation,
     lifetime: NativeLifetimeState,
 }
-pub(crate) fn admit(
-    tuple: &v2::DesktopDefinition,
-    apartment: host::ComApartment,
-) -> io::Result<host::AdmittedShortcut> {
-    let x = &tuple.executable;
-    let d = &tuple.desktop;
-    if x.root != d.entry_root || x.working_directory != x.root {
-        return Err(invalid("closed shortcut root/cwd differs"));
-    }
-
-    let profile = host::ShortcutProfile {
-        root: d.entry_root.clone(),
-        entry: d.entry.clone(),
-        executable: x.relative_path.clone(),
-        arguments: x.arguments[1..].to_vec(),
-        entry_artifact: host::ArtifactCommitment {
-            length: tuple.entry_length,
-            sha256: super::launch::digest(&d.entry_digest)?,
-        },
-        executable_artifact: host::ArtifactCommitment {
-            length: x.length,
-            sha256: super::launch::digest(&x.sha256)?,
-        },
-    };
-    host::AdmittedShortcut::parse(apartment, host::RetainedShortcut::open(profile)?)
-}
 pub(crate) fn prepare(
     _config: &super::BrokerServerConfig,
     tuple: &v2::DesktopDefinition,

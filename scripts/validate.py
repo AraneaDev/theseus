@@ -621,16 +621,22 @@ def native(runner, stage):
         )
         for case in grammar:
             runner.run('integration-' + case, [metadata['native_services_platforms']['path'], case, '--exact', '--nocapture'], required_cases=[case], require_tests=True)
-        if platform.system() == 'Linux':
-            cases = [
-                'source_desktop_clean_uses_original_broker_child_and_public_cli_saved_views',
-                'source_desktop_missing_and_leaked_entries_fail_exact_sut_postconditions',
-                'source_desktop_fresh_six_tool_mcp_matches_own_saved_desktop_and_tui',
-                'source_desktop_upgrade_keeps_original_base_and_target_generations',
-                'source_desktop_reinstall_same_tuple_requires_new_original_sut_generation',
-                'source_desktop_ordinary_fresh_six_tool_mcp_keeps_exact_generations_and_saved_views',
+        cases = [
+            'source_desktop_clean_uses_original_broker_child_and_public_cli_saved_views',
+            'source_desktop_missing_and_leaked_entries_fail_exact_sut_postconditions',
+            'source_desktop_fresh_six_tool_mcp_matches_own_saved_desktop_and_tui',
+            'source_desktop_upgrade_keeps_original_base_and_target_generations',
+            'source_desktop_reinstall_same_tuple_requires_new_original_sut_generation',
+            'source_desktop_ordinary_fresh_six_tool_mcp_keeps_exact_generations_and_saved_views',
+        ]
+        runner.run('source-desktop-product', [metadata['native_desktop']['path'], 'source_desktop_', '--nocapture', '--test-threads=1'], timeout=600, required_cases=cases, require_tests=True)
+        if platform.system() in ('Darwin', 'Windows'):
+            entry_cases = [
+                'source_owned_native_entry_clean_releases_original_and_preserves_saved_views',
+                'source_owned_native_entry_upgrade_releases_each_original_generation',
+                'source_owned_native_entry_reinstall_releases_same_tuple_new_generation',
             ]
-            runner.run('source-desktop-product', [metadata['native_desktop']['path'], 'source_desktop_', '--nocapture', '--test-threads=1'], timeout=600, required_cases=cases, require_tests=True)
+            runner.run('source-owned-native-entry-product', [metadata['native_desktop']['path'], 'source_owned_native_entry_', '--nocapture', '--test-threads=1'], timeout=600, required_cases=entry_cases, require_tests=True)
         manifest = manager_manifest(metadata, runner.host, platform.system())
         write_json(runner.evidence / 'native-manager-manifest.json', manifest)
     elif stage == 'release':

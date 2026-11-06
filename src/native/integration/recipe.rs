@@ -63,18 +63,6 @@ impl ValidatedIntegrationRecipe {
                 "macOS original descendant scope cannot prove escaped descendants joined"
             );
         }
-        if self.core.recipe.os == crate::native::recipe::NativeOs::Macos
-            && self
-                .recipe
-                .integrations
-                .desktop
-                .as_ref()
-                .is_some_and(|d| d.modes == [DesktopMode::OwnedExecutable])
-        {
-            anyhow::bail!(
-                "product cannot qualify OwnedExecutable lifetime on macOS; choose NativeActivation with manager-instance termination"
-            );
-        }
         if let Some(desktop) = &self.recipe.integrations.desktop
             && desktop.modes == [DesktopMode::NativeActivation]
         {
@@ -756,7 +744,7 @@ mod transition_contract_tests {
 mod desktop_selection_tests {
     use super::*;
     #[test]
-    fn macos_owned_primary_refuses_before_setup_without_changing_other_platforms() {
+    fn macos_owned_primary_selection_defers_to_committed_dynamic_admission() {
         use crate::native::recipe::NativeOs;
         let original = ValidatedIntegrationRecipe::decode(
             include_bytes!("../../../examples/native/service-recipe.example.json"),
@@ -788,14 +776,7 @@ mod desktop_selection_tests {
             let limits = recipe.core.recipe.limits.clone();
             let selected = recipe.validate_selection(&[ScenarioKind::Clean], &limits);
             if os == NativeOs::Macos {
-                let error =
-                    selected.expect_err("macOS OwnedPrimary cannot qualify product release");
-                assert!(
-                    error
-                        .to_string()
-                        .contains("OwnedExecutable lifetime on macOS")
-                );
-                assert!(error.to_string().contains("NativeActivation"));
+                selected.unwrap(); // The dynamic pre-Acquire gate requires the exact committed declaration.
                 recipe
                     .recipe
                     .integrations

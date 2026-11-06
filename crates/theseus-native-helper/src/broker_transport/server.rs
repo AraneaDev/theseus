@@ -252,6 +252,9 @@ pub struct BrokerServer {
     stopping: bool,
     errors: Vec<io::Error>,
     truncated: bool,
+    last_entry_observation: Option<DesktopObservation>,
+    observed_sut: Option<DesktopSutRunWitness>,
+    prepared_entries: Vec<EntryPreparation>,
     definition: Option<RetainedDefinition>,
     definition_used: bool,
     retired_definitions: Vec<RetainedDefinition>,
@@ -316,6 +319,16 @@ impl BrokerServer {
             config.validate()?;
             let measurement = measure_local_identity()?;
             let _session = launch::binding(&config, &measurement)?;
+            super::owned_entry::validate_session(
+                config.manifest.desktop_owned_entry.as_ref(),
+                &_session,
+                &config.header.os,
+            )?;
+            crate::broker::owned_lifetime::validate_backend(
+                config.manifest.desktop_owned_lifetime,
+                &_session,
+                &config.header.os,
+            )?;
             let ledger = HostDir::open(
                 std::path::Path::new(&config.ledger_root),
                 RootPolicy::AllComponentsNoFollow,
@@ -349,7 +362,9 @@ impl BrokerServer {
             let runtime = BrokerRuntime::open(store)?;
             let roots = DefinitionRoots::open(&config)?;
             #[cfg(windows)]
-            let apartment = if config.manifest.desktop_native.is_some() {
+            let apartment = if config.manifest.desktop_native.is_some()
+                || config.manifest.desktop_owned_entry.is_some()
+            {
                 Some(theseus_host::desktop::windows::ComApartment::initialize_original_thread()?)
             } else {
                 None
@@ -382,6 +397,9 @@ impl BrokerServer {
             stopping: false,
             errors: Vec::new(),
             truncated: false,
+            last_entry_observation: None,
+            observed_sut: None,
+            prepared_entries: Vec::new(),
             definition: None,
             definition_used: false,
             retired_definitions: Vec::new(),
@@ -487,7 +505,223 @@ impl BrokerServer {
         }
         Ok(())
     }
+    fn quarantine_entry(&mut self) -> io::Result<()> {
+        self.definition_revoked = true;
+        self.runtime.commit(BrokerEvent::EntryProofQuarantined {})?;
+        Ok(())
+    }
+    fn retire_entry_proof(&mut self) -> io::Result<()> {
+        if self.definition.is_none() {
+            return Ok(());
+        }
+        if self.retired_definitions.len() >= v2::MAX_OPERATIONS {
+            self.definition_revoked = true;
+            self.runtime.commit(BrokerEvent::EntryProofQuarantined {})?;
+            return Err(io::Error::other("entry tombstone capacity"));
+        }
+        let result = self
+            .roots
+            .revalidate()
+            .and_then(|()| self.definition.as_ref().unwrap().revalidate())
+            .and_then(|()| {
+                self.definition.as_mut().unwrap().retire_owned_entry(
+                    #[cfg(windows)]
+                    &mut self.apartment,
+                )
+            });
+        if let Err(error) = result {
+            self.definition_revoked = true;
+            self.runtime.commit(BrokerEvent::EntryProofQuarantined {})?;
+            let operations = BrokerLedgerView::replay(self.runtime.store().records())
+                .map_err(io::Error::other)?
+                .requests()
+                .filter(|r| matches!(r.action, DesktopAction::Activate { .. }))
+                .last()
+                .map(|r| r.helper_operation.clone());
+            if let Some(operation) = operations {
+                self.runtime
+                    .commit(BrokerEvent::Quarantined { operation })?;
+            }
+            self.definition_revoked = true;
+            return Err(error);
+        }
+        self.retired_definitions
+            .push(self.definition.take().unwrap());
+        self.definition_used = false;
+        Ok(())
+    }
+    fn observe_owned_sut(&mut self, sut: Option<&DesktopSutRunWitness>) -> io::Result<()> {
+        if self.config.manifest.desktop_owned_entry.is_none() {
+            return Err(io::Error::other("owned entry inspection not declared"));
+        }
+        let view =
+            BrokerLedgerView::replay(self.runtime.store().records()).map_err(io::Error::other)?;
+        if view.entry_blocked()
+            || view.entry_preparations().len() != self.prepared_entries.len()
+            || (view.requests().next().is_some() && self.prepared_entries.is_empty())
+        {
+            return Err(io::Error::other(
+                "entry preparation pending/quarantined/original continuity lost",
+            ));
+        }
+        if sut == self.observed_sut.as_ref() {
+            return Ok(());
+        }
+        let sut = sut.ok_or_else(|| io::Error::other("original SUT witness disappeared"))?;
+        sut.validate().map_err(io::Error::other)?;
+        let prepared = self
+            .prepared_entries
+            .last()
+            .ok_or_else(|| io::Error::other("original SUT preparation continuity missing"))?;
+        if sut.lease != prepared.helper_lease
+            || sut.operation != prepared.operation
+            || sut.request_digest != prepared.request_digest
+            || sut.program != prepared.program
+        {
+            return Err(io::Error::other(
+                "completed SUT differs from original prepared Run",
+            ));
+        }
+        if self.definition.is_some() || self.unconsumed_launch.is_some() {
+            return Err(io::Error::other("prior original proof remains retained"));
+        }
+        self.generation = None;
+        self.observed_sut = Some(sut.clone());
+        Ok(())
+    }
+    fn prepare_owned_entry(&mut self, preparation: &EntryPreparation) -> io::Result<()> {
+        preparation.validate().map_err(io::Error::other)?;
+        if self.config.manifest.desktop_owned_entry.is_none()
+            || self.definition_revoked
+            || self.unconsumed_launch.is_some()
+            || self.pending.is_some()
+        {
+            return Err(io::Error::other("entry retirement not available"));
+        }
+        let view =
+            BrokerLedgerView::replay(self.runtime.store().records()).map_err(io::Error::other)?;
+        if view.entry_quarantined() {
+            return Err(io::Error::other("entry proof quarantined"));
+        }
+        if let Some((old, settled)) = view
+            .entry_preparations()
+            .iter()
+            .find(|(p, _)| p.operation == preparation.operation)
+        {
+            if old == preparation && *settled && self.prepared_entries.contains(preparation) {
+                return Ok(());
+            }
+            return Err(io::Error::other(
+                "original entry preparation is pending/lost/changed",
+            ));
+        }
+        let lease = v2::LeaseId::parse(&preparation.broker_lease).map_err(io::Error::other)?;
+        if !matches!(
+            self.runtime.store().restart_view().query_lease(lease),
+            Ok(v2::LeaseView::Held { .. })
+        ) {
+            return Err(io::Error::other("entry preparation wrong broker lease"));
+        }
+        let observation = self
+            .last_entry_observation
+            .as_ref()
+            .ok_or_else(|| io::Error::other("original entry inspection missing"))?;
+        if !entry_predecessor_matches(
+            preparation,
+            observation,
+            self.observed_sut.as_ref(),
+            self.prepared_entries.last(),
+            &self
+                .config
+                .header
+                .digest()
+                .map_err(io::Error::other)?
+                .to_hex(),
+        ) {
+            return Err(io::Error::other(
+                "original entry preparation chronology changed",
+            ));
+        }
+        if let Some(original) = view
+            .requests()
+            .filter(|r| matches!(r.action, DesktopAction::Activate { .. }))
+            .last()
+        {
+            let identity = original.identity().map_err(io::Error::other)?;
+            if !view
+                .query(original)
+                .map_err(io::Error::other)?
+                .original_retired()
+                || self.runtime.retirement_continuity()?.as_ref() != Some(&identity)
+            {
+                return Err(io::Error::other("original activated owner not retired"));
+            }
+        }
+        let mapping = (|| {
+            self.roots.revalidate()?;
+            if let Some(definition) = &self.definition {
+                definition.revalidate()?;
+            } else if observation.entry_present {
+                // Only the latest inspected original, never obsolete historical images.
+                self.retired_definitions
+                    .last()
+                    .ok_or_else(|| io::Error::other("original entry tombstone missing"))?
+                    .revalidate_original_files()?;
+            } else {
+                let selected = super::generation::inspection(
+                    &self.config,
+                    &view,
+                    preparation.generation.as_ref(),
+                    self.runtime.retirement_continuity()?.as_ref(),
+                )?;
+                let current = launch::inspect(&self.config, &self.roots, &selected)?;
+                if current.entry_present || current.executable_digest.is_some() {
+                    return Err(io::Error::other("original vacant entry mapping changed"));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = mapping {
+            self.quarantine_entry()?;
+            return Err(error);
+        }
+        self.runtime.commit(BrokerEvent::EntryPreparationAccepted {
+            preparation: preparation.clone(),
+        })?;
+        self.retire_entry_proof()?;
+        self.runtime.commit(BrokerEvent::EntryPreparationSettled {
+            operation: preparation.operation.clone(),
+        })?;
+        self.prepared_entries.push(preparation.clone());
+        Ok(())
+    }
     fn reply(&mut self, sequence: u64, reply: v2::Reply) -> io::Result<()> {
+        if self.config.manifest.desktop_owned_entry.is_some() {
+            if let v2::Reply::DesktopState { identity, state } = &reply
+                && state.original_retired()
+            {
+                let view = BrokerLedgerView::replay(self.runtime.store().records())
+                    .map_err(io::Error::other)?;
+                if view.entry_quarantined() || self.definition_revoked {
+                    return Err(io::Error::other("original entry proof quarantine"));
+                }
+                let latest = view
+                    .requests()
+                    .filter(|r| matches!(r.action, DesktopAction::Activate { .. }))
+                    .last();
+                let current = latest.is_some_and(|r| {
+                    r.helper_operation == identity.helper_operation
+                        || r.close_request()
+                            .is_ok_and(|c| c.helper_operation == identity.helper_operation)
+                });
+                if current {
+                    self.retire_entry_proof()?;
+                }
+            }
+            if let v2::Reply::DesktopObservation { observation, .. } = &reply {
+                self.last_entry_observation = Some(*observation.clone());
+            }
+        }
         if self.replies.len() >= 2 {
             return Err(io::Error::other("bounded broker reply queue full"));
         }
@@ -618,7 +852,34 @@ impl BrokerServer {
                 },
             );
         }
+        let request = match request {
+            v2::Request::InspectOwnedEntry {
+                lease,
+                slot,
+                generation,
+                sut,
+            } => {
+                self.observe_owned_sut(sut.as_deref())?;
+                v2::Request::InspectDesktop {
+                    lease,
+                    slot,
+                    generation,
+                }
+            }
+            v2::Request::InspectDesktop { .. }
+                if self.config.manifest.desktop_owned_entry.is_some() =>
+            {
+                return Err(io::Error::other(
+                    "owned entry requires original helper SUT inspection",
+                ));
+            }
+            other => other,
+        };
         match request {
+            v2::Request::PrepareOwnedEntry { preparation } => {
+                self.prepare_owned_entry(&preparation)?;
+                self.reply(sequence, v2::Reply::OwnedEntryPrepared { preparation })
+            }
             v2::Request::Describe => self.reply(
                 sequence,
                 v2::Reply::BrokerDescription {
@@ -743,9 +1004,19 @@ impl BrokerServer {
                         self.definition_revoked = true;
                     }
                     if !self.definition_revoked {
+                        if self.definition.is_none()
+                            && self.config.manifest.desktop_owned_entry.is_some()
+                            && self.generation.is_some()
+                        {
+                            return Err(io::Error::other(
+                                "retired entry proof cannot be re-admitted without original SUT transition",
+                            ));
+                        }
                         if self.definition.is_none() {
                             #[cfg(windows)]
-                            if selected.native.is_some() && self.apartment.is_none() {
+                            if (selected.native.is_some() || selected.owned_entry.is_some())
+                                && self.apartment.is_none()
+                            {
                                 self.apartment=Some(theseus_host::desktop::windows::ComApartment::initialize_original_thread()?);
                             }
                             match RetainedDefinition::admit(
@@ -875,6 +1146,10 @@ impl BrokerServer {
                         let selected = selected
                             .as_ref()
                             .ok_or_else(|| io::Error::other("selected tuple missing"))?;
+                        crate::broker::owned_lifetime::validate_definition(
+                            selected.owned_lifetime,
+                            request.owned_lifetime_definition(),
+                        )?;
                         let action_digest = request.digest().map_err(io::Error::other)?;
                         if self.unconsumed_launch.is_none() {
                             #[cfg(target_os = "linux")]
@@ -1427,4 +1702,150 @@ pub(super) fn with_cancel_flag<T>(
     let _reset = Reset(Arc::clone(flag));
     flag.store(true, Ordering::Release);
     operation()
+}
+
+fn entry_predecessor_matches(
+    p: &EntryPreparation,
+    observation: &DesktopObservation,
+    observed_sut: Option<&DesktopSutRunWitness>,
+    previous: Option<&EntryPreparation>,
+    header_digest: &str,
+) -> bool {
+    if !observation.complete
+        || p.slot != observation.slot
+        || p.header_digest != header_digest
+        || p.binding_digest != observation.binding_digest
+        || p.generation != observation.generation
+        || p.prior_sut.as_ref() != observed_sut
+        || observation.entry_present && !observation.entry_valid
+        || previous.is_some_and(|old| old.prior_sut == p.prior_sut)
+    {
+        return false;
+    }
+    match p.program.as_str() {
+        "install_base" => {
+            !observation.entry_present
+                && observed_sut.is_none_or(|sut| sut.program.as_str() == "uninstall")
+        }
+        "install_target" | "upgrade" | "reinstall" => {
+            if observation.entry_present {
+                observed_sut.is_some_and(|sut| sut.program.as_str() == "configure")
+            } else {
+                observed_sut.is_none_or(|sut| sut.program.as_str() == "uninstall")
+            }
+        }
+        "configure" | "uninstall" => {
+            observation.entry_present
+                && observed_sut.is_some_and(|sut| sut.program.as_str() != "uninstall")
+        }
+        _ => false,
+    }
+}
+#[cfg(test)]
+mod entry_retirement_tests {
+    use super::*;
+    fn original(program: &str, operation: u8) -> DesktopSutRunWitness {
+        let program = v2::ProgramId::new(program).unwrap();
+        let lease = v2::LeaseId::from_bytes([1; 16]);
+        let operation = v2::OperationId::from_bytes([operation; 16]);
+        DesktopSutRunWitness {
+            lease: lease.to_hex(),
+            operation: operation.to_hex(),
+            request_digest: v2::request_digest(&v2::Request::Run {
+                lease,
+                operation,
+                program: program.clone(),
+            })
+            .unwrap()
+            .to_hex(),
+            program,
+        }
+    }
+    #[test]
+    fn entry_retirement_known_unused_proof_requires_exact_successful_predecessor_and_next_step() {
+        let sut = original("install_target", 2);
+        let run = original("configure", 3);
+        let p = EntryPreparation {
+            helper_lease: run.lease,
+            broker_lease: "04".repeat(16),
+            operation: run.operation,
+            request_digest: run.request_digest,
+            program: run.program,
+            slot: v2::ResourceSlot::new("desktop").unwrap(),
+            header_digest: "05".repeat(32),
+            binding_digest: "06".repeat(32),
+            generation: None,
+            prior_sut: Some(sut.clone()),
+        };
+        let observation = DesktopObservation {
+            slot: p.slot.clone(),
+            entry_present: true,
+            entry_valid: true,
+            entry_digest: Some("07".repeat(32)),
+            executable_digest: Some("08".repeat(32)),
+            session_header_digest: p.header_digest.clone(),
+            binding_digest: p.binding_digest.clone(),
+            complete: true,
+            generation: None,
+        };
+        assert!(entry_predecessor_matches(
+            &p,
+            &observation,
+            Some(&sut),
+            None,
+            &p.header_digest
+        ));
+        assert!(!entry_predecessor_matches(
+            &p,
+            &observation,
+            None,
+            None,
+            &p.header_digest
+        ));
+        assert!(!entry_predecessor_matches(
+            &p,
+            &observation,
+            Some(&original("install_target", 9)),
+            None,
+            &p.header_digest
+        ));
+        assert!(!entry_predecessor_matches(
+            &p,
+            &observation,
+            Some(&sut),
+            Some(&p),
+            &p.header_digest
+        ));
+        let mut changed = observation.clone();
+        changed.binding_digest = "09".repeat(32);
+        assert!(!entry_predecessor_matches(
+            &p,
+            &changed,
+            Some(&sut),
+            None,
+            &p.header_digest
+        ));
+        let mut changed = p.clone();
+        changed.program = v2::ProgramId::new("install_base").unwrap();
+        assert!(!entry_predecessor_matches(
+            &changed,
+            &observation,
+            Some(&sut),
+            None,
+            &p.header_digest
+        ));
+        let mut vacant = observation;
+        vacant.entry_present = false;
+        vacant.entry_valid = false;
+        let mut first = p;
+        first.program = v2::ProgramId::new("install_target").unwrap();
+        first.prior_sut = None;
+        assert!(entry_predecessor_matches(
+            &first,
+            &vacant,
+            None,
+            None,
+            &first.header_digest
+        ));
+    }
 }

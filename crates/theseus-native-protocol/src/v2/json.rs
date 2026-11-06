@@ -46,6 +46,8 @@ macro_rules! broker_wire {
     })+ };
 }
 broker_wire!(
+    broker::EntryPreparation,
+    broker::DesktopSutRunWitness,
     broker::IntegrationBrokerHeader,
     broker::BrokerBind,
     broker::BrokerBindingReceipt,
@@ -923,6 +925,24 @@ impl Wire for Request {
             "query_broker_bind" => Self::QueryBrokerBind {
                 original: Box::new(object.take("original")?),
             },
+            "inspect_owned_entry" => Self::InspectOwnedEntry {
+                lease: object.take("lease")?,
+                slot: object.take("slot")?,
+                generation: object
+                    .0
+                    .remove("generation")
+                    .map(broker::DesktopActivationTransition::read)
+                    .transpose()?,
+                sut: object
+                    .0
+                    .remove("sut")
+                    .map(broker::DesktopSutRunWitness::read)
+                    .transpose()?
+                    .map(Box::new),
+            },
+            "prepare_owned_entry" => Self::PrepareOwnedEntry {
+                preparation: Box::new(object.take("preparation")?),
+            },
             "desktop_action" => Self::DesktopAction {
                 request: Box::new(object.take("request")?),
             },
@@ -1036,6 +1056,30 @@ impl Wire for Request {
                     },
                 )?;
                 m.serialize_entry("original", &Ref(original.as_ref()))?;
+                m.end()
+            }
+            Self::InspectOwnedEntry {
+                lease,
+                slot,
+                generation,
+                sut,
+            } => {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry("kind", "inspect_owned_entry")?;
+                m.serialize_entry("lease", &Ref(lease))?;
+                m.serialize_entry("slot", &Ref(slot))?;
+                if let Some(g) = generation {
+                    m.serialize_entry("generation", &Ref(g))?;
+                }
+                if let Some(sut) = sut {
+                    m.serialize_entry("sut", &Ref(sut.as_ref()))?;
+                }
+                m.end()
+            }
+            Self::PrepareOwnedEntry { preparation } => {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry("kind", "prepare_owned_entry")?;
+                m.serialize_entry("preparation", &Ref(preparation.as_ref()))?;
                 m.end()
             }
             Self::DesktopAction { request } => {
@@ -1259,6 +1303,9 @@ impl Wire for Reply {
                 identity: Box::new(object.take("identity")?),
                 state: Box::new(object.take("state")?),
             },
+            "owned_entry_prepared" => Self::OwnedEntryPrepared {
+                preparation: Box::new(object.take("preparation")?),
+            },
             "desktop_observation" => Self::DesktopObservation {
                 lease: object.take("lease")?,
                 observation: Box::new(object.take("observation")?),
@@ -1427,6 +1474,12 @@ impl Wire for Reply {
                 m.serialize_entry("kind", "desktop_state")?;
                 m.serialize_entry("identity", &Ref(identity.as_ref()))?;
                 m.serialize_entry("state", &Ref(state.as_ref()))?;
+                m.end()
+            }
+            Self::OwnedEntryPrepared { preparation } => {
+                let mut m = s.serialize_map(None)?;
+                m.serialize_entry("kind", "owned_entry_prepared")?;
+                m.serialize_entry("preparation", &Ref(preparation.as_ref()))?;
                 m.end()
             }
             Self::DesktopObservation { lease, observation } => {

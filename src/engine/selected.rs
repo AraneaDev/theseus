@@ -527,6 +527,7 @@ fn run_native(
             report
                 .integrations
                 .push(crate::native::integration::IntegrationScenarioEvidence {
+                    owned_lifetime: None,
                     native_lifetime: None,
                     scenario_id: scenario_id.clone(),
                     ownership_id: ownership_id.clone(),
@@ -563,7 +564,11 @@ fn run_native(
                                 receipt: "no owned primary required".into(),
                             }
                         },
-                        descendant_scope: if report.requirements.desktop.as_ref().is_some_and(|d|d.modes==[crate::native::integration::DesktopMode::NativeActivation]) {
+                        descendant_scope: if report.requirements.desktop.as_ref().is_some_and(|d|
+                            d.modes==[crate::native::integration::DesktopMode::NativeActivation]
+                            || (recipe.recipe.os == crate::native::recipe::NativeOs::Macos
+                                && d.modes==[crate::native::integration::DesktopMode::OwnedExecutable]
+                                && d.lifetime==crate::native::integration::LifetimeRequirement::OwnedPrimaryExited)) {
                             Disposition::NotStarted
                         } else if report.requirements.desktop.is_some() {
                             Disposition::Unknown {

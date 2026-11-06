@@ -1613,6 +1613,30 @@ impl Worker {
                 };
                 return self.finish(v2::Outcome::NotStarted { reason });
             }
+            if let Some(desktop) = &mut self.desktop {
+                let program = self.program.as_ref().ok_or_else(|| {
+                    WorkerPrimary::Io(io::Error::other("original Run program missing"))
+                })?;
+                match desktop.prepare_original_run(
+                    self.store.as_mut().unwrap(),
+                    a._accepted.as_ref().ok_or_else(|| {
+                        WorkerPrimary::Io(io::Error::other(
+                            "original Run acceptance capability missing",
+                        ))
+                    })?,
+                    program,
+                    a.deadline,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(()),
+                    Err(error) => {
+                        desktop.fail(error);
+                        return self.finish(v2::Outcome::NotStarted {
+                            reason: v2::NotStartedReason::CancelRequested,
+                        });
+                    }
+                }
+            }
             if !matches!(a.start.poll(), StartState::Granted) {
                 return Ok(());
             }

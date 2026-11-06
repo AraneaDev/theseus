@@ -26,6 +26,8 @@ pub use crate::broker_transport::native_linux::{
     LinuxReapPermit, OriginalFinalizer, Prepared as PreparedLinuxActivation,
 };
 pub use activation::{PreparedActivation, RetainedActivation};
+#[path = "broker_owned.rs"]
+pub(crate) mod owned_lifetime;
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message)
 }
@@ -449,7 +451,7 @@ impl BrokerRuntime {
     pub fn native_errors(&self) -> Option<&[io::Error]> {
         self.owner.as_ref().map(|live| live.owner.retained_errors())
     }
-    fn commit(&mut self, event: BrokerEvent) -> io::Result<()> {
+    pub(crate) fn commit(&mut self, event: BrokerEvent) -> io::Result<()> {
         if self.poisoned {
             return Err(invalid("broker commit uncertainty"));
         }
@@ -547,6 +549,9 @@ impl BrokerRuntime {
             ));
         }
         let view = projection(&self.store)?;
+        if view.entry_blocked() {
+            return Err(invalid("original entry preparation is pending/quarantined"));
+        }
         if view.requests().any(|request| {
             view.query(request).map_or(true, |state| {
                 !state.original_retired()
@@ -700,6 +705,11 @@ impl BrokerRuntime {
             .as_ref()
             .ok_or_else(|| invalid("missing original owned launch"))?;
         validate_session(&self.header, &planned.session)?;
+        owned_lifetime::validate_backend(
+            request.owned_lifetime_definition(),
+            &planned.session,
+            &self.header.os,
+        )?;
         self.validate_next_activation(&request)?;
         if request.binding_digest != self.header.digest().map_err(io::Error::other)?.to_hex()
             || planned.binding.ready.lease != request.broker_lease
@@ -1034,15 +1044,32 @@ impl BrokerRuntime {
             .find(|live| &live.operation == original_activation)
         {
             let observed = live.owner.observation();
-            state.owner = if observed.local_cleanup_complete {
-                BrokerOwner::Settled
+            let activation = view
+                .original(original_activation)
+                .ok_or_else(|| invalid("original activation request missing"))?;
+            if activation.owned_lifetime_definition().is_some() {
+                // A durable Lost owner cannot be restored by a cached local observation.
+                if state.owner != BrokerOwner::Lost {
+                    let old = state
+                        .owned_lifetime
+                        .as_ref()
+                        .ok_or_else(|| invalid("accepted owned lifetime axis missing"))?;
+                    let next = owned_lifetime::observe(activation, &live.owner, old)?;
+                    state
+                        .record_owned_lifetime(next)
+                        .map_err(io::Error::other)?;
+                }
             } else {
-                BrokerOwner::Retained
-            };
-            state.primary = observed.primary;
-            state.descendants = observed.descendants;
-            state.cleanup_complete = observed.cleanup_complete;
-            state.native_lifetime = observed.native_lifetime;
+                state.owner = if observed.local_cleanup_complete {
+                    BrokerOwner::Settled
+                } else {
+                    BrokerOwner::Retained
+                };
+                state.primary = observed.primary;
+                state.descendants = observed.descendants;
+                state.cleanup_complete = observed.cleanup_complete;
+                state.native_lifetime = observed.native_lifetime;
+            }
             state.quarantined = durable_quarantine || self.poisoned || observed.session_revoked;
         }
         if self.poisoned {
@@ -1340,7 +1367,24 @@ impl BrokerRuntime {
             return Ok(());
         };
         let observed = live.owner.observation();
-        let event = if let Some(state) = observed.native_lifetime {
+        let view = projection(&self.store)?;
+        let original = view
+            .original(&live.operation)
+            .ok_or_else(|| invalid("original activation request missing"))?;
+        let event = if original.owned_lifetime_definition().is_some() {
+            let durable = view.query(original).map_err(io::Error::other)?;
+            let old = durable
+                .owned_lifetime
+                .as_ref()
+                .ok_or_else(|| invalid("accepted owned lifetime axis missing"))?;
+            if durable.owner == BrokerOwner::Lost {
+                return Err(invalid("lost original owned lifetime cannot progress"));
+            }
+            BrokerEvent::OwnedLifetimeRecorded {
+                operation: live.operation.clone(),
+                state: owned_lifetime::observe(original, &live.owner, old)?,
+            }
+        } else if let Some(state) = observed.native_lifetime {
             BrokerEvent::NativeLifetimeRecorded {
                 operation: live.operation.clone(),
                 state,
@@ -1363,7 +1407,8 @@ impl BrokerRuntime {
                 Entry::Broker {
                     event:
                         e @ (BrokerEvent::LifetimeRecorded { .. }
-                        | BrokerEvent::NativeLifetimeRecorded { .. }),
+                        | BrokerEvent::NativeLifetimeRecorded { .. }
+                        | BrokerEvent::OwnedLifetimeRecorded { .. }),
                 } => Some(e),
                 _ => None,
             })

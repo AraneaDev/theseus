@@ -28,11 +28,40 @@ struct Pending {
     sent: bool,
     deadline: Instant,
 }
+fn entry_preparation_ready(
+    pending: Option<&Pending>,
+    completed: Option<&EntryPreparation>,
+    preparation: &EntryPreparation,
+    deadline: Instant,
+    now: Instant,
+) -> io::Result<Option<bool>> {
+    if now >= deadline {
+        return Err(invalid("original SUT deadline elapsed"));
+    }
+    if completed == Some(preparation) {
+        return Ok(Some(true));
+    }
+    if let Some(pending) = pending {
+        if pending.deadline != deadline
+            || now >= pending.deadline
+            || pending.original
+                != (v2::Request::PrepareOwnedEntry {
+                    preparation: Box::new(preparation.clone()),
+                })
+        {
+            return Err(invalid("different original entry exchange or deadline"));
+        }
+        return Ok(Some(false));
+    }
+    Ok(None)
+}
 pub(crate) struct DesktopRuntime {
     header: IntegrationBrokerHeader,
     qualification: Option<theseus_native_helper_store::VerifiedLinuxGioBootstrap>,
     manifest: v2::IntegrationManifest,
     current_sut: Option<(DesktopSutRunWitness, Option<v2::DesktopDefinitionKey>)>,
+    last_entry_observation: Option<DesktopObservation>,
+    prepared_run: Option<EntryPreparation>,
     prior_definition: Option<v2::DesktopDefinitionKey>,
     slot: v2::ResourceSlot,
     intents: IntentStore,
@@ -73,12 +102,22 @@ impl DesktopRuntime {
                 },
             )
             .map_err(io::Error::other)?;
+        broker::owned_lifetime::validate_platform(
+            config.manifest.desktop_owned_lifetime,
+            &header.os,
+        )?;
+        crate::broker_transport::owned_entry::validate_platform(
+            config.manifest.desktop_owned_entry.as_ref(),
+            &header.os,
+        )?;
         Ok(Self {
             header,
             qualification: None,
             slot,
             manifest: config.manifest.clone(),
             current_sut: None,
+            last_entry_observation: None,
+            prepared_run: None,
             prior_definition: None,
             intents: IntentStore::new(HostDir::open(
                 ledger_root,
@@ -220,6 +259,96 @@ impl DesktopRuntime {
             previous_activation,
         }))
     }
+    /// Worker-only: after original Run Accepted, before its one existing spawn grant.
+    pub(crate) fn prepare_original_run(
+        &mut self,
+        store: &mut LedgerStore,
+        accepted: &theseus_native_helper_store::CommittedRecord,
+        program: &v2::ProgramId,
+        deadline: Instant,
+    ) -> io::Result<bool> {
+        if self.manifest.desktop_owned_entry.is_none() || !EntryPreparation::mutating(program) {
+            return Ok(true);
+        }
+        if self.unavailable || Instant::now() >= deadline {
+            return Err(invalid("original entry preparation unavailable/deadline"));
+        }
+        let v2::ledger::Entry::OperationAccepted {
+            lease,
+            operation,
+            request_digest: digest,
+            operation_kind: v2::OperationKind::Run,
+        } = accepted.record().entry()
+        else {
+            return Err(invalid("original accepted Run required"));
+        };
+        let (lease, operation, digest) = (*lease, *operation, *digest);
+        let run = v2::Request::Run {
+            lease,
+            operation,
+            program: program.clone(),
+        };
+        if v2::request_digest(&run).map_err(io::Error::other)? != digest
+            || store.records().get(usize::from(accepted.record().index()))
+                != Some(accepted.record())
+            || !matches!(accepted.record().entry(),v2::ledger::Entry::OperationAccepted {lease:l,operation:o,request_digest:d,operation_kind:v2::OperationKind::Run} if *l==lease && *o==operation && *d==digest)
+        {
+            return Err(invalid(
+                "entry retirement requires this durably accepted original Run",
+            ));
+        }
+        if let Some((sut, _)) = &self.current_sut {
+            sut.matches_successful_terminal(
+                &store.records()[..usize::from(accepted.record().index())],
+            )
+            .map_err(io::Error::other)?;
+        }
+        let observation = self
+            .last_entry_observation
+            .as_ref()
+            .ok_or_else(|| invalid("original entry inspection unavailable"))?;
+        let view = BrokerLedgerView::replay(store.records()).map_err(io::Error::other)?;
+        let original = view
+            .binding_original()
+            .ok_or_else(|| invalid("original broker bind unavailable"))?;
+        let receipt = view
+            .binding(original)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| invalid("original broker binding unavailable"))?;
+        let preparation = EntryPreparation {
+            helper_lease: lease.to_hex(),
+            broker_lease: receipt.broker_lease.clone(),
+            operation: operation.to_hex(),
+            request_digest: digest.to_hex(),
+            program: program.clone(),
+            slot: self.slot.clone(),
+            header_digest: self.header.digest().map_err(io::Error::other)?.to_hex(),
+            binding_digest: observation.binding_digest.clone(),
+            generation: observation.generation.clone(),
+            prior_sut: self.current_sut.as_ref().map(|(sut, _)| sut.clone()),
+        };
+        preparation.validate().map_err(io::Error::other)?;
+        if let Some(ready) = entry_preparation_ready(
+            self.pending.as_ref(),
+            self.prepared_run.as_ref(),
+            &preparation,
+            deadline,
+            Instant::now(),
+        )? {
+            return Ok(ready);
+        }
+        let request = v2::Request::PrepareOwnedEntry {
+            preparation: Box::new(preparation),
+        };
+        self.pending = Some(Pending {
+            original: request.clone(),
+            wire: request,
+            bind: None,
+            sent: false,
+            deadline,
+        });
+        Ok(false)
+    }
     pub(crate) fn is_pending(&self) -> bool {
         self.pending.is_some() || self.cancel.is_some()
     }
@@ -313,6 +442,19 @@ impl DesktopRuntime {
                     }
                 } else {
                     if matches!(action.action, DesktopAction::Activate { .. }) {
+                        let key = action
+                            .transition()
+                            .map_or(v2::DesktopDefinitionKey::CONFIGURED_TARGET, |transition| {
+                                transition.definition
+                            });
+                        let selected = self
+                            .manifest
+                            .desktop_definition(&key)
+                            .map_err(io::Error::other)?;
+                        broker::owned_lifetime::validate_definition(
+                            selected.owned_lifetime,
+                            action.owned_lifetime_definition(),
+                        )?;
                         self.revalidate_qualification()?;
                         let expected =
                             self.current_generation(&view, action.transition().is_some())?;
@@ -360,10 +502,23 @@ impl DesktopRuntime {
                         "inspection changed original SUT generation witness",
                     ));
                 }
-                v2::Request::InspectDesktop {
-                    lease: v2::LeaseId::parse(&receipt.broker_lease).map_err(io::Error::other)?,
-                    slot: slot.clone(),
-                    generation: expected,
+                let lease = v2::LeaseId::parse(&receipt.broker_lease).map_err(io::Error::other)?;
+                if self.manifest.desktop_owned_entry.is_some() {
+                    v2::Request::InspectOwnedEntry {
+                        lease,
+                        slot: slot.clone(),
+                        generation: expected,
+                        sut: self
+                            .current_sut
+                            .as_ref()
+                            .map(|(sut, _)| Box::new(sut.clone())),
+                    }
+                } else {
+                    v2::Request::InspectDesktop {
+                        lease,
+                        slot: slot.clone(),
+                        generation: expected,
+                    }
                 }
             }
             v2::Request::QueryDesktop { identity }
@@ -478,6 +633,19 @@ impl DesktopRuntime {
             return Ok(Some((original, reply)));
         }
         let mut pending = self.pending.take().unwrap();
+        if let v2::Request::PrepareOwnedEntry { preparation } = &pending.original {
+            let v2::Reply::OwnedEntryPrepared {
+                preparation: actual,
+            } = &reply
+            else {
+                return Err(invalid("original entry retirement refused/unavailable"));
+            };
+            if preparation != actual {
+                return Err(invalid("entry retirement acknowledgement changed"));
+            }
+            self.prepared_run = Some(*actual.clone());
+            return Ok(None);
+        }
         if let Some(dispatch) = pending.bind.take() {
             let v2::Reply::Acquired {
                 state:
@@ -514,7 +682,9 @@ impl DesktopRuntime {
                         lease: original, ..
                     } = &pending.original
                     {
-                        let v2::Request::InspectDesktop { generation, .. } = &pending.wire else {
+                        let (v2::Request::InspectDesktop { generation, .. }
+                        | v2::Request::InspectOwnedEntry { generation, .. }) = &pending.wire
+                        else {
                             return Err(invalid("original inspection wire changed"));
                         };
                         if observation.generation != *generation {
@@ -522,6 +692,7 @@ impl DesktopRuntime {
                                 "broker inspection changed completed SUT generation",
                             ));
                         }
+                        self.last_entry_observation = Some(*observation.clone());
                         *lease = *original;
                     }
                 }
@@ -662,6 +833,72 @@ mod generation_tests {
         assert_eq!(
             install.definition_after(runtime.prior_definition).unwrap(),
             Some(prior)
+        );
+    }
+}
+
+#[cfg(test)]
+mod entry_barrier_tests {
+    use super::*;
+    fn preparation() -> EntryPreparation {
+        let run = v2::Request::Run {
+            lease: v2::LeaseId::from_bytes([1; 16]),
+            operation: v2::OperationId::from_bytes([2; 16]),
+            program: v2::ProgramId::new("install_target").unwrap(),
+        };
+        EntryPreparation {
+            helper_lease: "01".repeat(16),
+            broker_lease: "03".repeat(16),
+            operation: "02".repeat(16),
+            request_digest: v2::request_digest(&run).unwrap().to_hex(),
+            program: v2::ProgramId::new("install_target").unwrap(),
+            slot: v2::ResourceSlot::new("desktop").unwrap(),
+            header_digest: "04".repeat(32),
+            binding_digest: "05".repeat(32),
+            generation: None,
+            prior_sut: None,
+        }
+    }
+    #[test]
+    fn entry_barrier_pending_cannot_spawn_or_refresh_original_deadline() {
+        let p = preparation();
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(3);
+        let wire = v2::Request::PrepareOwnedEntry {
+            preparation: Box::new(p.clone()),
+        };
+        let pending = Pending {
+            original: wire.clone(),
+            wire,
+            bind: None,
+            sent: true,
+            deadline,
+        };
+        assert_eq!(
+            entry_preparation_ready(Some(&pending), None, &p, deadline, now).unwrap(),
+            Some(false)
+        );
+        assert!(
+            entry_preparation_ready(
+                Some(&pending),
+                None,
+                &p,
+                deadline + Duration::from_secs(30),
+                now
+            )
+            .is_err()
+        );
+        assert!(entry_preparation_ready(Some(&pending), None, &p, deadline, deadline).is_err());
+        let mut changed = p.clone();
+        changed.operation = "06".repeat(16);
+        assert!(entry_preparation_ready(Some(&pending), None, &changed, deadline, now).is_err());
+        assert_eq!(
+            entry_preparation_ready(None, Some(&p), &p, deadline, now).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            entry_preparation_ready(None, None, &p, deadline, now).unwrap(),
+            None
         );
     }
 }

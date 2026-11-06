@@ -162,6 +162,7 @@ impl DefinitionRoots {
     }
 }
 pub(super) struct RetainedDefinition {
+    retired: bool,
     #[cfg(target_os = "linux")]
     linux: Option<theseus_host::desktop::linux::RetainedEntry>,
     #[cfg(target_os = "macos")]
@@ -182,10 +183,8 @@ impl RetainedDefinition {
         let _ = config;
         let d = &tuple.desktop;
         let x = &tuple.executable;
-        let relative = tuple
-            .native
-            .as_ref()
-            .map_or_else(|| d.entry.clone(), |n| n.entry_relative_path(d));
+        super::owned_entry::validate_platform(tuple.owned_entry.as_ref(), &config.header.os)?;
+        let relative = tuple.entry_relative_path();
         let entry = PinnedFile::open(
             &d.entry_root,
             &relative,
@@ -219,14 +218,14 @@ impl RetainedDefinition {
             },
         )?);
         #[cfg(target_os = "macos")]
-        let macos = if tuple.native.is_some() {
-            Some(super::native_macos::admit(tuple)?)
+        let macos = if tuple.native.is_some() || tuple.owned_entry.is_some() {
+            Some(super::entry_macos::admit(tuple)?)
         } else {
             None
         };
         #[cfg(windows)]
-        let windows = if tuple.native.is_some() {
-            Some(super::native_windows::admit(
+        let windows = if tuple.native.is_some() || tuple.owned_entry.is_some() {
+            Some(super::entry_windows::admit(
                 tuple,
                 apartment
                     .take()
@@ -236,13 +235,13 @@ impl RetainedDefinition {
             None
         };
         #[cfg(not(target_os = "linux"))]
-        if tuple.native.is_none() && !source_headless(config) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "native entry adapter qualification required for interactive non-Linux owned launch",
-            ));
-        }
+        super::owned_entry::require_interactive_definition(
+            tuple.native.is_some(),
+            tuple.owned_entry.is_some(),
+            source_headless(config),
+        )?;
         let owner = Self {
+            retired: false,
             #[cfg(target_os = "linux")]
             linux,
             #[cfg(target_os = "macos")]
@@ -256,7 +255,41 @@ impl RetainedDefinition {
         roots.revalidate()?;
         Ok(owner)
     }
+    /// Retain diagnostic original file identity, but consume executable parser authority.
+    pub fn retire_owned_entry(
+        &mut self,
+        #[cfg(windows)] apartment: &mut Option<theseus_host::desktop::windows::ComApartment>,
+    ) -> io::Result<()> {
+        if self.retired {
+            return Ok(());
+        }
+        #[cfg(windows)]
+        if let Some(owner) = self.windows.take() {
+            match owner.retire_original() {
+                Ok(original) => {
+                    *apartment = Some(original);
+                }
+                Err(failure) => {
+                    let theseus_host::desktop::windows::ShortcutRetireFailure { error, owner } =
+                        *failure;
+                    self.windows = Some(owner);
+                    return Err(error);
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.macos.take();
+        }
+        self.retired = true;
+        Ok(())
+    }
     pub fn revalidate(&self) -> io::Result<()> {
+        if self.retired {
+            return Err(invalid(
+                "original entry proof retired; no activation authority",
+            ));
+        }
         #[cfg(target_os = "linux")]
         if let Some(linux) = &self.linux {
             linux.revalidate()?;
@@ -269,6 +302,10 @@ impl RetainedDefinition {
         if let Some(windows) = &self.windows {
             windows.revalidate()?;
         }
+        self.revalidate_original_files()
+    }
+    /// Identity/content checks only: never restores retired activation authority.
+    pub fn revalidate_original_files(&self) -> io::Result<()> {
         self.entry.revalidate()?;
         self.executable.revalidate()
     }
@@ -473,6 +510,16 @@ pub(super) fn prepare(
     >,
     definition: &mut RetainedDefinition,
 ) -> io::Result<PreparedActivation> {
+    super::owned_entry::validate_session(tuple.owned_entry.as_ref(), &session, &config.header.os)?;
+    crate::broker::owned_lifetime::validate_definition(
+        tuple.owned_lifetime,
+        request.owned_lifetime_definition(),
+    )?;
+    crate::broker::owned_lifetime::validate_backend(
+        tuple.owned_lifetime,
+        &session,
+        &config.header.os,
+    )?;
     let d = &tuple.desktop;
     let x = &tuple.executable;
     let expected = &tuple.readiness;
@@ -764,14 +811,14 @@ pub(super) fn inspect(
     let _ = config;
     let d = &tuple.desktop;
     let x = &tuple.executable;
-    let relative = tuple
-        .native
-        .as_ref()
-        .map_or_else(|| d.entry.clone(), |n| n.entry_relative_path(d));
+    let relative = tuple.entry_relative_path();
     let entry_digest = observed_file(&roots.entry, &relative, 65536)?;
     let entry_present = if matches!(
         tuple.native,
         Some(v2::NativeDesktopDefinition::MacosBundle { .. })
+    ) || matches!(
+        tuple.owned_entry,
+        Some(v2::OwnedDesktopEntryDefinition::MacosBundle { .. })
     ) {
         // An app directory with absent metadata remains present/leaked, not absent.
         match open_child_directory_classified(&roots.entry, OsStr::new(&d.entry)) {

@@ -72,6 +72,7 @@ fn original_activation() -> v2::broker::DesktopRequest {
         slot: v2::ResourceSlot::new("fixture_desktop").unwrap(),
         prior_binding_digest: "66".repeat(32),
         action: DesktopAction::Activate {
+            owned_lifetime: None,
             transition: None,
             mode: DesktopMode::OwnedExecutable,
             entry_digest: "77".repeat(32),
@@ -95,6 +96,7 @@ fn original_activation() -> v2::broker::DesktopRequest {
 fn post_activation_validation_returns_refreshed_quarantine_state() {
     use v2::broker::*;
     let stale = BrokerState {
+        owned_lifetime: None,
         native_lifetime: None,
         effect: BrokerEffect::Receipt {
             receipt: BrokerEffectReceipt {

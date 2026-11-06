@@ -393,6 +393,7 @@ fn activate(
         slot: tuple.desktop.slot.clone(),
         prior_binding_digest: "bb".repeat(32),
         action: DesktopAction::Activate {
+            owned_lifetime: None,
             transition: Some(transition),
             mode: DesktopMode::OwnedExecutable,
             entry_digest: tuple.desktop.entry_digest,
@@ -428,6 +429,7 @@ fn accept(records: &mut Vec<v2::ledger::Record>, request: &DesktopRequest) {
 }
 fn retired(request: &DesktopRequest) -> BrokerState {
     BrokerState {
+        owned_lifetime: None,
         native_lifetime: None,
         effect: BrokerEffect::Receipt {
             receipt: BrokerEffectReceipt {

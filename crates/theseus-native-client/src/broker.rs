@@ -59,7 +59,9 @@ impl BrokerSession {
         }
         if !matches!(
             request,
-            v2::Request::Acquire { .. }
+            v2::Request::InspectOwnedEntry { .. }
+                | v2::Request::PrepareOwnedEntry { .. }
+                | v2::Request::Acquire { .. }
                 | v2::Request::QueryAcquire { .. }
                 | v2::Request::Release { .. }
                 | v2::Request::QueryLease { .. }

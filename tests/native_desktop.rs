@@ -1,5 +1,6 @@
-#![cfg(all(feature = "native-integration-test-support", target_os = "linux"))]
+#![cfg(feature = "native-integration-test-support")]
 //! SourceOwned desktop fixtures; Combined labels real and private-model manager evidence separately.
+#[cfg(target_os = "linux")]
 #[path = "support/native_desktop_combined.rs"]
 mod combined;
 #[path = "support/native_service_frontend.rs"]
@@ -83,7 +84,53 @@ fn assert_desktop(report: &NativeIntegrationReport) {
             .any(|c| c.predicate == IntegrationPredicate::ApplicationReady)
     );
     assert!(report.integrations[0].checks.iter().any(|c| c.predicate
-        == IntegrationPredicate::Lifetime(LifetimeRequirement::OwnedProcessTreeSettled)));
+        == IntegrationPredicate::Lifetime(if cfg!(target_os = "macos") {
+            LifetimeRequirement::OwnedPrimaryExited
+        } else {
+            LifetimeRequirement::OwnedProcessTreeSettled
+        })));
+    for desktop in &report.integrations[0].desktops {
+        let states = desktop
+            .observations
+            .iter()
+            .filter_map(|o| o.broker_state.as_ref())
+            .filter(|s| s.original_retired())
+            .collect::<Vec<_>>();
+        assert!(
+            !states.is_empty(),
+            "actual original primary/local retirement required"
+        );
+        for state in states {
+            assert!(
+                matches!(&state.effect, theseus_native_protocol::v2::broker::BrokerEffect::Receipt {receipt} if receipt.evidence == theseus_native_protocol::v2::broker::DesktopEvidence::SourceOwnedExecutable)
+            );
+            if cfg!(target_os = "macos") {
+                let owned = state
+                    .owned_lifetime
+                    .as_ref()
+                    .expect("committed Mac primary axis");
+                assert_eq!(
+                    owned.primary,
+                    theseus_native_protocol::v2::broker::OwnedPrimaryState::Exited
+                );
+                assert_eq!(
+                    owned.descendants,
+                    theseus_native_protocol::v2::broker::OwnedTreeState::Unavailable
+                );
+                assert_eq!(
+                    owned.local_resources,
+                    theseus_native_protocol::v2::broker::OwnedLocalState::Retired
+                );
+                assert!(
+                    !state.cleanup_complete,
+                    "primary retirement is never a tree proof"
+                );
+            } else {
+                assert!(state.owned_lifetime.is_none());
+                assert!(state.cleanup_complete);
+            }
+        }
+    }
 }
 #[test]
 fn source_desktop_clean_uses_original_broker_child_and_public_cli_saved_views() -> Result<()> {
@@ -364,6 +411,7 @@ fn source_desktop_reinstall_same_tuple_requires_new_original_sut_generation() ->
     f.finish()
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn source_combined_service_desktop_share_one_sequence_provider_and_lease() -> Result<()> {
     for scenario in [
@@ -422,6 +470,7 @@ fn source_desktop_ordinary_fresh_six_tool_mcp_keeps_exact_generations_and_saved_
     }
     Ok(())
 }
+#[cfg(target_os = "linux")]
 #[test]
 fn source_combined_ordinary_fresh_six_tool_mcp_keeps_one_shared_lease_and_saved_views() -> Result<()>
 {
@@ -447,6 +496,7 @@ fn source_combined_ordinary_fresh_six_tool_mcp_keeps_one_shared_lease_and_saved_
 }
 
 /// Private D-Bus manager model evidence; does not qualify native/supplied-manager Combined.
+#[cfg(target_os = "linux")]
 #[test]
 fn private_model_combined_service_desktop_ordinary_cli_one_shared_lease() -> Result<()> {
     for scenario in [
@@ -492,6 +542,7 @@ fn private_model_combined_service_desktop_ordinary_cli_one_shared_lease() -> Res
     Ok(())
 }
 /// Fresh private-model contexts, never reused to claim native manager qualification.
+#[cfg(target_os = "linux")]
 #[test]
 fn private_model_combined_ordinary_fresh_six_tool_mcp_one_shared_lease() -> Result<()> {
     for scenario in [
@@ -513,4 +564,50 @@ fn private_model_combined_ordinary_fresh_six_tool_mcp_one_shared_lease() -> Resu
         f.finish()?;
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn genuine_owned_entry_scenario(scenario: ScenarioKind) -> Result<()> {
+    let f = DesktopFixture::new_owned_entry_ordinary(scenario)?;
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(f.root().join("config.json"))?)?;
+    let manifest: theseus_native_protocol::v2::IntegrationManifest =
+        serde_json::from_value(config["integration_manifest"].clone())?;
+    ensure!(
+        manifest.desktop_native.is_none()
+            && manifest.desktop_owned_entry.as_ref().is_some_and(
+                |entry| entry.os() == setup::installer::os_name(setup::installer::current_os())
+            ),
+        "genuine owned entry declaration for actual platform"
+    );
+    ensure!(
+        manifest
+            .desktop_definitions
+            .iter()
+            .all(|d| d.native.is_none() && d.owned_entry == manifest.desktop_owned_entry),
+        "every committed generation retains genuine owned entry declaration"
+    );
+    let (report, directory) = cli_scenario(&f, scenario)?;
+    if scenario == ScenarioKind::Clean {
+        assert_desktop(&report);
+    } else {
+        assert_ordinary_generations(&report, &directory, scenario)?;
+    }
+    setup::assert_saved_views(&report, &directory)?;
+    f.finish()
+}
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn source_owned_native_entry_clean_releases_original_and_preserves_saved_views() -> Result<()> {
+    genuine_owned_entry_scenario(ScenarioKind::Clean)
+}
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn source_owned_native_entry_upgrade_releases_each_original_generation() -> Result<()> {
+    genuine_owned_entry_scenario(ScenarioKind::Upgrade)
+}
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn source_owned_native_entry_reinstall_releases_same_tuple_new_generation() -> Result<()> {
+    genuine_owned_entry_scenario(ScenarioKind::Reinstall)
 }

@@ -150,6 +150,14 @@ impl BrokerServerConfig {
         // A combined manifest is the same immutable fullM; this broker
         // still dispatches desktop requests only and acquires no service rights.
         self.manifest.validate().map_err(io::Error::other)?;
+        super::owned_entry::validate_platform(
+            self.manifest.desktop_owned_entry.as_ref(),
+            &self.header.os,
+        )?;
+        crate::broker::owned_lifetime::validate_platform(
+            self.manifest.desktop_owned_lifetime,
+            &self.header.os,
+        )?;
         let core =
             v2::Digest::parse(&self.manifest.core_manifest_digest).map_err(io::Error::other)?;
         let full = v2::integration_manifest_digest(
@@ -216,12 +224,11 @@ impl BrokerServerConfig {
             ));
         }
         #[cfg(not(target_os = "linux"))]
-        if self.manifest.desktop_native.is_none() && !super::launch::source_headless(self) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "interactive non-Linux entry adapter not integrated; owned headless source profile only",
-            ));
-        }
+        super::owned_entry::require_interactive_definition(
+            self.manifest.desktop_native.is_some(),
+            self.manifest.desktop_owned_entry.is_some(),
+            super::launch::source_headless(self),
+        )?;
         for tuple in &self.manifest.desktop_definitions {
             if tuple.native.is_some() {
                 super::native_policy::validate_bootstrap_tuple(tuple)?;

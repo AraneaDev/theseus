@@ -60,6 +60,7 @@ fn original_broker_profile_uses_existing_locked_store_and_never_becomes_native_c
         slot: theseus_native_protocol::v2::ResourceSlot::new("desktop").unwrap(),
         prior_binding_digest: "bb".repeat(32),
         action: DesktopAction::Activate {
+            owned_lifetime: None,
             transition: None,
             mode: DesktopMode::OwnedExecutable,
             entry_digest: "cc".repeat(32),

@@ -802,7 +802,15 @@ pub struct NativeDesktopLifetimeProjection {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct OwnedDesktopLifetimeProjection {
+    pub original: ActionReference,
+    pub state: theseus_native_protocol::v2::broker::OwnedLifetimeState,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IntegrationScenarioEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_lifetime: Option<OwnedDesktopLifetimeProjection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_lifetime: Option<NativeDesktopLifetimeProjection>,
     pub scenario_id: String,
@@ -1044,6 +1052,18 @@ pub fn validate_original_broker_effect(
         matches!(action.request, IntegrationRequest::Desktop { .. }),
         "broker state borrowed service effect authority"
     );
+    if let IntegrationRequest::Desktop { request, .. } = &action.request
+        && matches!(
+            request.action,
+            theseus_native_protocol::v2::broker::DesktopAction::Activate { .. }
+        )
+    {
+        ensure!(
+            request.owned_lifetime_definition()
+                == state.owned_lifetime.as_ref().map(|s| s.definition),
+            "recovered owned lifetime changed the original Activate declaration"
+        );
+    }
     validate_broker_effect_terminal(action.terminal.as_ref(), state)
 }
 pub fn validate_broker_effect_terminal(
@@ -1103,6 +1123,12 @@ pub fn validate_broker_progress(
 ) -> Result<()> {
     use theseus_native_protocol::v2::broker::*;
     next.validate()?;
+    match (&previous.owned_lifetime, &next.owned_lifetime) {
+        (Some(old), Some(new)) => new.validate_progress_from(old)?,
+        (Some(_), None) => anyhow::bail!("original owned lifetime projection disappeared"),
+        (None, Some(_)) => anyhow::bail!("owned lifetime invented after original initial state"),
+        _ => {}
+    }
     match (&previous.native_lifetime, &next.native_lifetime) {
         (Some(old), Some(new)) => new.validate_progress_from(old)?,
         (Some(_), None) => anyhow::bail!("original native lifetime projection disappeared"),
@@ -1236,6 +1262,16 @@ impl IntegrationDispositions {
 }
 impl IntegrationScenarioEvidence {
     pub fn complete(&self) -> bool {
+        if self.owned_lifetime.is_some()
+            || self
+                .desktops
+                .iter()
+                .flat_map(|d| &d.observations)
+                .filter_map(|o| o.broker_state.as_ref())
+                .any(|s| s.owned_lifetime.is_some())
+        {
+            return super::owned_lifetime::scenario_complete(self);
+        }
         let Some(native) = &self.native_lifetime else {
             let native_observed=self.desktops.iter().flat_map(|d|&d.observations).filter_map(|o|o.broker_state.as_ref()).any(|s|s.native_lifetime.is_some() || matches!(&s.effect,theseus_native_protocol::v2::broker::BrokerEffect::Receipt {receipt} if receipt.evidence==theseus_native_protocol::v2::broker::DesktopEvidence::NativeActivation));
             return !native_observed && self.dispositions.complete();
@@ -1655,6 +1691,7 @@ impl NativeIntegrationReport {
                     }
                 }
             }
+            super::owned_lifetime::validate_report_scenario(&self.requirements, integration)?;
             if let Some(native) = &integration.native_lifetime {
                 native.state.validate()?;
                 let required = self.requirements.desktop.as_ref().ok_or_else(|| {
@@ -2515,6 +2552,11 @@ impl NativeIntegrationJournal {
                     request.identity()? == observation.identity,
                     "broker observation original identity changed"
                 );
+                super::owned_lifetime::validate_recovered_observation(
+                    self,
+                    action,
+                    &observation.state,
+                )?;
                 validate_broker_effect_terminal(
                     broker_terminals
                         .get(&(action.operation.clone(), action.request_digest.clone()))
@@ -2709,6 +2751,7 @@ pub fn validate_pair(
         }
     }
     for integration in &report.integrations {
+        super::owned_lifetime::validate_pair_projection(integration, journal)?;
         for desktop in &integration.desktops {
             for observation in &desktop.observations {
                 validate_desktop_observation_generation(report, journal, observation)?;
@@ -2739,6 +2782,29 @@ pub fn validate_pair(
                         ) && request.prior_binding_digest == binding.binding_digest,
                         "desktop observation changed original activation context"
                     );
+                    if let Some(state) = &observation.broker_state
+                        && (request.owned_lifetime_definition().is_some()
+                            || state.owned_lifetime.is_some())
+                    {
+                        let broker = journal
+                            .broker_bindings
+                            .iter()
+                            .find(|b| {
+                                b.ownership_id == binding.ownership_id
+                                    && b.helper_lease == binding.lease
+                                    && b.broker_lease.as_ref() == Some(&request.broker_lease)
+                            })
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("owned lifetime original broker mapping missing")
+                            })?;
+                        super::owned_lifetime::validate_original_observation(
+                            request,
+                            state,
+                            report.requirements.desktop.as_ref(),
+                            &broker.original.expected_header.os,
+                        )?;
+                        super::owned_lifetime::validate_report_effect(action, state)?;
+                    }
                     if let Some(native) = observation
                         .broker_state
                         .as_ref()
@@ -3489,6 +3555,7 @@ mod native_desktop_mode_tests {
     fn native_state(authority: NativeLifetimeAuthority) -> BrokerState {
         let manager = authority == NativeLifetimeAuthority::ManagerInstance;
         BrokerState {
+            owned_lifetime: None,
             effect: BrokerEffect::Receipt {
                 receipt: BrokerEffectReceipt {
                     evidence:
@@ -3524,7 +3591,7 @@ mod native_desktop_mode_tests {
             }),
         }
     }
-    fn observation(state: BrokerState) -> BoundDesktopObservation {
+    pub(super) fn observation(state: BrokerState) -> BoundDesktopObservation {
         BoundDesktopObservation {
             generation: None,
             binding: ObservationBinding {
@@ -3998,7 +4065,7 @@ mod desktop_generation_presence_tests {
     use theseus_native_protocol::v2::{self, broker};
 
     // Pure saved DTOs: no application, broker, manager, or helper is executed.
-    fn pair(
+    pub(super) fn pair(
         scenario: ScenarioKind,
         activated: bool,
     ) -> (NativeIntegrationReport, NativeIntegrationJournal) {
@@ -4109,6 +4176,7 @@ mod desktop_generation_presence_tests {
             reason: "not sampled by this observation".into(),
         };
         let state = broker::BrokerState {
+            owned_lifetime: None,
             native_lifetime: None,
             effect: broker::BrokerEffect::Receipt {
                 receipt: broker::BrokerEffectReceipt {
@@ -4382,5 +4450,310 @@ mod desktop_generation_presence_tests {
             .unwrap()
             .to_hex();
         validate_pair(&report, &journal).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod owned_desktop_mode_tests {
+    use super::*;
+    use theseus_native_protocol::v2::broker::*;
+    fn scenario() -> IntegrationScenarioEvidence {
+        let mut scenario = crate::native::integration::view::tests::report()
+            .integrations
+            .remove(0);
+        let definition = OwnedDesktopLifetimeDefinition::MacosOriginalPrimaryV1;
+        let owned = OwnedLifetimeState {
+            definition,
+            primary: OwnedPrimaryState::Exited,
+            descendants: OwnedTreeState::Unavailable,
+            local_resources: OwnedLocalState::Retired,
+        };
+        let mut state = BrokerState {
+            owned_lifetime: Some(OwnedLifetimeState::initial(definition)),
+            owner: BrokerOwner::Retained,
+            quarantined: false,
+            ..BrokerState::unknown()
+        };
+        state.record_owned_lifetime(owned.clone()).unwrap();
+        state.effect = BrokerEffect::Receipt {
+            receipt: BrokerEffectReceipt {
+                evidence: theseus_native_protocol::v2::broker::DesktopEvidence::OwnedExecutable,
+                acknowledged: true,
+                receipt_digest: "ab".repeat(32),
+            },
+        };
+        state.validate().unwrap();
+        assert!(!state.cleanup_complete);
+        let mut bound = super::native_desktop_mode_tests::observation(state);
+        bound.evidence =
+            Some(theseus_native_protocol::v2::broker::DesktopEvidence::OwnedExecutable);
+        let original = ActionReference {
+            operation: bound.binding.action.clone().unwrap(),
+            request_digest: "04".repeat(32),
+        };
+        scenario.desktops = vec![super::DesktopEvidence {
+            slot: bound.binding.slot.clone(),
+            actions: vec![original.clone()],
+            observations: vec![bound],
+        }];
+        scenario.native_lifetime = None;
+        scenario.owned_lifetime = Some(OwnedDesktopLifetimeProjection {
+            original,
+            state: owned,
+        });
+        let done = || Disposition::Complete {
+            receipt: "separate original obligation completed".into(),
+        };
+        scenario.dispositions = IntegrationDispositions {
+            helper_worker: done(),
+            registration: done(),
+            manager_action: done(),
+            broker: done(),
+            primary: done(),
+            descendant_scope: Disposition::NotStarted,
+        };
+        scenario
+    }
+    #[test]
+    fn explicit_original_owned_primary_can_complete_without_a_tree_claim() {
+        let scenario = scenario();
+        assert!(scenario.complete());
+        assert!(
+            !scenario.dispositions.complete(),
+            "legacy strong completion is unchanged"
+        );
+        let state = scenario.desktops[0].observations[0]
+            .broker_state
+            .as_ref()
+            .unwrap();
+        assert!(!state.cleanup_complete);
+        assert_eq!(state.descendants, BrokerDescendants::Unknown);
+    }
+    #[test]
+    fn owned_primary_never_waives_missing_original_projection_or_uncertainty() {
+        let original = scenario();
+        let mut bad = original.clone();
+        bad.owned_lifetime = None;
+        assert!(!bad.complete());
+        let mut bad = original.clone();
+        bad.owned_lifetime.as_mut().unwrap().original.request_digest = "05".repeat(32);
+        assert!(!bad.complete());
+        let mut bad = original.clone();
+        bad.dispositions.descendant_scope = Disposition::Unknown {
+            reason: "original historical uncertainty".into(),
+        };
+        assert!(!bad.complete());
+        let mut bad = original.clone();
+        bad.dispositions.broker = Disposition::Unknown {
+            reason: "original lease still held".into(),
+        };
+        assert!(!bad.complete());
+        let mut bad = original.clone();
+        bad.desktops[0].observations[0]
+            .broker_state
+            .as_mut()
+            .unwrap()
+            .quarantined = true;
+        assert!(!bad.complete());
+        let mut bad = original.clone();
+        bad.owned_lifetime.as_mut().unwrap().state.descendants = OwnedTreeState::Unknown;
+        assert!(!bad.complete());
+        let mut erased_latest = original.clone();
+        let mut last = erased_latest.desktops[0].observations[0].clone();
+        last.broker_state.as_mut().unwrap().owned_lifetime = None;
+        erased_latest.desktops[0].observations.push(last);
+        assert!(
+            !erased_latest.complete(),
+            "an earlier retired sample cannot hide erased latest ownership facts"
+        );
+        let legacy = crate::native::integration::view::tests::report()
+            .integrations
+            .remove(0);
+        assert!(
+            serde_json::to_value(legacy)
+                .unwrap()
+                .get("owned_lifetime")
+                .is_none()
+        );
+    }
+    #[test]
+    fn compact_owned_lifetime_keeps_unavailable_tree_and_local_retirement_visible() {
+        let mut report = crate::native::integration::view::tests::report();
+        report.integrations = vec![scenario()];
+        let compact =
+            serde_json::to_value(crate::native::integration::view::summary(&report)).unwrap();
+        assert_eq!(
+            compact["owned_lifetimes"][0]["state"]["descendants"],
+            "unavailable"
+        );
+        assert_eq!(
+            compact["owned_lifetimes"][0]["state"]["local_resources"],
+            "retired"
+        );
+        assert_eq!(compact["owned_lifetimes"][0]["state"]["primary"], "exited");
+        let legacy = crate::native::integration::view::tests::report();
+        assert!(
+            serde_json::to_value(crate::native::integration::view::summary(&legacy))
+                .unwrap()
+                .get("owned_lifetimes")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_original_recovery_cannot_acquire_owned_primary_capability() {
+        // Saved DTOs only; this does not construct a Host proof or run a target.
+        let (_, journal) =
+            super::desktop_generation_presence_tests::pair(ScenarioKind::Clean, true);
+        let mut action = journal.integration_actions[0].clone();
+        action.terminal = None;
+        let state = scenario().desktops[0].observations[0]
+            .broker_state
+            .clone()
+            .unwrap();
+        assert!(
+            validate_original_broker_effect(&action, &state).is_err(),
+            "a legacy original Activate cannot acquire another lifetime contract during recovery"
+        );
+    }
+    // Valid saved DTO pair only; no Host owner, application or native target is created.
+    fn owned_saved_pair() -> (NativeIntegrationReport, NativeIntegrationJournal) {
+        use theseus_native_protocol::v2;
+        let (mut report, mut journal) =
+            super::desktop_generation_presence_tests::pair(ScenarioKind::Clean, true);
+        report.requirements.desktop.as_mut().unwrap().lifetime =
+            LifetimeRequirement::OwnedPrimaryExited;
+        report.compiled_requirements_digest = report.requirements.digest().unwrap();
+        journal.requirements = report.requirements.clone();
+        journal.compiled_requirements_digest = report.compiled_requirements_digest.clone();
+        let mut header = journal.broker_bindings[0].original.expected_header.clone();
+        header.os = "macos".into();
+        header.display = SuppliedDisplay::MacOsGui {
+            domain: "gui/1000".into(),
+        };
+        header.validate().unwrap();
+        let header_digest = header.digest().unwrap().to_hex();
+        let binding = &mut journal.broker_bindings[0];
+        binding.original.expected_header = header;
+        binding.expected_header_digest = header_digest.clone();
+        journal.integration_ownership[0]
+            .initial_binding
+            .namespace_or_session_receipt_digest = header_digest.clone();
+        journal.integration_ownership[0].binding_history[0].namespace_or_session_receipt_digest =
+            header_digest.clone();
+        let action = &mut journal.integration_actions[0];
+        let IntegrationRequest::Desktop { request, .. } = &mut action.request else {
+            panic!()
+        };
+        request.binding_digest = header_digest;
+        if let DesktopAction::Activate { owned_lifetime, .. } = &mut request.action {
+            *owned_lifetime = Some(OwnedDesktopLifetimeDefinition::MacosOriginalPrimaryV1);
+        }
+        let close_digest = request.close_request().unwrap().digest().unwrap().to_hex();
+        if let DesktopAction::Activate { close_binding, .. } = &mut request.action {
+            close_binding.action_digest = close_digest;
+        }
+        action.broker_identity = Some(
+            serde_json::from_value(serde_json::to_value(request.identity().unwrap()).unwrap())
+                .unwrap(),
+        );
+        let receipt_digest = request.digest().unwrap().to_hex();
+        action.request_digest = v2::request_digest(&action.request.wire().unwrap())
+            .unwrap()
+            .to_hex();
+        action.completion = Disposition::Complete {
+            receipt: receipt_digest.clone(),
+        };
+        action.terminal = Some(IntegrationOutcome::Complete {
+            receipt: receipt_digest.clone(),
+        });
+        let original = ActionReference {
+            operation: action.operation.clone(),
+            request_digest: action.request_digest.clone(),
+        };
+        let completed = scenario();
+        let mut state = completed.desktops[0].observations[0]
+            .broker_state
+            .clone()
+            .unwrap();
+        let BrokerEffect::Receipt { receipt } = &mut state.effect else {
+            panic!()
+        };
+        receipt.receipt_digest = receipt_digest;
+        receipt.evidence =
+            theseus_native_protocol::v2::broker::DesktopEvidence::SourceOwnedExecutable;
+        let integration = &mut report.integrations[0];
+        integration.dispositions = completed.dispositions;
+        integration.owned_lifetime = Some(OwnedDesktopLifetimeProjection {
+            original: original.clone(),
+            state: state.owned_lifetime.clone().unwrap(),
+        });
+        integration.desktops[0].actions = vec![original];
+        integration.desktops[0].observations[0].broker_state = Some(state);
+        validate_pair(&report, &journal).expect("positive owned saved pair");
+        (report, journal)
+    }
+    #[test]
+    fn owned_saved_pair_binds_actual_private_original_and_retains_pending_history() {
+        let (mut report, journal) = owned_saved_pair();
+        assert!(report.integrations[0].complete());
+        let mut pending = report.integrations[0].desktops[0].observations[0].clone();
+        pending.binding.id = "earlier-owned-pending".into();
+        pending.binding.sequence = 0;
+        pending.binding.complete = false;
+        pending.evidence = None;
+        pending.broker_state = Some(BrokerState {
+            owned_lifetime: Some(OwnedLifetimeState::initial(
+                OwnedDesktopLifetimeDefinition::MacosOriginalPrimaryV1,
+            )),
+            native_lifetime: None,
+            effect: BrokerEffect::Unknown,
+            owner: BrokerOwner::Retained,
+            primary: BrokerPrimary::Unknown,
+            descendants: BrokerDescendants::Unknown,
+            cleanup_complete: false,
+            quarantined: false,
+        });
+        report.integrations[0].desktops[0]
+            .observations
+            .insert(0, pending);
+        validate_pair(&report, &journal)
+            .expect("a later original terminal cannot erase legitimate Pending history");
+    }
+    #[test]
+    fn owned_saved_pair_rejects_two_public_digest_changes_without_private_change() {
+        let (mut report, journal) = owned_saved_pair();
+        let wrong = "de".repeat(32);
+        report.integrations[0]
+            .owned_lifetime
+            .as_mut()
+            .unwrap()
+            .original
+            .request_digest = wrong.clone();
+        report.integrations[0].desktops[0].actions[0].request_digest = wrong;
+        report.validate().unwrap();
+        journal.validate().unwrap();
+        assert!(
+            validate_pair(&report, &journal).is_err(),
+            "public-to-public equality is not exact private original request binding"
+        );
+    }
+    #[test]
+    fn owned_saved_pair_rejects_observed_receipt_for_another_original_effect() {
+        let (mut report, journal) = owned_saved_pair();
+        let state = report.integrations[0].desktops[0].observations[0]
+            .broker_state
+            .as_mut()
+            .unwrap();
+        let BrokerEffect::Receipt { receipt } = &mut state.effect else {
+            panic!()
+        };
+        receipt.receipt_digest = "ed".repeat(32);
+        report.validate().unwrap();
+        journal.validate().unwrap();
+        assert!(
+            validate_pair(&report, &journal).is_err(),
+            "owned report receipt must equal private original acknowledged terminal"
+        );
     }
 }

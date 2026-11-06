@@ -170,6 +170,12 @@ impl BrokerState {
         if self.validate().is_err() || self.owner != BrokerOwner::Settled || self.quarantined {
             return false;
         }
+        if let Some(owned) = &self.owned_lifetime {
+            return matches!(&self.effect, BrokerEffect::Receipt {receipt} if receipt.acknowledged && matches!(receipt.evidence, DesktopEvidence::OwnedExecutable | DesktopEvidence::SourceOwnedExecutable))
+                && owned.required_lifetime_satisfied()
+                && owned.local_retired()
+                && owned.descendants == super::OwnedTreeState::Unavailable;
+        }
         match &self.native_lifetime {
             None => {
                 self.cleanup_complete

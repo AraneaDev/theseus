@@ -63,12 +63,18 @@ that API actually provides. A callback PID is correlation data; it does not
 create termination or process-tree authority. If the selected launcher cannot
 meet a required lifetime contract, admission must refuse before activation.
 
-The macOS product currently refuses OwnedExecutable before execution: its
-process-group cleanup cannot prove the descendant settlement required by the
-current broker release contract, even when the recipe asks only for primary
-exit. Use the native AppKit manager-instance contract for a qualified supplied
-session. Supporting owned-primary-only completion requires a separate explicit
-retirement contract; it must not turn unknown descendants into a settled tree.
+macOS OwnedExecutable requires an explicit original-primary lifetime declaration
+in the complete manifest and each selected tuple. Completion proves the original
+child/group rights and both IPC channels retired; descendant-tree capability
+remains unavailable. It does not turn unknown descendants into a settled tree.
+Linux and Windows retain their stronger original scope/job retirement contract.
+
+Interactive owned execution on macOS and Windows also requires a separate exact
+owned-entry declaration. The helper validates the installed bundle or shortcut,
+its target, arguments and working directory through the actual platform parser
+after installation and revalidates that same retained proof before activation.
+Entry validity grants no native-launcher or process ownership. These source paths
+remain subject to the native OS acceptance gates on the roadmap.
 
 The native lifetime ceilings are intentionally different:
 

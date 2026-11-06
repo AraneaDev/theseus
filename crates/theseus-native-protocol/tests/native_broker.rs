@@ -354,11 +354,11 @@ fn desktop_only_manifest_has_platform_matched_closed_channels_without_service_au
     };
     manifest.validate().unwrap();
     manifest.ready_endpoint = LocalEndpoint::NamedPipe {
-        path: "ready".into(),
+        path: r"\\.\pipe\theseus.ready".into(),
     };
     assert!(manifest.validate().is_err());
     manifest.close_endpoint = LocalEndpoint::NamedPipe {
-        path: "close".into(),
+        path: r"\\.\pipe\theseus.close".into(),
     };
     manifest.entry_root = r"C:\fixture\entries".into();
     manifest.entry = "fixture.lnk".into();

@@ -435,6 +435,27 @@ fn raw_definition(d: &v2::ServiceDefinition) -> host::LaunchdDefinition {
     }
 }
 
+fn terminal_outcome(
+    start_complete: &mut bool,
+    action: host::ServiceAction,
+    completion: host::CommandCompletion,
+    job: String,
+    result: String,
+) -> v2::ServiceOutcome {
+    use sha2::{Digest as _, Sha256};
+    if completion.succeeded() {
+        *start_complete = action == host::ServiceAction::Start;
+        v2::ServiceOutcome::Complete {
+            receipt: format!(
+                "{:x}",
+                Sha256::digest(format!("{job}\0{action:?}\0{completion:?}\0{result}"))
+            ),
+        }
+    } else {
+        v2::ServiceOutcome::Failed { reason: result }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,26 +494,5 @@ mod tests {
                 }
             }
         }
-    }
-}
-
-fn terminal_outcome(
-    start_complete: &mut bool,
-    action: host::ServiceAction,
-    completion: host::CommandCompletion,
-    job: String,
-    result: String,
-) -> v2::ServiceOutcome {
-    use sha2::{Digest as _, Sha256};
-    if completion.succeeded() {
-        *start_complete = action == host::ServiceAction::Start;
-        v2::ServiceOutcome::Complete {
-            receipt: format!(
-                "{:x}",
-                Sha256::digest(format!("{job}\0{action:?}\0{completion:?}\0{result}"))
-            ),
-        }
-    } else {
-        v2::ServiceOutcome::Failed { reason: result }
     }
 }

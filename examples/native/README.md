@@ -30,11 +30,27 @@ theseus validate --recipe /absolute/new-example-directory/recipe.json
 theseus run --headless --preview --recipe /absolute/new-example-directory/recipe.json
 ```
 
+The fixture retains exact original inputs under `example-inputs/<graph-sha256>`
+before provider Prepare can update instance configuration. The exporter selects
+that unchanged graph's snapshot, verifies its original pins and preserves literal
+paths. Invalid snapshots fail closed; old changed contexts without one remain
+unexportable.
+
 The exporter starts no helper, provider or application. It checks the original
 graph/config pins, actual compiled artifact bytes, source metadata and recipe
 Base/Target commitments before writing a new private directory. It preserves the
 complete recipe, config, launch, graph and provider template byte for byte, plus
 `broker.json` when declared. `examples.json` records source and file hashes.
+Before provider preparation, fixture constructors save exact input bytes under
+`example-inputs/<sha256-of-graph.json>/` in the original private case directory.
+The exporter selects that snapshot using the unchanged current graph, verifies
+its file hashes and original graph pins, and records its provenance. Service
+and final Combined graphs retain separate snapshots. Config and broker files
+may then reflect provider preparation without changing the exported original
+inputs. Actual compiled artifacts are still verified at their original paths.
+Older cases without a snapshot require unchanged direct inputs; mutated inputs
+are refused. No paths or commitments are rewritten for export.
+
 Integrity verification works without the original target or executable files.
 Offline recipe validation and preview do not establish native execution.
 

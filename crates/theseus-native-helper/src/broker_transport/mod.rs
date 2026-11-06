@@ -1,6 +1,10 @@
 //! Explicit authenticated local broker transport and standalone serving adapter.
 mod config;
 mod connection;
+#[cfg(target_os = "macos")]
+mod entry_macos;
+#[cfg(windows)]
+mod entry_windows;
 pub(crate) mod generation;
 #[cfg(test)]
 pub(crate) mod generation_tests;
@@ -14,6 +18,7 @@ pub(crate) mod native_macos;
 pub(crate) mod native_policy;
 #[cfg(windows)]
 pub(crate) mod native_windows;
+pub(crate) mod owned_entry;
 mod server;
 pub use config::BrokerServerConfig;
 pub use connection::{BrokerConnection, ConnectionFailure};

@@ -193,11 +193,17 @@ impl NativeDesktopDefinition {
 }
 impl IntegrationManifest {
     pub fn native_entry_relative_path(&self) -> Result<String, Error> {
+        self.desktop_entry_relative_path()
+    }
+    pub fn desktop_entry_relative_path(&self) -> Result<String, Error> {
         let desktop = self.desktop.as_ref().ok_or(Error::InvalidValue)?;
-        Ok(self.desktop_native.as_ref().map_or_else(
-            || desktop.entry.clone(),
-            |native| native.entry_relative_path(desktop),
-        ))
+        Ok(if let Some(native) = &self.desktop_native {
+            native.entry_relative_path(desktop)
+        } else if let Some(entry) = &self.desktop_owned_entry {
+            entry.entry_relative_path(desktop)
+        } else {
+            desktop.entry.clone()
+        })
     }
 }
 fn nonzero(value: &str) -> Result<(), Error> {

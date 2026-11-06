@@ -23,38 +23,6 @@ pub struct Retained {
     native: host::NativeActivation,
     lifetime: NativeLifetimeState,
 }
-pub(crate) fn admit(tuple: &v2::DesktopDefinition) -> io::Result<host::AdmittedBundle> {
-    let Some(v2::NativeDesktopDefinition::MacosBundle {
-        app_leaf,
-        bundle_identifier,
-        executable_leaf,
-        info_plist,
-        ..
-    }) = &tuple.native
-    else {
-        return Err(invalid("Mac native definition missing"));
-    };
-    let x = &tuple.executable;
-    let d = &tuple.desktop;
-    let profile = host::BundleProfile {
-        app: app_leaf.clone(),
-        bundle_identifier: bundle_identifier.clone(),
-        executable: executable_leaf.clone(),
-        arguments: x.arguments[1..].to_vec(),
-        info: host::ArtifactCommitment {
-            length: info_plist.length,
-            sha256: super::launch::digest(&info_plist.sha256)?,
-        },
-        executable_artifact: host::ArtifactCommitment {
-            length: x.length,
-            sha256: super::launch::digest(&x.sha256)?,
-        },
-    };
-    host::AdmittedBundle::admit(host::RetainedBundle::open(
-        std::path::Path::new(&d.entry_root),
-        profile,
-    )?)
-}
 pub(crate) fn prepare(
     config: &super::BrokerServerConfig,
     tuple: &v2::DesktopDefinition,

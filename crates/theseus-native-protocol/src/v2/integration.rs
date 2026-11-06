@@ -2,11 +2,14 @@
 mod desktop_definitions;
 mod linux_qualification;
 mod native_desktop;
+mod owned_entry;
 mod platform;
+pub use super::broker::OwnedDesktopLifetimeDefinition;
 use super::{Digest, Error, NativeDescription};
 pub use desktop_definitions::*;
 pub use linux_qualification::*;
 pub use native_desktop::*;
+pub use owned_entry::*;
 pub use platform::*;
 use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -606,6 +609,10 @@ pub struct IntegrationManifest {
     pub desktop_readiness: Option<ReadinessDefinitionExpectation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desktop_native: Option<NativeDesktopDefinition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_owned_lifetime: Option<OwnedDesktopLifetimeDefinition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_owned_entry: Option<OwnedDesktopEntryDefinition>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub desktop_definitions: Vec<DesktopDefinition>,
     pub definitions: Vec<ServiceDefinition>,
@@ -626,6 +633,38 @@ impl IntegrationManifest {
         }
         Digest::parse(&self.core_manifest_digest)?;
         self.validate_desktop_definitions()?;
+        if let Some(owned) = self.desktop_owned_lifetime {
+            owned.validate_mode(
+                &self
+                    .desktop
+                    .as_ref()
+                    .ok_or(Error::InvalidValue)?
+                    .allowed_modes,
+            )?;
+            if self.desktop_native.is_some()
+                || self
+                    .service_authority
+                    .as_ref()
+                    .is_some_and(|a| a.platform() != ManagerPlatform::Launchd)
+            {
+                return Err(Error::InvalidValue);
+            }
+        }
+        if let Some(entry) = &self.desktop_owned_entry {
+            if self.desktop_native.is_some()
+                || self.desktop_owned_lifetime.is_some() && entry.os() != "macos"
+                || self.service_authority.as_ref().is_some_and(|a| {
+                    !matches!(
+                        (a.platform(), entry.os()),
+                        (ManagerPlatform::Launchd, "macos") | (ManagerPlatform::Scm, "windows")
+                    )
+                })
+            {
+                return Err(Error::InvalidValue);
+            }
+            let tuple = self.desktop_definition(&DesktopDefinitionKey::CONFIGURED_TARGET)?;
+            entry.validate(&tuple.desktop, &tuple.executable, tuple.entry_length)?;
+        }
         match &self.desktop {
             Some(desktop) => {
                 desktop.validate()?;
@@ -697,7 +736,8 @@ impl IntegrationManifest {
             None if !self.desktop_capabilities.is_empty()
                 || self.desktop_executable.is_some()
                 || self.desktop_readiness.is_some()
-                || self.desktop_native.is_some() =>
+                || self.desktop_native.is_some()
+                || self.desktop_owned_entry.is_some() =>
             {
                 return Err(Error::InvalidValue);
             }

@@ -1,4 +1,6 @@
 //! Supplied-manager acceptance fixture. Missing qualification fails; no model fallback.
+#[path = "native_example_inputs.rs"]
+pub(crate) mod example_inputs;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -888,6 +890,8 @@ impl IntegrationFixture {
         #[cfg(not(unix))]
         let gid = 0;
         let manifest = v2::IntegrationManifest {
+            desktop_owned_entry: None,
+            desktop_owned_lifetime: None,
             desktop_native: None,
             desktop_definitions: Vec::new(),
             schema: 1,
@@ -1126,8 +1130,9 @@ impl IntegrationFixture {
         let graph_path = root.path().join("graph.json");
         write(
             &graph_path,
-            &serde_json::json!({"kind":"theseus_native_integration_fixture_graph","schema":1,"launch":pin(&launch_path)?,"controller":pin(&controller_path)?,"base":pin(&base_path)?,"target":pin(&target_path)?,"helper":pin(&helper)?,"config":pin(&config_path)?,"provider":pin(&sut)?,"provider_template":pin(&template_path)?,"provider_root":provider_root,"binding":context.binding,"manifest_digest":full.to_hex(),"workspace_marker":context.workspace_marker,"provider_epoch":epoch.to_hex(),"core_manifest_digest":core.to_hex(),"integration_manifest_digest":integration.to_hex(),"service_authority":receipt.authority}),
+            &serde_json::json!({"kind":"theseus_native_integration_fixture_graph","schema":1,"recipe":pin(&recipe_path)?,"launch":pin(&launch_path)?,"controller":pin(&controller_path)?,"base":pin(&base_path)?,"target":pin(&target_path)?,"helper":pin(&helper)?,"config":pin(&config_path)?,"provider":pin(&sut)?,"provider_template":pin(&template_path)?,"provider_root":provider_root,"binding":context.binding,"manifest_digest":full.to_hex(),"workspace_marker":context.workspace_marker,"provider_epoch":epoch.to_hex(),"core_manifest_digest":core.to_hex(),"integration_manifest_digest":integration.to_hex(),"service_authority":receipt.authority}),
         )?;
+        example_inputs::capture(root.path())?;
         let output = root.path().join(".theseus-runs");
         #[cfg(any(target_os = "macos", windows))]
         let original_creator = std::sync::Mutex::new(Some(owner_operator::Operator::start(

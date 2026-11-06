@@ -54,6 +54,7 @@ fn request(
         slot: d.slot.clone(),
         prior_binding_digest: "05".repeat(32),
         action: DesktopAction::Activate {
+            owned_lifetime: None,
             transition,
             mode: DesktopMode::OwnedExecutable,
             entry_digest: d.entry_digest.clone(),

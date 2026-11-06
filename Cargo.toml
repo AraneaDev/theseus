@@ -12,7 +12,7 @@ description = "Installation lifecycle workbench with Docker evidence and a termi
 
 [features]
 native-catalog-test-support = []
-native-integration-test-support = ["theseus-native-protocol/test-support"]
+native-integration-test-support = ["theseus-native-protocol/test-support", "theseus-host/desktop-test-support"]
 mcp-test-support = ["theseus-host/test-support"]
 
 [[bin]]

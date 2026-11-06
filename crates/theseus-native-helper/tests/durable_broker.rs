@@ -176,6 +176,7 @@ fn actual_broker(point: Option<SourceInterruption>, native_io: bool) {
         slot: v2::ResourceSlot::new("desktop").unwrap(),
         prior_binding_digest: "bb".repeat(32),
         action: DesktopAction::Activate {
+            owned_lifetime: None,
             transition: None,
             mode: DesktopMode::OwnedExecutable,
             entry_digest: "cc".repeat(32),
@@ -473,6 +474,7 @@ fn broker_restart_persists_quarantine_for_every_unfinished_acceptance_boundary()
             slot: v2::ResourceSlot::new("desktop").unwrap(),
             prior_binding_digest: "bb".repeat(32),
             action: DesktopAction::Activate {
+                owned_lifetime: None,
                 transition: None,
                 mode: DesktopMode::OwnedExecutable,
                 entry_digest: "cc".repeat(32),

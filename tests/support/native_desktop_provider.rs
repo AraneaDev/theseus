@@ -10,6 +10,15 @@ use theseus::native::model::{ProviderAction, ProviderInvocation, ProviderReceipt
 use theseus_host::fs::{HostDir, RootPolicy};
 use theseus_native_helper_store::{BootstrapRequest, LedgerStore, bootstrap_declared_integration};
 use theseus_native_protocol::v2;
+fn current_os() -> v2::Os {
+    if cfg!(target_os = "macos") {
+        v2::Os::Macos
+    } else if cfg!(windows) {
+        v2::Os::Windows
+    } else {
+        v2::Os::Linux
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperatorRequest {
@@ -177,7 +186,7 @@ pub fn run(args: &[String]) -> Result<()> {
             .as_mut()
             .context("broker header")?
             .ownership_id = invocation.ownership_id.clone();
-        manifest.validate_context(&context, v2::Os::Linux)?;
+        manifest.validate_context(&context, current_os())?;
         let field = |name: &str| {
             config[name]
                 .as_str()
@@ -215,7 +224,7 @@ pub fn run(args: &[String]) -> Result<()> {
             BootstrapRequest {
                 binding: v2::BindingId::parse(field("binding")?)?,
                 manifest_digest: v2::Digest::parse(field("manifest_digest")?)?,
-                os: v2::Os::Linux,
+                os: current_os(),
             },
             &context,
             &manifest,

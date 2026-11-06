@@ -1964,6 +1964,7 @@ mod desktop_progress_review_tests {
     }
     fn pending() -> BrokerState {
         BrokerState {
+            owned_lifetime: None,
             native_lifetime: None,
             effect: BrokerEffect::Receipt {
                 receipt: BrokerEffectReceipt {

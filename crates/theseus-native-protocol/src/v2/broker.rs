@@ -1,7 +1,10 @@
 //! Durable original desktop operations in the existing native ledger domain.
 //! These serializable records are diagnostic knowledge, never native authority.
+mod entry_retirement;
 mod generation;
+pub use entry_retirement::*;
 mod native_lifetime;
+mod owned_lifetime;
 use super::{
     BindingId, Digest, Error, IntentId, LeaseId, LocalEndpoint, OperationId, ResourceSlot, SidText,
     WorkspaceMarker,
@@ -9,6 +12,7 @@ use super::{
 };
 pub use generation::*;
 pub use native_lifetime::*;
+pub use owned_lifetime::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -55,11 +59,13 @@ pub fn validate_endpoint(value: &LocalEndpoint) -> Result<(), Error> {
                     .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b))
         }
         LocalEndpoint::NamedPipe { path } => {
-            !path.is_empty()
-                && path.len() <= 64
-                && path
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            path.strip_prefix(r"\\.\pipe\theseus.").is_some_and(|name| {
+                !name.is_empty()
+                    && name.len() <= 64
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            })
         }
     };
     if valid {
@@ -373,6 +379,8 @@ impl DesktopManifest {
 pub enum DesktopAction {
     Activate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        owned_lifetime: Option<OwnedDesktopLifetimeDefinition>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         transition: Option<DesktopActivationTransition>,
         mode: DesktopMode,
         entry_digest: String,
@@ -420,11 +428,16 @@ impl DesktopRequest {
         }
         match &self.action {
             DesktopAction::Activate {
+                owned_lifetime,
+                mode,
                 entry_digest,
                 expectation_digest,
                 close_binding,
                 ..
             } => {
+                if let Some(definition) = owned_lifetime {
+                    definition.validate_mode(&[*mode])?;
+                }
                 Digest::parse(entry_digest)?;
                 Digest::parse(expectation_digest)?;
                 OperationId::parse(&close_binding.operation)?;
@@ -655,6 +668,8 @@ pub enum BrokerDescendants {
 #[serde(deny_unknown_fields)]
 pub struct BrokerState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_lifetime: Option<OwnedLifetimeState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_lifetime: Option<NativeLifetimeState>,
     pub effect: BrokerEffect,
     pub owner: BrokerOwner,
@@ -665,6 +680,7 @@ pub struct BrokerState {
 }
 impl BrokerState {
     pub fn validate(&self) -> Result<(), Error> {
+        self.validate_owned_lifetime()?;
         if let Some(native) = &self.native_lifetime {
             native.validate()?;
             if self.cleanup_complete
@@ -702,6 +718,7 @@ impl BrokerState {
     }
     pub fn unknown() -> Self {
         Self {
+            owned_lifetime: None,
             native_lifetime: None,
             effect: BrokerEffect::Unknown,
             owner: BrokerOwner::Lost,
@@ -715,6 +732,13 @@ impl BrokerState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrokerEvent {
+    EntryPreparationAccepted {
+        preparation: EntryPreparation,
+    },
+    EntryPreparationSettled {
+        operation: String,
+    },
+    EntryProofQuarantined {},
     HelperSutRunCompleted {
         witness: DesktopSutRunWitness,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -755,6 +779,10 @@ pub enum BrokerEvent {
         operation: String,
         receipt: BrokerEffectReceipt,
     },
+    OwnedLifetimeRecorded {
+        operation: String,
+        state: OwnedLifetimeState,
+    },
     NativeLifetimeRecorded {
         operation: String,
         state: NativeLifetimeState,
@@ -780,6 +808,8 @@ struct Accepted {
 /// launch authority: all reopened incomplete native owners are lost.
 #[derive(Clone, Debug, Default)]
 pub struct BrokerLedgerView {
+    entry_preparations: Vec<(EntryPreparation, bool)>,
+    entry_quarantined: bool,
     sut_runs: Vec<(DesktopSutRunWitness, Option<super::DesktopDefinitionKey>)>,
     sut_accepted_at: Vec<(String, u16)>,
     helper_retired_at: Vec<(String, u16)>,
@@ -861,6 +891,15 @@ pub fn declared_desktop(
     )))
 }
 impl BrokerLedgerView {
+    pub fn entry_preparations(&self) -> &[(EntryPreparation, bool)] {
+        &self.entry_preparations
+    }
+    pub fn entry_blocked(&self) -> bool {
+        self.entry_quarantined || self.entry_preparations.iter().any(|(_, settled)| !settled)
+    }
+    pub fn entry_quarantined(&self) -> bool {
+        self.entry_quarantined
+    }
     pub fn replay(records: &[Record]) -> Result<Self, LedgerError> {
         let mut result = Self::default();
         let broker_header = match records.first().map(Record::entry) {
@@ -885,10 +924,51 @@ impl BrokerLedgerView {
                 return Err(LedgerError::InvalidTransition);
             }
             let Entry::Broker { event } = record.entry() else {
+                if matches!(record.entry(), Entry::LeaseClosed { .. }) && result.entry_blocked() {
+                    return Err(LedgerError::InvalidTransition);
+                }
                 continue;
             };
             let invalid = || LedgerError::InvalidTransition;
             match event {
+                BrokerEvent::EntryPreparationAccepted { preparation } => {
+                    preparation.validate().map_err(|_| invalid())?;
+                    let header = broker_header.ok_or_else(invalid)?;
+                    if result.entry_blocked()
+                        || result.accepted.iter().any(|a| !a.state.original_retired())
+                        || lease.as_deref() != Some(&preparation.broker_lease)
+                        || header.digest().map_err(|_| invalid())?.to_hex()
+                            != preparation.header_digest
+                        || result.entry_preparations.len() >= super::MAX_OPERATIONS
+                        || result
+                            .entry_preparations
+                            .iter()
+                            .any(|(p, _)| p.operation == preparation.operation)
+                    {
+                        return Err(invalid());
+                    }
+                    result.entry_preparations.push((preparation.clone(), false));
+                }
+                BrokerEvent::EntryPreparationSettled { operation } => {
+                    if broker_header.is_none() || result.entry_quarantined {
+                        return Err(invalid());
+                    }
+                    let (_, settled) = result
+                        .entry_preparations
+                        .iter_mut()
+                        .find(|(p, _)| &p.operation == operation)
+                        .ok_or_else(invalid)?;
+                    if *settled {
+                        return Err(invalid());
+                    }
+                    *settled = true;
+                }
+                BrokerEvent::EntryProofQuarantined {} => {
+                    if broker_header.is_none() {
+                        return Err(invalid());
+                    }
+                    result.entry_quarantined = true;
+                }
                 BrokerEvent::HelperSutRunCompleted {
                     witness,
                     definition,
@@ -987,7 +1067,41 @@ impl BrokerLedgerView {
                                 .any(|(r, _)| r.close_request().as_ref() == Ok(request)) => {}
                         _ => return Err(invalid()),
                     }
-                    result.helper_actions.push((request.clone(), None));
+                    let initial = match &request.action {
+                        DesktopAction::Activate {
+                            owned_lifetime: Some(definition),
+                            ..
+                        } => {
+                            definition
+                                .validate_platform(&header.os)
+                                .map_err(|_| invalid())?;
+                            Some(BrokerState::accepted_owned(*definition))
+                        }
+                        DesktopAction::RequestClose {
+                            original_activation_operation,
+                            ..
+                        } => result
+                            .helper_actions
+                            .iter()
+                            .find(|(r, _)| &r.helper_operation == original_activation_operation)
+                            .and_then(|(_, state)| state.as_ref())
+                            .filter(|state| state.owned_lifetime.is_some())
+                            .map(|original| {
+                                let owned = original
+                                    .owned_lifetime
+                                    .as_ref()
+                                    .ok_or(Error::InvalidValue)?;
+                                let mut state = BrokerState::accepted_owned(owned.definition);
+                                state.record_owned_lifetime(owned.clone())?;
+                                state.owner = original.owner;
+                                state.quarantined = original.quarantined;
+                                Ok::<_, Error>(state)
+                            })
+                            .transpose()
+                            .map_err(|_| invalid())?,
+                        _ => None,
+                    };
+                    result.helper_actions.push((request.clone(), initial));
                 }
                 BrokerEvent::HelperStateObserved { identity, state } => {
                     identity.validate().map_err(|_| invalid())?;
@@ -1018,6 +1132,26 @@ impl BrokerLedgerView {
                             || (old.quarantined && !state.quarantined))
                     {
                         return Err(invalid());
+                    }
+                    match (
+                        entry.1.as_ref().and_then(|s| s.owned_lifetime.as_ref()),
+                        &state.owned_lifetime,
+                    ) {
+                        (Some(old), Some(next)) => {
+                            next.validate_platform(&declared.ok_or_else(invalid)?.1.os)
+                                .map_err(|_| invalid())?;
+                            next.validate_progress_from(old).map_err(|_| invalid())?;
+                            if entry
+                                .1
+                                .as_ref()
+                                .is_some_and(|s| s.owner == BrokerOwner::Lost)
+                                && state.owner != BrokerOwner::Lost
+                            {
+                                return Err(invalid());
+                            }
+                        }
+                        (None, None) => {}
+                        _ => return Err(invalid()),
                     }
                     if let Some(native) = &state.native_lifetime {
                         let manifest = records
@@ -1155,7 +1289,16 @@ impl BrokerLedgerView {
                         return Err(invalid());
                     }
                     match &request.action {
-                        DesktopAction::Activate { mode, .. } => {
+                        DesktopAction::Activate {
+                            mode,
+                            owned_lifetime,
+                            ..
+                        } => {
+                            if let Some(definition) = owned_lifetime {
+                                definition
+                                    .validate_platform(&header.os)
+                                    .map_err(|_| invalid())?;
+                            }
                             if !header.allowed_modes.contains(mode)
                                 || result.validate_broker_generation(request).is_err()
                             {
@@ -1174,9 +1317,38 @@ impl BrokerLedgerView {
                             }
                         }
                     }
+                    let state = match &request.action {
+                        DesktopAction::Activate {
+                            owned_lifetime: Some(definition),
+                            ..
+                        } => BrokerState::accepted_owned(*definition),
+                        DesktopAction::RequestClose {
+                            original_activation_operation,
+                            ..
+                        } => {
+                            let original = result
+                                .accepted
+                                .iter()
+                                .find(|a| {
+                                    &a.request.helper_operation == original_activation_operation
+                                })
+                                .ok_or_else(invalid)?;
+                            if let Some(owned) = &original.state.owned_lifetime {
+                                let mut state = BrokerState::accepted_owned(owned.definition);
+                                state
+                                    .record_owned_lifetime(owned.clone())
+                                    .map_err(|_| invalid())?;
+                                state.quarantined = original.state.quarantined;
+                                state
+                            } else {
+                                BrokerState::unknown()
+                            }
+                        }
+                        _ => BrokerState::unknown(),
+                    };
                     result.accepted.push(Accepted {
                         request: request.clone(),
-                        state: BrokerState::unknown(),
+                        state,
                         receipt: false,
                         quarantined: false,
                     });
@@ -1257,6 +1429,25 @@ impl BrokerLedgerView {
                         receipt: receipt.clone(),
                     };
                 }
+                BrokerEvent::OwnedLifetimeRecorded { operation, state } => {
+                    state
+                        .validate_platform(&broker_header.ok_or_else(invalid)?.os)
+                        .map_err(|_| invalid())?;
+                    let accepted = result
+                        .accepted
+                        .iter_mut()
+                        .find(|a| a.request.helper_operation == *operation)
+                        .ok_or_else(invalid)?;
+                    if !matches!(&accepted.request.action, DesktopAction::Activate { mode: DesktopMode::OwnedExecutable, owned_lifetime: Some(definition), .. } if definition == &state.definition)
+                    {
+                        return Err(invalid());
+                    }
+                    accepted
+                        .state
+                        .record_owned_lifetime(state.clone())
+                        .map_err(|_| invalid())?;
+                    accepted.state.quarantined = accepted.quarantined;
+                }
                 BrokerEvent::NativeLifetimeRecorded { operation, state } => {
                     state
                         .validate_platform(&broker_header.ok_or_else(invalid)?.os)
@@ -1306,7 +1497,8 @@ impl BrokerLedgerView {
                             mode: DesktopMode::OwnedExecutable,
                             ..
                         }
-                    ) || (accepted.state.cleanup_complete && !cleanup_complete)
+                    ) || accepted.state.owned_lifetime.is_some()
+                        || (accepted.state.cleanup_complete && !cleanup_complete)
                         || (accepted.state.primary == BrokerPrimary::Exited
                             && *primary != BrokerPrimary::Exited)
                         || (accepted.state.primary == BrokerPrimary::NotCreated
@@ -1375,6 +1567,7 @@ impl BrokerLedgerView {
                     .find(|(op, _)| op == original_activation_operation)
             {
                 accepted.state.native_lifetime = lifetime.native_lifetime.clone();
+                accepted.state.owned_lifetime = lifetime.owned_lifetime.clone();
                 accepted.state.owner = lifetime.owner;
                 accepted.state.primary = lifetime.primary;
                 accepted.state.descendants = lifetime.descendants;

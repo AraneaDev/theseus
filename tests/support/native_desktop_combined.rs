@@ -1,8 +1,9 @@
 //! Compiled SourceOwned desktop plus an explicitly supplied real private manager.
 //! One provider/helper/ordinary sequence; no native activation or manager fallback.
 #![allow(dead_code)]
+use service_setup::example_inputs;
 #[path = "native_service_setup.rs"]
-mod service_setup;
+pub(crate) mod service_setup;
 use super::setup::{Operator, pin, write};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -194,6 +195,8 @@ impl CombinedFixture {
             ),
         ] {
             let mut d = v2::DesktopDefinition {
+                owned_entry: None,
+                owned_lifetime: None,
                 key: v2::DesktopDefinitionKey { role, artifact },
                 entry_length: bytes.len() as u64,
                 desktop: manifest.desktop.clone().unwrap(),
@@ -308,6 +311,7 @@ impl CombinedFixture {
             &launch,
             &json!({"fixture":"source-owned-combined","manifest_digest":full.to_hex()}),
         )?;
+        graph["recipe"] = pin(&service.recipe_path)?;
         graph["launch"] = pin(&launch)?;
         graph["helper"] = pin(&helper)?;
         graph["config"] = pin(&config_path)?;
@@ -320,6 +324,7 @@ impl CombinedFixture {
         graph["broker"] = pin(&broker)?;
         graph["broker_config"] = pin(&broker_path)?;
         write(&service.graph_path, &graph)?;
+        example_inputs::capture(root)?;
         let provider_root = PathBuf::from(
             graph["provider_root"]
                 .as_str()

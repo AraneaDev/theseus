@@ -188,6 +188,11 @@ fn visit_record_values(
                         }
                     }
                     Selector::Desktop => {
+                        if let Some(owned) = &s.owned_lifetime {
+                            push(
+                                serde_json::json!({"scenario_id":s.scenario_id,"owned_lifetime":owned}),
+                            );
+                        }
                         if let Some(native) = &s.native_lifetime {
                             push(
                                 serde_json::json!({"scenario_id":s.scenario_id,"native_lifetime":native}),
@@ -226,6 +231,9 @@ fn visit_record_values(
                     }
                     Selector::Dispositions => {
                         let mut value = serde_json::json!({"scenario_id":s.scenario_id,"dispositions":s.dispositions});
+                        if let Some(owned) = &s.owned_lifetime {
+                            value["owned_lifetime"] = serde_json::to_value(owned)?;
+                        }
                         if let Some(native) = &s.native_lifetime {
                             value["native_lifetime"] = serde_json::to_value(native)?;
                         }
@@ -427,6 +435,8 @@ fn flags<'a>(states: impl Iterator<Item = &'a Disposition>) -> DispositionFlags 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Summary {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owned_lifetimes: Vec<OwnedDesktopLifetimeProjection>,
     pub schema: u32,
     pub profile: String,
     pub outcome: RunOutcome,
@@ -451,6 +461,10 @@ pub fn summary(report: &NativeIntegrationReport) -> Summary {
         s[..end].to_owned()
     };
     Summary {
+        owned_lifetimes: scenarios
+            .iter()
+            .filter_map(|s| s.owned_lifetime.clone())
+            .collect(),
         schema: report.schema,
         profile: report.profile.clone(),
         outcome: report.outcome,
@@ -634,6 +648,7 @@ pub(crate) mod tests {
                 outcome: RunOutcome::Incomplete,
             },
             integrations: vec![IntegrationScenarioEvidence {
+                owned_lifetime: None,
                 native_lifetime: None,
                 scenario_id: "clean".into(),
                 ownership_id: "owner".into(),

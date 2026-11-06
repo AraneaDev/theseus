@@ -29,6 +29,10 @@ struct Graph {
     kind: String,
     schema: u32,
     launch: Pin,
+    // Original input fidelity is enforced by snapshot capture/export. This is
+    // decode-only metadata: fixtures may reconstruct recipes before execution.
+    #[serde(default, rename = "recipe")]
+    _recipe: Option<Pin>,
     controller: Pin,
     base: Pin,
     target: Pin,
@@ -312,11 +316,24 @@ fn main() {
 #[cfg(test)]
 mod source_graph_tests {
     use super::*;
-    fn combined() -> Graph {
+    fn combined_raw() -> serde_json::Value {
         let pin = serde_json::json!({"path":"/fixture/image","sha256":"11".repeat(32),"length":1});
         let service = serde_json::json!({"kind":"systemd","slot":"service","scope":"user","bus_endpoint":{"kind":"unix_path","path":"/fixture/bus"},"qualification":{"manager":"systemd","version":"262","api_profile":"systemd_dbus_private_v1","features":["unit_properties","start_stop","manager_reload"],"receipt_sha256":"03".repeat(32)},"namespace":{"kind":"exclusive_owned_registration","slot":"service","unit_load_roots":["/fixture/units"],"dropins":"forbidden","provider_context":"source-fixture"},"manager_context":{"kind":"whole_private","slot":"manager","sut_allowed_actions":["daemon_reload"],"rehearsal_allowed_actions":[],"provider_receipt_required":true},"expected_peer_uid":1000,"expected_manager_uid":1000,"definition_root":"/fixture/units","unit":"theseus-fixture.service","managed_by":"installer","sut_effects":["registration","configuration","removal","daemon_reload"],"allowed_actions":["inspect","start","stop"]});
         let desktop = serde_json::json!({"target_id":"source-combined","os":"linux","session_id":"source-combined","session_epoch":"66".repeat(32),"broker_endpoint":{"kind":"unix_path","path":"/fixture/broker.sock"},"broker_principal":{"kind":"posix","effective_uid":1000,"effective_gid":1000},"helper_principal":{"kind":"posix","effective_uid":1000,"effective_gid":1000},"display":{"kind":"source_owned_headless"},"allowed_modes":["owned_executable"]});
-        serde_json::from_value(serde_json::json!({"kind":"theseus_native_integration_fixture_graph","schema":1,"launch":pin,"controller":pin,"base":pin,"target":pin,"helper":pin,"config":pin,"provider":pin,"provider_template":pin,"provider_root":"/fixture/provider","binding":"01".repeat(16),"manifest_digest":"11".repeat(32),"workspace_marker":"02".repeat(16),"provider_epoch":"22".repeat(32),"core_manifest_digest":"33".repeat(32),"integration_manifest_digest":"44".repeat(32),"service_authority":service,"desktop_authority":desktop,"source_mode":"source_owned_combined","broker":pin,"broker_config":pin})).unwrap()
+        serde_json::json!({"kind":"theseus_native_integration_fixture_graph","schema":1,"launch":pin,"controller":pin,"base":pin,"target":pin,"helper":pin,"config":pin,"provider":pin,"provider_template":pin,"provider_root":"/fixture/provider","binding":"01".repeat(16),"manifest_digest":"11".repeat(32),"workspace_marker":"02".repeat(16),"provider_epoch":"22".repeat(32),"core_manifest_digest":"33".repeat(32),"integration_manifest_digest":"44".repeat(32),"service_authority":service,"desktop_authority":desktop,"source_mode":"source_owned_combined","broker":pin,"broker_config":pin})
+    }
+    fn combined() -> Graph {
+        serde_json::from_value(combined_raw()).unwrap()
+    }
+    #[test]
+    fn original_recipe_pin_is_optional_decode_only_fixture_metadata() {
+        let legacy: Graph = serde_json::from_value(combined_raw()).unwrap();
+        assert!(source_graph_mode(&legacy).is_ok());
+        let mut captured = combined_raw();
+        captured["recipe"] = serde_json::json!({"path":"/fixture/recipe.json","sha256":"aa".repeat(32),"length":123});
+        let current: Graph = serde_json::from_value(captured)
+            .expect("new original input metadata must decode without changing fixture authority");
+        assert!(source_graph_mode(&current).is_ok());
     }
     #[test]
     fn source_combined_graph_requires_both_authorities_exact_owned_mode_and_broker_pins() {
