@@ -46,11 +46,11 @@ backend. A native controller is distinct from a native guest adapter.
    independently reviewed. Original parser handles settle before mutating SUT
    commands; failed or uncertain retirement stays quarantined. Native execution
    remains required in the combined CI batch.
-5. Finish generated-example validation and the final source-pinned acceptance
-   inventory. The independent original recipe pin now passes focused capture,
-   export and decoder checks, and independent review is closed. A fresh compiled
-   export remains pending.
-   Owned ordinary/combined CLI/MCP and recovery local gates pass.
+5. Fresh local acceptance passes at `1f812a0`: all six standalone Source-owned
+   desktop cases; combined CLI and fresh six-tool MCP each cover Clean, Upgrade
+   and Reinstall against the private D-Bus model. The clean build pins 19 separate
+   executable roles. Fresh original-input export, byte verification and production
+   CLI validate/preview pass. These model checks do not qualify a real manager.
 6. Run one combined CI batch, resolve failures and merge accepted work to `main`.
 
 Keep this queue and the checklists below current as work lands. Record source
