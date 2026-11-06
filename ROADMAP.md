@@ -55,9 +55,11 @@ backend. A native controller is distinct from a native guest adapter.
 
 The [first combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42224965159)
 exposed a Windows planning import, JSON error-source retention and three macOS
-test-fixture issues. Corrections pass focused local checks; the full default
-workspace rerun and final native acceptance remain pending. Docker acceptance
-from that run is still in progress.
+test-fixture issues. Corrections pass focused local checks and the complete
+default workspace at `a481a30`: 1,565 passing tests, no failures, with matching
+pinned fixtures. The old-source Docker job was cancelled after collecting all
+native failures to avoid repeating remaining CI minutes. Final corrected-source
+native/Docker acceptance remains pending.
 
 Keep this queue and the checklists below current as work lands. Record source
 implementation, review, local verification, CI acceptance and merge separately.
