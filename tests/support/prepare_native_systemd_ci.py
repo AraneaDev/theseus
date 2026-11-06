@@ -22,7 +22,6 @@ import struct
 import subprocess
 import sys
 import time
-import xml.sax.saxutils
 
 BINARY_ENV = (
     "THESEUS_NATIVE_HELPER_BINARY", "THESEUS_NATIVE_SERVICE_FIXTURE",
@@ -59,7 +58,7 @@ SDK_SYMBOLS = (
     "sd_bus_message_ref", "sd_bus_message_unref", "sd_bus_message_get_error",
     "sd_bus_call_async", "sd_bus_match_signal", "sd_bus_slot_unref",
 )
-SUPPORT_TARGET = "[Unit]\nDescription=Theseus private fixture anchor\nDefaultDependencies=no\n"
+SUPPORT_TARGET = "[Unit]\nDescription=Theseus private fixture anchor\nDefaultDependencies=no\nRequires=dbus.socket dbus.service\nAfter=dbus.service\n"
 MANAGER = "org.freedesktop.systemd1"
 OBJECT = "/org/freedesktop/systemd1"
 IFACE = "org.freedesktop.systemd1.Manager"
@@ -74,6 +73,108 @@ def canonical_path(value):
     require(isinstance(value, str) and re.fullmatch(r"/[A-Za-z0-9_./-]+", value), "closed absolute ASCII path required")
     require(all(p not in ("", ".", "..") for p in value[1:].split("/")), "noncanonical path")
     return value
+
+
+def bus_command(root):
+    canonical_path(root)
+    return ["/usr/bin/dbus-daemon", "--config-file=" + root + "/dbus.conf",
+            "--address=systemd:", "--nofork", "--nopidfile",
+            "--systemd-activation", "--nosyslog"]
+
+
+def support_units(root):
+    canonical_path(root)
+    # Real upstream dbus socket activation + READY=1, not a marker for an
+    # externally spawned daemon. The initial target needs no already-live API.
+    return {
+        "theseus-empty.target": SUPPORT_TARGET,
+        "dbus.socket": "[Unit]\nDescription=Theseus original bus socket\nDefaultDependencies=no\n[Socket]\nListenStream=" + root + "/runtime/bus\nSocketMode=0600\nService=dbus.service\nRemoveOnStop=yes\n",
+        "dbus.service": "[Unit]\nDescription=Theseus original manager-owned bus\nDefaultDependencies=no\nRequires=dbus.socket\nAfter=dbus.socket\n[Service]\nType=notify\nNotifyAccess=main\nSockets=dbus.socket\nSlice=-.slice\nExecStart=" + " ".join(bus_command(root)) + "\nRestart=no\nTimeoutStartSec=30s\nTimeoutStopSec=10s\nKillMode=control-group\nStandardOutput=append:" + root + "/dbus.log\nStandardError=inherit\n",
+    }
+
+
+def managed_bus_proof(root, uid, manager_pid, manager_scope, observed, *, expected=None):
+    """Validate actual observations under the retained original manager only."""
+    canonical_path(root)
+    canonical_path(manager_scope)
+    service, sock = observed["service"], observed["socket"]
+    require(uid > 0 and manager_pid > 0, "original manager identity required")
+    require(observed["socket_peer_pid"] == manager_pid and observed["socket_peer_uid"] == uid,
+            "socket creator must be original manager, not daemon/name lookup")
+    require(observed["driver_uid"] == uid and observed["driver_pid"] == service["main_pid"]
+            and service["main_pid"] > 0 and service["main_pid"] != manager_pid,
+            "bus driver must be exact original managed daemon")
+    for name, unit in (("dbus.service", service), ("dbus.socket", sock)):
+        require(unit["id"] == name and unit["active"] == "active" and unit["sub"] == "running",
+                "original managed bus unit not running")
+        require(re.fullmatch(r"[a-f0-9]{32}", unit["invocation"]) and unit["invocation"] != "0" * 32,
+                "original managed unit invocation required")
+        require(unit["fragment"] == root + "/support-units/" + name and unit["dropins"] == [],
+                "bus unit must be the exact closed support definition")
+    require(service["control_group"] == manager_scope + "/dbus.service", "original managed daemon cgroup mismatch")
+    require(service["arguments"] == bus_command(root), "original managed daemon argv mismatch")
+    require(sock["listen"] == [["Stream", root + "/runtime/bus"]], "original bus listener mismatch")
+    proof = {"kind": "original_manager_owned_bus_v1", "manager_pid": manager_pid,
+             "socket_creator_pid": observed["socket_peer_pid"], "socket_creator_uid": observed["socket_peer_uid"],
+             "daemon_pid": service["main_pid"], "daemon_uid": observed["driver_uid"],
+             "service_invocation": service["invocation"], "socket_invocation": sock["invocation"],
+             "control_group": service["control_group"], "service_fragment": service["fragment"],
+             "socket_fragment": sock["fragment"], "arguments": service["arguments"], "listen": sock["listen"]}
+    require(expected is None or proof == expected, "original managed bus identity changed; never adopt replacement")
+    return proof
+
+
+def scope_unpopulated(text):
+    lines = text.splitlines()
+    return [line for line in lines if line.startswith("populated ")] == ["populated 0"]
+
+
+def manager_cleanup_complete(owner, empty):
+    return bool(owner is not None and type(owner.get("joined_status")) is int and empty is True)
+
+
+def original_scope_settled(cleanup):
+    return bool(isinstance(cleanup, dict) and cleanup.get("kind") == "theseus_original_manager_cleanup_v1"
+                and cleanup.get("manager_scope_empty") is True and cleanup.get("errors") == []
+                and (cleanup.get("manager_started") is False
+                     or (cleanup.get("manager_started") is True
+                         and manager_cleanup_complete(cleanup.get("manager"), True))))
+
+
+CLOSED_INITIAL_UNITS = frozenset({"theseus-empty.target", "dbus.socket", "dbus.service", "init.scope", "-.slice"})
+# A user manager synthesizes these from kernel mount/swap/udev state, never
+# from a unit file; every definition-backed type stays exactly closed.
+KERNEL_DERIVED_UNIT_SUFFIXES = (".mount", ".swap", ".device")
+WORKER_CLEANUP_LIMIT = 64 * 1024
+
+
+def initial_units_closed(units):
+    return all(unit in CLOSED_INITIAL_UNITS or unit.endswith(KERNEL_DERIVED_UNIT_SUFFIXES) for unit in units)
+
+
+def read_worker_cleanup(path):
+    """Worker-owned receipt; missing, malformed, special or redirected is uncertainty."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return None
+            raw = handle.read(WORKER_CLEANUP_LIMIT + 1)
+            if len(raw) > WORKER_CLEANUP_LIMIT:
+                return None
+            document = json.loads(raw)
+    except (OSError, ValueError):
+        return None
+    return document if isinstance(document, dict) else None
+
+
+def remaining(deadline, limit):
+    interval = deadline - time.monotonic()
+    require(interval > 0, "original manager operation deadline expired")
+    return min(interval, limit)
 
 
 def execution_guard(env, *, execute, disposable, uid, system):
@@ -188,7 +289,24 @@ def manager_receipt(plan, uid, evidence):
     require(re.fullmatch(r":[0-9]+\.[0-9]+", evidence["manager_unique_name"]), "live D-Bus unique manager owner required")
     require(re.fullmatch(r"[a-f0-9]{32}", evidence["service_invocation_id"]), "retained original transient service invocation required")
     require(evidence.get("no_other_namespace_writers") is True, "exclusive fresh UID namespace required")
-    require(evidence["bus_pid"] > 0 and evidence["manager_pid"] > 0 and evidence["bus_pid"] != evidence["manager_pid"], "original distinct Popen identities required")
+    require(evidence["bus_pid"] > 0 and evidence["manager_pid"] > 0 and evidence["bus_pid"] != evidence["manager_pid"], "original manager and managed daemon identities required")
+    proof, peer = evidence.get("bus_ownership"), evidence.get("private_manager_peer")
+    require(isinstance(proof, dict) and proof.get("kind") == "original_manager_owned_bus_v1"
+            and proof.get("manager_pid") == evidence["manager_pid"]
+            and proof.get("socket_creator_pid") == evidence["manager_pid"]
+            and proof.get("socket_creator_uid") == uid
+            and proof.get("daemon_pid") == evidence["bus_pid"] and proof.get("daemon_uid") == uid,
+            "original manager-owned bus role proof required")
+    require(isinstance(peer, dict) and peer.get("pid") == evidence["manager_pid"] and peer.get("uid") == uid,
+            "original private manager peer proof required")
+    for field in ("service_invocation", "socket_invocation"):
+        require(isinstance(proof.get(field), str) and re.fullmatch(r"[a-f0-9]{32}", proof[field])
+                and proof[field] != "0" * 32, "original managed bus invocation required")
+    require(proof.get("service_fragment") == plan["root"] + "/support-units/dbus.service"
+            and proof.get("socket_fragment") == plan["root"] + "/support-units/dbus.socket"
+            and proof.get("arguments") == bus_command(plan["root"])
+            and proof.get("listen") == [["Stream", plan["root"] + "/runtime/bus"]],
+            "exact closed bus definition proof required")
     digest = hashlib.sha256(json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     namespace = "theseus-real-private-systemd:" + plan["token"] + ":" + digest
     authority = {
@@ -293,15 +411,22 @@ def operator(plan, env):
         for signum, handler in old_handlers.items():
             signal.signal(signum, handler)
         cleanup = {"account_created": account_created, "fixture_uid": uid, "original_launcher_pid": child.pid if child else None, "original_launcher_joined": joined_service, "interrupted": interrupted, "root_original_inode": os.fstat(root_fd).st_ino, "root_retained": str(root)}
-        if account_created and joined_service:
-            current = pwd.getpwnam(plan["account"])
-            require(current.pw_uid == uid, "original account identity lost; refusing account cleanup")
-            result = subprocess.run(["/usr/sbin/userdel", plan["account"]], check=False)
-            cleanup["account_removed"] = result.returncode == 0
-        else:
-            cleanup["account_removed"] = False
+        worker_cleanup = read_worker_cleanup(root / "worker-cleanup.json")
+        managed_scope_settled = child is None or original_scope_settled(worker_cleanup)
+        cleanup["original_managed_scope_settled"] = managed_scope_settled
+        cleanup["account_removed"] = False
+        if account_created and joined_service and managed_scope_settled:
+            try:
+                current_uid = pwd.getpwnam(plan["account"]).pw_uid
+            except KeyError:
+                current_uid = None
+            cleanup["account_identity_retained"] = current_uid == uid
+            if current_uid == uid:
+                result = subprocess.run(["/usr/sbin/userdel", plan["account"]], check=False)
+                cleanup["account_removed"] = result.returncode == 0
         write_new(root / "operator-cleanup.json", cleanup)
         os.close(root_fd)
+        require(not account_created or cleanup.get("account_identity_retained") is not False, "original account identity lost; refusing account cleanup")
         require(not account_created or cleanup["account_removed"], "original account cleanup incomplete; inspect retained receipt")
 
 
@@ -338,6 +463,105 @@ def native_child(command, **kwargs):
         raise
     finally:
         os.close(fd)
+
+
+def pin_native_binary(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        identity = os.fstat(fd)
+        require(stat.S_ISREG(identity.st_mode), "regular original native executable required")
+        with os.fdopen(os.dup(fd), "rb") as binary:
+            digest = hashlib.sha256(binary.read()).hexdigest()
+        return fd, {"path": path, "dev": identity.st_dev, "inode": identity.st_ino,
+                    "length": identity.st_size, "sha256": digest}
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def verify_managed_executable(pid, pin, command, control_group):
+    # Observation of the original manager's already-bound MainPID, never a
+    # process handle reconstructed for mutation or cleanup.
+    executed = Path(f"/proc/{pid}/exe").stat()
+    require((executed.st_dev, executed.st_ino, executed.st_size) == (pin["dev"], pin["inode"], pin["length"]),
+            "original managed executable identity changed")
+    raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    require(raw == b"\0".join(arg.encode() for arg in command) + b"\0", "original managed executable argv changed")
+    require(Path(f"/proc/{pid}/cgroup").read_text().splitlines() == ["0::" + control_group],
+            "daemon is not in its original manager-owned cgroup")
+    with Path(f"/proc/{pid}/exe").open("rb") as binary:
+        require(hashlib.sha256(binary.read()).hexdigest() == pin["sha256"], "original managed executable bytes changed")
+
+
+def connection_peer(connection):
+    with socket.fromfd(connection.get_unix_fd(), socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+        return struct.unpack("3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+
+
+def bus_unit_observation(dbus, connection, manager_object, *, deadline=None):
+    manager = dbus.Interface(manager_object, IFACE)
+    def timeout():
+        return 5 if deadline is None else remaining(deadline, 5)
+    records = {}
+    for name in ("dbus.service", "dbus.socket"):
+        path = str(manager.GetUnit(name, timeout=timeout()))
+        obj = connection.get_object(None, path, introspect=False)
+        properties = dbus.Interface(obj, "org.freedesktop.DBus.Properties")
+        unit = properties.GetAll("org.freedesktop.systemd1.Unit", timeout=timeout())
+        record = {"id": str(unit["Id"]), "active": str(unit["ActiveState"]), "sub": str(unit["SubState"]),
+                  "invocation": bytes(unit["InvocationID"]).hex(), "fragment": str(unit["FragmentPath"]),
+                  "dropins": [str(p) for p in unit["DropInPaths"]]}
+        if name == "dbus.service":
+            service = properties.GetAll("org.freedesktop.systemd1.Service", timeout=timeout())
+            starts = service["ExecStart"]
+            require(len(starts) == 1, "exact original bus ExecStart required")
+            record.update(main_pid=int(service["MainPID"]), control_group=str(service["ControlGroup"]),
+                          arguments=[str(a) for a in starts[0][1]])
+        else:
+            sock = properties.GetAll("org.freedesktop.systemd1.Socket", timeout=timeout())
+            record["listen"] = [[str(kind), str(address)] for kind, address in sock["Listen"]]
+        records[name.split(".")[1]] = record
+    return records
+
+
+def stop_original_bus(dbus, connection, manager_object, proof, deadline):
+    """Only the same authenticated original private connection can settle it."""
+    remaining(deadline, 5)
+    units = bus_unit_observation(dbus, connection, manager_object, deadline=deadline)
+    require(units["service"]["invocation"] == proof["service_invocation"]
+            and units["service"]["main_pid"] == proof["daemon_pid"]
+            and units["service"]["control_group"] == proof["control_group"]
+            and units["service"]["fragment"] == proof["service_fragment"]
+            and units["service"]["arguments"] == proof["arguments"]
+            and units["service"]["dropins"] == []
+            and units["socket"]["invocation"] == proof["socket_invocation"]
+            and units["socket"]["fragment"] == proof["socket_fragment"]
+            and units["socket"]["listen"] == proof["listen"]
+            and units["socket"]["dropins"] == [],
+            "original managed bus replaced before cleanup; refusing name-based stop")
+    manager = dbus.Interface(manager_object, IFACE)
+    manager.StopUnit("dbus.socket", "replace", timeout=remaining(deadline, 5))
+    # Stop of the required socket also stops the service. Public bus disconnect
+    # says nothing; observe the original units over our retained private channel.
+    while True:
+        require(time.monotonic() < deadline, "original managed bus stop deadline")
+        settled = True
+        for name, invocation in (("dbus.service", proof["service_invocation"]), ("dbus.socket", proof["socket_invocation"])):
+            try:
+                path = manager.GetUnit(name, timeout=remaining(deadline, 2))
+                properties = dbus.Interface(connection.get_object(None, path, introspect=False), "org.freedesktop.DBus.Properties")
+                unit = properties.GetAll("org.freedesktop.systemd1.Unit", timeout=remaining(deadline, 2))
+                current = bytes(unit["InvocationID"]).hex()
+                # A null id is sent as an empty array; never a different id.
+                require(current in (invocation, "", "0" * 32), "managed bus invocation changed during stop")
+                settled = settled and str(unit["ActiveState"]) in ("inactive", "failed")
+            except dbus.DBusException as error:
+                # Collected after stop (before or between GetUnit/GetAll).
+                require(error.get_dbus_name() in ("org.freedesktop.systemd1.NoSuchUnit", "org.freedesktop.DBus.Error.UnknownObject"),
+                        "lost original private cleanup observation")
+        if settled:
+            return {"original_service_invocation": proof["service_invocation"], "original_socket_invocation": proof["socket_invocation"], "settled": True}
+        time.sleep(0.05)
 
 
 def service_terminal(fields, original_invocation):
@@ -391,10 +615,14 @@ def worker(document):
     require(not (root / "runtime/bus").exists(), "refusing preexisting bus")
     write_new(root / "worker-owner.json", {"service_invocation_id": invocation, "fixture_uid": uid, "worker_pid": os.getpid(), "service": "theseus-private-" + plan["token"] + ".service"})
     import dbus  # operator-only native Python D-Bus SDK, never product fallback
-    bus_child = manager_child = None
-    connection = None
+    manager_child = None
+    connection = private_connection = None
+    private_object = None
+    manager_cgroup = None
+    scope_fd = events_fd = bus_binary_fd = None
+    bus_proof = None
     logs = []
-    cleanup = {}
+    cleanup = {"kind": "theseus_original_manager_cleanup_v1"}
     old_handlers = {}
     try:
         for signum in (signal.SIGTERM, signal.SIGINT):
@@ -402,32 +630,50 @@ def worker(document):
                 raise InterruptedError(f"fixture received signal {value}")
             old_handlers[signum] = signal.signal(signum, interrupt)
         base, owner, manager_cgroup, controllers = delegated_cgroups(plan["token"])
-        support_path = root / "support-units/theseus-empty.target"
-        with support_path.open("x") as support:
-            support.write(SUPPORT_TARGET)
-        support_path.chmod(0o400)
+        scope_fd = os.open(manager_cgroup, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        events_fd = os.open("cgroup.events", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=scope_fd)
+        scope_identity = os.fstat(scope_fd)
+        definitions = support_units(str(root))
+        for name, contents in definitions.items():
+            path = root / "support-units" / name
+            with path.open("x") as support:
+                support.write(contents)
+            path.chmod(0o400)
         address = plan["worker_environment"]["DBUS_SESSION_BUS_ADDRESS"]
-        config = '<busconfig><type>session</type><listen>' + xml.sax.saxutils.escape(address) + '</listen><auth>EXTERNAL</auth><policy context="default"><allow user="' + str(uid) + '"/><allow own="*"/><allow send_destination="*"/><allow receive_sender="*"/></policy></busconfig>'
-        (root / "dbus.conf").write_text(config)
-        bus_log = (root / "dbus.log").open("x")
-        logs.append(bus_log)
-        bus_child, bus_binary = native_child(["/usr/bin/dbus-daemon", "--nofork", "--nopidfile", "--config-file=" + str(root / "dbus.conf")], stdout=bus_log, stderr=subprocess.STDOUT, env=plan["worker_environment"])
-        deadline = time.monotonic() + 30
-        while not (root / "runtime/bus").exists():
-            require(bus_child.poll() is None and time.monotonic() < deadline, "original private bus failed to start")
-            time.sleep(0.05)
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
-            peer.connect(str(root / "runtime/bus"))
-            peer_pid, peer_uid, peer_gid = struct.unpack("3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
-        require(peer_uid == uid and peer_pid == bus_child.pid and bus_child.poll() is None, "bus socket does not belong to original fixture Popen")
-        connection = dbus.bus.BusConnection(address)
-        daemon = dbus.Interface(connection.get_object("org.freedesktop.DBus", "/org/freedesktop/DBus", introspect=False), "org.freedesktop.DBus")
+        config = '<busconfig><type>session</type><listen>systemd:</listen><auth>EXTERNAL</auth><policy context="default"><allow user="' + str(uid) + '"/><allow own="*"/><allow send_destination="*"/><allow receive_sender="*"/></policy></busconfig>'
+        with (root / "dbus.conf").open("x") as config_file:
+            config_file.write(config)
+        (root / "dbus.conf").chmod(0o400)
+        bus_binary_fd, bus_binary = pin_native_binary(bus_command(str(root))[0])
         manager_log = (root / "manager.log").open("x")
         logs.append(manager_log)
         def enter_manager_cgroup():
             (manager_cgroup / "cgroup.procs").write_text(str(os.getpid()))
         manager_child, manager_binary = native_child(["/usr/lib/systemd/systemd", "--user", "--unit=theseus-empty.target"], stdout=manager_log, stderr=subprocess.STDOUT, preexec_fn=enter_manager_cgroup, env=plan["worker_environment"])
         deadline = time.monotonic() + 45
+        # Retain a separate original peer-to-peer manager channel. It performs
+        # no Hello/name lookup and survives shutdown of the managed public bus.
+        while not (root / "runtime/systemd/private").exists():
+            require(manager_child.poll() is None and time.monotonic() < deadline, "original manager private API failed to start")
+            time.sleep(0.05)
+        private_connection = dbus.connection.Connection("unix:path=" + str(root / "runtime/systemd/private"))
+        private_peer_pid, private_peer_uid, private_peer_gid = connection_peer(private_connection)
+        require(private_peer_pid == manager_child.pid and private_peer_uid == uid,
+                "private API must be exact original manager peer")
+        private_object = private_connection.get_object(None, OBJECT, introspect=False)
+        while not (root / "runtime/bus").exists():
+            require(manager_child.poll() is None and time.monotonic() < deadline, "original managed bus socket failed to start")
+            time.sleep(0.05)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+            peer.settimeout(max(0.001, deadline - time.monotonic()))
+            peer.connect(str(root / "runtime/bus"))
+            peer_pid, peer_uid, peer_gid = struct.unpack("3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+        require(peer_uid == uid and peer_pid == manager_child.pid and manager_child.poll() is None,
+                "bus listening socket must be created by original manager")
+        connection = dbus.bus.BusConnection(address)
+        actual_peer_pid, actual_peer_uid, _ = connection_peer(connection)
+        require((actual_peer_pid, actual_peer_uid) == (peer_pid, peer_uid), "actual bus connection peer changed")
+        daemon = dbus.Interface(connection.get_object("org.freedesktop.DBus", "/org/freedesktop/DBus", introspect=False), "org.freedesktop.DBus")
         while True:
             require(manager_child.poll() is None and time.monotonic() < deadline, "original native user manager did not acquire its private bus name")
             try:
@@ -436,6 +682,14 @@ def worker(document):
             except dbus.DBusException as error:
                 require(error.get_dbus_name() == "org.freedesktop.DBus.Error.NameHasNoOwner", "unexpected private bus failure")
                 time.sleep(0.05)
+        units = bus_unit_observation(dbus, private_connection, private_object)
+        observed = {**units, "socket_peer_pid": peer_pid, "socket_peer_uid": peer_uid,
+                    "socket_peer_gid": peer_gid,
+                    "driver_pid": int(daemon.GetConnectionUnixProcessID("org.freedesktop.DBus", timeout=5)),
+                    "driver_uid": int(daemon.GetConnectionUnixUser("org.freedesktop.DBus", timeout=5))}
+        manager_scope = "/" + str(manager_cgroup.relative_to("/sys/fs/cgroup"))
+        bus_proof = managed_bus_proof(str(root), uid, manager_child.pid, manager_scope, observed)
+        verify_managed_executable(bus_proof["daemon_pid"], bus_binary, bus_command(str(root)), bus_proof["control_group"])
         manager_uid = int(daemon.GetConnectionUnixUser(unique, timeout=5))
         manager_pid = int(daemon.GetConnectionUnixProcessID(unique, timeout=5))
         require(manager_pid == manager_child.pid and manager_child.poll() is None, "manager owner must be original retained Popen")
@@ -449,7 +703,7 @@ def worker(document):
         for method in ("StartUnit", "StopUnit", "Reload", "GetUnit", "ListUnits"):
             require(f'name="{method}"' in introspection, "native manager API missing: " + method)
         initial_units = [str(row[0]) for row in dbus.Interface(obj, IFACE).ListUnits(timeout=5)]
-        require(set(initial_units).issubset({"theseus-empty.target", "init.scope", "-.slice"}), "new whole-private manager loaded an unexpected unit")
+        require(initial_units_closed(initial_units), "new whole-private manager loaded an unexpected unit")
         require(not list((root / "units").iterdir()), "unit namespace changed before qualification")
         sdk = ctypes.CDLL("libsystemd.so.0")
         for symbol in SDK_SYMBOLS:
@@ -460,9 +714,11 @@ def worker(document):
         evidence = {
             "version": version, "unit_paths": unit_paths, "bus_peer_uid": peer_uid,
             "bus_peer_gid": peer_gid, "manager_uid": manager_uid, "manager_unique_name": unique,
-            "bus_pid": bus_child.pid, "manager_pid": manager_pid, "service_invocation_id": invocation,
+            "bus_pid": bus_proof["daemon_pid"], "manager_pid": manager_pid, "service_invocation_id": invocation,
+            "bus_ownership": bus_proof, "private_manager_peer": {"pid": private_peer_pid, "uid": private_peer_uid, "gid": private_peer_gid},
             "manager_features": actual_features, "os": platform.uname()._asdict(),
-            "initial_units": initial_units, "support_target_sha256": hashlib.sha256(support_path.read_bytes()).hexdigest(),
+            "initial_units": initial_units, "support_units_sha256": {name: hashlib.sha256((root / "support-units" / name).read_bytes()).hexdigest() for name in definitions},
+            "bus_config_sha256": hashlib.sha256((root / "dbus.conf").read_bytes()).hexdigest(),
             "os_release": Path("/etc/os-release").read_text(),
             "native_sdk_mappings": sdk_mappings, "native_sdk_symbols": SDK_SYMBOLS,
             "native_sdk_libraries": [{"path": path, "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(), "length": Path(path).stat().st_size} for path in sdk_paths],
@@ -479,7 +735,16 @@ def worker(document):
         test_env = artifact_environment(plan)
         results = []
         for index, case in enumerate(plan["manifest"]["cases"]):
-            require(bus_child.poll() is None and manager_child.poll() is None, "lost original manager/bus during acceptance")
+            require(manager_child.poll() is None, "lost original manager during acceptance")
+            current = bus_unit_observation(dbus, private_connection, private_object)
+            observed.update(current)
+            observed["driver_pid"] = int(daemon.GetConnectionUnixProcessID("org.freedesktop.DBus", timeout=5))
+            observed["driver_uid"] = int(daemon.GetConnectionUnixUser("org.freedesktop.DBus", timeout=5))
+            managed_bus_proof(str(root), uid, manager_child.pid, manager_scope, observed, expected=bus_proof)
+            verify_managed_executable(bus_proof["daemon_pid"], bus_binary, bus_command(str(root)), bus_proof["control_group"])
+            for name, contents in definitions.items():
+                require((root / "support-units" / name).read_text() == contents, "closed support definition changed")
+            require((root / "dbus.conf").read_text() == config, "original bus config changed")
             require(str(daemon.GetNameOwner(MANAGER, timeout=5)) == unique, "original manager bus owner replaced")
             binary = str(root / "artifacts" / case["binary"])
             inventory = subprocess.run([binary, "--list"], env=test_env, capture_output=True, text=True, timeout=30, check=True)
@@ -502,20 +767,46 @@ def worker(document):
         # joins. The original system service still has its bounded stop policy.
         for signum in old_handlers:
             signal.signal(signum, signal.SIG_IGN)
-        if connection is not None:
+        # Stop only the exact already-bound unit instances on the original
+        # private connection. Never reconnect after loss or mutate a found PID.
+        if bus_proof is not None and private_connection is not None:
             try:
-                connection.close()
+                cleanup["bus"] = stop_original_bus(dbus, private_connection, private_object, bus_proof, time.monotonic() + 20)
+                dbus.Interface(private_object, IFACE).Exit(timeout=5)
+                manager_child.wait(timeout=5)
             except Exception as error:
-                errors.append(str(error))
-        # Native user manager Exit/Stop calls are unnecessary: terminate only the
-        # actual original owned Popen, then let the original service's KillMode
-        # settle its delegated subtree. No PID lookup, attach, killpg, or scan.
-        for name, child in (("manager", manager_child), ("bus", bus_child)):
+                errors.append("original managed bus shutdown: " + str(error))
+        for channel in (connection, private_connection):
+            if channel is not None:
+                try:
+                    channel.close()
+                except Exception as error:
+                    errors.append(str(error))
+        try:
+            cleanup["manager"] = join_original(manager_child)
+        except Exception as error:
+            errors.append("manager: " + str(error))
+        cleanup["manager_scope_empty"] = manager_child is None and events_fd is None
+        if events_fd is not None:
             try:
-                cleanup[name] = join_original(child)
+                # This is the held original manager subtree, not the sibling
+                # worker's containing delegated scope or a path reconstructed
+                # after exit. Missing/unreadable is uncertainty, never empty.
+                current_identity = os.fstat(scope_fd)
+                require((current_identity.st_dev, current_identity.st_ino) == (scope_identity.st_dev, scope_identity.st_ino), "original manager scope identity lost")
+                cleanup["manager_scope_identity"] = {"path": str(manager_cgroup), "dev": scope_identity.st_dev, "inode": scope_identity.st_ino}
+                text = os.pread(events_fd, 4096, 0).decode("ascii")
+                cleanup["manager_scope_events"] = text
+                cleanup["manager_scope_empty"] = scope_unpopulated(text)
             except Exception as error:
-                errors.append(name + ": " + str(error))
+                errors.append("original manager subtree: " + str(error))
+        if manager_child is not None and not manager_cleanup_complete(cleanup.get("manager"), cleanup["manager_scope_empty"]):
+            errors.append("original manager subtree remains unknown or populated")
         cleanup["errors"] = errors
+        cleanup["manager_started"] = manager_child is not None
+        for fd in (events_fd, scope_fd, bus_binary_fd):
+            if fd is not None:
+                os.close(fd)
         for log in logs:
             log.close()
         write_new(root / "worker-cleanup.json", cleanup)

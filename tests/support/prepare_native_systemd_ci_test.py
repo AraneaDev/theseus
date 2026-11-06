@@ -7,7 +7,8 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+from types import SimpleNamespace
 
 SPEC = importlib.util.spec_from_file_location("prepare_native_systemd_ci", Path(__file__).with_name("prepare_native_systemd_ci.py"))
 fixture = importlib.util.module_from_spec(SPEC)
@@ -33,6 +34,166 @@ def manifest():
 
 
 class Planning(unittest.TestCase):
+    def test_initial_target_bootstraps_real_notify_bus_without_api_calls(self):
+        root = "/tmp/th-sd-abcd1234abcd1234"
+        units = fixture.support_units(root)
+        self.assertEqual(set(units), {"theseus-empty.target", "dbus.socket", "dbus.service"})
+        self.assertIn("Requires=dbus.socket dbus.service\n", units["theseus-empty.target"])
+        self.assertIn("After=dbus.service\n", units["theseus-empty.target"])
+        self.assertIn("ListenStream=" + root + "/runtime/bus\n", units["dbus.socket"])
+        self.assertIn("SocketMode=0600\n", units["dbus.socket"])
+        service = units["dbus.service"]
+        for line in ["Type=notify", "NotifyAccess=main", "Sockets=dbus.socket", "Slice=-.slice", "Restart=no", "TimeoutStartSec=30s", "TimeoutStopSec=10s"]:
+            self.assertIn(line + "\n", service)
+        self.assertEqual(fixture.bus_command(root), ["/usr/bin/dbus-daemon", "--config-file=" + root + "/dbus.conf", "--address=systemd:", "--nofork", "--nopidfile", "--systemd-activation", "--nosyslog"])
+        self.assertIn("ExecStart=" + " ".join(fixture.bus_command(root)) + "\n", service)
+        for text in units.values():
+            self.assertNotIn("RemainAfterExit", text)
+            self.assertNotIn("/usr/lib/systemd/user", text)
+        with self.assertRaises(ValueError):
+            fixture.support_units("/tmp/private/../escape")
+
+    def owned_bus_observation(self):
+        root = "/tmp/th-sd-abcd1234abcd1234"
+        scope = "/system.slice/theseus-private-abcd1234abcd1234.service/theseus-private-manager"
+        return root, scope, {
+            "socket_peer_pid": 18, "socket_peer_uid": 12345, "socket_peer_gid": 12345,
+            "driver_pid": 19, "driver_uid": 12345,
+            "service": {"id": "dbus.service", "active": "active", "sub": "running", "invocation": "a" * 32, "fragment": root + "/support-units/dbus.service", "dropins": [], "main_pid": 19, "control_group": scope + "/dbus.service", "arguments": fixture.bus_command(root)},
+            "socket": {"id": "dbus.socket", "active": "active", "sub": "running", "invocation": "b" * 32, "fragment": root + "/support-units/dbus.socket", "dropins": [], "listen": [["Stream", root + "/runtime/bus"]]},
+        }
+
+    def test_managed_bus_roles_and_original_invocations_are_exact_and_sticky(self):
+        root, scope, observed = self.owned_bus_observation()
+        proof = fixture.managed_bus_proof(root, 12345, 18, scope, observed)
+        self.assertEqual(proof["kind"], "original_manager_owned_bus_v1")
+        self.assertEqual(proof["socket_creator_pid"], 18)
+        self.assertEqual(proof["daemon_pid"], 19)
+        self.assertEqual(proof, fixture.managed_bus_proof(root, 12345, 18, scope, observed, expected=proof))
+        mutations = [("socket_peer_pid", 19), ("socket_peer_uid", 0), ("driver_pid", 20), ("driver_uid", 0)]
+        for field, value in mutations:
+            bad = copy.deepcopy(observed); bad[field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                fixture.managed_bus_proof(root, 12345, 18, scope, bad, expected=proof)
+        for unit, field, value in [("service", "invocation", "c" * 32), ("socket", "invocation", "c" * 32), ("service", "main_pid", 20), ("service", "control_group", scope + "evil/dbus.service"), ("service", "arguments", ["/usr/bin/other"]), ("service", "fragment", "/usr/lib/systemd/user/dbus.service"), ("socket", "listen", [["Stream", "/tmp/ambient/bus"]]), ("service", "active", "inactive"), ("socket", "sub", "listening")]:
+            bad = copy.deepcopy(observed); bad[unit][field] = value
+            with self.subTest(unit=unit, field=field), self.assertRaises(ValueError):
+                fixture.managed_bus_proof(root, 12345, 18, scope, bad, expected=proof)
+
+    def test_cleanup_requires_original_join_and_empty_retained_scope(self):
+        self.assertTrue(fixture.manager_cleanup_complete({"joined_status": 0}, True))
+        self.assertTrue(fixture.manager_cleanup_complete({"joined_status": -9}, True))
+        for owner, empty in [(None, True), ({}, True), ({"joined_status": None}, True), ({"joined_status": 0}, False)]:
+            with self.subTest(owner=owner, empty=empty):
+                self.assertFalse(fixture.manager_cleanup_complete(owner, empty))
+        self.assertTrue(fixture.scope_unpopulated("populated 0\nfrozen 0\n"))
+        for value in ["", "populated 1\n", "populated 0\npopulated 1\n", "populated 00\n"]:
+            with self.subTest(value=value):
+                self.assertFalse(fixture.scope_unpopulated(value))
+
+    def test_private_cleanup_never_stops_replaced_or_expired_original(self):
+        root, scope, observed = self.owned_bus_observation()
+        proof = fixture.managed_bus_proof(root, 12345, 18, scope, observed)
+        manager = Mock()
+        dbus = SimpleNamespace(Interface=lambda obj, iface: obj)
+        replaced = copy.deepcopy(observed)
+        replaced["service"]["invocation"] = "c" * 32
+        with patch.object(fixture, "bus_unit_observation", return_value=replaced), self.assertRaises(ValueError):
+            fixture.stop_original_bus(dbus, Mock(), manager, proof, fixture.time.monotonic() + 5)
+        manager.StopUnit.assert_not_called()
+        with patch.object(fixture, "bus_unit_observation", return_value=observed), self.assertRaises(ValueError):
+            fixture.stop_original_bus(dbus, Mock(), manager, proof, fixture.time.monotonic() - 1)
+        manager.StopUnit.assert_not_called()
+
+    def test_same_private_connection_survives_public_bus_stop_but_loss_never_settles(self):
+        root, scope, observed = self.owned_bus_observation()
+        proof = fixture.managed_bus_proof(root, 12345, 18, scope, observed)
+        class NativeError(Exception):
+            def get_dbus_name(self):
+                return "org.freedesktop.DBus.Error.Disconnected"
+        dbus = SimpleNamespace(Interface=lambda obj, iface: obj, DBusException=NativeError)
+        manager = Mock()
+        manager.GetUnit.side_effect = lambda name, **kw: name
+        private = Mock()
+        def original_unit(bus_name, name, **kw):
+            invocation = proof["service_invocation"] if name == "dbus.service" else proof["socket_invocation"]
+            return SimpleNamespace(GetAll=lambda *args, **kwargs: {"InvocationID": bytes.fromhex(invocation), "ActiveState": "inactive"})
+        private.get_object.side_effect = original_unit
+        with patch.object(fixture, "bus_unit_observation", return_value=observed):
+            result = fixture.stop_original_bus(dbus, private, manager, proof, fixture.time.monotonic() + 5)
+        self.assertTrue(result["settled"])
+        self.assertEqual(manager.StopUnit.call_args.args, ("dbus.socket", "replace"))
+        self.assertEqual(private.get_object.call_count, 2)
+        private.get_object.side_effect = NativeError("original private connection lost")
+        with patch.object(fixture, "bus_unit_observation", return_value=observed), self.assertRaisesRegex(ValueError, "lost original"):
+            fixture.stop_original_bus(dbus, private, manager, proof, fixture.time.monotonic() + 5)
+        self.assertEqual(private.get_object.call_count, 3)
+
+    def test_account_cleanup_requires_actual_original_scope_receipt(self):
+        good = {"kind": "theseus_original_manager_cleanup_v1", "manager_started": True, "manager": {"joined_status": 0}, "manager_scope_empty": True, "errors": []}
+        self.assertTrue(fixture.original_scope_settled(good))
+        for field, value in [("kind", "old_cleanup"), ("manager", None), ("manager_scope_empty", False), ("errors", ["private connection lost"]), ("manager_started", None)]:
+            bad = dict(good); bad[field] = value
+            with self.subTest(field=field):
+                self.assertFalse(fixture.original_scope_settled(bad))
+        self.assertFalse(fixture.original_scope_settled(None))
+
+    def test_initial_units_close_definitions_but_admit_kernel_derived_units(self):
+        closed = ["theseus-empty.target", "dbus.socket", "dbus.service", "init.scope", "-.slice"]
+        kernel = ["-.mount", "tmp.mount", "run-user-1001.mount", "dev-sda2.swap", "sys-devices-virtual-net-lo.device"]
+        self.assertTrue(fixture.initial_units_closed(closed + kernel))
+        for unexpected in ("app.slice", "default.target", "dbus-broker.service", "tmp.automount", "x.timer", "x.path", "session.scope", "theseus.mount.service"):
+            with self.subTest(unit=unexpected):
+                self.assertFalse(fixture.initial_units_closed(closed + kernel + [unexpected]))
+
+    def test_stop_poll_accepts_null_or_collected_original_units(self):
+        root, scope, observed = self.owned_bus_observation()
+        proof = fixture.managed_bus_proof(root, 12345, 18, scope, observed)
+        class NativeError(Exception):
+            def get_dbus_name(self):
+                return "org.freedesktop.DBus.Error.UnknownObject"
+        dbus = SimpleNamespace(Interface=lambda obj, iface: obj, DBusException=NativeError)
+        manager = Mock()
+        manager.GetUnit.side_effect = lambda name, **kw: name
+        private = Mock()
+        def collected(bus_name, name, **kw):
+            if name == "dbus.service":
+                return SimpleNamespace(GetAll=lambda *a, **k: {"InvocationID": b"", "ActiveState": "inactive"})
+            def gone(*a, **k):
+                raise NativeError("collected between GetUnit and GetAll")
+            return SimpleNamespace(GetAll=gone)
+        private.get_object.side_effect = collected
+        with patch.object(fixture, "bus_unit_observation", return_value=observed):
+            self.assertTrue(fixture.stop_original_bus(dbus, private, manager, proof, fixture.time.monotonic() + 5)["settled"])
+
+    def test_worker_cleanup_reader_never_blocks_on_special_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "worker-cleanup.json"
+            fixture.os.mkfifo(path)
+            self.assertIsNone(fixture.read_worker_cleanup(path))
+            path.unlink()
+            path.write_text(json.dumps({"kind": "x", "pad": "y" * (fixture.WORKER_CLEANUP_LIMIT + 1)}))
+            self.assertIsNone(fixture.read_worker_cleanup(path))
+
+    def test_unreadable_worker_cleanup_is_uncertainty_not_a_lost_receipt(self):
+        good = {"kind": "theseus_original_manager_cleanup_v1", "manager_started": True, "manager": {"joined_status": 0}, "manager_scope_empty": True, "errors": []}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "worker-cleanup.json"
+            self.assertIsNone(fixture.read_worker_cleanup(path))
+            path.write_text('{"kind": "theseus_original_manager_cleanup_v1", "manager_sc')
+            self.assertIsNone(fixture.read_worker_cleanup(path))
+            path.write_text("[]")
+            self.assertIsNone(fixture.read_worker_cleanup(path))
+            target = Path(directory) / "elsewhere.json"
+            target.write_text(json.dumps(good))
+            path.unlink()
+            path.symlink_to(target)
+            self.assertIsNone(fixture.read_worker_cleanup(path))
+            path.unlink()
+            path.write_text(json.dumps(good))
+            self.assertEqual(fixture.read_worker_cleanup(path), good)
+            self.assertTrue(fixture.original_scope_settled(fixture.read_worker_cleanup(path)))
+
     def test_pure_planning_imports_without_unix_pwd_module(self):
         # Windows has no pwd module. Exercise the actual import and pure plan;
         # keep the dependency mandatory for Linux execution before any effects.
@@ -177,7 +338,10 @@ class Planning(unittest.TestCase):
 
     def test_receipt_binds_live_native_qualification_and_retained_owners(self):
         plan = fixture.make_plan(manifest(), "abcd1234abcd1234")
-        evidence = {"version": "255.4-1ubuntu8", "unit_paths": [plan["root"] + "/units", plan["root"] + "/support-units"], "bus_peer_uid": 12345, "manager_uid": 12345, "manager_unique_name": ":1.7", "bus_pid": 17, "manager_pid": 18, "service_invocation_id": "a" * 32, "manager_features": "+PAM +LIBCRYPTSETUP", "no_other_namespace_writers": True}
+        evidence = {"version": "255.4-1ubuntu8", "unit_paths": [plan["root"] + "/units", plan["root"] + "/support-units"], "bus_peer_uid": 12345, "manager_uid": 12345, "manager_unique_name": ":1.7", "bus_pid": 19, "manager_pid": 18, "service_invocation_id": "a" * 32, "manager_features": "+PAM +LIBCRYPTSETUP", "no_other_namespace_writers": True}
+        root, scope, observed = self.owned_bus_observation()
+        evidence["bus_ownership"] = fixture.managed_bus_proof(root, 12345, 18, scope, observed)
+        evidence["private_manager_peer"] = {"pid": 18, "uid": 12345, "gid": 12345}
         receipt = fixture.manager_receipt(plan, 12345, evidence)
         self.assertEqual(set(receipt), {"kind", "schema", "manager", "authority", "manager_unique_name", "namespace_receipt"})
         self.assertEqual(receipt["kind"], "theseus_supplied_manager_receipt")
@@ -192,7 +356,19 @@ class Planning(unittest.TestCase):
             bad[key] = value
             with self.subTest(field=key), self.assertRaises(ValueError):
                 fixture.manager_receipt(plan, 12345, bad)
-        changed = dict(evidence, manager_pid=19)
+        for field in ["bus_ownership", "private_manager_peer"]:
+            missing = copy.deepcopy(evidence); missing.pop(field)
+            with self.subTest(missing=field), self.assertRaises(ValueError):
+                fixture.manager_receipt(plan, 12345, missing)
+        for field, value in [("kind", "external_popen"), ("daemon_pid", 17), ("socket_creator_pid", 19), ("service_invocation", "")]:
+            bad = copy.deepcopy(evidence); bad["bus_ownership"][field] = value
+            with self.subTest(bus_proof=field), self.assertRaises(ValueError):
+                fixture.manager_receipt(plan, 12345, bad)
+        changed = copy.deepcopy(evidence)
+        changed["manager_pid"] = 20
+        changed["bus_ownership"]["manager_pid"] = 20
+        changed["bus_ownership"]["socket_creator_pid"] = 20
+        changed["private_manager_peer"]["pid"] = 20
         self.assertNotEqual(receipt["namespace_receipt"], fixture.manager_receipt(plan, 12345, changed)["namespace_receipt"])
 
     def test_original_service_cleanup_refuses_live_or_replaced_instances(self):

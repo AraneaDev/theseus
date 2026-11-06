@@ -27,7 +27,7 @@ checks; independent review and combined acceptance are separate unchecked gates.
 The latest accepted `main` is `d4e5304` (0.12). Native foundations,
 client/file operations, adapter integration and the earlier service checkpoint
 were committed through `2fb9c73`. Further service/desktop work continues on
-`feat/native-adapter` for [draft PR #1](https://github.com/AraneaDev/theseus/pull/1).
+`feat/native-adapter` for [PR #1](https://github.com/AraneaDev/theseus/pull/1).
 The native work is not merged into `main`. Intermediate CI is deferred until the
 combined acceptance batch; feature pushes use the PR workflow instead of
 duplicating both push and PR runs.
@@ -58,8 +58,25 @@ exposed a Windows planning import, JSON error-source retention and three macOS
 test-fixture issues. Corrections pass focused local checks and the complete
 default workspace at `a481a30`: 1,565 passing tests, no failures, with matching
 pinned fixtures. The old-source Docker job was cancelled after collecting all
-native failures to avoid repeating remaining CI minutes. Final corrected-source
-native/Docker acceptance remains pending.
+native failures to avoid repeating remaining CI minutes.
+
+The [second combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42230821459)
+at `b68ea8d` is not acceptance. Windows stdio passed, then workspace lint found
+an oversized `WorkerCompletion` variant; the original failure owner is now boxed
+and full Windows/macOS cross-lint passes under default and all features (lint
+only, not native execution). Linux passed runtime checks and all six compiled
+desktop cases, then failed real-systemd setup before any manager case ran:
+systemd v255 opens its public API only after its own managed `dbus.socket` and
+`dbus.service` run, and the fixture had started an external bus daemon. The
+corrected operator bootstraps those closed units under the original user
+manager, binds manager/socket/daemon roles, stops only the verified original
+bus over the retained private manager channel and deletes the temporary account
+only after the held manager cgroup reports empty; uncertainty retains it. 22
+pure operator and 42 validation-driver controls pass and the change is
+independently reviewed; real-manager execution is still unproven. GitHub
+cancelled macOS for arm64 runner capacity before assigning a runner, and the
+old-source Docker job was cancelled. Final corrected-source native/Docker
+acceptance remains pending.
 
 Keep this queue and the checklists below current as work lands. Record source
 implementation, review, local verification, CI acceptance and merge separately.
