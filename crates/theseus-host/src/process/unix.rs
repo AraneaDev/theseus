@@ -256,7 +256,8 @@ mod tests {
     #[test]
     fn original_retirement_witness_requires_actual_reap_and_disarmed_group() {
         use std::time::{Duration, Instant};
-        let command = NativeCommand::new("/bin/true");
+        let mut command = NativeCommand::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
         let mut child = OwnedChild::spawn_files(&command, None, None, None).unwrap();
         let original = child.original_peer_pid().unwrap();
         assert!(child.retirement_witness().is_none());

@@ -153,12 +153,22 @@ fn only_explicit_original_provider_attestation_bootstraps_qualification_before_l
         store.records()[2].entry(),
         v2::ledger::Entry::LinuxGioQualificationDeclared { .. }
     ));
-    let retained = store.retain_linux_gio_qualification().unwrap().unwrap();
-    retained.revalidate().unwrap();
-    assert_eq!(
-        retained.attestation().reference().unwrap(),
-        c.linux_gio_qualification.unwrap()
-    );
+    #[cfg(target_os = "linux")]
+    {
+        let retained = store.retain_linux_gio_qualification().unwrap().unwrap();
+        retained.revalidate().unwrap();
+        assert_eq!(
+            retained.attestation().reference().unwrap(),
+            c.linux_gio_qualification.unwrap()
+        );
+    }
+    // A valid original Linux bootstrap never grants a non-Linux receiver
+    // operational Linux authority. The issuer/bootstrap checks above still run.
+    #[cfg(not(target_os = "linux"))]
+    assert!(matches!(
+        store.retain_linux_gio_qualification(),
+        Err(store::StoreError::BindingMismatch)
+    ));
 }
 #[test]
 fn retained_original_graph_revokes_on_mapping_or_bytes_change_and_never_heals() {

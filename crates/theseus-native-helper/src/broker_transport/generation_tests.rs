@@ -4,6 +4,22 @@ use theseus_native_protocol::v2::{
     broker::*,
     ledger::{Entry, Record},
 };
+// Pure serialized declarations for generation selection: no runtime/session admission.
+// These Linux DTOs intentionally do not claim a platform parser on the test host.
+fn declaration(value: serde_json::Value) -> BrokerServerConfig {
+    let config: BrokerServerConfig = serde_json::from_value(value).unwrap();
+    config.manifest.validate().unwrap();
+    config.header.validate().unwrap();
+    assert_eq!(
+        config.header.manifest_digest,
+        v2::integration_manifest_digest(
+            v2::Digest::parse(&config.manifest.core_manifest_digest).unwrap(),
+            config.manifest.digest().unwrap(),
+        )
+        .to_hex(),
+    );
+    config
+}
 fn config() -> BrokerServerConfig {
     let mut value = super::native_routing_tests::native_config();
     value["manifest"]
@@ -21,7 +37,7 @@ fn config() -> BrokerServerConfig {
         manifest.digest().unwrap(),
     );
     value["header"]["manifest_digest"] = serde_json::json!(full.to_hex());
-    BrokerServerConfig::from_bytes(&serde_json::to_vec(&value).unwrap()).unwrap()
+    declaration(value)
 }
 fn witness(program: &str, n: u8) -> DesktopSutRunWitness {
     let lease = v2::LeaseId::from_bytes([1; 16]);
@@ -205,7 +221,7 @@ pub(crate) fn combined_manifest_fixture() -> v2::IntegrationManifest {
     manifest
 }
 #[test]
-fn combined_owned_full_manifest_is_admitted_without_broker_manager_authority() {
+fn combined_owned_declaration_preserves_complete_manifest_and_header() {
     let owned = config();
     let manifest = combined_manifest_fixture();
     assert_eq!(
@@ -219,7 +235,9 @@ fn combined_owned_full_manifest_is_admitted_without_broker_manager_authority() {
     )
     .to_hex();
     let value = serde_json::json!({"kind":"theseus_native_desktop_broker","schema":1,"profile":"native_integration_broker_v1","ledger_root":"/fixture/ledger","workspace_root":"/fixture/workspace","manifest":manifest,"header":header});
-    assert!(BrokerServerConfig::from_bytes(&serde_json::to_vec(&value).unwrap()).is_ok());
+    let decoded = declaration(value);
+    assert_eq!(decoded.manifest, manifest);
+    assert_eq!(decoded.header, header);
 }
 #[test]
 fn generation_binding_changes_with_successful_sut_witness_and_keeps_legacy_bytes() {

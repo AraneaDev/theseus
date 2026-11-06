@@ -53,6 +53,12 @@ backend. A native controller is distinct from a native guest adapter.
    CLI validate/preview pass. These model checks do not qualify a real manager.
 6. Run one combined CI batch, resolve failures and merge accepted work to `main`.
 
+The [first combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42224965159)
+exposed a Windows planning import, JSON error-source retention and three macOS
+test-fixture issues. Corrections pass focused local checks; the full default
+workspace rerun and final native acceptance remain pending. Docker acceptance
+from that run is still in progress.
+
 Keep this queue and the checklists below current as work lands. Record source
 implementation, review, local verification, CI acceptance and merge separately.
 Do not estimate a completion percentage from checkbox counts: tasks differ
