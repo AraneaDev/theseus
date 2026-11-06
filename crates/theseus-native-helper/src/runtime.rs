@@ -213,13 +213,15 @@ impl RuntimeOwner {
                     };
                     completion
                 }
-                Err(payload) => WorkerCompletion::Failed(crate::contract::OwnedWorkerFailure {
-                    primary: crate::contract::WorkerPrimary::Panic(payload),
-                    retained_file: None,
-                    retained_spawn: None,
-                    retained_service_errors: vec![],
-                    cleanup_errors: std::array::from_fn(|_| None),
-                }),
+                Err(payload) => {
+                    WorkerCompletion::Failed(Box::new(crate::contract::OwnedWorkerFailure {
+                        primary: crate::contract::WorkerPrimary::Panic(payload),
+                        retained_file: None,
+                        retained_spawn: None,
+                        retained_service_errors: vec![],
+                        cleanup_errors: std::array::from_fn(|_| None),
+                    }))
+                }
             });
             if let Some(WorkerCompletion::Clean {
                 store_poisoned,

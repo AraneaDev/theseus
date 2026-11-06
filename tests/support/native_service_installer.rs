@@ -1,4 +1,8 @@
 //! Installer effects belong to the compiled SUT, never to the helper service API.
+#[cfg(windows)]
+#[path = "native_service_acl.rs"]
+#[allow(unused_imports)] // This SUT uses the shared ACL module without its setup-only probe.
+mod acl;
 #[path = "native_service_definition.rs"]
 mod definition;
 #[cfg(target_os = "linux")]

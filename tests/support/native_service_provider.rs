@@ -187,10 +187,12 @@ pub fn run(args: &[String]) -> Result<()> {
                 "sidecar belongs to another original ownership"
             );
             #[cfg(target_os = "linux")]
-            crate::desktop_provider::stop_broker_sidecar(root, &invocation)?;
+            {
+                crate::desktop_provider::stop_broker_sidecar(root, &invocation)?;
+                std::fs::remove_file(marker)?;
+            }
             #[cfg(not(target_os = "linux"))]
             anyhow::bail!("compiled combined sidecar unsupported on this fixture platform");
-            std::fs::remove_file(marker)?;
         }
         let mut epoch = [0; 32];
         theseus_host::random_bytes(&mut epoch)?;

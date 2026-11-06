@@ -150,7 +150,7 @@ pub(crate) enum WorkerCompletion {
         store_poisoned: bool,
         native_settled: bool,
     },
-    Failed(OwnedWorkerFailure),
+    Failed(Box<OwnedWorkerFailure>),
 }
 pub(crate) enum WorkerEvent {
     CacheUpdate(CachePatch),

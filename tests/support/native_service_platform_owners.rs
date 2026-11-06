@@ -256,7 +256,7 @@ fn scm_authority(
     context: &v2::IntegrationRuntimeContext,
 ) -> theseus_host::services::scm::ScmAuthority {
     use theseus_host::services::scm as host;
-    let authority = host::ScmAuthority {
+    host::ScmAuthority {
         context: host::ScmContext::LocalMachine,
         service_name: service_name.to_owned(),
         ownership_id: context.ownership_id.clone(),
@@ -283,8 +283,7 @@ fn scm_authority(
             no_other_acl_grants: p.no_other_acl_grants,
             exact_access_receipt: p.exact_access_receipt.clone(),
         },
-    };
-    authority
+    }
 }
 
 #[cfg(windows)]

@@ -1,7 +1,8 @@
 //! Test-owned original creator. SUT requests and fixture teardown are distinct.
 #![cfg(any(target_os = "macos", windows))]
-#[path = "native_service_definition.rs"]
-mod definition;
+#[cfg(windows)]
+use super::acl;
+use super::definition;
 #[cfg(target_os = "macos")]
 #[path = "native_service_launchd_sut.rs"]
 mod platform_sut;

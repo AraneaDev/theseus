@@ -1,9 +1,7 @@
 //! Installer-only SCM registration/configuration/removal. Never a helper API.
 #![cfg(windows)]
+use super::acl;
 use super::definition::{self, ScmReaderConfig};
-#[path = "native_service_acl.rs"]
-#[allow(unused_imports)] // This SUT uses the shared ACL module without its setup-only probe.
-mod acl;
 use anyhow::{Context, Result, ensure};
 use std::{
     ffi::c_void,
@@ -816,6 +814,54 @@ impl PinnedReader {
     }
 }
 
+/// Remove only a workspace reader matching one originally pinned artifact.
+/// Clearing readonly uses its original verified handle and cannot alter a
+/// same-path replacement. The private parent remains the namespace authority.
+pub fn remove_reader(path: &Path, artifacts: &[(u64, String)]) -> Result<()> {
+    use sha2::{Digest as _, Sha256};
+    let parent = HostDir::open(
+        path.parent().ok_or_else(|| invalid("reader parent"))?,
+        RootPolicy::AllComponentsNoFollow,
+    )?;
+    let name = path.file_name().ok_or_else(|| invalid("reader name"))?;
+    let mut file = match parent.open_leaf_classified(name) {
+        LeafOpenResult::Opened(file) => file,
+        LeafOpenResult::MissingSettled => return Ok(()),
+        other => anyhow::bail!("original fixture reader unavailable: {other:?}"),
+    };
+    let before = fingerprint(&file)?;
+    ensure!(
+        artifacts.iter().any(|(length, _)| *length == before.len),
+        "foreign fixture reader length"
+    );
+    let mut hasher = Sha256::new();
+    let mut read = 0u64;
+    let mut buffer = [0u8; 16384];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        read = read
+            .checked_add(count as u64)
+            .ok_or_else(|| invalid("reader size overflow"))?;
+        ensure!(read <= before.len, "reader grew while hashing");
+        hasher.update(&buffer[..count]);
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    ensure!(
+        read == before.len
+            && fingerprint(&file)? == before
+            && artifacts
+                .iter()
+                .any(|(length, sha)| *length == read && sha == &digest),
+        "foreign or changed fixture reader commitment"
+    );
+    clear_readonly_original(path, &file)?;
+    parent.remove_created_leaf(name, &file)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod repeat_reader_tests {
     use super::*;
@@ -866,52 +912,4 @@ mod repeat_reader_tests {
         assert!(!path.exists());
         assert_eq!(std::fs::read(&data).unwrap(), b"configured-data");
     }
-}
-
-/// Remove only a workspace reader matching one originally pinned artifact.
-/// Clearing readonly uses its original verified handle and cannot alter a
-/// same-path replacement. The private parent remains the namespace authority.
-pub fn remove_reader(path: &Path, artifacts: &[(u64, String)]) -> Result<()> {
-    use sha2::{Digest as _, Sha256};
-    let parent = HostDir::open(
-        path.parent().ok_or_else(|| invalid("reader parent"))?,
-        RootPolicy::AllComponentsNoFollow,
-    )?;
-    let name = path.file_name().ok_or_else(|| invalid("reader name"))?;
-    let mut file = match parent.open_leaf_classified(name) {
-        LeafOpenResult::Opened(file) => file,
-        LeafOpenResult::MissingSettled => return Ok(()),
-        other => anyhow::bail!("original fixture reader unavailable: {other:?}"),
-    };
-    let before = fingerprint(&file)?;
-    ensure!(
-        artifacts.iter().any(|(length, _)| *length == before.len),
-        "foreign fixture reader length"
-    );
-    let mut hasher = Sha256::new();
-    let mut read = 0u64;
-    let mut buffer = [0u8; 16384];
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        read = read
-            .checked_add(count as u64)
-            .ok_or_else(|| invalid("reader size overflow"))?;
-        ensure!(read <= before.len, "reader grew while hashing");
-        hasher.update(&buffer[..count]);
-    }
-    let digest = format!("{:x}", hasher.finalize());
-    ensure!(
-        read == before.len
-            && fingerprint(&file)? == before
-            && artifacts
-                .iter()
-                .any(|(length, sha)| *length == read && sha == &digest),
-        "foreign or changed fixture reader commitment"
-    );
-    clear_readonly_original(path, &file)?;
-    parent.remove_created_leaf(name, &file)?;
-    Ok(())
 }

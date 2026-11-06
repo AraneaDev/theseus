@@ -123,79 +123,6 @@ impl ScmReaderConfig {
     }
 }
 
-#[cfg(test)]
-mod platform_tests {
-    use super::*;
-    fn config() -> ScmReaderConfig {
-        ScmReaderConfig {
-            kind: "theseus_native_scm_reader".into(),
-            schema: 1,
-            service_name: "theseus.fixture".into(),
-            endpoint: r"\\.\pipe\theseus.fixture".into(),
-            data: r"C:\fixture\data".into(),
-            cooperative_instance: "provider-attested-installation-instance".into(),
-            fault: "none".into(),
-            helper_sid: "S-1-5-21-123-456-789-1001".into(),
-            service_sid: "S-1-5-18".into(),
-        }
-    }
-    #[test]
-    fn scm_reader_config_requires_closed_explicit_installation_input() {
-        let original = config();
-        original.validate().unwrap();
-        assert_eq!(
-            serde_json::from_slice::<ScmReaderConfig>(&serde_json::to_vec(&original).unwrap())
-                .unwrap(),
-            original
-        );
-        for field in [
-            "kind",
-            "service_name",
-            "endpoint",
-            "data",
-            "cooperative_instance",
-            "helper_sid",
-            "service_sid",
-            "fault",
-        ] {
-            let mut json = serde_json::to_value(&original).unwrap();
-            json[field] = "".into();
-            assert!(
-                serde_json::from_value::<ScmReaderConfig>(json)
-                    .unwrap()
-                    .validate()
-                    .is_err(),
-                "{field}"
-            );
-        }
-        let mut unknown = serde_json::to_value(&original).unwrap();
-        unknown["discover_domain"] = true.into();
-        assert!(serde_json::from_value::<ScmReaderConfig>(unknown).is_err());
-    }
-    #[test]
-    fn scm_reader_config_refuses_remote_pipe_wrong_principal_and_unbound_fault() {
-        let original = config();
-        for (field, value) in [
-            ("endpoint", r"\\server\pipe\theseus.fixture"),
-            ("data", "relative/data"),
-            ("service_sid", "S-1-5-32-544"),
-            ("fault", "discover"),
-            ("cooperative_instance", "bad\ninstance"),
-            ("service_name", "other/service"),
-        ] {
-            let mut json = serde_json::to_value(&original).unwrap();
-            json[field] = value.into();
-            assert!(
-                serde_json::from_value::<ScmReaderConfig>(json)
-                    .unwrap()
-                    .validate()
-                    .is_err(),
-                "{field}"
-            );
-        }
-    }
-}
-
 /// Measures the current token user only to compare with an already supplied SID.
 /// It never selects a principal, logs on, impersonates, or creates another token.
 #[cfg(windows)]
@@ -281,4 +208,77 @@ pub fn verify_current_sid(expected: &str) -> anyhow::Result<()> {
         "actual process token user differs from explicit fixture SID"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+    fn config() -> ScmReaderConfig {
+        ScmReaderConfig {
+            kind: "theseus_native_scm_reader".into(),
+            schema: 1,
+            service_name: "theseus.fixture".into(),
+            endpoint: r"\\.\pipe\theseus.fixture".into(),
+            data: r"C:\fixture\data".into(),
+            cooperative_instance: "provider-attested-installation-instance".into(),
+            fault: "none".into(),
+            helper_sid: "S-1-5-21-123-456-789-1001".into(),
+            service_sid: "S-1-5-18".into(),
+        }
+    }
+    #[test]
+    fn scm_reader_config_requires_closed_explicit_installation_input() {
+        let original = config();
+        original.validate().unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ScmReaderConfig>(&serde_json::to_vec(&original).unwrap())
+                .unwrap(),
+            original
+        );
+        for field in [
+            "kind",
+            "service_name",
+            "endpoint",
+            "data",
+            "cooperative_instance",
+            "helper_sid",
+            "service_sid",
+            "fault",
+        ] {
+            let mut json = serde_json::to_value(&original).unwrap();
+            json[field] = "".into();
+            assert!(
+                serde_json::from_value::<ScmReaderConfig>(json)
+                    .unwrap()
+                    .validate()
+                    .is_err(),
+                "{field}"
+            );
+        }
+        let mut unknown = serde_json::to_value(&original).unwrap();
+        unknown["discover_domain"] = true.into();
+        assert!(serde_json::from_value::<ScmReaderConfig>(unknown).is_err());
+    }
+    #[test]
+    fn scm_reader_config_refuses_remote_pipe_wrong_principal_and_unbound_fault() {
+        let original = config();
+        for (field, value) in [
+            ("endpoint", r"\\server\pipe\theseus.fixture"),
+            ("data", "relative/data"),
+            ("service_sid", "S-1-5-32-544"),
+            ("fault", "discover"),
+            ("cooperative_instance", "bad\ninstance"),
+            ("service_name", "other/service"),
+        ] {
+            let mut json = serde_json::to_value(&original).unwrap();
+            json[field] = value.into();
+            assert!(
+                serde_json::from_value::<ScmReaderConfig>(json)
+                    .unwrap()
+                    .validate()
+                    .is_err(),
+                "{field}"
+            );
+        }
+    }
 }

@@ -220,7 +220,7 @@ impl Worker {
         }
         self.retire_file();
         match self.failure.take() {
-            Some(failure) => WorkerCompletion::Failed(failure),
+            Some(failure) => WorkerCompletion::Failed(Box::new(failure)),
             None => WorkerCompletion::Clean {
                 store_poisoned: self.poisoned(),
                 native_settled: true,
