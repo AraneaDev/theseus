@@ -547,3 +547,69 @@ fn helper_close_acceptance_preserves_lost_original_quarantine() {
     assert_eq!(state.owner, BrokerOwner::Lost);
     assert!(state.quarantined);
 }
+/// CI6 macOS regression: the ordinary order is close accepted while the owned
+/// primary still runs, then the primary exits and local resources retire. The
+/// later SUT entry preparation must be judged on the close's inherited (current)
+/// owned lifetime, exactly as `query` projects it, not on the close-time snapshot.
+#[test]
+fn entry_preparation_after_owned_close_uses_current_original_lifetime() {
+    let (request, mut records) = owned_records();
+    let receipt = |operation: &str| BrokerEvent::EffectRecorded {
+        operation: operation.into(),
+        receipt: BrokerEffectReceipt {
+            evidence: DesktopEvidence::OwnedExecutable,
+            acknowledged: true,
+            receipt_digest: request.digest().unwrap().to_hex(),
+        },
+    };
+    push(&mut records, receipt(&request.helper_operation));
+    push(
+        &mut records,
+        owned_event(&request, "running", "unavailable", "retained"),
+    );
+    let close = request.close_request().unwrap();
+    push(
+        &mut records,
+        BrokerEvent::Accepted {
+            request: close.clone(),
+            request_digest: close.digest().unwrap().to_hex(),
+        },
+    );
+    push(&mut records, receipt(&close.helper_operation));
+    let header = match records[0].entry() {
+        Entry::IntegrationBrokerHeader { header } => header.clone(),
+        _ => unreachable!(),
+    };
+    let run = v2::Request::Run {
+        lease: v2::LeaseId::parse(&request.helper_lease).unwrap(),
+        operation: v2::OperationId::from_bytes([9; 16]),
+        program: v2::ProgramId::new("uninstall").unwrap(),
+    };
+    let preparation = EntryPreparation {
+        helper_lease: request.helper_lease.clone(),
+        broker_lease: request.broker_lease.clone(),
+        operation: "09".repeat(16),
+        request_digest: v2::request_digest(&run).unwrap().to_hex(),
+        program: v2::ProgramId::new("uninstall").unwrap(),
+        slot: v2::ResourceSlot::new("desktop").unwrap(),
+        header_digest: header.digest().unwrap().to_hex(),
+        binding_digest: "05".repeat(32),
+        generation: None,
+        prior_sut: None,
+    };
+    let entry = BrokerEvent::EntryPreparationAccepted { preparation };
+    // While the original primary still runs, entry authority stays refused.
+    let mut early = records.clone();
+    push(&mut early, entry.clone());
+    assert!(BrokerLedgerView::replay(&early).is_err());
+    push(
+        &mut records,
+        owned_event(&request, "exited", "unavailable", "retired"),
+    );
+    let view = BrokerLedgerView::replay(&records).unwrap();
+    assert!(view.query(&request).unwrap().original_retired());
+    assert!(view.query(&close).unwrap().original_retired());
+    push(&mut records, entry);
+    BrokerLedgerView::replay(&records)
+        .expect("entry preparation after the original owned primary retired");
+}

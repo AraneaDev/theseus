@@ -46,9 +46,31 @@ fn long_name_tempdir() -> tempfile::TempDir {
 fn windows_shortcut_native_com_parser_and_retained_pins_are_actual() {
     let temp = long_name_tempdir();
     let profile = fixture(temp.path());
+    let expected = format!(
+        "target={:?} arguments={:?} cwd={:?}",
+        format!("{}\\{}", profile.root, profile.executable),
+        command_line(&profile.arguments),
+        profile.root
+    );
     let apartment = ComApartment::initialize_original_thread().unwrap();
     let admitted =
-        AdmittedShortcut::parse(apartment, RetainedShortcut::open(profile).unwrap()).unwrap();
+        match AdmittedShortcut::parse(apartment, RetainedShortcut::open(profile).unwrap()) {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                // Bounded diagnostic only; the failure itself is preserved.
+                let entry = temp.path().join("app.lnk");
+                let observed = match ComApartment::initialize_original_thread() {
+                    Ok(apartment) => super::super::com::diagnose_native_metadata(
+                        &apartment,
+                        entry.to_str().unwrap(),
+                    ),
+                    Err(apartment_error) => {
+                        format!("diagnostic apartment unavailable: {apartment_error}")
+                    }
+                };
+                panic!("native parse refused: {error}\nexpected: {expected}\nobserved: {observed}");
+            }
+        };
     admitted.revalidate().unwrap();
     // Actual Windows sharing prevents both replacement and in-place mutation
     // while Shell/COM could consume the original admitted pathname.

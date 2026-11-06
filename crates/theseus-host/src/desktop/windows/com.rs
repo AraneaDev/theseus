@@ -215,6 +215,93 @@ fn output(buffer: &[u16]) -> io::Result<String> {
     }
     String::from_utf16(&buffer[..len]).map_err(|_| invalid("non Unicode native shortcut string"))
 }
+const SLGP_RAWPATH: u32 = 4;
+/// Create an in-process IShellLinkW and load (never resolve) one pathname.
+fn load_link(entry: &str) -> io::Result<Object> {
+    let mut raw = ptr::null_mut();
+    hr("CoCreateInstance(IShellLinkW)", unsafe {
+        CoCreateInstance(
+            &CLSID_SHELL_LINK,
+            ptr::null_mut(),
+            1,
+            &IID_SHELL_LINK,
+            &mut raw,
+        )
+    })?;
+    if raw.is_null() {
+        return Err(invalid("COM returned no shell link"));
+    }
+    let link = Object(raw);
+    let mut persist = ptr::null_mut();
+    hr("IShellLinkW::QueryInterface(IPersistFile)", unsafe {
+        (link.table::<LinkTable>().unknown.query)(link.0, &IID_PERSIST_FILE, &mut persist)
+    })?;
+    if persist.is_null() {
+        return Err(invalid("COM returned no IPersistFile"));
+    }
+    let persist = Object(persist);
+    let path = wide(entry);
+    hr("IPersistFile::Load", unsafe {
+        (persist.table::<PersistTable>().load)(persist.0, path.as_ptr(), 0)
+    })?;
+    Ok(link)
+}
+/// Returns the success HRESULT too: S_FALSE (1) means no path was produced.
+fn get_path(link: &Object, flags: u32) -> io::Result<(i32, String)> {
+    let mut target = [0u16; 2048];
+    let result = unsafe {
+        (link.table::<LinkTable>().get_path)(
+            link.0,
+            target.as_mut_ptr(),
+            target.len() as i32,
+            ptr::null_mut(),
+            flags,
+        )
+    };
+    hr("IShellLinkW::GetPath", result)?;
+    Ok((result, output(&target)?))
+}
+fn get_arguments(link: &Object) -> io::Result<String> {
+    let mut arguments = [0u16; 16385];
+    hr("IShellLinkW::GetArguments", unsafe {
+        (link.table::<LinkTable>().get_arguments)(
+            link.0,
+            arguments.as_mut_ptr(),
+            arguments.len() as i32,
+        )
+    })?;
+    output(&arguments)
+}
+fn get_working_directory(link: &Object) -> io::Result<String> {
+    let mut cwd = [0u16; 2048];
+    hr("IShellLinkW::GetWorkingDirectory", unsafe {
+        (link.table::<LinkTable>().get_cwd)(link.0, cwd.as_mut_ptr(), cwd.len() as i32)
+    })?;
+    output(&cwd)
+}
+/// Test-only bounded diagnostic of what native Shell COM reports for one
+/// shortcut. It never admits anything and never resolves or activates.
+#[cfg(test)]
+pub(super) fn diagnose_native_metadata(apartment: &ComApartment, entry: &str) -> String {
+    fn bounded<T: std::fmt::Debug>(value: io::Result<T>) -> String {
+        let text = format!("{value:?}");
+        text.chars().take(600).collect()
+    }
+    if let Err(error) = apartment.check() {
+        return format!("apartment: {error}");
+    }
+    let link = match load_link(entry) {
+        Ok(link) => link,
+        Err(error) => return format!("load: {error}"),
+    };
+    format!(
+        "GetPath(RAWPATH)={} GetPath(0)={} GetArguments={} GetWorkingDirectory={}",
+        bounded(get_path(&link, SLGP_RAWPATH)),
+        bounded(get_path(&link, 0)),
+        bounded(get_arguments(&link)),
+        bounded(get_working_directory(&link)),
+    )
+}
 pub struct ShortcutRetireFailure {
     pub error: io::Error,
     pub owner: AdmittedShortcut,
@@ -244,61 +331,18 @@ impl AdmittedShortcut {
         retained.revalidate()?;
         let bytes = retained.entry_bytes()?;
         let flags = super::validate_link_bytes(&bytes)?;
-        let mut raw = ptr::null_mut();
-        hr("CoCreateInstance(IShellLinkW)", unsafe {
-            CoCreateInstance(
-                &CLSID_SHELL_LINK,
-                ptr::null_mut(),
-                1,
-                &IID_SHELL_LINK,
-                &mut raw,
-            )
-        })?;
-        if raw.is_null() {
-            return Err(invalid("COM returned no shell link"));
-        }
-        let link = Object(raw);
-        let mut persist = ptr::null_mut();
-        hr("IShellLinkW::QueryInterface(IPersistFile)", unsafe {
-            (link.table::<LinkTable>().unknown.query)(link.0, &IID_PERSIST_FILE, &mut persist)
-        })?;
-        if persist.is_null() {
-            return Err(invalid("COM returned no IPersistFile"));
-        }
-        let persist = Object(persist);
-        let path = wide(
+        let link = load_link(
             retained
                 .entry_path()
                 .to_str()
                 .ok_or_else(|| invalid("non Unicode entry path"))?,
-        );
-        hr("IPersistFile::Load", unsafe {
-            (persist.table::<PersistTable>().load)(persist.0, path.as_ptr(), 0)
-        })?;
-        let mut target = [0u16; 2048];
-        let mut arguments = [0u16; 16385];
-        let mut cwd = [0u16; 2048];
-        let table = link.table::<LinkTable>();
+        )?;
         // RAWPATH only. Resolve is deliberately never called.
-        hr("IShellLinkW::GetPath", unsafe {
-            (table.get_path)(
-                link.0,
-                target.as_mut_ptr(),
-                target.len() as i32,
-                ptr::null_mut(),
-                4,
-            )
-        })?;
-        hr("IShellLinkW::GetArguments", unsafe {
-            (table.get_arguments)(link.0, arguments.as_mut_ptr(), arguments.len() as i32)
-        })?;
-        hr("IShellLinkW::GetWorkingDirectory", unsafe {
-            (table.get_cwd)(link.0, cwd.as_mut_ptr(), cwd.len() as i32)
-        })?;
+        let (_, target) = get_path(&link, SLGP_RAWPATH)?;
         retained.profile().admit_metadata(&ShortcutMetadata {
-            target: output(&target)?,
-            arguments: output(&arguments)?,
-            working_directory: output(&cwd)?,
+            target,
+            arguments: get_arguments(&link)?,
+            working_directory: get_working_directory(&link)?,
             flags,
         })?;
         validate_executable_run_level(&retained)?;

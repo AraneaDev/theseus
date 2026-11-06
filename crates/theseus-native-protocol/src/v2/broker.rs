@@ -804,6 +804,33 @@ struct Accepted {
     receipt: bool,
     quarantined: bool,
 }
+/// The externally visible state of one accepted request at the current replay
+/// point: a RequestClose carries its own effect and quarantine but inherits the
+/// lifetime facts of its original activation as they stand now.
+fn projected_state(all: &[Accepted], accepted: &Accepted) -> BrokerState {
+    let mut state = accepted.state.clone();
+    if let DesktopAction::RequestClose {
+        original_activation_operation,
+        ..
+    } = &accepted.request.action
+        && let Some(lifetime) = all
+            .iter()
+            .find(|a| {
+                matches!(a.request.action, DesktopAction::Activate { .. })
+                    && &a.request.helper_operation == original_activation_operation
+            })
+            .map(|a| &a.state)
+    {
+        state.native_lifetime = lifetime.native_lifetime.clone();
+        state.owned_lifetime = lifetime.owned_lifetime.clone();
+        state.owner = lifetime.owner;
+        state.primary = lifetime.primary;
+        state.descendants = lifetime.descendants;
+        state.cleanup_complete = lifetime.cleanup_complete;
+        state.quarantined = accepted.quarantined || lifetime.quarantined;
+    }
+    state
+}
 /// A projection over the SAME LedgerStore records. Its in-memory table grants no
 /// launch authority: all reopened incomplete native owners are lost.
 #[derive(Clone, Debug, Default)]
@@ -935,7 +962,13 @@ impl BrokerLedgerView {
                     preparation.validate().map_err(|_| invalid())?;
                     let header = broker_header.ok_or_else(invalid)?;
                     if result.entry_blocked()
-                        || result.accepted.iter().any(|a| !a.state.original_retired())
+                        // A RequestClose inherits its original activation's
+                        // lifetime; judge it on the same projection queries use,
+                        // not on the snapshot captured when the close was accepted.
+                        || result
+                            .accepted
+                            .iter()
+                            .any(|a| !projected_state(&result.accepted, a).original_retired())
                         || lease.as_deref() != Some(&preparation.broker_lease)
                         || header.digest().map_err(|_| invalid())?.to_hex()
                             != preparation.header_digest
@@ -1551,29 +1584,13 @@ impl BrokerLedgerView {
                 }
             }
         }
-        let lifetimes: Vec<_> = result
+        let projected: Vec<_> = result
             .accepted
             .iter()
-            .filter(|a| matches!(a.request.action, DesktopAction::Activate { .. }))
-            .map(|a| (a.request.helper_operation.clone(), a.state.clone()))
+            .map(|accepted| projected_state(&result.accepted, accepted))
             .collect();
-        for accepted in &mut result.accepted {
-            if let DesktopAction::RequestClose {
-                original_activation_operation,
-                ..
-            } = &accepted.request.action
-                && let Some((_, lifetime)) = lifetimes
-                    .iter()
-                    .find(|(op, _)| op == original_activation_operation)
-            {
-                accepted.state.native_lifetime = lifetime.native_lifetime.clone();
-                accepted.state.owned_lifetime = lifetime.owned_lifetime.clone();
-                accepted.state.owner = lifetime.owner;
-                accepted.state.primary = lifetime.primary;
-                accepted.state.descendants = lifetime.descendants;
-                accepted.state.cleanup_complete = lifetime.cleanup_complete;
-                accepted.state.quarantined = accepted.quarantined || lifetime.quarantined;
-            }
+        for (accepted, state) in result.accepted.iter_mut().zip(projected) {
+            accepted.state = state;
         }
         if helper {
             let mut ids = std::collections::BTreeSet::new();

@@ -469,8 +469,10 @@ impl Message {
             out.push(value);
         }
         self.exit()?;
-        if out.len() != 16 {
-            return Err(invalid("invocation identity must be 16 bytes"));
+        // systemd sends a null id128 (a never-started or not-found unit, CI6
+        // journal) as an empty array; any other length is refused.
+        if !out.is_empty() && out.len() != 16 {
+            return Err(invalid("invocation identity must be empty or 16 bytes"));
         }
         Ok(out)
     }
@@ -726,7 +728,7 @@ mod tests {
             }
             close(&mut message);
             seal(&mut message);
-            assert_eq!(message.bytes().is_ok(), count == 16);
+            assert_eq!(message.bytes().is_ok(), count == 0 || count == 16);
         }
         let mut message = model_message(&bus);
         message.append_array(&["entry"; 65]).unwrap();

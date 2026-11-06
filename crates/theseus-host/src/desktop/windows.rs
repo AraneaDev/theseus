@@ -70,14 +70,25 @@ impl ShortcutProfile {
     }
     pub fn admit_metadata(&self, metadata: &ShortcutMetadata) -> io::Result<()> {
         self.validate()?;
-        if metadata.target != format!("{}\\{}", self.root, self.executable)
-            || metadata.arguments != command_line(&self.arguments)
-            || metadata.working_directory != self.root
-            || metadata.flags & !0xb2 != 0
-            || metadata.flags & 0x82 != 0x82
-        {
+        // Exact comparisons; each refusal names only the differing field.
+        if metadata.target != format!("{}\\{}", self.root, self.executable) {
             return Err(invalid(
-                "native shortcut differs from exact admitted target/argv/cwd/flags",
+                "native shortcut target differs from exact admitted target",
+            ));
+        }
+        if metadata.arguments != command_line(&self.arguments) {
+            return Err(invalid(
+                "native shortcut arguments differ from exact admitted argv",
+            ));
+        }
+        if metadata.working_directory != self.root {
+            return Err(invalid(
+                "native shortcut working directory differs from exact admitted cwd",
+            ));
+        }
+        if metadata.flags & !0xb2 != 0 || metadata.flags & 0x82 != 0x82 {
+            return Err(invalid(
+                "native shortcut flags differ from exact admitted closed flags",
             ));
         }
         Ok(())

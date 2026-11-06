@@ -110,6 +110,25 @@ impl HostDir {
         }
         platform::open_leaf_classified(&self.directory, name)
     }
+    /// Classified open for read-stable inspection. On Windows the handle
+    /// shares read and delete only, so while it is held no other handle can
+    /// gain write access, and an existing writer makes the open fail settled
+    /// (`FailedSettled`, sharing violation). Rename/replacement stays possible
+    /// and must be detected through file identity. POSIX has no mandatory
+    /// deny-write primitive; there this is exactly `open_leaf_classified`.
+    pub fn open_leaf_deny_write_classified(&self, name: &OsStr) -> LeafOpenResult {
+        if let Err(error) = validate_name(name) {
+            return LeafOpenResult::FailedSettled(error);
+        }
+        #[cfg(windows)]
+        {
+            platform::open_leaf_deny_write_classified(&self.directory, name)
+        }
+        #[cfg(not(windows))]
+        {
+            platform::open_leaf_classified(&self.directory, name)
+        }
+    }
     pub fn open(path: &Path, policy: RootPolicy) -> io::Result<Self> {
         Ok(Self {
             directory: platform::open_root(path, policy)?,
@@ -1161,5 +1180,47 @@ mod classified_created_leaf_cleanup_tests {
             ),
             "missing mapping cannot become a deletion receipt"
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod deny_write_inspection_tests {
+    use super::*;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    #[test]
+    fn deny_write_open_refuses_writers_settled_and_keeps_default_open_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("leaf");
+        std::fs::write(&path, b"original").unwrap();
+        let root = HostDir::open(temp.path(), RootPolicy::LeafNoFollow).unwrap();
+        // An existing writer makes the inspection open a settled refusal.
+        let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        match root.open_leaf_deny_write_classified(OsStr::new("leaf")) {
+            LeafOpenResult::FailedSettled(error) => {
+                assert_eq!(error.raw_os_error(), Some(ERROR_SHARING_VIOLATION))
+            }
+            other => panic!("existing writer must refuse settled, got {other:?}"),
+        }
+        // The default classified open still shares write with that writer.
+        assert!(matches!(
+            root.open_leaf_classified(OsStr::new("leaf")),
+            LeafOpenResult::Opened(_)
+        ));
+        drop(writer);
+        let held = match root.open_leaf_deny_write_classified(OsStr::new("leaf")) {
+            LeafOpenResult::Opened(file) => file,
+            other => panic!("inspection open failed: {other:?}"),
+        };
+        let refused = std::fs::write(&path, b"modified").unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(ERROR_SHARING_VIOLATION));
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        // A second deny-write reader is compatible; rename stays possible.
+        assert!(matches!(
+            root.open_leaf_deny_write_classified(OsStr::new("leaf")),
+            LeafOpenResult::Opened(_)
+        ));
+        std::fs::rename(&path, temp.path().join("moved")).unwrap();
+        drop(held);
+        std::fs::write(temp.path().join("moved"), b"modified").unwrap();
     }
 }

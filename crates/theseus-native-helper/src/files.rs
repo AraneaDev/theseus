@@ -314,7 +314,12 @@ pub(crate) fn inspect_native(
     }
     owner.attempted = true;
     owner.opening = true;
-    match root.open_leaf_classified(std::ffi::OsStr::new(path.as_str())) {
+    // Windows: this handle shares read/delete only and stays owned from the
+    // first fingerprint through the reopen check, so no writer can coexist
+    // (an existing writer is a settled refusal). Same-size in-place rewrites
+    // within one NTFS timestamp tick are otherwise invisible to fingerprints.
+    // Rename/replacement is still caught by file identity at reopen.
+    match root.open_leaf_deny_write_classified(std::ffi::OsStr::new(path.as_str())) {
         LeafOpenResult::Opened(file) => {
             owner.handle = Some(file);
             owner.opening = false;
@@ -364,7 +369,7 @@ pub(crate) fn inspect_native(
     #[cfg(test)]
     tests::native_reopen_checkpoint();
     owner.opening = true;
-    match root.open_leaf_classified(std::ffi::OsStr::new(path.as_str())) {
+    match root.open_leaf_deny_write_classified(std::ffi::OsStr::new(path.as_str())) {
         LeafOpenResult::Opened(file) => {
             owner.native_reopened = Some(file);
             owner.opening = false;
@@ -466,16 +471,24 @@ mod tests {
     }
     #[test]
     fn native_after_read_change_and_same_size_replacement_refuse() {
+        // What the mutation hook actually achieved: Ok(()) means the
+        // "modified" bytes landed; Err(code) means the OS refused the write.
+        type Landed = std::rc::Rc<std::cell::Cell<Option<Result<(), Option<i32>>>>>;
         for replace in [false, true] {
             let temp = tempfile::tempdir().unwrap();
             let root = root(&temp);
             let path = temp.path().join("leaf");
             std::fs::write(&path, b"original").unwrap();
+            let landed = Landed::default();
+            let record = landed.clone();
+            let target = path.clone();
             let mutation = Box::new(move || {
                 if replace {
-                    std::fs::rename(&path, path.with_extension("moved")).unwrap();
+                    // FILE_SHARE_DELETE keeps rename possible on Windows too.
+                    std::fs::rename(&target, target.with_extension("moved")).unwrap();
                 }
-                std::fs::write(&path, b"modified").unwrap();
+                let write = std::fs::write(&target, b"modified");
+                record.set(Some(write.map_err(|e| e.raw_os_error())));
             });
             if replace {
                 NATIVE_REOPEN_HOOK.with(|hook| *hook.borrow_mut() = Some(mutation));
@@ -483,18 +496,39 @@ mod tests {
                 NATIVE_HOOK.with(|hook| *hook.borrow_mut() = Some(mutation));
             }
             let mut owner = FileOwner::new();
-            assert!(
-                inspect_native(
-                    &mut owner,
-                    &root,
-                    &leaf(),
-                    std::time::Instant::now() + std::time::Duration::from_secs(30),
-                    || false
-                )
-                .is_err()
+            let result = inspect_native(
+                &mut owner,
+                &root,
+                &leaf(),
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+                || false,
             );
+            let write = landed.take().expect("mutation hook never ran");
             assert!(owner.handle.is_some());
-            assert_eq!(owner.native_reopened.is_some(), replace);
+            match (result, write) {
+                // A mutation that landed must always be refused.
+                (result, Ok(())) => {
+                    assert!(result.is_err(), "landed mutation went unnoticed");
+                    assert_eq!(owner.native_reopened.is_some(), replace);
+                }
+                // Windows deny-write inspection: the in-place rewrite could not
+                // land, so the observation is exactly the original bytes.
+                #[cfg(windows)]
+                (Ok(observed), Err(Some(32))) if !replace => {
+                    assert_eq!(
+                        observed,
+                        NativeObservation::Present {
+                            length: 8,
+                            sha256: digest(b"original")
+                        }
+                    );
+                    assert_eq!(std::fs::read(&path).unwrap(), b"original");
+                    assert!(owner.native_reopened.is_some());
+                }
+                (result, write) => {
+                    panic!("unexpected outcome: inspect {result:?}, mutation {write:?}")
+                }
+            }
         }
     }
     #[cfg(unix)]

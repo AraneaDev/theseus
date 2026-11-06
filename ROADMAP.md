@@ -124,8 +124,27 @@ also dropped from the upload and are now retained under visible names). An owned
 activation that never receives a receipt still cannot settle; no required case
 reaches that path. Windows stopped at a new
 evidence-copy control that followed a symlink without `O_NOFOLLOW`; links and
-reparse points are now refused. Final corrected-source native acceptance remains
-pending.
+reparse points are now refused.
+
+The [sixth combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42270763738)
+at `1f47516` passed all eight Docker suites, and macOS passed all six Source-owned
+desktop cases natively for the first time. The following three owned
+native-entry cases failed because broker ledger replay judged a close request by
+the activation lifetime recorded at close acceptance rather than its current
+projection, so the store refused the uninstall entry preparation; replay now
+uses the same projection as queries, pending macOS execution. Linux again completed real
+qualification and original cleanup; the first real case then failed because the
+SDK reader required a 16-byte `InvocationID`, while real systemd reports a null
+id as an empty array for never-started and not-found units. The reader now
+accepts empty or exactly 16 bytes, and the private model now mirrors real
+systemd (empty id before first start, transient not-found unit from `LoadUnit`);
+all eight private-model service cases pass locally. Windows had two failures:
+the same-size after-read check could miss a rewrite within one coarse NTFS
+timestamp tick, so native file inspection now holds a deny-write handle for the
+whole observation (a file another process holds open for writing is refused
+rather than read); the shortcut fixture's field mismatch against the admitted
+profile is not yet diagnosed, and the next run reports the differing field. Final corrected-source native acceptance
+remains pending.
 
 Keep this queue and the checklists below current as work lands. Record source
 implementation, review, local verification, CI acceptance and merge separately.

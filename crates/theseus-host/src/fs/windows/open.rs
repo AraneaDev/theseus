@@ -305,6 +305,28 @@ pub(in crate::fs) fn open_leaf_classified(
     parent: &File,
     name: &OsStr,
 ) -> crate::fs::LeafOpenResult {
+    open_leaf_classified_shared(
+        parent,
+        name,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )
+}
+/// Read-stable inspection open: shares read and delete only, never write.
+/// While the returned handle lives, no other handle can open the file for
+/// write (including writable mappings created through a new handle); an
+/// existing writer makes this open fail with a settled sharing violation.
+/// Rename/replacement remains possible and is detected by file identity.
+pub(in crate::fs) fn open_leaf_deny_write_classified(
+    parent: &File,
+    name: &OsStr,
+) -> crate::fs::LeafOpenResult {
+    open_leaf_classified_shared(parent, name, FILE_SHARE_READ | FILE_SHARE_DELETE)
+}
+fn open_leaf_classified_shared(
+    parent: &File,
+    name: &OsStr,
+    share: u32,
+) -> crate::fs::LeafOpenResult {
     use crate::fs::LeafOpenResult;
     let result = (|| -> Result<File, LeafOpenResult> {
         let name = wide(name).map_err(LeafOpenResult::FailedSettled)?;
@@ -354,7 +376,7 @@ pub(in crate::fs) fn open_leaf_classified(
                 &mut call.status,
                 null(),
                 FILE_ATTRIBUTE_NORMAL,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                share,
                 nt::FILE_OPEN,
                 options,
                 null(),

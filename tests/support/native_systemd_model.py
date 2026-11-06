@@ -111,7 +111,8 @@ class UnitObject(dbus.service.Object):
         self.argv, self.cwd, self.environment = parse_definition(raw)
         self.child = None
         self.children = []  # Retain every original Popen owner through teardown.
-        self.invocation = bytes(16)
+        # Real systemd reports a null id128 as an empty array until first start.
+        self.invocation = b""
         self.result = "success"
         self.stopping = False
         self.path = MANAGER_PATH + "/unit/" + "".join(
@@ -166,11 +167,60 @@ class UnitObject(dbus.service.Object):
         return self.properties(str(interface))
 
 
+class NotFoundUnit(dbus.service.Object):
+    """What real systemd returns from LoadUnit for an absent definition: a
+    transient not-found unit (CI6 journal), never a definition or process."""
+    def __init__(self, manager, name):
+        self.name = name
+        self.path = MANAGER_PATH + "/unit/" + "".join(
+            character if character.isascii() and character.isalnum() else f"_{ord(character):02x}"
+            for character in name
+        )
+        super().__init__(manager.bus_connection, self.path)
+
+    def properties(self, interface):
+        if interface == UNIT:
+            return {
+                "Id": dbus.String(self.name, variant_level=1),
+                "Names": dbus.Array([self.name], signature="s", variant_level=1),
+                "LoadState": dbus.String("not-found", variant_level=1),
+                "ActiveState": dbus.String("inactive", variant_level=1),
+                "SubState": dbus.String("dead", variant_level=1),
+                "FragmentPath": dbus.String("", variant_level=1),
+                "DropInPaths": dbus.Array([], signature="s", variant_level=1),
+                "InvocationID": dbus.ByteArray(b"", variant_level=1),
+                "NeedDaemonReload": dbus.Boolean(False, variant_level=1),
+            }
+        if interface == SERVICE:
+            return {
+                "Type": dbus.String("simple", variant_level=1),
+                "Restart": dbus.String("no", variant_level=1),
+                "ExecStart": dbus.Array([], signature="(sasbttttuii)", variant_level=1),
+                "Environment": dbus.Array([], signature="s", variant_level=1),
+                "WorkingDirectory": dbus.String("", variant_level=1),
+                "MainPID": dbus.UInt32(0, variant_level=1),
+                "Result": dbus.String("success", variant_level=1),
+            }
+        raise ModelError("unsupported unit interface")
+
+    @dbus.service.method(PROPERTIES, in_signature="ss", out_signature="v")
+    def Get(self, interface, name):
+        values = self.properties(str(interface))
+        if str(name) not in values:
+            raise ModelError("unsupported unit property")
+        return values[str(name)]
+
+    @dbus.service.method(PROPERTIES, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, interface):
+        return self.properties(str(interface))
+
+
 class ManagerObject(dbus.service.Object):
     def __init__(self, connection, unit_root, loop):
         self.bus_connection, self.unit_root, self.loop = connection, unit_root, loop
         self.root_fd = os.open(unit_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         self.units = {}
+        self.missing = {}
         self.retired = []
         self.jobs = 0
         self.log_bytes = 0
@@ -241,9 +291,14 @@ class ManagerObject(dbus.service.Object):
         if name not in self.units:
             raw = self.definition(name)
             if raw is None:
-                raise NoSuchUnit("model definition absent")
+                # Real LoadUnit yields a transient not-found unit, not an error.
+                if name not in self.missing:
+                    self.missing[name] = NotFoundUnit(self, name)
+                return dbus.ObjectPath(self.missing[name].path)
             if len(self.units) + len(self.retired) >= MAX_UNITS:
                 raise ModelError("model unit bound reached")
+            if name in self.missing:
+                self.missing.pop(name).remove_from_connection()
             self.units[name] = UnitObject(self, name, raw)
             self.log("load", unit=name)
         return dbus.ObjectPath(self.units[name].path)
@@ -285,6 +340,8 @@ class ManagerObject(dbus.service.Object):
         if mode != "fail":
             raise ModelError("only exact fail job mode is modeled")
         self.LoadUnit(name)
+        if str(name) not in self.units:
+            raise NoSuchUnit("model definition absent")
         if self.jobs >= MAX_JOBS:
             raise ModelError("model job bound reached")
         self.jobs += 1
