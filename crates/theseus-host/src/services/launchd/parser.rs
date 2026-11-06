@@ -402,6 +402,27 @@ mod absence_tests {
         }
     }
     #[test]
+    fn real_runner_uid_form_absence_profile_qualifies_exactly() {
+        // Exact bytes observed on a real macOS 15.8.2 runner (CI8 run 42302044978).
+        let mut a = authority();
+        let real = b"Bad request.\nCould not find service \"org.theseus.fixture\" in domain for uid: 501\n";
+        a.qualification.absence_profile.as_mut().unwrap().stderr = real.to_vec();
+        a.validate().unwrap();
+        assert_eq!(
+            normalize_print(&a, evidence(&a)).registration,
+            Fact::Known(false)
+        );
+        for near in [
+            &b"Bad request.\nCould not find service \"org.theseus.fixture\" in domain for uid: 502\n"[..],
+            b"Bad request.\nCould not find domain for uid: 501\n",
+            b"Bad request.\nCould not find service \"org.theseus.fixture\" in domain for gui: 501\n",
+        ] {
+            let mut bad = a.clone();
+            bad.qualification.absence_profile.as_mut().unwrap().stderr = near.to_vec();
+            assert!(bad.validate().is_err());
+        }
+    }
+    #[test]
     fn qualified_absence_is_separate_from_unavailable_loaded_definition() {
         let a = authority();
         let e = evidence(&a);

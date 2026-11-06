@@ -153,6 +153,24 @@ class Planners(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 self.mac.manager_receipt(plan, reservation, bad)
 
+    def test_launchd_absence_accepts_exact_real_runner_uid_form_only(self):
+        # Exact bytes retained from the real macOS 15.8.2 (24H232) runner, CI8 run 42302044978.
+        name, uid = "theseus.ci.bc2bccaf8c83b2cf-00", 501
+        real = 'Bad request.\nCould not find service "theseus.ci.bc2bccaf8c83b2cf-00" in domain for uid: 501\n'
+        self.mac.validate_absence(name, uid, 113, "", real)
+        self.mac.validate_absence(name, uid, 113, "", real.removeprefix("Bad request.\n"))
+        for status, stdout, stderr in [
+            (0, "", real), (113, "x", real), (256, "", real),
+            (113, "", real.replace("uid: 501", "uid: 502")),
+            (113, "", real.replace("bc2bccaf8c83b2cf-00", "bc2bccaf8c83b2cf-01")),
+            (113, "", real.replace("domain for uid", "domain for gui")),
+            (113, "", real.rstrip("\n")),
+            (113, "", "Bad request.\nCould not find domain for uid: 501\n"),
+            (113, "", real + "extra\n"),
+        ]:
+            with self.subTest(stderr=stderr, status=status), self.assertRaises(ValueError):
+                self.mac.validate_absence(name, uid, status, stdout, stderr)
+
     def test_scm_receipt_binds_actual_exact_path_acl_probes_and_original_manager(self):
         plan = self.win.make_plan(manifest(True), "abcd1234abcd1234")
         reservation = plan["cases"][0]["reservations"][0]

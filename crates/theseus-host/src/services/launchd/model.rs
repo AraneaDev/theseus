@@ -158,15 +158,20 @@ impl LaunchdAuthority {
             let LaunchdDomain::User(uid) = self.domain else {
                 return Err(invalid("absence profile requires exact User domain"));
             };
-            let diagnostic = format!(
-                "Could not find service \"{}\" in domain for user: {uid}\n",
-                self.label
-            );
+            // Exact launchctl forms only; `uid:` is the form observed on a real
+            // macOS 15.8.2 runner, `user:` the previously modelled form.
+            let exact = ["user", "uid"].iter().any(|kind| {
+                let diagnostic = format!(
+                    "Could not find service \"{}\" in domain for {kind}: {uid}\n",
+                    self.label
+                );
+                profile.stderr == diagnostic.as_bytes()
+                    || profile.stderr == format!("Bad request.\n{diagnostic}").as_bytes()
+            });
             if profile.profile != "launchctl-user-no-service-v1"
                 || !(1..=255).contains(&profile.exit_code)
                 || !literal(&profile.receipt, 4096)
-                || (profile.stderr != diagnostic.as_bytes()
-                    && profile.stderr != format!("Bad request.\n{diagnostic}").as_bytes())
+                || !exact
             {
                 return Err(invalid(
                     "unsupported or unqualified exact launchd absence profile",

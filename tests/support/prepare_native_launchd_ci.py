@@ -38,9 +38,15 @@ def file_fingerprint(metadata):
     return list(b"\x01" + struct.pack(">QQQqqqq", metadata.st_size, metadata.st_dev, metadata.st_ino, metadata.st_mtime_ns // 1000000000, metadata.st_mtime_ns % 1000000000, metadata.st_ctime_ns // 1000000000, metadata.st_ctime_ns % 1000000000))
 
 
+def absence_diagnostics(name, uid):
+    # Exact launchctl "no such service" forms only. The `uid:` form is the one
+    # observed on a real macOS 15.8.2 (24H232) GitHub runner (CI8 run 42302044978).
+    forms = [f'Could not find service "{name}" in domain for {kind}: {uid}\n' for kind in ("user", "uid")]
+    return tuple(prefix + form for form in forms for prefix in ("", "Bad request.\n"))
+
+
 def validate_absence(name, uid, status, stdout, stderr):
-    diagnostic = f'Could not find service "{name}" in domain for user: {uid}\n'
-    require(1 <= status <= 255 and not stdout and stderr in (diagnostic, "Bad request.\n" + diagnostic), "exact qualified native User-domain label absence required; unknown is not absent")
+    require(1 <= status <= 255 and not stdout and stderr in absence_diagnostics(name, uid), "exact qualified native User-domain label absence required; unknown is not absent")
 
 
 def manager_receipt(plan, reservation, evidence):

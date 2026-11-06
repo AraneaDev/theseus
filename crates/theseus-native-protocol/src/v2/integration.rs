@@ -1402,6 +1402,41 @@ mod cooperative_context_tests {
         value["service_authority"]["qualification"]["absence_profile"] = serde_json::json!({"profile":"launchctl-user-no-service-v1","exit_code":113,"stderr":"Bad request.\nCould not find service \"org.theseus.fixture\" in domain for user: 501\n","receipt_sha256":"88".repeat(32)});
         let manifest: IntegrationManifest = serde_json::from_value(value.clone()).unwrap();
         manifest.validate().unwrap();
+        // Exact form observed on a real macOS 15.8.2 runner (CI8); near forms stay refused.
+        for (stderr, valid) in [
+            (
+                "Bad request.\nCould not find service \"org.theseus.fixture\" in domain for uid: 501\n",
+                true,
+            ),
+            (
+                "Could not find service \"org.theseus.fixture\" in domain for uid: 501\n",
+                true,
+            ),
+            (
+                "Bad request.\nCould not find service \"org.theseus.fixture\" in domain for uid: 502\n",
+                false,
+            ),
+            (
+                "Bad request.\nCould not find service \"org.theseus.other\" in domain for uid: 501\n",
+                false,
+            ),
+            ("Bad request.\nCould not find domain for uid: 501\n", false),
+            (
+                "Bad request.\nCould not find service \"org.theseus.fixture\" in domain for gui: 501\n",
+                false,
+            ),
+        ] {
+            let mut real = value.clone();
+            real["service_authority"]["qualification"]["absence_profile"]["stderr"] = stderr.into();
+            assert_eq!(
+                serde_json::from_value::<IntegrationManifest>(real)
+                    .map_err(|_| ())
+                    .and_then(|m| m.validate().map_err(|_| ()))
+                    .is_ok(),
+                valid,
+                "{stderr}"
+            );
+        }
         let mut context:IntegrationRuntimeContext=serde_json::from_value(serde_json::json!({"kind":"theseus_native_integration_context","schema":1,"ownership_id":"original","binding":"11".repeat(16),"manifest_digest":"22".repeat(32),"workspace_marker":"33".repeat(16),"provider_epoch":"44".repeat(32),"integration_manifest_digest":manifest.digest().unwrap().to_hex(),"manager_unique_name":"provider-context","manager_platform":"launchd","namespace_receipt":"exclusive-original-context","installation_instance_digest":format!("{:x}",Sha256::digest(b"provider-private-instance"))})).unwrap();
         manifest
             .validate_context(&context, super::super::Os::Macos)

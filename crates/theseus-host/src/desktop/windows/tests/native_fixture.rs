@@ -130,25 +130,22 @@ fn long_name_tempdir() -> tempfile::TempDir {
         .expect("canonical temporary directory is not a verbatim drive path");
     tempfile::tempdir_in(base).unwrap()
 }
-#[test]
-fn windows_shortcut_native_com_parser_and_retained_pins_are_actual() {
-    let temp = long_name_tempdir();
-    let profile = fixture(temp.path());
+/// Native COM admission; a refusal panics with a bounded diagnostic naming
+/// the refused field, the native COM view and the saved byte layout.
+fn admit_or_explain(root: &Path, profile: ShortcutProfile) -> AdmittedShortcut {
     let expected = format!(
         "target={:?} arguments={:?} cwd={:?}",
         format!("{}\\{}", profile.root, profile.executable),
         command_line(&profile.arguments),
         profile.root
     );
+    let profile_entry = profile.entry.clone();
     let apartment = ComApartment::initialize_original_thread().unwrap();
-    let admitted = match AdmittedShortcut::parse(
-        apartment,
-        RetainedShortcut::open(profile).unwrap(),
-    ) {
+    match AdmittedShortcut::parse(apartment, RetainedShortcut::open(profile).unwrap()) {
         Ok(admitted) => admitted,
         Err(error) => {
             // Bounded diagnostic only; the failure itself is preserved.
-            let entry = temp.path().join("app.lnk");
+            let entry = root.join(&profile_entry);
             let observed = match ComApartment::initialize_original_thread() {
                 Ok(apartment) => {
                     super::super::com::diagnose_native_metadata(&apartment, entry.to_str().unwrap())
@@ -165,7 +162,33 @@ fn windows_shortcut_native_com_parser_and_retained_pins_are_actual() {
                 "native parse refused: {error}\nexpected: {expected}\nobserved: {observed}\nlayout: {layout}"
             );
         }
-    };
+    }
+}
+#[test]
+fn windows_shortcut_inert_encoder_bytes_are_admitted_by_native_com() {
+    // The deterministic inert encoder (used by the SUT desktop entry fixture)
+    // must produce bytes native Shell COM reads back as the exact target.
+    let temp = long_name_tempdir();
+    let mut profile = fixture(temp.path());
+    let bytes = super::super::fixture::encode_link(
+        &format!("{}\\{}", profile.root, profile.executable),
+        &profile.root,
+        &command_line(&profile.arguments),
+    )
+    .unwrap();
+    fs::write(temp.path().join("app.lnk"), &bytes).unwrap();
+    profile.entry_artifact = commitment(&bytes);
+    let admitted = admit_or_explain(temp.path(), profile);
+    admitted.revalidate().unwrap();
+    if admitted.retire_original().is_err() {
+        panic!("original thread parser retirement failed");
+    }
+}
+#[test]
+fn windows_shortcut_native_com_parser_and_retained_pins_are_actual() {
+    let temp = long_name_tempdir();
+    let profile = fixture(temp.path());
+    let admitted = admit_or_explain(temp.path(), profile);
     admitted.revalidate().unwrap();
     // Actual Windows sharing prevents both replacement and in-place mutation
     // while Shell/COM could consume the original admitted pathname.

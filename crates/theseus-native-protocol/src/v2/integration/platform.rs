@@ -214,12 +214,17 @@ impl ServiceAuthority {
             let LaunchdDomain::User { uid } = domain else {
                 return Err(Error::InvalidValue);
             };
-            let diagnostic =
-                format!("Could not find service \"{label}\" in domain for user: {uid}\n");
+            // Exact launchctl forms only; `uid:` is the form observed on a real
+            // macOS 15.8.2 runner, `user:` the previously modelled form.
+            let exact = ["user", "uid"].iter().any(|kind| {
+                let diagnostic =
+                    format!("Could not find service \"{label}\" in domain for {kind}: {uid}\n");
+                absence.stderr == diagnostic
+                    || absence.stderr == format!("Bad request.\n{diagnostic}")
+            });
             if absence.profile != "launchctl-user-no-service-v1"
                 || !(1..=255).contains(&absence.exit_code)
-                || (absence.stderr != diagnostic
-                    && absence.stderr != format!("Bad request.\n{diagnostic}"))
+                || !exact
             {
                 return Err(Error::InvalidValue);
             }

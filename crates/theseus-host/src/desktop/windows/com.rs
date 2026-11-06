@@ -370,7 +370,7 @@ impl AdmittedShortcut {
         apartment.check()?;
         retained.revalidate()?;
         let bytes = retained.entry_bytes()?;
-        let flags = super::validate_link_bytes(&bytes)?;
+        let layout = super::validate_link_bytes(&bytes)?;
         let link = load_link(
             retained
                 .entry_path()
@@ -383,7 +383,7 @@ impl AdmittedShortcut {
             target,
             arguments: get_arguments(&link)?,
             working_directory: get_working_directory(&link)?,
-            flags,
+            layout,
         })?;
         validate_executable_run_level(&retained)?;
         retained.revalidate()?;

@@ -193,7 +193,7 @@ class NotFoundUnit(dbus.service.Object):
             }
         if interface == SERVICE:
             return {
-                "Type": dbus.String("simple", variant_level=1),
+                "Type": dbus.String("", variant_level=1),  # real v255 (CI8 probe)
                 "Restart": dbus.String("no", variant_level=1),
                 "ExecStart": dbus.Array([], signature="(sasbttttuii)", variant_level=1),
                 "Environment": dbus.Array([], signature="s", variant_level=1),

@@ -732,6 +732,37 @@ def absent_unit_probe(dbus, connection, manager_object, bus_name, name):
     return record
 
 
+PRESENT_PROBE_UNIT = ("[Unit]\nDescription=Theseus evidence probe\nDefaultDependencies=no\n[Service]\nType=simple\nRestart=no\n"
+                      "ExecStart=\"/usr/bin/true\" \"true\" \"probe argument\"\nWorkingDirectory=/tmp\nEnvironment=\"VALUE=probe value\"\n")
+
+
+def present_unit_probe(dbus, connection, manager_object, bus_name, unit_root, name):
+    """Evidence only: the real manager's view of an exact present, never-started
+    unit in the product's definition format; the file is removed before return."""
+    path = Path(unit_root) / name
+    record = {"unit": name}
+    try:
+        # Same order as the installer: observed absent first, then written.
+        record["before_write"] = absent_unit_probe(dbus, connection, manager_object, bus_name, name)
+        with path.open("x") as handle:
+            handle.write(PRESENT_PROBE_UNIT)
+        manager = dbus.Interface(manager_object, IFACE)
+        record["unit_files"] = repr(manager.ListUnitFilesByPatterns([], [name], timeout=5))[:1024]
+        record.update(absent_unit_probe(dbus, connection, manager_object, bus_name, name))
+    except Exception as error:
+        record["error"] = repr(error)[:1024]
+    finally:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            # The caller's closed-namespace check refuses a leftover file.
+            record["unlink_error"] = repr(error)[:512]
+    record["after_unlink"] = absent_unit_probe(dbus, connection, manager_object, bus_name, name)
+    return record
+
+
 def stop_original_bus(observe, private, proof, deadline):
     """Only the same authenticated original private connection can settle it."""
     remaining(deadline, 5)
@@ -937,6 +968,8 @@ def worker(document):
         }
         write_new(root / "qualification.json", evidence)
         write_new(root / "absent-unit-probe.json", absent_unit_probe(dbus, connection, obj, unique, "theseus-absent-probe-" + plan["token"] + ".service"))
+        write_new(root / "present-unit-probe.json", present_unit_probe(dbus, connection, obj, unique, root / "units", "theseus-present-probe-" + plan["token"] + ".service"))
+        require(not list((root / "units").iterdir()), "unit namespace changed by evidence probe")
         receipt = manager_receipt(plan, uid, evidence)
         write_new(root / "manager-receipt.json", receipt)
         test_env = artifact_environment(plan)

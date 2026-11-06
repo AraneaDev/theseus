@@ -74,34 +74,33 @@ fn windows_shortcut_exact_target_arguments_cwd_and_closed_flags() {
         target: r"C:\fixture\fixture.exe".into(),
         arguments: "--instance \"fresh nonce\"".into(),
         working_directory: r"C:\fixture".into(),
-        flags: 0xb2,
+        layout: LinkLayout {
+            flags: 0xbb,
+            local_base_path: r"C:\fixture\fixture.exe".into(),
+            relative_path: r".\fixture.exe".into(),
+        },
     };
     assert!(p.admit_metadata(&good).is_ok());
+    let with = |change: &dyn Fn(&mut ShortcutMetadata)| {
+        let mut bad = good.clone();
+        change(&mut bad);
+        bad
+    };
     for bad in [
-        ShortcutMetadata {
-            target: "https://example.test".into(),
-            ..good.clone()
-        },
-        ShortcutMetadata {
-            arguments: "--instance other".into(),
-            ..good.clone()
-        },
-        ShortcutMetadata {
-            working_directory: r"C:\other".into(),
-            ..good.clone()
-        },
-        ShortcutMetadata {
-            flags: good.flags | 0x2000,
-            ..good.clone()
-        },
-        ShortcutMetadata {
-            flags: good.flags | 0x200,
-            ..good.clone()
-        },
-        ShortcutMetadata {
-            flags: good.flags | 1,
-            ..good.clone()
-        },
+        with(&|m| m.target = "https://example.test".into()),
+        with(&|m| m.target = String::new()),
+        with(&|m| m.arguments = "--instance other".into()),
+        with(&|m| m.working_directory = r"C:\other".into()),
+        // argv present requires HasArguments; any other flag refuses.
+        with(&|m| m.layout.flags = 0x9b),
+        with(&|m| m.layout.flags |= 0x2000),
+        with(&|m| m.layout.flags |= 0x200),
+        with(&|m| m.layout.flags |= 0x40),
+        with(&|m| m.layout.flags |= 4),
+        // Shell resolution fallbacks must name the same exact target.
+        with(&|m| m.layout.local_base_path = r"C:\other\fixture.exe".into()),
+        with(&|m| m.layout.relative_path = r"..\fixture.exe".into()),
+        with(&|m| m.layout.relative_path = r".\other.exe".into()),
     ] {
         assert!(p.admit_metadata(&bad).is_err(), "{bad:?}");
     }
@@ -160,27 +159,122 @@ fn windows_argument_commitment_quotes_backslashes_and_empty_values() {
     assert_eq!(command_line(&["a\\\"b".into()]), r#""a\\\"b""#);
     assert_eq!(command_line(&["tail \\".into()]), r#""tail \\""#);
 }
+/// Exact bytes IShellLinkW + IPersistFile::Save wrote on windows-2025 (CI8,
+/// run 42302044978) for the native fixture shortcut.
+pub(super) fn shell_saved_link() -> Vec<u8> {
+    let hex = include_str!("tests/shell_saved_windows_2025.lnk.hex").trim();
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect()
+}
+const SHELL_SAVED_TARGET: &str = r"C:\Users\runneradmin\AppData\Local\Temp\.tmpNdQTs6\fixture.exe";
+// Offsets inside the CI8 vector (asserted below before use).
+const LINK_INFO: usize = 618;
+const EXTRA: usize = 946;
+const SPECIAL: usize = EXTRA;
+const KNOWN: usize = EXTRA + 16;
+const TRACKER: usize = KNOWN + 28;
+const PROPERTIES: usize = TRACKER + 96;
+fn put(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+#[test]
+fn windows_shortcut_closed_profile_admits_exact_shell_saved_bytes() {
+    let bytes = shell_saved_link();
+    assert_eq!(bytes.len(), 1296);
+    for (offset, signature) in [
+        (SPECIAL, 0xa000_0005u32),
+        (KNOWN, 0xa000_000b),
+        (TRACKER, 0xa000_0003),
+        (PROPERTIES, 0xa000_0009),
+    ] {
+        assert_eq!(bytes[offset + 4..offset + 8], signature.to_le_bytes());
+    }
+    assert_eq!(
+        validate_link_bytes(&bytes).unwrap(),
+        LinkLayout {
+            flags: 0xbb,
+            local_base_path: SHELL_SAVED_TARGET.into(),
+            relative_path: r".\fixture.exe".into(),
+        }
+    );
+}
 #[test]
 fn windows_shortcut_structural_policy_refuses_opaque_launcher_extensions() {
-    let mut bytes = vec![0u8; 108];
-    bytes[..4].copy_from_slice(&76u32.to_le_bytes());
-    bytes[4..20].copy_from_slice(&[1, 20, 2, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 70]);
-    bytes[20..24].copy_from_slice(&0x82u32.to_le_bytes());
-    bytes[60..64].copy_from_slice(&1u32.to_le_bytes());
-    bytes[76..80].copy_from_slice(&28u32.to_le_bytes());
-    bytes[84..88].copy_from_slice(&1u32.to_le_bytes());
-    assert_eq!(validate_link_bytes(&bytes).unwrap(), 0x82);
-    for flag in [1, 4, 8, 0x40, 0x100, 0x200, 0x2000, 0x40000] {
+    let bytes = shell_saved_link();
+    let refuse = |change: &dyn Fn(&mut Vec<u8>), why: &str| {
         let mut bad = bytes.clone();
-        bad[20..24].copy_from_slice(&(0x82u32 | flag).to_le_bytes());
-        assert!(validate_link_bytes(&bad).is_err());
+        change(&mut bad);
+        assert!(validate_link_bytes(&bad).is_err(), "{why}");
+    };
+    // Every LinkFlag outside the closed set: HasName, HasIconLocation,
+    // HasExpString, RunInSeparateProcess, HasDarwinID, RunAsUser,
+    // HasExpIcon, ForceNoLinkInfo, RunWithShimLayer, EnableTargetMetadata,
+    // PreferEnvironmentPath, ...
+    for flag in [
+        4, 0x40, 0x100, 0x200, 0x400, 0x1000, 0x2000, 0x4000, 0x8000, 0x10000, 0x20000, 0x40000,
+        0x80000, 0x2000000,
+    ] {
+        refuse(&|b| put(b, 20, 0xbb | flag), "extra flag");
     }
-    let mut extra = bytes.clone();
-    extra.extend([0; 4]);
-    assert!(validate_link_bytes(&extra).is_err());
-    let mut network = bytes;
-    network[84..88].copy_from_slice(&2u32.to_le_bytes());
-    assert!(validate_link_bytes(&network).is_err());
+    // Required flags cannot be dropped (IDList, LinkInfo, relative, cwd).
+    for flag in [1, 2, 8, 0x10, 0x80] {
+        refuse(&|b| put(b, 20, 0xbb & !flag), "missing flag");
+    }
+    refuse(&|b| put(b, 24, 0x10), "directory target attributes");
+    refuse(&|b| put(b, 56, 1), "icon index");
+    refuse(&|b| put(b, 60, 3), "maximized show command");
+    refuse(&|b| b[64] = 0x41, "hotkey");
+    refuse(&|b| b[76] -= 2, "IDList size framing");
+    refuse(&|b| b[78] = 2, "IDList undersized item");
+    refuse(&|b| put(b, LINK_INFO + 8, 3), "network LinkInfo flags");
+    refuse(&|b| put(b, LINK_INFO + 20, 40), "network LinkInfo offset");
+    refuse(&|b| put(b, LINK_INFO + 4, 36), "unicode LinkInfo header");
+    refuse(&|b| put(b, LINK_INFO + 28 + 4, 4), "remote drive type");
+    // Unobserved or authority-bearing ExtraData blocks, by signature:
+    // EnvironmentVariable, Console, ConsoleFE, Darwin, IconEnvironment,
+    // Shim, VistaAndAboveIDList and an unknown signature.
+    for signature in [
+        0xa000_0001u32,
+        0xa000_0002,
+        0xa000_0004,
+        0xa000_0006,
+        0xa000_0007,
+        0xa000_0008,
+        0xa000_000c,
+        0xa000_00ff,
+    ] {
+        refuse(&|b| put(b, SPECIAL + 4, signature), "ExtraData signature");
+    }
+    refuse(
+        &|b| put(b, KNOWN + 4, 0xa000_0005),
+        "duplicate/out-of-order block",
+    );
+    refuse(
+        &|b| put(b, SPECIAL + 12, 540),
+        "folder offset beyond IDList",
+    );
+    refuse(&|b| put(b, TRACKER + 8, 0x50), "tracker length");
+    refuse(&|b| b[PROPERTIES + 8 + 8] ^= 1, "unknown property set");
+    refuse(&|b| b[PROPERTIES + 8 + 41] = b'!', "owner SID text");
+    refuse(&|b| put(b, 1292, 4), "non-terminal ExtraData end");
+    refuse(&|b| b.extend([0; 4]), "trailing bytes");
+}
+#[test]
+fn windows_shortcut_closed_profile_admits_each_observed_block_as_optional() {
+    // Removing whole ExtraData blocks keeps a closed, still-ordered subset.
+    let bytes = shell_saved_link();
+    for (start, end) in [
+        (SPECIAL, KNOWN),
+        (KNOWN, TRACKER),
+        (TRACKER, PROPERTIES),
+        (EXTRA, 1292),
+    ] {
+        let mut subset = bytes[..start].to_vec();
+        subset.extend(&bytes[end..]);
+        assert!(validate_link_bytes(&subset).is_ok());
+    }
 }
 #[cfg(windows)]
 mod native_fixture;

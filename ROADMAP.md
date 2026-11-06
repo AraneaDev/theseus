@@ -145,6 +145,32 @@ whole observation (a file another process holds open for writing is refused
 rather than read); the shortcut fixture's field mismatch against the admitted
 profile is not yet diagnosed, and the next run reports the differing field.
 
+The [seventh combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42294689119)
+at `95586ff` passed all eight Docker suites. Windows confirmed that the inert test
+shortcut has no target ID list (`GetPath` returns `S_FALSE` with an empty path);
+the fixture now authors shortcuts through `IShellLinkW`/`IPersistFile::Save`
+like real installers, and the next run records the exact saved bytes so the
+closed admitted byte profile can be defined from evidence. Linux still refuses
+the baseline inspection of the absent unit after all sixteen property reads;
+the operator now records the real manager's view of an absent unit as evidence.
+macOS failed an earlier client recovery test that had passed in three prior
+runs; it now reports the actual recovered reply.
+
+The [eighth combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42302044978)
+at `1e73965` passed all eight Docker suites. macOS passed every gate before the
+real manager step, including all six Source-owned desktop cases, all three owned
+native-entry cases and the client recovery test, then the first real launchd
+qualification refused absence because macOS 15 reports `domain for uid: N`
+rather than the assumed `domain for user: N`; both exact forms are now accepted
+by the operator, protocol and host checks. Windows captured the exact 1,296-byte
+Shell-saved shortcut; the admitted shortcut profile is now a closed layout built
+from those bytes (exact header flags, size-checked target ID list proven by the
+exact COM target, local-drive LinkInfo and an exact ExtraData allowlist). Linux
+showed that real and model not-found units now agree, and that the real
+installer stops after observing its freshly written unit; the operator now
+records the real manager's view of a present never-started unit. Final
+corrected-source native acceptance remains pending.
+
 Keep this queue and the checklists below current as work lands. Record source
 implementation, review, local verification, CI acceptance and merge separately.
 Do not estimate a completion percentage from checkbox counts: tasks differ
@@ -460,15 +486,3 @@ See [documentation](docs/README.md), [recipe contracts](docs/reference/recipes.m
 and [validation gates](docs/contribute/validation.md).
 Design specifications, implementation plans and working review records remain
 private and ignored; this public tracker records scope and progress.
-
-The [seventh combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42294689119)
-at `95586ff` passed all eight Docker suites. Windows confirmed that the inert test
-shortcut has no target ID list (`GetPath` returns `S_FALSE` with an empty path);
-the fixture now authors shortcuts through `IShellLinkW`/`IPersistFile::Save`
-like real installers, and the next run records the exact saved bytes so the
-closed admitted byte profile can be defined from evidence. Linux still refuses
-the baseline inspection of the absent unit after all sixteen property reads;
-the operator now records the real manager's view of an absent unit as evidence.
-macOS failed an earlier client recovery test that had passed in three prior
-runs; it now reports the actual recovered reply. Final corrected-source native
-acceptance remains pending.
