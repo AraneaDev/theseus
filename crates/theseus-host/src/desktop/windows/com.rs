@@ -87,18 +87,18 @@ struct LinkTable {
     get_description: usize,
     set_description: usize,
     get_cwd: unsafe extern "system" fn(*mut c_void, *mut u16, i32) -> i32,
-    set_cwd: usize,
+    set_cwd: unsafe extern "system" fn(*mut c_void, *const u16) -> i32,
     get_arguments: unsafe extern "system" fn(*mut c_void, *mut u16, i32) -> i32,
-    set_arguments: usize,
+    set_arguments: unsafe extern "system" fn(*mut c_void, *const u16) -> i32,
     get_hotkey: usize,
     set_hotkey: usize,
     get_show: usize,
-    set_show: usize,
+    set_show: unsafe extern "system" fn(*mut c_void, i32) -> i32,
     get_icon: usize,
     set_icon: usize,
     set_relative: usize,
     resolve: usize,
-    set_path: usize,
+    set_path: unsafe extern "system" fn(*mut c_void, *const u16) -> i32,
 }
 #[repr(C)]
 struct PersistTable {
@@ -106,7 +106,7 @@ struct PersistTable {
     get_class: usize,
     is_dirty: usize,
     load: unsafe extern "system" fn(*mut c_void, *const u16, u32) -> i32,
-    save: usize,
+    save: unsafe extern "system" fn(*mut c_void, *const u16, i32) -> i32,
     save_completed: usize,
     get_current: usize,
 }
@@ -216,8 +216,7 @@ fn output(buffer: &[u16]) -> io::Result<String> {
     String::from_utf16(&buffer[..len]).map_err(|_| invalid("non Unicode native shortcut string"))
 }
 const SLGP_RAWPATH: u32 = 4;
-/// Create an in-process IShellLinkW and load (never resolve) one pathname.
-fn load_link(entry: &str) -> io::Result<Object> {
+fn create_link() -> io::Result<(Object, Object)> {
     let mut raw = ptr::null_mut();
     hr("CoCreateInstance(IShellLinkW)", unsafe {
         CoCreateInstance(
@@ -239,7 +238,11 @@ fn load_link(entry: &str) -> io::Result<Object> {
     if persist.is_null() {
         return Err(invalid("COM returned no IPersistFile"));
     }
-    let persist = Object(persist);
+    Ok((link, Object(persist)))
+}
+/// Create an in-process IShellLinkW and load (never resolve) one pathname.
+fn load_link(entry: &str) -> io::Result<Object> {
+    let (link, persist) = create_link()?;
     let path = wide(entry);
     hr("IPersistFile::Load", unsafe {
         (persist.table::<PersistTable>().load)(persist.0, path.as_ptr(), 0)
@@ -278,6 +281,43 @@ fn get_working_directory(link: &Object) -> io::Result<String> {
         (link.table::<LinkTable>().get_cwd)(link.0, cwd.as_mut_ptr(), cwd.len() as i32)
     })?;
     output(&cwd)
+}
+/// Test-only installer fixture: author a shortcut exactly as real installers
+/// do, through IShellLinkW setters and IPersistFile::Save on the original STA.
+/// It never resolves or activates the shortcut.
+#[cfg(test)]
+pub(super) fn author_shortcut_for_test(
+    apartment: &ComApartment,
+    entry: &str,
+    target: &str,
+    arguments: &str,
+    working_directory: &str,
+) -> io::Result<()> {
+    apartment.check()?;
+    let (link, persist) = create_link()?;
+    let table = link.table::<LinkTable>();
+    let (target, arguments, cwd, entry) = (
+        wide(target),
+        wide(arguments),
+        wide(working_directory),
+        wide(entry),
+    );
+    hr("IShellLinkW::SetPath", unsafe {
+        (table.set_path)(link.0, target.as_ptr())
+    })?;
+    hr("IShellLinkW::SetArguments", unsafe {
+        (table.set_arguments)(link.0, arguments.as_ptr())
+    })?;
+    hr("IShellLinkW::SetWorkingDirectory", unsafe {
+        (table.set_cwd)(link.0, cwd.as_ptr())
+    })?;
+    // SW_SHOWNORMAL, the only show command the closed profile admits.
+    hr("IShellLinkW::SetShowCmd", unsafe {
+        (table.set_show)(link.0, 1)
+    })?;
+    hr("IPersistFile::Save", unsafe {
+        (persist.table::<PersistTable>().save)(persist.0, entry.as_ptr(), 1)
+    })
 }
 /// Test-only bounded diagnostic of what native Shell COM reports for one
 /// shortcut. It never admits anything and never resolves or activates.

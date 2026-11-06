@@ -230,6 +230,20 @@ class Planning(unittest.TestCase):
                 fixture.retain_service_journal(missing, "theseus-private-abcd1234abcd1234.service")
             self.assertIn("journal unavailable", missing.read_text())
 
+    def test_absent_unit_probe_records_real_view_and_never_raises(self):
+        class Props:
+            def GetAll(self, interface, timeout):
+                return {"Id": "x.service", "Names": ["x.service"], "LoadState": "not-found", "InvocationID": b""}
+        connection = SimpleNamespace(get_object=lambda *a, **k: object())
+        dbus = SimpleNamespace(Interface=lambda obj, iface: Props() if iface.endswith("Properties") else SimpleNamespace(LoadUnit=lambda name, timeout: "/unit/x"))
+        record = fixture.absent_unit_probe(dbus, connection, object(), ":1.1", "x.service")
+        self.assertEqual(record["path"], "/unit/x")
+        self.assertIn("not-found", record["org.freedesktop.systemd1.Unit"]["LoadState"])
+        def broken(*a, **k):
+            raise RuntimeError("no reply")
+        failing = SimpleNamespace(Interface=lambda obj, iface: SimpleNamespace(LoadUnit=broken))
+        self.assertIn("no reply", fixture.absent_unit_probe(failing, connection, object(), ":1.1", "x.service")["error"])
+
     def test_unreadable_worker_cleanup_is_uncertainty_not_a_lost_receipt(self):
         good = {"kind": "theseus_original_manager_cleanup_v1", "manager_started": True, "manager": {"joined_status": 0}, "manager_scope_empty": True, "errors": []}
         with tempfile.TemporaryDirectory() as directory:

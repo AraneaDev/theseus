@@ -614,15 +614,18 @@ fn native_client_file_connection_loss_queries_original_without_second_create() {
         Err(ClientError::RecoveryRequired)
     );
     let reply = client.request(Action::Query { lease, operation });
-    assert!(matches!(
-        reply,
-        Reply::Operation {
-            state: OperationView::Finished {
-                outcome: Outcome::FileCreated { .. }
-            } | OperationView::Unknown { .. },
-            ..
-        }
-    ));
+    assert!(
+        matches!(
+            reply,
+            Reply::Operation {
+                state: OperationView::Finished {
+                    outcome: Outcome::FileCreated { .. }
+                } | OperationView::Unknown { .. },
+                ..
+            }
+        ),
+        "actual recovered query reply: {reply:?}"
+    );
     if matches!(
         reply,
         Reply::Operation {

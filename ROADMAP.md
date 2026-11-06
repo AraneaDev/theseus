@@ -143,8 +143,7 @@ the same-size after-read check could miss a rewrite within one coarse NTFS
 timestamp tick, so native file inspection now holds a deny-write handle for the
 whole observation (a file another process holds open for writing is refused
 rather than read); the shortcut fixture's field mismatch against the admitted
-profile is not yet diagnosed, and the next run reports the differing field. Final corrected-source native acceptance
-remains pending.
+profile is not yet diagnosed, and the next run reports the differing field.
 
 Keep this queue and the checklists below current as work lands. Record source
 implementation, review, local verification, CI acceptance and merge separately.
@@ -461,3 +460,15 @@ See [documentation](docs/README.md), [recipe contracts](docs/reference/recipes.m
 and [validation gates](docs/contribute/validation.md).
 Design specifications, implementation plans and working review records remain
 private and ignored; this public tracker records scope and progress.
+
+The [seventh combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42294689119)
+at `95586ff` passed all eight Docker suites. Windows confirmed that the inert test
+shortcut has no target ID list (`GetPath` returns `S_FALSE` with an empty path);
+the fixture now authors shortcuts through `IShellLinkW`/`IPersistFile::Save`
+like real installers, and the next run records the exact saved bytes so the
+closed admitted byte profile can be defined from evidence. Linux still refuses
+the baseline inspection of the absent unit after all sixteen property reads;
+the operator now records the real manager's view of an absent unit as evidence.
+macOS failed an earlier client recovery test that had passed in three prior
+runs; it now reports the actual recovered reply. Final corrected-source native
+acceptance remains pending.

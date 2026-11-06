@@ -2,8 +2,91 @@
 use super::*;
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
-fn fixture_link(target: &str, cwd: &str, args: &str) -> Vec<u8> {
-    super::super::fixture::encode_link(target, cwd, args).unwrap()
+/// Author `entry` under `root` exactly as a real installer does: Shell COM
+/// IShellLinkW setters plus IPersistFile::Save (which writes the target
+/// IDList that IShellLinkW::GetPath reports). Returns the saved bytes.
+fn author_link(root: &Path, entry: &str, target: &str, cwd: &str, args: &str) -> Vec<u8> {
+    let apartment = ComApartment::initialize_original_thread().unwrap();
+    let path = root.join(entry);
+    super::super::com::author_shortcut_for_test(
+        &apartment,
+        path.to_str().unwrap(),
+        target,
+        args,
+        cwd,
+    )
+    .unwrap();
+    fs::read(path).unwrap()
+}
+/// Bounded structural description of saved shortcut bytes, used only when
+/// admission refuses, so the real Shell-authored layout is visible in CI.
+fn describe_link_bytes(bytes: &[u8]) -> String {
+    let u16at = |i: usize| {
+        bytes
+            .get(i..i + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+    };
+    let u32at = |i: usize| {
+        bytes
+            .get(i..i + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let mut out = format!(
+        "len={} flags={:#x?} attributes={:#x?} show={:?} hotkey={:?} validator={:?}",
+        bytes.len(),
+        u32at(20),
+        u32at(24),
+        u32at(60),
+        u16at(64),
+        validate_link_bytes(bytes).map_err(|e| e.to_string()),
+    );
+    let flags = u32at(20).unwrap_or(0);
+    let mut offset = 76;
+    if flags & 1 != 0 {
+        let size = u16at(offset).unwrap_or(0);
+        out += &format!(" idlist={size}");
+        offset += 2 + size;
+    }
+    if flags & 2 != 0 {
+        let size = u32at(offset).unwrap_or(0) as usize;
+        out += &format!(
+            " linkinfo(size={size} header={:?} flags={:?})",
+            u32at(offset + 4),
+            u32at(offset + 8)
+        );
+        offset += size.max(4);
+    }
+    for (flag, name) in [
+        (4, "name"),
+        (8, "relative"),
+        (0x10, "cwd"),
+        (0x20, "args"),
+        (0x40, "icon"),
+    ] {
+        if flags & flag != 0 {
+            let count = u16at(offset).unwrap_or(0);
+            out += &format!(" {name}={count}");
+            offset += 2 + count * 2;
+        }
+    }
+    out += " extra=[";
+    for _ in 0..32 {
+        match u32at(offset) {
+            Some(size) if size >= 8 => {
+                out += &format!("{:#x}:{size} ", u32at(offset + 4).unwrap_or(0));
+                offset += size as usize;
+            }
+            terminal => {
+                out += &format!("end:{terminal:?} at {offset}");
+                break;
+            }
+        }
+    }
+    out += "] hex=";
+    for byte in bytes.iter().take(8192) {
+        out += &format!("{byte:02x}");
+    }
+    out
 }
 fn commitment(data: &[u8]) -> ArtifactCommitment {
     ArtifactCommitment {
@@ -19,8 +102,13 @@ fn fixture(root: &Path) -> ShortcutProfile {
     fs::write(root.join("fixture.exe"), &executable).unwrap();
     let root = root.to_str().unwrap().to_owned();
     let args = vec!["--theseus-inert-fixture".into(), "original nonce".into()];
-    let bytes = fixture_link(&format!("{root}\\fixture.exe"), &root, &command_line(&args));
-    fs::write(Path::new(&root).join("app.lnk"), &bytes).unwrap();
+    let bytes = author_link(
+        Path::new(&root),
+        "app.lnk",
+        &format!("{root}\\fixture.exe"),
+        &root,
+        &command_line(&args),
+    );
     ShortcutProfile {
         root,
         entry: "app.lnk".into(),
@@ -53,24 +141,31 @@ fn windows_shortcut_native_com_parser_and_retained_pins_are_actual() {
         profile.root
     );
     let apartment = ComApartment::initialize_original_thread().unwrap();
-    let admitted =
-        match AdmittedShortcut::parse(apartment, RetainedShortcut::open(profile).unwrap()) {
-            Ok(admitted) => admitted,
-            Err(error) => {
-                // Bounded diagnostic only; the failure itself is preserved.
-                let entry = temp.path().join("app.lnk");
-                let observed = match ComApartment::initialize_original_thread() {
-                    Ok(apartment) => super::super::com::diagnose_native_metadata(
-                        &apartment,
-                        entry.to_str().unwrap(),
-                    ),
-                    Err(apartment_error) => {
-                        format!("diagnostic apartment unavailable: {apartment_error}")
-                    }
-                };
-                panic!("native parse refused: {error}\nexpected: {expected}\nobserved: {observed}");
-            }
-        };
+    let admitted = match AdmittedShortcut::parse(
+        apartment,
+        RetainedShortcut::open(profile).unwrap(),
+    ) {
+        Ok(admitted) => admitted,
+        Err(error) => {
+            // Bounded diagnostic only; the failure itself is preserved.
+            let entry = temp.path().join("app.lnk");
+            let observed = match ComApartment::initialize_original_thread() {
+                Ok(apartment) => {
+                    super::super::com::diagnose_native_metadata(&apartment, entry.to_str().unwrap())
+                }
+                Err(apartment_error) => {
+                    format!("diagnostic apartment unavailable: {apartment_error}")
+                }
+            };
+            let layout = match fs::read(&entry) {
+                Ok(bytes) => describe_link_bytes(&bytes),
+                Err(read_error) => format!("unreadable: {read_error}"),
+            };
+            panic!(
+                "native parse refused: {error}\nexpected: {expected}\nobserved: {observed}\nlayout: {layout}"
+            );
+        }
+    };
     admitted.revalidate().unwrap();
     // Actual Windows sharing prevents both replacement and in-place mutation
     // while Shell/COM could consume the original admitted pathname.
@@ -90,15 +185,36 @@ fn windows_shortcut_native_com_parser_and_retained_pins_are_actual() {
 fn windows_shortcut_native_com_rejects_changed_target_before_activation() {
     let temp = long_name_tempdir();
     let mut profile = fixture(temp.path());
-    let bad = fixture_link(
-        r"C:\other\wrong.exe",
+    // A real, existing, different executable in the same root, authored by
+    // Shell COM, so only the COM-reported target differs from the profile.
+    fs::copy(
+        temp.path().join("fixture.exe"),
+        temp.path().join("wrong.exe"),
+    )
+    .unwrap();
+    let bad = author_link(
+        temp.path(),
+        "app.lnk",
+        &format!("{}\\wrong.exe", profile.root),
         &profile.root,
         &command_line(&profile.arguments),
     );
-    fs::write(temp.path().join("app.lnk"), &bad).unwrap();
     profile.entry_artifact = commitment(&bad);
     let apartment = ComApartment::initialize_original_thread().unwrap();
-    assert!(AdmittedShortcut::parse(apartment, RetainedShortcut::open(profile).unwrap()).is_err());
+    let error = match AdmittedShortcut::parse(apartment, RetainedShortcut::open(profile).unwrap()) {
+        Ok(_) => panic!("changed shortcut target admitted"),
+        Err(error) => error,
+    };
+    // Once the byte profile admits the Shell-authored layout, the refusal
+    // must be the exact target comparison, not an incidental earlier check.
+    if validate_link_bytes(&bad).is_ok() {
+        assert_eq!(
+            error.to_string(),
+            "native shortcut target differs from exact admitted target",
+            "{}",
+            describe_link_bytes(&bad)
+        );
+    }
 }
 
 // This is original-handle source IPC, not a Shell/native-activation receipt.

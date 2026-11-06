@@ -715,6 +715,23 @@ def private_channel_matches(private, observed, deadline):
     return True
 
 
+def absent_unit_probe(dbus, connection, manager_object, bus_name, name):
+    """Evidence only: the real manager's view of an exact absent unit name,
+    as product inspection reads it after LoadUnit. Never raises."""
+    record = {"unit": name}
+    try:
+        path = str(dbus.Interface(manager_object, IFACE).LoadUnit(name, timeout=5))
+        record["path"] = path
+        properties = dbus.Interface(connection.get_object(bus_name, path, introspect=False), "org.freedesktop.DBus.Properties")
+        for interface, keys in (("org.freedesktop.systemd1.Unit", ("Id", "Names", "LoadState", "ActiveState", "SubState", "FragmentPath", "SourcePath", "DropInPaths", "InvocationID", "NeedDaemonReload", "LoadError")),
+                                ("org.freedesktop.systemd1.Service", ("Type", "Restart", "ExecStart", "Environment", "WorkingDirectory", "MainPID", "Result"))):
+            values = properties.GetAll(interface, timeout=5)
+            record[interface] = {key: repr(values.get(key))[:512] for key in keys}
+    except Exception as error:
+        record["error"] = repr(error)[:1024]
+    return record
+
+
 def stop_original_bus(observe, private, proof, deadline):
     """Only the same authenticated original private connection can settle it."""
     remaining(deadline, 5)
@@ -919,6 +936,7 @@ def worker(document):
             "manager_binary": manager_binary, "dbus_binary": bus_binary,
         }
         write_new(root / "qualification.json", evidence)
+        write_new(root / "absent-unit-probe.json", absent_unit_probe(dbus, connection, obj, unique, "theseus-absent-probe-" + plan["token"] + ".service"))
         receipt = manager_receipt(plan, uid, evidence)
         write_new(root / "manager-receipt.json", receipt)
         test_env = artifact_environment(plan)
