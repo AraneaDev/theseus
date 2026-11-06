@@ -126,7 +126,9 @@ fn parse_profile_bytes(b: &[u8], allow_source_desktop: bool) -> Result<Config, C
     if b.len() > MAX_CONFIG as usize || b.starts_with(&[0xef, 0xbb, 0xbf]) {
         return Err(invalid());
     }
-    let raw: serde_json::Value = serde_json::from_slice(b).map_err(|_| invalid())?;
+    let raw: serde_json::Value = serde_json::from_slice(b).map_err(|e| ConfigError {
+        kind: ConfigErrorKind::Json(e),
+    })?;
     if !allow_source_desktop
         && raw
             .pointer("/runtime_context/desktop_broker_header/display/kind")
@@ -859,7 +861,8 @@ mod tests {
         assert_eq!(std::fs::read_dir(&ledger).unwrap().count(), 0);
         std::fs::write(&path, b"{SECRET_INVALID_JSON").unwrap();
         let e = load_config(&path).err().unwrap();
-        assert!(e.source().is_some());
+        assert!(matches!(e.kind, ConfigErrorKind::Json(_)));
+        assert!(e.source().unwrap().is::<serde_json::Error>());
         assert!(!format!("{e:?}").contains("SECRET"));
         let e = load_config(&root.path().join("SECRET_MISSING"))
             .err()

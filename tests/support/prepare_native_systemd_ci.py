@@ -13,7 +13,6 @@ import json
 import os
 from pathlib import Path
 import platform
-import pwd
 import re
 import shutil
 import signal
@@ -230,6 +229,8 @@ def pinned_copy(source, target, pin, uid, gid):
 
 
 def operator(plan, env):
+    import pwd  # Linux execution only; pure planning is portable.
+
     require(plan["manifest"]["source_sha"] == env["GITHUB_SHA"], "artifact source SHA must match exact GitHub source")
     for path in ("/usr/bin/systemd-run", "/usr/bin/systemctl", "/usr/sbin/useradd", "/usr/sbin/userdel", "/usr/bin/python3", "/usr/bin/dbus-daemon", "/usr/lib/systemd/systemd"):
         require(Path(path).is_file(), f"mandatory CI dependency absent: {path}")
@@ -366,6 +367,8 @@ def delegated_cgroups(token):
 
 
 def worker(document):
+    import pwd  # Linux execution only; pure planning is portable.
+
     require(os.environ.get("THESEUS_CI_PRIVATE_SYSTEMD_WORKER") == "1", "internal fixture worker guard absent")
     plan = document["plan"]
     require(make_plan(plan["manifest"], plan["token"]) == plan, "worker plan altered")

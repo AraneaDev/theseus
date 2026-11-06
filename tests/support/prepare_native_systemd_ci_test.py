@@ -33,6 +33,24 @@ def manifest():
 
 
 class Planning(unittest.TestCase):
+    def test_pure_planning_imports_without_unix_pwd_module(self):
+        # Windows has no pwd module. Exercise the actual import and pure plan;
+        # keep the dependency mandatory for Linux execution before any effects.
+        portable = importlib.util.module_from_spec(SPEC)
+        with patch.dict("sys.modules", {"pwd": None}):
+            try:
+                SPEC.loader.exec_module(portable)
+            except ModuleNotFoundError as error:
+                self.fail(f"pure planning import requires a Unix-only dependency: {error}")
+            plan = portable.make_plan(manifest(), "abcd1234abcd1234")
+            self.assertEqual(plan["root"], "/tmp/th-sd-abcd1234abcd1234")
+            self.assertEqual(len(plan["manifest"]["artifacts"]), 10)
+            self.assertEqual(len(plan["manifest"]["cases"]), 7)
+            with self.assertRaises(ModuleNotFoundError):
+                portable.operator({}, {})
+            with self.assertRaises(ModuleNotFoundError):
+                portable.worker({})
+
     def test_real_combined_dispatch_has_exact_pinned_owners_and_bounded_case_budget(self):
         plan = fixture.make_plan(manifest(), "abcd1234abcd1234")
         self.assertEqual(len(plan["manifest"]["cases"]), 7)
