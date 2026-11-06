@@ -401,6 +401,14 @@ impl Worker {
             }
             WorkerCommand::Release { lease, ticket } => self.release(lease, ticket)?,
             WorkerCommand::Stop => self.stopping = true,
+            #[cfg(test)]
+            WorkerCommand::ReadPhysicalLedger(reply) => {
+                let physical = match self.store.as_mut() {
+                    Some(store) => store.read_physical().map_err(|e| format!("{e:?}")),
+                    None => Err("no open store".into()),
+                };
+                let _ = reply.send(physical);
+            }
         }
         Ok(())
     }
@@ -2431,8 +2439,18 @@ mod native_tests {
         }
         // Undrained case has consumed no Output or returned tokens; neither case
         // sends ProducerDrained before checking the physical Finished barrier.
-        let physical = std::fs::read(lp.join("ledger.bin"))
-            .or_else(|_| std::fs::read(lp.join("ledger")))
+        // Read through the live worker's own locked store handle: Windows
+        // byte-range locks refuse reads through any other handle, and reading
+        // after the owner drops would no longer prove Finished precedes drain.
+        let (physical_tx, physical_rx) = std::sync::mpsc::sync_channel(1);
+        ports
+            .commands
+            .try_send(WorkerCommand::ReadPhysicalLedger(physical_tx))
+            .ok()
+            .unwrap();
+        let physical = physical_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
             .unwrap();
         let mut decoder = v2::ledger::Decoder::new();
         let mut offset = 0;

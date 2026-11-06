@@ -29,6 +29,9 @@ impl Fixture {
             os: Os::Linux,
         }
     }
+    /// Reads through a separate handle, so only while no `LedgerStore` is open:
+    /// Windows exclusive byte-range locks refuse reads through other handles.
+    /// Use `LedgerStore::read_physical` while a store owns the ledger.
     pub fn bytes(&self) -> Vec<u8> {
         std::fs::read(self.tmp.path().join("ledger/ledger.bin")).unwrap()
     }

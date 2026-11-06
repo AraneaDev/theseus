@@ -1035,6 +1035,10 @@ mod owned_leaf_cleanup_tests {
     use super::*;
     use std::io::Write;
 
+    // POSIX permits renaming a directory while a created leaf beneath it is
+    // open, so cleanup must follow the retained identity, not the pathname.
+    // Windows refuses that rename (see the cfg(windows) counterpart below).
+    #[cfg(unix)]
     #[test]
     fn retained_leaf_cleanup_survives_root_rename_without_touching_replacement() {
         let temp = tempfile::tempdir().unwrap();
@@ -1059,6 +1063,41 @@ mod owned_leaf_cleanup_tests {
         assert!(!moved.join("identity").exists());
         assert_eq!(
             std::fs::read(original.join("identity")).unwrap(),
+            b"unrelated"
+        );
+    }
+
+    // Windows (NTFS) refuses to rename a directory while any handle to an
+    // object beneath it is open, even with FILE_SHARE_DELETE, so a retained
+    // created leaf pins its root's pathname. Cleanup then removes exactly the
+    // retained leaf under the unmoved root.
+    #[cfg(windows)]
+    #[test]
+    fn retained_leaf_pins_root_against_rename_and_cleanup_removes_only_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("auth");
+        let moved = temp.path().join("moved-auth");
+        let root = HostDir::create_private(&original).unwrap();
+        let mut file = root
+            .create_file(&RelativePath::parse("identity").unwrap())
+            .unwrap();
+        file.write_all(b"inert test material").unwrap();
+        file.sync_all().unwrap();
+        let mut sibling = root
+            .create_file(&RelativePath::parse("sibling").unwrap())
+            .unwrap();
+        sibling.write_all(b"unrelated").unwrap();
+        sibling.sync_all().unwrap();
+        drop(sibling);
+        let refused = std::fs::rename(&original, &moved).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!moved.exists());
+        root.remove_created_leaf(OsStr::new("identity"), &file)
+            .unwrap();
+        drop(file);
+        assert!(!original.join("identity").exists());
+        assert_eq!(
+            std::fs::read(original.join("sibling")).unwrap(),
             b"unrelated"
         );
     }

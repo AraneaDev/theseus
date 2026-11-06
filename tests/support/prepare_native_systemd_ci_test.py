@@ -91,43 +91,75 @@ class Planning(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertFalse(fixture.scope_unpopulated(value))
 
+    class FakePrivate:
+        """Retained private channel double: (invocation, ActiveState) per unit."""
+        def __init__(self, units=None, error=None):
+            self.units, self.error = units or {}, error
+            self.stops, self.reads = [], 0
+
+        def wait_ready(self, deadline):
+            fixture.remaining(deadline, 1)
+
+        def get_unit(self, name, timeout):
+            if self.error is not None:
+                raise self.error
+            if name not in self.units:
+                raise fixture.PrivateBusError("org.freedesktop.systemd1.NoSuchUnit", name)
+            return "/unit/" + name
+
+        def unit_state(self, path, timeout):
+            self.reads += 1
+            value = self.units[path.rsplit("/", 1)[1]]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        def stop_unit(self, name, mode, timeout):
+            self.stops.append((name, mode))
+            return "/job/1"
+
     def test_private_cleanup_never_stops_replaced_or_expired_original(self):
         root, scope, observed = self.owned_bus_observation()
         proof = fixture.managed_bus_proof(root, 12345, 18, scope, observed)
-        manager = Mock()
-        dbus = SimpleNamespace(Interface=lambda obj, iface: obj)
+        private = self.FakePrivate()
         replaced = copy.deepcopy(observed)
         replaced["service"]["invocation"] = "c" * 32
-        with patch.object(fixture, "bus_unit_observation", return_value=replaced), self.assertRaises(ValueError):
-            fixture.stop_original_bus(dbus, Mock(), manager, proof, fixture.time.monotonic() + 5)
-        manager.StopUnit.assert_not_called()
-        with patch.object(fixture, "bus_unit_observation", return_value=observed), self.assertRaises(ValueError):
-            fixture.stop_original_bus(dbus, Mock(), manager, proof, fixture.time.monotonic() - 1)
-        manager.StopUnit.assert_not_called()
+        with self.assertRaises(ValueError):
+            fixture.stop_original_bus(lambda: replaced, private, proof, fixture.time.monotonic() + 5)
+        self.assertEqual(private.stops, [])
+        with self.assertRaises(ValueError):
+            fixture.stop_original_bus(lambda: observed, private, proof, fixture.time.monotonic() - 1)
+        self.assertEqual(private.stops, [])
 
     def test_same_private_connection_survives_public_bus_stop_but_loss_never_settles(self):
         root, scope, observed = self.owned_bus_observation()
         proof = fixture.managed_bus_proof(root, 12345, 18, scope, observed)
-        class NativeError(Exception):
-            def get_dbus_name(self):
-                return "org.freedesktop.DBus.Error.Disconnected"
-        dbus = SimpleNamespace(Interface=lambda obj, iface: obj, DBusException=NativeError)
-        manager = Mock()
-        manager.GetUnit.side_effect = lambda name, **kw: name
-        private = Mock()
-        def original_unit(bus_name, name, **kw):
-            invocation = proof["service_invocation"] if name == "dbus.service" else proof["socket_invocation"]
-            return SimpleNamespace(GetAll=lambda *args, **kwargs: {"InvocationID": bytes.fromhex(invocation), "ActiveState": "inactive"})
-        private.get_object.side_effect = original_unit
-        with patch.object(fixture, "bus_unit_observation", return_value=observed):
-            result = fixture.stop_original_bus(dbus, private, manager, proof, fixture.time.monotonic() + 5)
+        private = self.FakePrivate({"dbus.service": (proof["service_invocation"], "inactive"),
+                                    "dbus.socket": (proof["socket_invocation"], "inactive")})
+        result = fixture.stop_original_bus(lambda: observed, private, proof, fixture.time.monotonic() + 5)
         self.assertTrue(result["settled"])
-        self.assertEqual(manager.StopUnit.call_args.args, ("dbus.socket", "replace"))
-        self.assertEqual(private.get_object.call_count, 2)
-        private.get_object.side_effect = NativeError("original private connection lost")
-        with patch.object(fixture, "bus_unit_observation", return_value=observed), self.assertRaisesRegex(ValueError, "lost original"):
-            fixture.stop_original_bus(dbus, private, manager, proof, fixture.time.monotonic() + 5)
-        self.assertEqual(private.get_object.call_count, 3)
+        self.assertEqual(private.stops, [("dbus.socket", "replace")])
+        self.assertEqual(private.reads, 2)
+        lost = self.FakePrivate(error=fixture.PrivateBusError("org.freedesktop.DBus.Error.Disconnected", "lost"))
+        with self.assertRaisesRegex(ValueError, "lost original"):
+            fixture.stop_original_bus(lambda: observed, lost, proof, fixture.time.monotonic() + 5)
+        changed = self.FakePrivate({"dbus.service": ("d" * 32, "inactive"), "dbus.socket": (proof["socket_invocation"], "inactive")})
+        with self.assertRaisesRegex(ValueError, "invocation changed"):
+            fixture.stop_original_bus(lambda: observed, changed, proof, fixture.time.monotonic() + 5)
+
+    def test_private_channel_must_answer_for_the_same_original_units_before_cases(self):
+        root, scope, observed = self.owned_bus_observation()
+        same = self.FakePrivate({"dbus.service": (observed["service"]["invocation"], "active"),
+                                 "dbus.socket": (observed["socket"]["invocation"], "active")})
+        self.assertTrue(fixture.private_channel_matches(same, observed, fixture.time.monotonic() + 5))
+        other = self.FakePrivate({"dbus.service": ("e" * 32, "active"), "dbus.socket": (observed["socket"]["invocation"], "active")})
+        with self.assertRaisesRegex(ValueError, "disagrees"):
+            fixture.private_channel_matches(other, observed, fixture.time.monotonic() + 5)
+        silent = self.FakePrivate(error=fixture.PrivateBusError("org.freedesktop.DBus.Error.NoReply", "no reply"))
+        with self.assertRaises(fixture.PrivateBusError):
+            fixture.private_channel_matches(silent, observed, fixture.time.monotonic() + 5)
+        with self.assertRaisesRegex(ValueError, "deadline expired"):
+            fixture.private_channel_matches(same, observed, fixture.time.monotonic() - 1)
 
     def test_account_cleanup_requires_actual_original_scope_receipt(self):
         good = {"kind": "theseus_original_manager_cleanup_v1", "manager_started": True, "manager": {"joined_status": 0}, "manager_scope_empty": True, "errors": []}
@@ -139,32 +171,25 @@ class Planning(unittest.TestCase):
         self.assertFalse(fixture.original_scope_settled(None))
 
     def test_initial_units_close_definitions_but_admit_kernel_derived_units(self):
-        closed = ["theseus-empty.target", "dbus.socket", "dbus.service", "init.scope", "-.slice"]
-        kernel = ["-.mount", "tmp.mount", "run-user-1001.mount", "dev-sda2.swap", "sys-devices-virtual-net-lo.device"]
-        self.assertTrue(fixture.initial_units_closed(closed + kernel))
-        for unexpected in ("app.slice", "default.target", "dbus-broker.service", "tmp.automount", "x.timer", "x.path", "session.scope", "theseus.mount.service"):
+        closed = [(n, "loaded", "active") for n in ("theseus-empty.target", "dbus.socket", "dbus.service", "init.scope", "-.slice", "app.slice")]
+        kernel = [(n, "loaded", "active") for n in ("-.mount", "tmp.mount", "run-user-1001.mount", "dev-sda2.swap", "sys-devices-virtual-net-lo.device")]
+        # CI4 journal: referenced but definition-less units stay loaded as not-found.
+        missing = [(n, "not-found", "inactive") for n in ("blockdev@dev-sda16.target", "systemd-remount-fs.service", "shutdown.target")]
+        self.assertTrue(fixture.initial_units_closed(closed + kernel + missing))
+        for unexpected in ("default.target", "dbus-broker.service", "tmp.automount", "x.timer", "x.path", "session.scope", "theseus.mount.service"):
             with self.subTest(unit=unexpected):
-                self.assertFalse(fixture.initial_units_closed(closed + kernel + [unexpected]))
+                self.assertFalse(fixture.initial_units_closed(closed + kernel + [(unexpected, "loaded", "active")]))
+                self.assertFalse(fixture.initial_units_closed(closed + [(unexpected, "loaded", "inactive")]))
+                self.assertFalse(fixture.initial_units_closed(closed + [(unexpected, "not-found", "active")]))
 
     def test_stop_poll_accepts_null_or_collected_original_units(self):
         root, scope, observed = self.owned_bus_observation()
         proof = fixture.managed_bus_proof(root, 12345, 18, scope, observed)
-        class NativeError(Exception):
-            def get_dbus_name(self):
-                return "org.freedesktop.DBus.Error.UnknownObject"
-        dbus = SimpleNamespace(Interface=lambda obj, iface: obj, DBusException=NativeError)
-        manager = Mock()
-        manager.GetUnit.side_effect = lambda name, **kw: name
-        private = Mock()
-        def collected(bus_name, name, **kw):
-            if name == "dbus.service":
-                return SimpleNamespace(GetAll=lambda *a, **k: {"InvocationID": b"", "ActiveState": "inactive"})
-            def gone(*a, **k):
-                raise NativeError("collected between GetUnit and GetAll")
-            return SimpleNamespace(GetAll=gone)
-        private.get_object.side_effect = collected
-        with patch.object(fixture, "bus_unit_observation", return_value=observed):
-            self.assertTrue(fixture.stop_original_bus(dbus, private, manager, proof, fixture.time.monotonic() + 5)["settled"])
+        collected = fixture.PrivateBusError("org.freedesktop.DBus.Error.UnknownObject", "collected between GetUnit and reads")
+        private = self.FakePrivate({"dbus.service": ("", "inactive"), "dbus.socket": collected})
+        self.assertTrue(fixture.stop_original_bus(lambda: observed, private, proof, fixture.time.monotonic() + 5)["settled"])
+        gone = self.FakePrivate({})
+        self.assertTrue(fixture.stop_original_bus(lambda: observed, gone, proof, fixture.time.monotonic() + 5)["settled"])
 
     def test_worker_cleanup_reader_never_blocks_on_special_files(self):
         with tempfile.TemporaryDirectory() as directory:

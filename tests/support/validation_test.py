@@ -3,6 +3,7 @@ import copy
 import importlib.util
 import io
 import json
+import os
 import pathlib
 import sys
 import tempfile
@@ -169,6 +170,34 @@ class ValidationTests(unittest.TestCase):
                     self.assertEqual(runner.calls[0][1][key], '1')
                     self.assertEqual(key in runner.env, key in original)
                     self.assertEqual(runner.env.get(key), original.get(key))
+
+    def test_failed_desktop_step_retains_bounded_printed_fixture_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            evidence = root / 'evidence'
+            evidence.mkdir()
+            fixture = root / 'fixture'
+            (fixture / '.theseus-runs/native-1').mkdir(parents=True)
+            (fixture / '.theseus-runs/native-1/native-report.json').write_text('{"error":"provider"}')
+            (fixture / 'big.bin').write_bytes(b'x' * 64)
+            if hasattr(os, 'mkfifo'):
+                os.mkfifo(fixture / 'pipe')
+            outside = root / 'outside.txt'
+            outside.write_text('secret')
+            try:
+                (fixture / 'link').symlink_to(outside)
+            except (OSError, NotImplementedError):
+                pass
+            (evidence / 'source-desktop-product.log').write_text(
+                f'retained desktop fixture: {fixture}\nretained desktop endpoints: {root / "absent"}\nretained desktop fixture: relative\n')
+            result = validation.retain_desktop_evidence(evidence, 'source-desktop-product', file_limit=32)
+            copied = evidence / 'retained-desktop/source-desktop-product/0/.theseus-runs/native-1/native-report.json'
+            self.assertEqual(copied.read_text(), '{"error":"provider"}')
+            self.assertFalse((evidence / 'retained-desktop/source-desktop-product/0/big.bin').exists())
+            self.assertFalse((evidence / 'retained-desktop/source-desktop-product/0/link').exists())
+            self.assertTrue((evidence / 'retained-desktop/source-desktop-product/manifest.json').is_file())
+            self.assertTrue(any('skipped invalid' in note for note in result['notes']))
+            self.assertEqual(validation.retain_desktop_evidence(evidence, 'missing-step')['copied'], [])
 
     def test_zero_tests_cannot_pass_required_cargo_gate(self):
         self.assert_required_cases_rejected([], ['required_case'])

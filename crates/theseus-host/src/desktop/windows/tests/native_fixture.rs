@@ -30,9 +30,21 @@ fn fixture(root: &Path) -> ShortcutProfile {
         executable_artifact: commitment(&executable),
     }
 }
+/// The closed profile admits only canonical long-name drive roots. Runner
+/// `%TEMP%` may be an 8.3 alias (for example `C:\Users\RUNNER~1\...`),
+/// which the profile correctly refuses, so the fixture root is created under
+/// the filesystem-resolved long form of the temporary directory.
+fn long_name_tempdir() -> tempfile::TempDir {
+    let resolved = fs::canonicalize(std::env::temp_dir()).unwrap();
+    let resolved = resolved.to_str().expect("temporary directory is not UTF-8");
+    let base = resolved
+        .strip_prefix(r"\\?\")
+        .expect("canonical temporary directory is not a verbatim drive path");
+    tempfile::tempdir_in(base).unwrap()
+}
 #[test]
 fn windows_shortcut_native_com_parser_and_retained_pins_are_actual() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = long_name_tempdir();
     let profile = fixture(temp.path());
     let apartment = ComApartment::initialize_original_thread().unwrap();
     let admitted =
@@ -54,7 +66,7 @@ fn windows_shortcut_native_com_parser_and_retained_pins_are_actual() {
 }
 #[test]
 fn windows_shortcut_native_com_rejects_changed_target_before_activation() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = long_name_tempdir();
     let mut profile = fixture(temp.path());
     let bad = fixture_link(
         r"C:\other\wrong.exe",

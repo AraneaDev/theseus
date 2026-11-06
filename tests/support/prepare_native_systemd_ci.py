@@ -142,15 +142,26 @@ def original_scope_settled(cleanup):
                          and manager_cleanup_complete(cleanup.get("manager"), True))))
 
 
-CLOSED_INITIAL_UNITS = frozenset({"theseus-empty.target", "dbus.socket", "dbus.service", "init.scope", "-.slice"})
+# app.slice is synthesized by the user manager itself (CI4 journal: "Created
+# slice app.slice") without any unit file in our closed paths.
+CLOSED_INITIAL_UNITS = frozenset({"theseus-empty.target", "dbus.socket", "dbus.service", "init.scope", "-.slice", "app.slice"})
 # A user manager synthesizes these from kernel mount/swap/udev state, never
 # from a unit file; every definition-backed type stays exactly closed.
 KERNEL_DERIVED_UNIT_SUFFIXES = (".mount", ".swap", ".device")
 WORKER_CLEANUP_LIMIT = 64 * 1024
 
 
-def initial_units_closed(units):
-    return all(unit in CLOSED_INITIAL_UNITS or unit.endswith(KERNEL_DERIVED_UNIT_SUFFIXES) for unit in units)
+def initial_units_closed(rows):
+    """rows: (name, load_state, active_state) from the manager's ListUnits.
+
+    Definition-backed units stay exactly closed. Kernel-derived units and
+    references whose definition was not found (CI4 journal: e.g.
+    blockdev@dev-sda16.target, systemd-remount-fs.service) carry no
+    definition or process and are admitted only while inactive.
+    """
+    return all(name in CLOSED_INITIAL_UNITS or name.endswith(KERNEL_DERIVED_UNIT_SUFFIXES)
+               or (load == "not-found" and active == "inactive")
+               for name, load, active in rows)
 
 
 def read_worker_cleanup(path):
@@ -532,14 +543,16 @@ def connection_peer(connection):
         return struct.unpack("3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
 
 
-def bus_unit_observation(dbus, connection, manager_object, *, deadline=None):
+def bus_unit_observation(dbus, connection, manager_object, *, bus_name, deadline=None):
+    """Read-only facts over the public bus, addressed to the verified unique
+    manager name; authority-bearing actions use only the private channel."""
     manager = dbus.Interface(manager_object, IFACE)
     def timeout():
         return 5 if deadline is None else remaining(deadline, 5)
     records = {}
     for name in ("dbus.service", "dbus.socket"):
         path = str(manager.GetUnit(name, timeout=timeout()))
-        obj = connection.get_object(None, path, introspect=False)
+        obj = connection.get_object(bus_name, path, introspect=False)
         properties = dbus.Interface(obj, "org.freedesktop.DBus.Properties")
         unit = properties.GetAll("org.freedesktop.systemd1.Unit", timeout=timeout())
         record = {"id": str(unit["Id"]), "active": str(unit["ActiveState"]), "sub": str(unit["SubState"]),
@@ -558,10 +571,154 @@ def bus_unit_observation(dbus, connection, manager_object, *, deadline=None):
     return records
 
 
-def stop_original_bus(dbus, connection, manager_object, proof, deadline):
+class PrivateBusError(Exception):
+    def __init__(self, name, message):
+        super().__init__(f"{name}: {message}")
+        self.name = name
+
+    def get_dbus_name(self):
+        return self.name
+
+
+class PrivateManager:
+    """Retained original peer-to-peer channel to the manager's private socket.
+
+    Uses libsystemd's sd-bus client (as systemctl does for this socket): CI4
+    proved a libdbus client authenticates but its calls are never received.
+    No Hello, no name lookup; it survives shutdown of the managed public bus.
+    """
+
+    class Error(ctypes.Structure):
+        _fields_ = [("name", ctypes.c_char_p), ("message", ctypes.c_char_p), ("need_free", ctypes.c_int)]
+
+    def __init__(self, address, sdk=None):
+        self.sdk = sdk if sdk is not None else ctypes.CDLL("libsystemd.so.0")
+        self.libc = ctypes.CDLL(None)
+        for name in ("sd_bus_new", "sd_bus_set_address", "sd_bus_start", "sd_bus_get_fd", "sd_bus_is_ready",
+                     "sd_bus_process", "sd_bus_wait",
+                     "sd_bus_set_method_call_timeout", "sd_bus_call_method", "sd_bus_get_property",
+                     "sd_bus_get_property_string", "sd_bus_message_read", "sd_bus_message_read_array"):
+            getattr(self.sdk, name).restype = ctypes.c_int
+        self.sdk.sd_bus_set_method_call_timeout.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+        self.sdk.sd_bus_is_ready.argtypes = [ctypes.c_void_p]
+        self.sdk.sd_bus_process.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self.sdk.sd_bus_wait.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+        self.sdk.sd_bus_message_read_array.argtypes = [ctypes.c_void_p, ctypes.c_char, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_size_t)]
+        self.sdk.sd_bus_message_unref.restype = ctypes.c_void_p
+        self.sdk.sd_bus_message_unref.argtypes = [ctypes.c_void_p]
+        self.sdk.sd_bus_error_free.argtypes = [ctypes.POINTER(PrivateManager.Error)]
+        self.sdk.sd_bus_flush_close_unref.restype = ctypes.c_void_p
+        self.sdk.sd_bus_flush_close_unref.argtypes = [ctypes.c_void_p]
+        self.libc.free.argtypes = [ctypes.c_void_p]
+        self.bus = ctypes.c_void_p()
+        self.check(self.sdk.sd_bus_new(ctypes.byref(self.bus)), "sd_bus_new")
+        try:
+            self.check(self.sdk.sd_bus_set_address(self.bus, address.encode()), "sd_bus_set_address")
+            self.check(self.sdk.sd_bus_start(self.bus), "sd_bus_start")
+        except BaseException:
+            self.close()
+            raise
+
+    def check(self, result, what, error=None):
+        if result >= 0:
+            return result
+        name = error.name.decode() if error is not None and error.name else "errno." + str(-result)
+        message = error.message.decode() if error is not None and error.message else os.strerror(-result)
+        raise PrivateBusError(name, what + ": " + message)
+
+    def wait_ready(self, deadline):
+        """Bound authentication by our deadline, not sd-bus's own auth timeout."""
+        while self.check(self.sdk.sd_bus_is_ready(self.bus), "sd_bus_is_ready") == 0:
+            if self.check(self.sdk.sd_bus_process(self.bus, None), "sd_bus_process") == 0:
+                self.check(self.sdk.sd_bus_wait(self.bus, max(1, int(remaining(deadline, 1) * 1_000_000))), "sd_bus_wait")
+            remaining(deadline, 1)
+
+    def fd(self):
+        return self.check(self.sdk.sd_bus_get_fd(self.bus), "sd_bus_get_fd")
+
+    def peer(self):
+        with socket.socket(fileno=os.dup(self.fd())) as peer:
+            return struct.unpack("3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+
+    def _timeout(self, seconds):
+        self.check(self.sdk.sd_bus_set_method_call_timeout(self.bus, max(1, int(seconds * 1_000_000))), "timeout")
+
+    def _call(self, member, signature, args, timeout, read=None):
+        self._timeout(timeout)
+        error, reply = PrivateManager.Error(), ctypes.c_void_p()
+        try:
+            self.check(self.sdk.sd_bus_call_method(self.bus, None, OBJECT.encode(), IFACE.encode(), member.encode(),
+                                                   ctypes.byref(error), ctypes.byref(reply),
+                                                   signature.encode() if signature else None, *args), member, error)
+            if read is None:
+                return None
+            value = ctypes.c_char_p()
+            result = self.check(self.sdk.sd_bus_message_read(reply, read.encode(), ctypes.byref(value)), member + " reply")
+            if result == 0 or value.value is None:
+                raise PrivateBusError("theseus.EmptyReply", member + " reply carried no " + read)
+            return value.value.decode()
+        finally:
+            self.sdk.sd_bus_error_free(ctypes.byref(error))
+            if reply:
+                self.sdk.sd_bus_message_unref(reply)
+
+    def get_unit(self, name, timeout):
+        return self._call("GetUnit", "s", [ctypes.c_char_p(name.encode())], timeout, read="o")
+
+    def stop_unit(self, name, mode, timeout):
+        return self._call("StopUnit", "ss", [ctypes.c_char_p(name.encode()), ctypes.c_char_p(mode.encode())], timeout, read="o")
+
+    def exit(self, timeout):
+        self._call("Exit", None, [], timeout)
+
+    def unit_state(self, path, timeout):
+        """(InvocationID hex, ActiveState) of the unit object, read privately."""
+        iface = b"org.freedesktop.systemd1.Unit"
+        self._timeout(timeout)
+        error, reply = PrivateManager.Error(), ctypes.c_void_p()
+        try:
+            self.check(self.sdk.sd_bus_get_property(self.bus, None, path.encode(), iface, b"InvocationID",
+                                                    ctypes.byref(error), ctypes.byref(reply), b"ay"), "InvocationID", error)
+            data, size = ctypes.c_void_p(), ctypes.c_size_t()
+            self.check(self.sdk.sd_bus_message_read_array(reply, b"y", ctypes.byref(data), ctypes.byref(size)), "InvocationID array")
+            invocation = ctypes.string_at(data, size.value).hex() if size.value else ""
+        finally:
+            self.sdk.sd_bus_error_free(ctypes.byref(error))
+            if reply:
+                self.sdk.sd_bus_message_unref(reply)
+        self._timeout(timeout)
+        error, value = PrivateManager.Error(), ctypes.c_char_p()
+        try:
+            self.check(self.sdk.sd_bus_get_property_string(self.bus, None, path.encode(), iface, b"ActiveState",
+                                                           ctypes.byref(error), ctypes.byref(value)), "ActiveState", error)
+            state = (value.value or b"").decode()
+        finally:
+            self.sdk.sd_bus_error_free(ctypes.byref(error))
+            if value:
+                self.libc.free(ctypes.cast(value, ctypes.c_void_p))
+        return invocation, state
+
+    def close(self):
+        if self.bus:
+            self.sdk.sd_bus_flush_close_unref(self.bus)
+            self.bus = ctypes.c_void_p()
+
+
+def private_channel_matches(private, observed, deadline):
+    """Before any case: the retained private channel answers and names the
+    same original manager units and invocations as the public observation."""
+    private.wait_ready(deadline)
+    for key, name in (("service", "dbus.service"), ("socket", "dbus.socket")):
+        invocation, state = private.unit_state(private.get_unit(name, remaining(deadline, 5)), remaining(deadline, 5))
+        require(invocation == observed[key]["invocation"] and state == "active",
+                "retained private manager channel disagrees with original managed bus")
+    return True
+
+
+def stop_original_bus(observe, private, proof, deadline):
     """Only the same authenticated original private connection can settle it."""
     remaining(deadline, 5)
-    units = bus_unit_observation(dbus, connection, manager_object, deadline=deadline)
+    units = observe()
     require(units["service"]["invocation"] == proof["service_invocation"]
             and units["service"]["main_pid"] == proof["daemon_pid"]
             and units["service"]["control_group"] == proof["control_group"]
@@ -573,8 +730,7 @@ def stop_original_bus(dbus, connection, manager_object, proof, deadline):
             and units["socket"]["listen"] == proof["listen"]
             and units["socket"]["dropins"] == [],
             "original managed bus replaced before cleanup; refusing name-based stop")
-    manager = dbus.Interface(manager_object, IFACE)
-    manager.StopUnit("dbus.socket", "replace", timeout=remaining(deadline, 5))
+    private.stop_unit("dbus.socket", "replace", remaining(deadline, 5))
     # Stop of the required socket also stops the service. Public bus disconnect
     # says nothing; observe the original units over our retained private channel.
     while True:
@@ -582,22 +738,17 @@ def stop_original_bus(dbus, connection, manager_object, proof, deadline):
         settled = True
         for name, invocation in (("dbus.service", proof["service_invocation"]), ("dbus.socket", proof["socket_invocation"])):
             try:
-                path = manager.GetUnit(name, timeout=remaining(deadline, 2))
-                properties = dbus.Interface(connection.get_object(None, path, introspect=False), "org.freedesktop.DBus.Properties")
-                unit = properties.GetAll("org.freedesktop.systemd1.Unit", timeout=remaining(deadline, 2))
-                current = bytes(unit["InvocationID"]).hex()
+                current, state = private.unit_state(private.get_unit(name, remaining(deadline, 2)), remaining(deadline, 2))
                 # A null id is sent as an empty array; never a different id.
                 require(current in (invocation, "", "0" * 32), "managed bus invocation changed during stop")
-                settled = settled and str(unit["ActiveState"]) in ("inactive", "failed")
-            except dbus.DBusException as error:
-                # Collected after stop (before or between GetUnit/GetAll).
+                settled = settled and state in ("inactive", "failed")
+            except PrivateBusError as error:
+                # Collected after stop (before or between GetUnit and the reads).
                 require(error.get_dbus_name() in ("org.freedesktop.systemd1.NoSuchUnit", "org.freedesktop.DBus.Error.UnknownObject"),
                         "lost original private cleanup observation")
         if settled:
             return {"original_service_invocation": proof["service_invocation"], "original_socket_invocation": proof["socket_invocation"], "settled": True}
         time.sleep(0.05)
-
-
 def service_terminal(fields, original_invocation):
     if fields.get("LoadState") == "not-found" and fields.get("ActiveState") == "inactive" and not fields.get("InvocationID"):
         return True
@@ -651,7 +802,6 @@ def worker(document):
     import dbus  # operator-only native Python D-Bus SDK, never product fallback
     manager_child = None
     connection = private_connection = None
-    private_object = None
     manager_cgroup = None
     scope_fd = events_fd = bus_binary_fd = None
     bus_proof = None
@@ -690,11 +840,10 @@ def worker(document):
         while not (root / "runtime/systemd/private").exists():
             require(manager_child.poll() is None and time.monotonic() < deadline, "original manager private API failed to start")
             time.sleep(0.05)
-        private_connection = dbus.connection.Connection("unix:path=" + str(root / "runtime/systemd/private"))
-        private_peer_pid, private_peer_uid, private_peer_gid = connection_peer(private_connection)
+        private_connection = PrivateManager("unix:path=" + str(root / "runtime/systemd/private"))
+        private_peer_pid, private_peer_uid, private_peer_gid = private_connection.peer()
         require(private_peer_pid == manager_child.pid and private_peer_uid == uid,
                 "private API must be exact original manager peer")
-        private_object = private_connection.get_object(None, OBJECT, introspect=False)
         while not (root / "runtime/bus").exists():
             require(manager_child.poll() is None and time.monotonic() < deadline, "original managed bus socket failed to start")
             time.sleep(0.05)
@@ -716,7 +865,15 @@ def worker(document):
             except dbus.DBusException as error:
                 require(error.get_dbus_name() == "org.freedesktop.DBus.Error.NameHasNoOwner", "unexpected private bus failure")
                 time.sleep(0.05)
-        units = bus_unit_observation(dbus, private_connection, private_object)
+        manager_uid = int(daemon.GetConnectionUnixUser(unique, timeout=5))
+        manager_pid = int(daemon.GetConnectionUnixProcessID(unique, timeout=5))
+        require(manager_pid == manager_child.pid and manager_child.poll() is None, "manager owner must be original retained Popen")
+        obj = connection.get_object(unique, OBJECT, introspect=False)
+
+        def observe_units(deadline=None):
+            return bus_unit_observation(dbus, connection, obj, bus_name=unique, deadline=deadline)
+
+        units = observe_units()
         observed = {**units, "socket_peer_pid": peer_pid, "socket_peer_uid": peer_uid,
                     "socket_peer_gid": peer_gid,
                     "driver_pid": int(daemon.GetConnectionUnixProcessID("org.freedesktop.DBus", timeout=5)),
@@ -724,10 +881,7 @@ def worker(document):
         manager_scope = "/" + str(manager_cgroup.relative_to("/sys/fs/cgroup"))
         bus_proof = managed_bus_proof(str(root), uid, manager_child.pid, manager_scope, observed)
         verify_managed_executable(bus_proof["daemon_pid"], bus_binary, bus_command(str(root)), bus_proof["control_group"])
-        manager_uid = int(daemon.GetConnectionUnixUser(unique, timeout=5))
-        manager_pid = int(daemon.GetConnectionUnixProcessID(unique, timeout=5))
-        require(manager_pid == manager_child.pid and manager_child.poll() is None, "manager owner must be original retained Popen")
-        obj = connection.get_object(unique, OBJECT, introspect=False)
+        private_channel_matches(private_connection, units, time.monotonic() + 10)
         properties = dbus.Interface(obj, "org.freedesktop.DBus.Properties")
         version = str(properties.Get(IFACE, "Version", timeout=5))
         unit_paths = [str(p) for p in properties.Get(IFACE, "UnitPath", timeout=5)]
@@ -736,8 +890,9 @@ def worker(document):
         introspection = str(dbus.Interface(obj, "org.freedesktop.DBus.Introspectable").Introspect(timeout=5))
         for method in ("StartUnit", "StopUnit", "Reload", "GetUnit", "ListUnits"):
             require(f'name="{method}"' in introspection, "native manager API missing: " + method)
-        initial_units = [str(row[0]) for row in dbus.Interface(obj, IFACE).ListUnits(timeout=5)]
-        require(initial_units_closed(initial_units), "new whole-private manager loaded an unexpected unit")
+        initial_rows = [(str(row[0]), str(row[2]), str(row[3])) for row in dbus.Interface(obj, IFACE).ListUnits(timeout=5)]
+        initial_units = [row[0] for row in initial_rows]
+        require(initial_units_closed(initial_rows), "new whole-private manager loaded an unexpected unit")
         require(not list((root / "units").iterdir()), "unit namespace changed before qualification")
         sdk = ctypes.CDLL("libsystemd.so.0")
         for symbol in SDK_SYMBOLS:
@@ -770,7 +925,7 @@ def worker(document):
         results = []
         for index, case in enumerate(plan["manifest"]["cases"]):
             require(manager_child.poll() is None, "lost original manager during acceptance")
-            current = bus_unit_observation(dbus, private_connection, private_object)
+            current = observe_units()
             observed.update(current)
             observed["driver_pid"] = int(daemon.GetConnectionUnixProcessID("org.freedesktop.DBus", timeout=5))
             observed["driver_uid"] = int(daemon.GetConnectionUnixUser("org.freedesktop.DBus", timeout=5))
@@ -809,8 +964,10 @@ def worker(document):
         # private connection. Never reconnect after loss or mutate a found PID.
         if bus_proof is not None and private_connection is not None:
             try:
-                cleanup["bus"] = stop_original_bus(dbus, private_connection, private_object, bus_proof, time.monotonic() + 20)
-                dbus.Interface(private_object, IFACE).Exit(timeout=5)
+                cleanup_deadline = time.monotonic() + 20
+                cleanup["bus"] = stop_original_bus(lambda: observe_units(deadline=cleanup_deadline),
+                                                   private_connection, bus_proof, cleanup_deadline)
+                private_connection.exit(5)
                 manager_child.wait(timeout=5)
             except Exception as error:
                 errors.append("original managed bus shutdown: " + str(error))

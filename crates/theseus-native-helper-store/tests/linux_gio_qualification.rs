@@ -1,4 +1,9 @@
 //! File/ledger models only: synthetic ELF-shaped data is never loaded or executed.
+// Linux GIO qualification artifact roots are POSIX absolute paths by protocol
+// contract (`LinuxQualifiedArtifact::validate`); a Windows temp root such as
+// `C:\...` is correctly refused, so the file graph cannot be built there. Unix
+// hosts keep both the Linux retention path and the non-Linux refusal branch.
+#![cfg(unix)]
 #[path = "../../theseus-native-protocol/tests/support/linux_gio_qualification.rs"]
 mod support;
 use sha2::{Digest as _, Sha256};

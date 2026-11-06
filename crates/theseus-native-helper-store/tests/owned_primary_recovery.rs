@@ -63,7 +63,9 @@ fn owned_primary_store_reopen_preserves_original_pending_and_retirement_without_
         OwnedPrimaryState::Pending
     );
     assert!(!pending.original_retired());
-    let bytes = std::fs::read(temp.path().join("ledger/ledger.bin")).unwrap();
+    // Physical reads go through the store's own locked handle while it is open;
+    // Windows byte-range locks refuse reads through any other handle.
+    let bytes = store.read_physical().unwrap();
     let bad = Record::new(
         3,
         Entry::Broker {
@@ -77,10 +79,7 @@ fn owned_primary_store_reopen_preserves_original_pending_and_retirement_without_
     )
     .unwrap();
     assert!(store.append(bad).is_err());
-    assert_eq!(
-        std::fs::read(temp.path().join("ledger/ledger.bin")).unwrap(),
-        bytes
-    );
+    assert_eq!(store.read_physical().unwrap(), bytes);
     push(
         &mut records,
         BrokerEvent::EffectRecorded {

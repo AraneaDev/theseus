@@ -87,7 +87,25 @@ whole exception chain, and keeps the exact unit's debug journal as evidence.
 macOS (first native helper-runtime run): two saturated-output tests exceeded their
 deadlines because the helper read one 4 KiB chunk per stream per worker tick; it
 now drains up to 16 bounded reads per tick. Windows: an export test compared a
-short 8.3 temp path with the export's canonical root. Final corrected-source
+short 8.3 temp path with the export's canonical root.
+
+The [fourth combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42247956461)
+at `f9f67b8` again passed all eight Docker suites and every earlier native gate,
+and each native job reached further. Linux: the private manager bootstrapped its
+own bus and public API within 53 ms, but the retained libdbus peer connection
+authenticated and was never served; the private channel now uses libsystemd's
+sd-bus client (as `systemctl` does) for stop/settle/exit only, exercised locally
+against a dbus-python peer server, with read-only observation over the verified public
+manager name. The real journal also showed the manager-synthesized `app.slice`
+and inactive not-found references, which the initial closed-unit check now admits.
+Windows ran its full workspace suite for the first time: the mandatory ledger lock
+refuses reads through other handles (tests now read through the owner), launchd
+origins are compared as POSIX literals, readiness deadlines compare instants
+exactly, and several fixtures assumed POSIX paths, long temp names or
+unprivileged handle semantics. macOS ran its six Source-owned desktop cases for
+the first time; all six failed because the desktop fixture's provider dispatch
+was compiled only on Linux. That is fixed and failed desktop steps now retain
+their fixture evidence; macOS execution of the fix is pending. Final corrected-source
 native acceptance, including real-manager execution, remains pending.
 
 Keep this queue and the checklists below current as work lands. Record source

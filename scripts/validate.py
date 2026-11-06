@@ -422,6 +422,62 @@ class Runner:
         return self.run(name, ['cargo', *arguments], timeout, required_cases=required_cases, require_tests=executing_tests)
 
 
+RETAINED_DESKTOP = re.compile(r'^retained desktop (?:fixture|endpoints): (.+?)\s*$', re.M)
+
+
+def retain_desktop_evidence(evidence, name, file_limit=4 * 1024 * 1024, total_limit=128 * 1024 * 1024):
+    """Evidence only, after a failed desktop step: copy bounded regular files from
+    the retained fixture/endpoint trees the step itself printed, which otherwise
+    stay outside the uploaded evidence. Never follows links; never raises."""
+    copied, total, notes = [], 0, []
+    try:
+        text = (evidence / f'{name}.log').read_text(encoding='utf-8', errors='replace')
+    except OSError as error:
+        return {'copied': [], 'notes': [f'log unreadable: {error}']}
+    target = evidence / 'retained-desktop' / name
+    for index, raw in enumerate(dict.fromkeys(RETAINED_DESKTOP.findall(text))):
+        source = pathlib.Path(raw)
+        if '\0' in raw or not source.is_absolute():
+            notes.append(f'skipped invalid {raw!r}')
+            continue
+        for directory, subdirectories, files in os.walk(source, followlinks=False):
+            for file_name in sorted(files):
+                path = pathlib.Path(directory) / file_name
+                try:
+                    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_BINARY', 0)
+                    descriptor = os.open(path, flags)
+                    with os.fdopen(descriptor, 'rb') as reader:
+                        st = os.fstat(reader.fileno())
+                        if not stat.S_ISREG(st.st_mode) or st.st_size > file_limit or total + st.st_size > total_limit:
+                            notes.append(f'skipped {path} ({st.st_size} bytes)')
+                            continue
+                        data = reader.read(file_limit + 1)
+                    if len(data) > file_limit:
+                        notes.append(f'skipped growing {path}')
+                        continue
+                    destination = target / str(index) / path.relative_to(source)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_bytes(data)
+                    total += len(data)
+                    copied.append(str(path))
+                except Exception as error:
+                    notes.append(f'unreadable {path}: {error}')
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        write_json(target / 'manifest.json', {'copied': copied, 'notes': notes[:2000], 'bytes': total})
+    except OSError:
+        pass
+    return {'copied': copied, 'notes': notes}
+
+
+def run_desktop(runner, name, command, cases):
+    try:
+        runner.run(name, command, timeout=600, required_cases=cases, require_tests=True)
+    except GateFailure:
+        retain_desktop_evidence(runner.evidence, name)
+        raise
+
+
 def load_pinned(runner):
     metadata = json.loads((runner.evidence / 'native-artifacts.json').read_text(encoding='utf-8'))
     verify_artifacts(metadata)
@@ -629,14 +685,14 @@ def native(runner, stage):
             'source_desktop_reinstall_same_tuple_requires_new_original_sut_generation',
             'source_desktop_ordinary_fresh_six_tool_mcp_keeps_exact_generations_and_saved_views',
         ]
-        runner.run('source-desktop-product', [metadata['native_desktop']['path'], 'source_desktop_', '--nocapture', '--test-threads=1'], timeout=600, required_cases=cases, require_tests=True)
+        run_desktop(runner, 'source-desktop-product', [metadata['native_desktop']['path'], 'source_desktop_', '--nocapture', '--test-threads=1'], cases)
         if platform.system() in ('Darwin', 'Windows'):
             entry_cases = [
                 'source_owned_native_entry_clean_releases_original_and_preserves_saved_views',
                 'source_owned_native_entry_upgrade_releases_each_original_generation',
                 'source_owned_native_entry_reinstall_releases_same_tuple_new_generation',
             ]
-            runner.run('source-owned-native-entry-product', [metadata['native_desktop']['path'], 'source_owned_native_entry_', '--nocapture', '--test-threads=1'], timeout=600, required_cases=entry_cases, require_tests=True)
+            run_desktop(runner, 'source-owned-native-entry-product', [metadata['native_desktop']['path'], 'source_owned_native_entry_', '--nocapture', '--test-threads=1'], entry_cases)
         manifest = manager_manifest(metadata, runner.host, platform.system())
         write_json(runner.evidence / 'native-manager-manifest.json', manifest)
     elif stage == 'release':

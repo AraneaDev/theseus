@@ -234,12 +234,17 @@ fn mcp_scenario(
         .to_owned();
     server.active = Some((instance.clone(), handle.clone()));
     let until = Instant::now() + Duration::from_secs(120);
+    let mut last_status = serde_json::Value::Null;
     let status = loop {
-        ensure!(Instant::now() < until, "desktop MCP completion deadline");
+        ensure!(
+            Instant::now() < until,
+            "desktop MCP completion deadline; last status: {last_status}"
+        );
         let status = server.application(
             "run_status",
             serde_json::json!({"server_instance":instance,"handle":handle,"refresh":true}),
         )?;
+        last_status = status.clone();
         if status["ok"] != true {
             ensure!(
                 status["error"]["code"] == "query_busy"

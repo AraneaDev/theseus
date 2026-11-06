@@ -181,6 +181,21 @@ impl LaunchdAuthority {
     pub fn plist_path(&self) -> PathBuf {
         self.definition_root.join(format!("{}.plist", self.label))
     }
+    /// The definition origin literal launchd itself reports. launchd paths are
+    /// always POSIX, so this is rendered with `/` independent of the build
+    /// host's separator (on macOS it equals `plist_path()` for every validated
+    /// root). Only a plain absolute POSIX root yields an origin.
+    pub fn plist_origin(&self) -> Option<String> {
+        let root = self
+            .definition_root
+            .to_str()
+            .filter(|r| plain_absolute(r))?;
+        Some(format!(
+            "{}/{}.plist",
+            root.strip_suffix('/').unwrap_or(root),
+            self.label
+        ))
+    }
     pub fn command(&self, command: LaunchctlCommand) -> io::Result<crate::process::NativeCommand> {
         self.validate()?;
         let mut native = crate::process::NativeCommand::new(&self.launchctl);
@@ -353,6 +368,23 @@ pub(super) mod tests {
             executable: "/fixture/service".into(),
             arguments: vec!["/fixture/service".into(), "literal $x; *".into()],
             working_directory: "/fixture".into(),
+        }
+    }
+    #[test]
+    fn launchd_origin_literal_is_posix_on_every_build_host() {
+        let mut a = authority();
+        assert_eq!(
+            a.plist_origin().as_deref(),
+            Some("/fixture/plists/org.theseus.fixture.plist")
+        );
+        a.definition_root = "/".into();
+        assert_eq!(
+            a.plist_origin().as_deref(),
+            Some("/org.theseus.fixture.plist")
+        );
+        for root in ["relative/plists", "/fixture/../plists", "/fixture//plists"] {
+            a.definition_root = root.into();
+            assert_eq!(a.plist_origin(), None, "{root}");
         }
     }
     const PLIST: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>Label</key><string>org.theseus.fixture</string><key>ProgramArguments</key><array><string>/fixture/service</string><string>literal $x; *</string></array><key>WorkingDirectory</key><string>/fixture</string><key>RunAtLoad</key><false/><key>KeepAlive</key><false/></dict></plist>";

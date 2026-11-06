@@ -582,7 +582,7 @@ fn check_loaded(
         Fact::Known(loaded)
             if loaded.label == authority.label
                 && loaded.domain == authority.domain
-                && Some(loaded.origin.as_str()) == authority.plist_path().to_str()
+                && authority.plist_origin().as_deref() == Some(loaded.origin.as_str())
                 && &loaded.definition == definition =>
         {
             Ok(())

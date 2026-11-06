@@ -278,6 +278,14 @@ impl LedgerStore {
     pub fn is_write_poisoned(&self) -> bool {
         self.poisoned
     }
+    /// Read the physical ledger bytes through this owner's locked file object.
+    /// The exclusive lock is mandatory on Windows, so other handles, including
+    /// handles in this process, cannot read the ledger while the store is open.
+    /// Diagnostic only: after an uncertain append these bytes are not evidence of
+    /// a valid commit; reopen and validate the full ledger before interpreting them.
+    pub fn read_physical(&mut self) -> Result<Vec<u8>, StoreError> {
+        Ok(self.file.read_bounded(ledger::MAX_LEDGER_BYTES)?)
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -333,13 +341,16 @@ mod tests {
             assert!(matches!(result,Err(StoreError::Io(ref e)) if e.raw_os_error()==Some(123)));
             assert!(s.is_write_poisoned());
             assert_eq!(s.records.len(), 1);
-            let physical = std::fs::read(tmp.path().join("l").join(LEDGER)).unwrap();
+            // Read through the owner's handle: Windows byte-range locks are
+            // mandatory and refuse reads through any other handle.
+            let physical = s.read_physical().unwrap();
             assert!(matches!(s.append(record), Err(StoreError::WritePoisoned)));
+            assert_eq!(s.read_physical().unwrap(), physical);
+            drop(s);
             assert_eq!(
                 std::fs::read(tmp.path().join("l").join(LEDGER)).unwrap(),
                 physical
             );
-            drop(s);
             let reopened = LedgerStore::open(
                 &l,
                 &w,

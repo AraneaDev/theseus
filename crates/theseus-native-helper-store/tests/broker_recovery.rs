@@ -123,17 +123,16 @@ fn original_broker_profile_uses_existing_locked_store_and_never_becomes_native_c
         .is_err()
     );
     let mut store = LedgerStore::open_broker(&ledger, &workspace, &h).unwrap();
-    let before = std::fs::read(temp.path().join("ledger/ledger.bin")).unwrap();
+    // Physical reads go through the store's own locked handle while it is open;
+    // Windows byte-range locks refuse reads through any other handle.
+    let before = store.read_physical().unwrap();
     for _ in 0..3 {
         let view = BrokerLedgerView::replay(store.records()).unwrap();
         assert_eq!(view.query(&request).unwrap().effect, BrokerEffect::Unknown);
         assert_eq!(view.query(&request).unwrap().owner, BrokerOwner::Lost);
         assert_eq!(view.accepted_count(), 1);
     }
-    assert_eq!(
-        std::fs::read(temp.path().join("ledger/ledger.bin")).unwrap(),
-        before
-    );
+    assert_eq!(store.read_physical().unwrap(), before);
     store
         .append(
             Record::new(

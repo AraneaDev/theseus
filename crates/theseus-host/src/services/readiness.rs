@@ -432,10 +432,14 @@ fn deadline_failure_at(
     if cancelled {
         return Ok(Some(ReadinessFailure::Cancelled));
     }
-    let Some(left) = deadline.checked_duration_since(now) else {
+    // Compare instants exactly. `checked_duration_since` is not a strict
+    // ordering test: on Windows std treats instants within one performance
+    // counter tick as equal and returns zero, so an instant already past the
+    // deadline would not expire it.
+    if now > deadline {
         return Ok(Some(ReadinessFailure::Deadline));
-    };
-    if left > Duration::from_secs(30) {
+    }
+    if deadline.duration_since(now) > Duration::from_secs(30) {
         return Err(invalid("readiness deadline exceeds 30 seconds"));
     }
     Ok(None)

@@ -191,7 +191,7 @@ fn parse(authority: &LaunchdAuthority, bytes: &[u8]) -> io::Result<LoadedService
     };
     decimal(required("active count")?)?;
     let origin = required("path")?;
-    if Some(origin) != authority.plist_path().to_str() || required("type")? != "LaunchAgent" {
+    if authority.plist_origin().as_deref() != Some(origin) || required("type")? != "LaunchAgent" {
         return Err(invalid("wrong loaded definition origin/type"));
     }
     let domain = required("domain")?;

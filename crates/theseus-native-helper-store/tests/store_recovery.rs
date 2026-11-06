@@ -11,13 +11,16 @@ fn append_receipt_tracks_physical_bytes_and_preflight_preserves_state() {
         LedgerStore::open(&f.ledger, &f.workspace, f.binding(b.workspace_marker())).unwrap();
     let r = s.append(reserved()).unwrap();
     assert_eq!(r.record(), &reserved());
-    assert_eq!(r.ledger_bytes(), f.bytes().len() as u64);
-    let before = f.bytes();
+    // While the store is open, physical bytes are read through its own locked
+    // handle; Windows refuses reads through any other handle.
+    let before = s.read_physical().unwrap();
+    assert_eq!(r.ledger_bytes(), before.len() as u64);
     assert!(s.append(reserved()).is_err());
-    assert_eq!(f.bytes(), before);
+    assert_eq!(s.read_physical().unwrap(), before);
     assert_eq!(s.records().len(), 2);
     assert!(!s.is_write_poisoned());
     drop(s);
+    assert_eq!(f.bytes(), before);
     let s = LedgerStore::open(&f.ledger, &f.workspace, f.binding(b.workspace_marker())).unwrap();
     assert_eq!(s.records().len(), 2);
 }

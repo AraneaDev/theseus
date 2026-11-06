@@ -1056,6 +1056,7 @@ mod native_pipe_tests {
 #[cfg(test)]
 mod error_retention_tests {
     use super::*;
+    use windows_sys::Win32::Foundation::STATUS_CANCELLED;
     fn original() -> LocalChallenge {
         LocalChallenge {
             endpoint: NamedPipe::new(r"\\.\pipe\theseus.error-model".into()).unwrap(),
@@ -1079,9 +1080,13 @@ mod error_retention_tests {
     #[test]
     fn windows_native_error_identity_survives_abandon_and_cleanup_with_bounded_storage() {
         let mut channel = original();
+        // INVALID_HANDLE_VALUE (-1) is also GetCurrentProcess()'s pseudo-handle,
+        // so OpenProcessToken would succeed on it. A null handle is invalid
+        // for every native API used here and fails with ERROR_INVALID_HANDLE.
+        let invalid_handle: HANDLE = ptr::null_mut();
         let mut read = IoSlot::new(Kind::Body, vec![0; 4]).unwrap();
-        channel.retain_error(read.issue(INVALID_HANDLE_VALUE).unwrap_err());
-        let auth_error = match token_sid(INVALID_HANDLE_VALUE) {
+        channel.retain_error(read.issue(invalid_handle).unwrap_err());
+        let auth_error = match token_sid(invalid_handle) {
             Err(error) => error,
             Ok(_) => panic!("invalid process handle authenticated"),
         };
@@ -1149,10 +1154,14 @@ mod error_retention_tests {
     #[test]
     fn terminal_native_cancellation_errors_remain_on_original_channel() {
         let mut channel = original();
-        // Invalid native handles deterministically fail cancellation/completion;
+        // The pseudo-handle (-1) is a process, not a file object, so CancelIoEx
+        // deterministically fails. GetOverlappedResult never inspects the handle
+        // of a non-pending OVERLAPPED; it reports the terminal status recorded
+        // in OVERLAPPED.Internal. Model a terminal cancelled completion there;
         // no native operation owns the test slot's storage.
         channel.pipe = Some(Handle(INVALID_HANDLE_VALUE));
         let mut slot = IoSlot::new(Kind::Body, vec![0; 4]).unwrap();
+        slot.overlapped.Internal = STATUS_CANCELLED as u32 as usize;
         slot.pending = true;
         channel.active = Some(probe_state(Some(slot)));
         assert!(channel.settle_cancelled());
@@ -1181,6 +1190,13 @@ mod error_retention_tests {
                 .unwrap()
                 .api
                 == "GetOverlappedResult"
+        }));
+        assert!(channel.retained_errors.iter().any(|e| {
+            e.get_ref()
+                .and_then(|e| e.downcast_ref::<NativeError>())
+                .is_some_and(|e| {
+                    e.api == "GetOverlappedResult" && e.error.raw_os_error() == Some(995)
+                })
         }));
         channel.cleanup().unwrap();
         assert!(!channel.retained_errors.is_empty());

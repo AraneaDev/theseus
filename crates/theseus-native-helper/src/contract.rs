@@ -161,6 +161,10 @@ pub(crate) enum WorkerEvent {
     },
 }
 pub(crate) enum WorkerCommand {
+    /// Test-only: read the physical ledger through the worker's own locked
+    /// store handle. Windows byte-range locks refuse every other handle.
+    #[cfg(test)]
+    ReadPhysicalLedger(std::sync::mpsc::SyncSender<Result<Vec<u8>, String>>),
     Desktop {
         request: v2::Request,
         ticket: ResponseTicket,

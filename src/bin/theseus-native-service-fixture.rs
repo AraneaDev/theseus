@@ -1,8 +1,8 @@
 //! Compiled, explicitly supplied-context test fixture only.
-#[cfg(target_os = "linux")]
+// Desktop-only Source fixtures run on every native platform; only the
+// Combined (service + desktop) dispatch requires the supplied Linux manager.
 #[path = "../../tests/support/native_desktop_installer.rs"]
 mod desktop_installer;
-#[cfg(target_os = "linux")]
 #[path = "../../tests/support/native_desktop_provider.rs"]
 mod desktop_provider;
 #[path = "../../tests/support/native_service_installer.rs"]
@@ -47,7 +47,6 @@ fn combined_effects(
     }
 }
 fn execute(args: &[String]) -> anyhow::Result<()> {
-    #[cfg(target_os = "linux")]
     {
         use anyhow::{Context, ensure};
         let provider_call = args.first().is_some_and(|s| s == "provider");
@@ -64,6 +63,12 @@ fn execute(args: &[String]) -> anyhow::Result<()> {
             desktop || service,
             "source fixture has no declared integration"
         );
+        #[cfg(not(target_os = "linux"))]
+        ensure!(
+            !(desktop && service),
+            "combined source fixture is Linux-only"
+        );
+        #[cfg(target_os = "linux")]
         if desktop && service {
             ensure!(
                 config["integration_manifest"]["desktop_native"].is_null()
@@ -95,7 +100,7 @@ fn execute(args: &[String]) -> anyhow::Result<()> {
                 || desktop_installer::run(&desktop_args),
             );
         }
-        if desktop {
+        if desktop && !service {
             return if provider_call {
                 desktop_provider::run(&args[1..])
             } else {
