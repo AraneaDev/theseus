@@ -75,8 +75,20 @@ only after the held manager cgroup reports empty; uncertainty retains it. 22
 pure operator and 42 validation-driver controls pass and the change is
 independently reviewed; real-manager execution is still unproven. GitHub
 cancelled macOS for arm64 runner capacity before assigning a runner, and the
-old-source Docker job was cancelled. Final corrected-source native/Docker
-acceptance remains pending.
+old-source Docker job was cancelled.
+
+The [third combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42238957864)
+at `566194f` passed all eight Docker suites and the six Linux desktop cases; it is
+not acceptance because all three native jobs failed. Linux: the private manager
+started its managed bus, then qualification failed about five seconds later and
+the fail-closed cleanup error hid the primary exception; manager console logs
+were also dropped. The operator now retains the primary traceback, prints the
+whole exception chain, and keeps the exact unit's debug journal as evidence.
+macOS (first native helper-runtime run): two saturated-output tests exceeded their
+deadlines because the helper read one 4 KiB chunk per stream per worker tick; it
+now drains up to 16 bounded reads per tick. Windows: an export test compared a
+short 8.3 temp path with the export's canonical root. Final corrected-source
+native acceptance, including real-manager execution, remains pending.
 
 Keep this queue and the checklists below current as work lands. Record source
 implementation, review, local verification, CI acceptance and merge separately.

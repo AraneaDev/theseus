@@ -175,6 +175,36 @@ class Planning(unittest.TestCase):
             path.write_text(json.dumps({"kind": "x", "pad": "y" * (fixture.WORKER_CLEANUP_LIMIT + 1)}))
             self.assertIsNone(fixture.read_worker_cleanup(path))
 
+    def test_cleanup_failure_never_hides_primary_failure(self):
+        try:
+            try:
+                raise ValueError("unexpected private bus failure")
+            finally:
+                fixture.require(False, "original native cleanup incomplete")
+        except ValueError as error:
+            text = fixture.exception_chain(error)
+        self.assertLess(text.index("unexpected private bus failure"), text.index("original native cleanup incomplete"))
+        self.assertEqual(fixture.exception_chain(ValueError("only")), "only")
+
+    def test_manager_logs_reach_retained_journal_not_inaccessible_console(self):
+        env = fixture.make_plan(manifest(), "abcd1234abcd1234")["worker_environment"]
+        self.assertEqual(env["SYSTEMD_LOG_TARGET"], "journal")
+        cases = fixture.artifact_environment(fixture.make_plan(manifest(), "abcd1234abcd1234"))
+        self.assertEqual((cases["SYSTEMD_LOG_TARGET"], cases["SYSTEMD_LOG_LEVEL"]), ("console", "info"))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "service-journal.log"
+            observed = SimpleNamespace(stdout="systemd[17460]: Reached target\n", stderr="", returncode=0)
+            with patch.object(fixture.subprocess, "run", return_value=observed) as run:
+                fixture.retain_service_journal(path, "theseus-private-abcd1234abcd1234.service")
+            self.assertEqual(run.call_args.args[0][-1], "--unit=theseus-private-abcd1234abcd1234.service")
+            with patch.object(fixture.subprocess, "run", return_value=observed):
+                fixture.retain_service_journal(path, "theseus-private-abcd1234abcd1234.service")  # existing: never raises
+            self.assertIn("Reached target", path.read_text())
+            missing = Path(directory) / "missing.log"
+            with patch.object(fixture.subprocess, "run", side_effect=OSError("no journalctl")):
+                fixture.retain_service_journal(missing, "theseus-private-abcd1234abcd1234.service")
+            self.assertIn("journal unavailable", missing.read_text())
+
     def test_unreadable_worker_cleanup_is_uncertainty_not_a_lost_receipt(self):
         good = {"kind": "theseus_original_manager_cleanup_v1", "manager_started": True, "manager": {"joined_status": 0}, "manager_scope_empty": True, "errors": []}
         with tempfile.TemporaryDirectory() as directory:

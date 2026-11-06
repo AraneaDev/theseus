@@ -166,7 +166,8 @@ class ExportExamples(unittest.TestCase):
             result = examples.export(root, metadata, output)
             self.assertEqual((output / 'config.json').read_bytes(), original)
             self.assertEqual((output / 'graph.json').read_bytes(), (root / 'graph.json').read_bytes())
-            self.assertEqual(result['original_fixture_root'], str(root))
+            # Export records the canonical root (Windows expands 8.3 temp names).
+            self.assertEqual(result['original_fixture_root'], str(root.resolve(strict=True)))
             self.assertEqual(result['input_snapshot']['graph_sha256'], sha((root / 'graph.json').read_bytes()))
             self.assertEqual((root / 'config.json').read_text(), '{"provider_prepared":true}')
             examples.verify(output)

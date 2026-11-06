@@ -65,6 +65,11 @@ impl OutputState {
         self.truncated |= retain < n;
         Ok((offset, retain))
     }
+    /// The run transcript is already lossy (truncated) or its lifetime wire
+    /// reservation is spent, so a permitless discard loses no completeness.
+    pub(crate) fn discard_preserves_completeness(&self) -> bool {
+        self.truncated || self.reserved >= 16384
+    }
     pub(crate) fn boundary(&self) -> FinalBoundary {
         FinalBoundary {
             key: self.key,
@@ -133,6 +138,28 @@ mod tests {
         );
         assert!(out.truncated);
         assert_eq!(out.stdout + out.stderr, 20480);
+    }
+    #[test]
+    fn permitless_discard_batching_only_after_transcript_is_already_lossy() {
+        use theseus_native_protocol::v2::Channel;
+        let key = crate::contract::RunKey {
+            lease: theseus_native_protocol::v2::LeaseId::from_bytes([1; 16]),
+            operation: theseus_native_protocol::v2::OperationId::from_bytes([2; 16]),
+            generation: 1,
+        };
+        let mut out = OutputState::new(key);
+        assert!(!out.discard_preserves_completeness());
+        assert_eq!(out.observe(Channel::Stdout, 4096, true).unwrap().1, 4096);
+        // Delivered complete output: a burst must wait for returned permits.
+        assert!(!out.discard_preserves_completeness());
+        assert_eq!(out.observe(Channel::Stderr, 4096, false).unwrap().1, 0);
+        assert!(out.truncated && out.discard_preserves_completeness());
+        let mut spent = OutputState::new(key);
+        assert_eq!(
+            spent.observe(Channel::Stdout, 16384, true).unwrap().1,
+            16384
+        );
+        assert!(!spent.truncated && spent.discard_preserves_completeness());
     }
 }
 

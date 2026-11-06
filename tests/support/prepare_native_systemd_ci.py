@@ -22,6 +22,7 @@ import struct
 import subprocess
 import sys
 import time
+import traceback
 
 BINARY_ENV = (
     "THESEUS_NATIVE_HELPER_BINARY", "THESEUS_NATIVE_SERVICE_FIXTURE",
@@ -229,7 +230,9 @@ def make_plan(manifest, token):
         # systemd's user manager also opens a system-bus client for cgroup
         # notifications. Keep even that client on our owned private bus.
         "DBUS_SYSTEM_BUS_ADDRESS": "unix:path=" + root + "/runtime/bus",
-        "SYSTEMD_LOG_TARGET": "console", "SYSTEMD_LOG_LEVEL": "info",
+        # Manager logs go to the journal (retained by the operator for this exact
+        # unit only); manager.log stayed empty with the console target.
+        "SYSTEMD_LOG_TARGET": "journal", "SYSTEMD_LOG_LEVEL": "debug",
         "CI": "true", "GITHUB_ACTIONS": "true", "RUNNER_OS": "Linux",
         "RUNNER_ENVIRONMENT": "github-hosted",
     }
@@ -274,6 +277,9 @@ def case_timeout(case):
 
 def artifact_environment(plan):
     environment = dict(plan["worker_environment"])
+    # Debug journal logging is manager evidence only; cases keep the previous
+    # stderr-visible systemd tool logging.
+    environment.update(SYSTEMD_LOG_TARGET="console", SYSTEMD_LOG_LEVEL="info")
     environment["THESEUS_NATIVE_SYSTEMD_RECEIPT"] = plan["root"] + "/manager-receipt.json"
     for name in BINARY_ENV:
         require(name in plan["manifest"]["artifacts"], "required original binary role absent")
@@ -401,6 +407,7 @@ def operator(plan, env):
             observed = subprocess.run(["/usr/bin/systemctl", "--system", "show", service_name, "--property=LoadState", "--property=ActiveState", "--property=InvocationID"], capture_output=True, text=True, env={"PATH": "/usr/bin:/bin"}, timeout=15)
             fields = dict(line.split("=", 1) for line in observed.stdout.splitlines() if "=" in line)
             write_new(root / "original-service-terminal.json", {"unit": service_name, "status": observed.returncode, "fields": fields, "stderr": observed.stderr})
+            retain_service_journal(root / "service-journal.log", service_name)
             owner_path = root / "worker-owner.json"
             owner = json.loads(owner_path.read_text()) if owner_path.is_file() else None
             joined_service = service_terminal(fields, owner["service_invocation_id"] if owner else None)
@@ -428,6 +435,33 @@ def operator(plan, env):
         os.close(root_fd)
         require(not account_created or cleanup.get("account_identity_retained") is not False, "original account identity lost; refusing account cleanup")
         require(not account_created or cleanup["account_removed"], "original account cleanup incomplete; inspect retained receipt")
+
+
+def retain_service_journal(path, service_name):
+    """Evidence only: read this exact unit's journal; never grants authority."""
+    try:
+        # --unit also includes PID 1's own UNIT= start/kill/timeout messages.
+        observed = subprocess.run(["/usr/bin/journalctl", "--system", "--no-pager", "--output=short-monotonic",
+                                   "--unit=" + service_name],
+                                  capture_output=True, text=True, env={"PATH": "/usr/bin:/bin"}, timeout=30)
+        text = observed.stdout + observed.stderr + f"\n[journalctl exit {observed.returncode}]\n"
+    except (OSError, subprocess.SubprocessError) as error:
+        text = f"[journal unavailable: {error}]\n"
+    try:
+        with Path(path).open("x") as handle:
+            handle.write(text[-4 * 1024 * 1024:])
+    except OSError as error:
+        print(f"service journal not retained: {error}", file=sys.stderr)
+
+
+def exception_chain(error):
+    """Primary failure first; a later cleanup error must never hide it."""
+    chain, seen = [], set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        chain.append(error)
+        error = error.__cause__ or error.__context__
+    return "; caused after: ".join(str(e) for e in reversed(chain))
 
 
 def join_original(child):
@@ -761,6 +795,10 @@ def worker(document):
             require(status == 0 and "running 1 test" in text and "1 passed; 0 failed; 0 ignored" in text, "mandatory native case failed or did not execute: " + case["name"])
             results.append({"case": case, "command": command, "status": status, "owner": joined, "log_sha256": hashlib.sha256(output_path.read_bytes()).hexdigest()})
         write_new(root / "result.json", {"kind": "theseus_real_systemd_ci_acceptance", "schema": 1, "qualification_sha256": hashlib.sha256((root / "qualification.json").read_bytes()).hexdigest(), "cases": results})
+    except BaseException:
+        cleanup["primary_error"] = traceback.format_exc()[-16384:]
+        print("original worker failure:\n" + cleanup["primary_error"], file=sys.stderr, flush=True)
+        raise
     finally:
         errors = []
         # Do not allow a second polite cancellation to interrupt original-owner
@@ -842,5 +880,5 @@ if __name__ == "__main__":
     try:
         main()
     except (ValueError, OSError, subprocess.SubprocessError) as error:
-        print(f"mandatory real systemd CI fixture failed: {error}", file=sys.stderr)
+        print(f"mandatory real systemd CI fixture failed: {exception_chain(error)}", file=sys.stderr)
         sys.exit(1)

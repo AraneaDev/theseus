@@ -1969,6 +1969,10 @@ impl Worker {
         }
     }
 }
+/// Bounded nonblocking reads per stream per worker tick. One read per tick
+/// capped child output at one 4 KiB read per sleep; small native pipes (macOS
+/// 16 KiB) then throttled the child far below the observed deadline budget.
+const READS_PER_TICK: usize = 16;
 fn read_stream(
     ports: &WorkerPorts,
     tokens: &mut Vec<DataPermit>,
@@ -1978,17 +1982,40 @@ fn read_stream(
     eof: &mut bool,
     channel: v2::Channel,
 ) -> io::Result<()> {
+    for read in 0..READS_PER_TICK {
+        // The first read keeps the original per-tick behavior. Later reads
+        // never discard a still-complete transcript for want of a permit:
+        // pipe backpressure waits for permits returned before the next tick.
+        if read > 0 && tokens.is_empty() && !out.discard_preserves_completeness() {
+            break;
+        }
+        if !read_stream_once(ports, tokens, out, outstanding, reader, eof, channel)? {
+            break;
+        }
+    }
+    Ok(())
+}
+/// Returns whether child bytes were read.
+fn read_stream_once(
+    ports: &WorkerPorts,
+    tokens: &mut Vec<DataPermit>,
+    out: &mut OutputState,
+    outstanding: &mut [Option<u32>; 4],
+    reader: &mut PipeReader,
+    eof: &mut bool,
+    channel: v2::Channel,
+) -> io::Result<bool> {
     if *eof {
-        return Ok(());
+        return Ok(false);
     }
     let mut discard = [0; 4096];
     let n = match reader.try_read(&mut discard) {
         Ok(0) => {
             *eof = true;
-            return Ok(());
+            return Ok(false);
         }
         Ok(n) => n,
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
         Err(e) => return Err(e),
     };
     let (offset, retain) = out.observe(channel, n, !tokens.is_empty())?;
@@ -2000,7 +2027,7 @@ fn read_stream(
             // Nonempty child bytes are actually discarded without a permit.
             control.mark_capture_saturated();
         }
-        return Ok(());
+        return Ok(true);
     }
     let mut permit = tokens.pop().unwrap();
     permit.storage[..retain].copy_from_slice(&discard[..retain]);
@@ -2027,7 +2054,7 @@ fn read_stream(
             tokens.push(chunk.permit)
         }
     }
-    Ok(())
+    Ok(true)
 }
 #[cfg(test)]
 mod tests {
