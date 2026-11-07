@@ -17,9 +17,12 @@ pub fn definition_bytes(definition: &v2::ServiceDefinition) -> Vec<u8> {
         .map(|arg| quote(arg))
         .collect::<Vec<_>>()
         .join(" ");
+    // systemd never unquotes path settings (CI10 real manager): WorkingDirectory
+    // is written literally. `$`, `%` and quotes are unsupported there and refused
+    // by the closed definition grammar.
     let mut text = format!(
         "[Unit]\nDescription=Theseus fixture\nDefaultDependencies=no\n[Service]\nType=simple\nRestart=no\nExecStart={command}\nWorkingDirectory={}\n",
-        quote(&definition.working_directory)
+        definition.working_directory
     );
     for env in &definition.environment {
         text.push_str(&format!("Environment={}\n", quote(env)));

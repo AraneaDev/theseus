@@ -86,7 +86,9 @@ def parse_definition(raw):
         if entries.get("DefaultDependencies", "no") != "no" or entries.get("Type", "simple") != "simple" or entries.get("Restart", "no") != "no":
             raise ValueError("only no-dependency simple/no-restart fixture units are supported")
         argv = shlex.split(entries.get("ExecStart", ""))
-        cwd = shlex.split(entries.get("WorkingDirectory", ""))
+        # Real systemd reads path settings literally and never strips quotes.
+        literal = entries.get("WorkingDirectory", "").strip()
+        cwd = [literal] if literal and not any(c in literal for c in "\"'") else []
         if not argv or not argv[0].startswith("/") or len(argv) > 64 or len(cwd) != 1 or not cwd[0].startswith("/"):
             raise ValueError("exact absolute command and working directory required")
         if "$" in entries["ExecStart"] or "%" in text:

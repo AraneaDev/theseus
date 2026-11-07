@@ -342,6 +342,15 @@ pub fn run(args: &[String]) -> Result<()> {
                     );
                 }
                 std::fs::copy(source, &reader)?;
+                // CopyFileW also copies the pinned source image's read-only
+                // attribute; the installed reader is SUT-owned and removable.
+                #[cfg(windows)]
+                {
+                    let mut permissions = std::fs::metadata(&reader)?.permissions();
+                    #[allow(clippy::permissions_set_readonly_false)]
+                    permissions.set_readonly(false);
+                    std::fs::set_permissions(&reader, permissions)?;
+                }
                 if existing.is_none() {
                     root.publish(std::ffi::OsStr::new("app"), &mut |f| {
                         f.write_all(b"theseus fixture app\n")

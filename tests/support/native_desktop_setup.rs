@@ -346,6 +346,18 @@ impl DesktopFixture {
         let temporary = std::env::temp_dir();
         #[cfg(unix)]
         let temporary = temporary.canonicalize()?;
+        // Runner %TEMP% is an 8.3 alias (C:\Users\RUNNER~1\...). Pinned
+        // image paths are compared exactly (e.g. the controller's own
+        // current_exe), so the fixture root uses the resolved long-name form.
+        #[cfg(windows)]
+        let temporary = PathBuf::from(
+            temporary
+                .canonicalize()?
+                .to_str()
+                .context("UTF-8 temporary directory")?
+                .strip_prefix(r"\\?\")
+                .context("verbatim drive temporary directory")?,
+        );
         let directory = tempfile::tempdir_in(temporary)?;
         let fixture_root = directory.path().join("fixture");
         HostDir::create_private(&fixture_root)?;
@@ -397,6 +409,14 @@ impl DesktopFixture {
             {
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o500))?;
+            }
+            // Pinned images must be immutable; FixtureExecutablePins requires
+            // the Windows read-only attribute (as the service setup sets).
+            #[cfg(not(unix))]
+            {
+                let mut permissions = std::fs::metadata(&destination)?.permissions();
+                permissions.set_readonly(true);
+                std::fs::set_permissions(&destination, permissions)?;
             }
             Ok(destination)
         };

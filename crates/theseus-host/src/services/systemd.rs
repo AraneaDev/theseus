@@ -1195,10 +1195,15 @@ fn validate_definition_source(bytes: &[u8]) -> io::Result<()> {
             ("[Unit]", "DefaultDependencies") => value == "no",
             ("[Service]", "Type") => value == "simple",
             ("[Service]", "Restart") => value == "no",
-            ("[Service]", "ExecStart" | "WorkingDirectory") => {
+            ("[Service]", "ExecStart") => {
                 !value.is_empty()
                     && !value.contains(['$', '%'])
                     && (value.starts_with('/') || value.starts_with("\"/"))
+            }
+            // A real manager reads path settings literally (quotes are never
+            // stripped), so only an unquoted absolute literal is admitted.
+            ("[Service]", "WorkingDirectory") => {
+                value.starts_with('/') && !value.contains(['$', '%', '"', '\''])
             }
             ("[Service]", "Environment") => !value.contains('%'),
             _ => false,
@@ -1243,6 +1248,32 @@ mod definition_model_tests {
         for prefix in ["+", "!", "@", "-", ":"] {
             let text = format!("[Service]\nExecStart={prefix}/fixture/service\n");
             assert!(validate_definition_source(text.as_bytes()).is_err());
+        }
+    }
+    #[test]
+    fn working_directory_is_admitted_only_as_the_literal_a_real_manager_reads() {
+        // CI10 real systemd keeps quotes in path settings, so a quoted
+        // WorkingDirectory would name a different, relative directory.
+        let base = "[Unit]\nDescription=Theseus fixture\nDefaultDependencies=no\n[Service]\nType=simple\nRestart=no\nExecStart=\"/fixture/service\" \"service\"\n";
+        assert!(
+            validate_definition_source(
+                format!("{base}WorkingDirectory=/fixture/work dir\n").as_bytes()
+            )
+            .is_ok()
+        );
+        for value in [
+            "\"/fixture\"",
+            "'/fixture'",
+            "fixture",
+            "/fix\"ture",
+            "/fixture/%h",
+            "/fixture/$HOME",
+        ] {
+            assert!(
+                validate_definition_source(format!("{base}WorkingDirectory={value}\n").as_bytes())
+                    .is_err(),
+                "{value}"
+            );
         }
     }
     #[test]
