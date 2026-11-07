@@ -287,7 +287,17 @@ named the refused step `transition_admission`: an admitted SUT upgrade stops and
 restarts the service, but the retained SCM handle kept its earlier process pin, so
 the new process looked like an unadmitted restart. Admission now opens a fresh
 runtime interval exactly as the helper's own start does; any later unadmitted
-restart still revokes. Final corrected-source native acceptance remains pending.
+restart still revokes.
+
+The [twenty-first combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42393948658)
+at `1ff9932` passed all eight Docker suites and the complete Linux and macOS native
+jobs, and Windows passed its first five real SCM cases including upgrade from a
+running service. The remaining case showed that a service record marked for
+deletion still opens by name while handles keep it alive, which deletion polling
+had classified as an unrelated same-name object; a read-only configuration query
+now distinguishes the delete-pending record (exactly `ERROR_SERVICE_MARKED_FOR_DELETE`)
+from a live same-name service, which remains a terminal refusal. Final
+corrected-source native acceptance remains pending.
 
 Keep this queue and the checklists below current as work lands. Record source
 implementation, review, local verification, CI acceptance and merge separately.

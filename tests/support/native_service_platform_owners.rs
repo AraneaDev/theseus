@@ -187,11 +187,13 @@ fn scm_delete_success_remains_pending_until_original_handles_close_and_name_is_a
         .close_after_sut_delete(&mut original, delete_receipt, deadline, &cancel)
         .unwrap();
     assert!(original.original_handle_closed());
-    assert_ne!(
+    // The extra handle keeps the marked record openable; it must read as
+    // the original's pending deletion, never as an unrelated same-name object.
+    assert_eq!(
         manager
             .poll_deletion(&mut deletion, deadline, &cancel)
             .unwrap(),
-        host::DeletionProgress::Complete,
+        host::DeletionProgress::Pending,
         "extra original SC_HANDLE keeps real deletion pending"
     );
     extra.close();

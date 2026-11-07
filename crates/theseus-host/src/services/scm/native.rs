@@ -771,11 +771,34 @@ impl ScmManager {
                 raw,
                 errors: self.errors.clone(),
             };
+            // OpenServiceW still succeeds on a record that is marked for
+            // deletion while any handle (or services.exe cleanup) keeps it.
+            // Only a read-only config query on this observation handle that
+            // fails with exactly ERROR_SERVICE_MARKED_FOR_DELETE proves the
+            // delete-pending record; no new same-name service can be created
+            // while it exists. A readable configuration is a live same-name
+            // object and stays terminal. Nothing is adopted or mutated.
+            // One QueryServiceConfigW distinguishes the two states. The
+            // expected 1072 is not retained (it recurs every poll); any other
+            // native error is retained exactly as before.
+            let probe: Errors = Rc::default();
+            let name = match config_buffer(raw, None, &probe) {
+                Err(e) if e.raw_os_error() == Some(MARKED_FOR_DELETE as i32) => {
+                    NameObservation::MarkedForDeletion
+                }
+                Ok(_) => NameObservation::Present,
+                Err(e) => {
+                    self.errors
+                        .borrow_mut()
+                        .extend(probe.borrow_mut().drain(..));
+                    NameObservation::Unknown(e.raw_os_error().unwrap_or(0) as u32)
+                }
+            };
             if let Err(e) = observation.close() {
                 owner.progress = DeletionProgress::Unknown(e.raw_os_error().unwrap_or(0) as u32);
                 return Ok(owner.progress);
             }
-            NameObservation::Present
+            name
         };
         owner.progress = normalize_deletion(true, true, name);
         Ok(owner.progress)
