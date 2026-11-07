@@ -248,6 +248,7 @@ impl Pump {
                     }
                     v2::Reply::Refused {
                         code: v2::RefusalCode::OwnershipPending,
+                        ..
                     } => {
                         let seq = self
                             .queue(v2::Message::Request {
@@ -531,6 +532,7 @@ pub(crate) mod tests {
                 reply_to: 1,
                 result: v2::Reply::Refused {
                     code: v2::RefusalCode::OwnershipPending,
+                    inspect_failure: None,
                 },
             },
         )
@@ -773,7 +775,8 @@ mod file_wire_tests {
                 Some(Event::Reply {
                     request: RequestId(42),
                     reply: v2::Reply::Refused {
-                        code: v2::RefusalCode::Unsupported
+                        code: v2::RefusalCode::Unsupported,
+                        ..
                     }
                 })
             ));

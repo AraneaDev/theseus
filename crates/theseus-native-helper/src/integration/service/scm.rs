@@ -69,44 +69,66 @@ impl ServiceRuntime {
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> io::Result<v2::ServiceObservation> {
+        use v2::InspectFailure as F;
         if slot != self.config.authority().slot() {
-            return Err(io::Error::other("undeclared service slot"));
+            return classify(
+                F::SlotUndeclared,
+                Err(io::Error::other("undeclared service slot")),
+            );
         }
-        self.ensure_readiness_channel()?;
-        self.manager(deadline, cancel)?;
+        let readiness_step = if self.readiness.is_none() {
+            F::ReadinessBind
+        } else {
+            F::ReadinessRenewal
+        };
+        classify(readiness_step, self.ensure_readiness_channel())?;
+        classify(
+            F::ManagerConnect,
+            self.manager(deadline, cancel).map(|_| ()),
+        )?;
         if self.owner.is_some()
             && self.deletion.is_none()
             && let Some((program, receipt)) = self.sut_transition.clone()
         {
             if program == "uninstall" {
-                let status = self
-                    .manager
-                    .as_mut()
-                    .unwrap()
-                    .inspect(deadline, cancel)?
-                    .status;
+                let status = classify(
+                    F::UninstallTransition,
+                    self.manager.as_mut().unwrap().inspect(deadline, cancel),
+                )?
+                .status;
                 if scm_uninstall_allows_handle_close(status.map(|s| s.state)) {
                     // This explicit transition follows the accepted SUT uninstaller;
                     // it is local original-handle closure, never DeleteService repair.
-                    self.deletion = Some(self.manager.as_mut().unwrap().close_after_sut_delete(
-                        self.owner.as_mut().unwrap(),
-                        receipt,
-                        deadline,
-                        cancel,
+                    self.deletion = Some(classify(
+                        F::UninstallTransition,
+                        self.manager.as_mut().unwrap().close_after_sut_delete(
+                            self.owner.as_mut().unwrap(),
+                            receipt,
+                            deadline,
+                            cancel,
+                        ),
                     )?);
                 }
             } else {
-                let d = self.transition_definition(&program)?;
-                self.manager.as_mut().unwrap().admit_configuration(
-                    self.owner.as_mut().unwrap(),
-                    &raw_definition(
-                        d.scm
-                            .as_ref()
-                            .ok_or_else(|| io::Error::other("raw SCM definition missing"))?,
+                let d = classify(
+                    F::TransitionDefinition,
+                    self.transition_definition(&program),
+                )?;
+                let raw = classify(
+                    F::TransitionDefinition,
+                    d.scm
+                        .as_ref()
+                        .ok_or_else(|| io::Error::other("raw SCM definition missing")),
+                )?;
+                classify(
+                    F::TransitionAdmission,
+                    self.manager.as_mut().unwrap().admit_configuration(
+                        self.owner.as_mut().unwrap(),
+                        &raw_definition(raw),
+                        receipt,
+                        deadline,
+                        cancel,
                     ),
-                    receipt,
-                    deadline,
-                    cancel,
                 )?;
             }
             if program != "uninstall" || self.deletion.is_some() {
@@ -114,56 +136,68 @@ impl ServiceRuntime {
             }
         }
         if let Some(owner) = &mut self.deletion {
-            let progress = self
-                .manager
-                .as_mut()
-                .unwrap()
-                .poll_deletion(owner, deadline, cancel)?;
+            let progress = classify(
+                F::DeletionProgress,
+                self.manager
+                    .as_mut()
+                    .unwrap()
+                    .poll_deletion(owner, deadline, cancel),
+            )?;
             let (present, complete) = match progress {
                 host::DeletionProgress::Complete => (false, true),
                 host::DeletionProgress::SameNamePresent => (true, true),
                 _ => (true, false),
             };
-            return self.bind_observation(
-                lease,
-                v2::ServiceObservation {
-                    platform: Some(v2::ServicePlatformFacts::Scm {
-                        next_start: None,
-                        registration: match progress {
-                            host::DeletionProgress::Complete => v2::ScmRegistrationState::Absent,
-                            host::DeletionProgress::SameNamePresent => {
-                                v2::ScmRegistrationState::SameNamePresent
-                            }
-                            host::DeletionProgress::Pending => {
-                                v2::ScmRegistrationState::DeletePending
-                            }
-                            host::DeletionProgress::Unknown(_) => v2::ScmRegistrationState::Unknown,
-                        },
-                        status: None,
-                        configured_account_sid: None,
-                        child_token_measured: false,
-                        original_handle_retained: false,
-                    }),
-                    instance: self.instance.clone(),
-                    slot: slot.clone(),
-                    registration_present: present,
-                    definition_digest: None,
-                    configured: false,
-                    running: false,
-                    origin: None,
-                    manager_generation: self
-                        .config
-                        .context
-                        .manager_unique_name
-                        .clone()
-                        .expect("validated service context"),
-                    complete,
-                    binding_digest: String::new(),
-                },
-                None,
+            return classify(
+                F::ObservationBinding,
+                self.bind_observation(
+                    lease,
+                    v2::ServiceObservation {
+                        platform: Some(v2::ServicePlatformFacts::Scm {
+                            next_start: None,
+                            registration: match progress {
+                                host::DeletionProgress::Complete => {
+                                    v2::ScmRegistrationState::Absent
+                                }
+                                host::DeletionProgress::SameNamePresent => {
+                                    v2::ScmRegistrationState::SameNamePresent
+                                }
+                                host::DeletionProgress::Pending => {
+                                    v2::ScmRegistrationState::DeletePending
+                                }
+                                host::DeletionProgress::Unknown(_) => {
+                                    v2::ScmRegistrationState::Unknown
+                                }
+                            },
+                            status: None,
+                            configured_account_sid: None,
+                            child_token_measured: false,
+                            original_handle_retained: false,
+                        }),
+                        instance: self.instance.clone(),
+                        slot: slot.clone(),
+                        registration_present: present,
+                        definition_digest: None,
+                        configured: false,
+                        running: false,
+                        origin: None,
+                        manager_generation: self
+                            .config
+                            .context
+                            .manager_unique_name
+                            .clone()
+                            .expect("validated service context"),
+                        complete,
+                        binding_digest: String::new(),
+                    },
+                    None,
+                ),
             );
         }
-        let observed = self.manager.as_mut().unwrap().inspect(deadline, cancel)?;
+        let observed = classify(
+            F::ManagerQuery,
+            self.manager.as_mut().unwrap().inspect(deadline, cancel),
+        )?;
         if self.manager.as_ref().is_some_and(|m| m.is_revoked()) {
             self.uncertain = true;
         }
@@ -181,16 +215,20 @@ impl ServiceRuntime {
         if self.owner.is_none()
             && let (Some(d), Some(receipt)) = (&definition, &self.install_receipt)
         {
-            let raw = raw_definition(
+            let raw = raw_definition(classify(
+                F::RegistrationQualification,
                 d.scm
                     .as_ref()
-                    .ok_or_else(|| io::Error::other("raw SCM definition missing"))?,
-            );
-            self.owner = Some(self.manager.as_mut().unwrap().qualify_registration(
-                &raw,
-                receipt.clone(),
-                deadline,
-                cancel,
+                    .ok_or_else(|| io::Error::other("raw SCM definition missing")),
+            )?);
+            self.owner = Some(classify(
+                F::RegistrationQualification,
+                self.manager.as_mut().unwrap().qualify_registration(
+                    &raw,
+                    receipt.clone(),
+                    deadline,
+                    cancel,
+                ),
             )?);
             self.sut_transition = None;
         }
@@ -245,7 +283,7 @@ impl ServiceRuntime {
             {
                 self.uncertain = true;
                 self.manager.as_mut().unwrap().revoke_context();
-                return Err(error);
+                return classify(F::ActivationPid, Err(error));
             }
             self.instance = self
                 .config
@@ -261,29 +299,32 @@ impl ServiceRuntime {
                 && observed
                     .status
                     .is_some_and(|s| scm_runtime_complete(s.state)));
-        self.bind_observation(
-            lease,
-            v2::ServiceObservation {
-                platform,
-                instance: self.instance.clone(),
-                slot: slot.clone(),
-                registration_present: !absent,
-                definition_digest: definition.as_ref().map(|d| d.definition_sha256.clone()),
-                configured: definition.is_some(),
-                running: observed
-                    .status
-                    .is_some_and(|s| s.state() == host::RuntimeState::Running),
-                origin: None,
-                manager_generation: self
-                    .config
-                    .context
-                    .manager_unique_name
-                    .clone()
-                    .expect("validated service context"),
-                complete,
-                binding_digest: String::new(),
-            },
-            definition,
+        classify(
+            F::ObservationBinding,
+            self.bind_observation(
+                lease,
+                v2::ServiceObservation {
+                    platform,
+                    instance: self.instance.clone(),
+                    slot: slot.clone(),
+                    registration_present: !absent,
+                    definition_digest: definition.as_ref().map(|d| d.definition_sha256.clone()),
+                    configured: definition.is_some(),
+                    running: observed
+                        .status
+                        .is_some_and(|s| s.state() == host::RuntimeState::Running),
+                    origin: None,
+                    manager_generation: self
+                        .config
+                        .context
+                        .manager_unique_name
+                        .clone()
+                        .expect("validated service context"),
+                    complete,
+                    binding_digest: String::new(),
+                },
+                definition,
+            ),
         )
     }
     fn ensure_readiness_channel(&mut self) -> io::Result<()> {

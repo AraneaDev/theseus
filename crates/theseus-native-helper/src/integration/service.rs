@@ -7,6 +7,50 @@ mod launchd;
 #[cfg(windows)]
 #[path = "service/scm.rs"]
 mod scm;
+/// A failed inspection step with its closed classification. Display and the
+/// retained error stay the original error; only `failure`, a fixed protocol
+/// name, may leave the helper (in the OwnershipPending refusal).
+#[derive(Debug)]
+/// Wraps the original inspect error: `Display`, `kind()` and `source()` are
+/// preserved, but `raw_os_error()` and downcasts apply to the inner error, so
+/// evidence formatting must reach the native code through `source()`.
+struct ClassifiedInspect {
+    failure: v2::InspectFailure,
+    source: io::Error,
+}
+impl std::fmt::Display for ClassifiedInspect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
+    }
+}
+impl std::error::Error for ClassifiedInspect {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+// launchd inspection is not yet tagged (its refusals report Unclassified).
+#[cfg(any(target_os = "linux", windows, test))]
+/// Tag a failed inspection step at its call site. The innermost (first)
+/// classification wins; the error kind is preserved.
+pub(crate) fn classify<T>(failure: v2::InspectFailure, result: io::Result<T>) -> io::Result<T> {
+    result.map_err(|source| {
+        if source
+            .get_ref()
+            .is_some_and(|inner| inner.is::<ClassifiedInspect>())
+        {
+            return source;
+        }
+        io::Error::new(source.kind(), ClassifiedInspect { failure, source })
+    })
+}
+/// The closed classification of a refused inspection; untagged errors are
+/// `Unclassified`. No error text is ever derived from or carried by it.
+pub(crate) fn inspect_failure(error: &io::Error) -> v2::InspectFailure {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<ClassifiedInspect>())
+        .map_or(v2::InspectFailure::Unclassified, |c| c.failure)
+}
 /// A cause interval contains accepted identities, never a reconstructed manager
 /// name or PID. A successful SUT mutation closes the previous Start interval.
 #[derive(Default)]
@@ -292,11 +336,27 @@ impl ServiceRuntime {
     ) -> io::Result<v2::ServiceObservation> {
         use sha2::{Digest as _, Sha256};
         use theseus_host::services::systemd::SystemdDefinition;
+        use v2::InspectFailure as F;
         if slot != self.config.authority().slot() {
-            return Err(io::Error::other("undeclared service slot"));
+            return classify(
+                F::SlotUndeclared,
+                Err(io::Error::other("undeclared service slot")),
+            );
         }
-        self.ensure_readiness_channel()?;
-        let observation = self.manager(deadline, cancel)?.inspect(deadline, cancel)?;
+        let readiness_step = if self.readiness.is_none() {
+            F::ReadinessBind
+        } else {
+            F::ReadinessRenewal
+        };
+        classify(readiness_step, self.ensure_readiness_channel())?;
+        classify(
+            F::ManagerConnect,
+            self.manager(deadline, cancel).map(|_| ()),
+        )?;
+        let observation = classify(
+            F::ManagerQuery,
+            self.manager.as_mut().unwrap().inspect(deadline, cancel),
+        )?;
         let actual_definition_digest = observation
             .definition_bytes
             .as_ref()
@@ -320,7 +380,10 @@ impl ServiceRuntime {
         if let Some((program, receipt)) = self.sut_transition.clone()
             && program != "uninstall"
         {
-            let expected = self.transition_definition(&program)?;
+            let expected = classify(
+                F::TransitionDefinition,
+                self.transition_definition(&program),
+            )?;
             if definition.as_ref() == Some(&expected) {
                 let raw = SystemdDefinition {
                     executable: expected.executable.clone(),
@@ -329,24 +392,28 @@ impl ServiceRuntime {
                     working_directory: expected.working_directory.clone(),
                 };
                 if let Some(owner) = self.owner.as_mut() {
-                    self.manager.as_mut().unwrap().admit_configuration(
-                        owner,
-                        &raw,
+                    let bytes = classify(
+                        F::TransitionAdmission,
                         observation
                             .definition_bytes
                             .as_deref()
-                            .ok_or_else(|| io::Error::other("SUT definition bytes missing"))?,
-                        receipt,
-                        deadline,
-                        cancel,
+                            .ok_or_else(|| io::Error::other("SUT definition bytes missing")),
                     )?;
-                } else {
-                    self.owner = Some(
+                    classify(
+                        F::TransitionAdmission,
                         self.manager
                             .as_mut()
                             .unwrap()
-                            .qualify_registration(&raw, receipt, deadline, cancel)?,
-                    );
+                            .admit_configuration(owner, &raw, bytes, receipt, deadline, cancel),
+                    )?;
+                } else {
+                    self.owner = Some(classify(
+                        F::RegistrationQualification,
+                        self.manager
+                            .as_mut()
+                            .unwrap()
+                            .qualify_registration(&raw, receipt, deadline, cancel),
+                    )?);
                 }
             } else if self.owner.is_some() {
                 // Preserve the complete known SUT mismatch as an observation,
@@ -392,10 +459,13 @@ impl ServiceRuntime {
                 .as_ref()
                 .is_some_and(|(p, _)| p == "uninstall")
         {
-            self.manager
-                .as_mut()
-                .unwrap()
-                .verify_registration(owner, deadline, cancel)?;
+            classify(
+                F::RegistrationQualification,
+                self.manager
+                    .as_mut()
+                    .unwrap()
+                    .verify_registration(owner, deadline, cancel),
+            )?;
         }
         if self.activation.from_sut
             && result.running
@@ -410,14 +480,17 @@ impl ServiceRuntime {
         let mut hash = Sha256::new();
         hash.update(b"theseus.native_integration_v1.service_binding\0");
         hash.update(
-            self.config
-                .context
-                .digest()
-                .map_err(io::Error::other)?
-                .to_hex(),
+            classify(
+                F::ObservationBinding,
+                self.config.context.digest().map_err(io::Error::other),
+            )?
+            .to_hex(),
         );
         hash.update(lease.to_hex());
-        hash.update(serde_json::to_vec(&result).map_err(io::Error::other)?);
+        hash.update(classify(
+            F::ObservationBinding,
+            serde_json::to_vec(&result).map_err(io::Error::other),
+        )?);
         let digest = v2::Digest::from_bytes(hash.finalize().into());
         result.binding_digest = digest.to_hex();
         self.binding = Some(digest);
@@ -1050,5 +1123,60 @@ mod activation_interval_tests {
             .unwrap();
         assert!(!interval.from_sut);
         assert!(!interval.complete);
+    }
+}
+
+#[cfg(test)]
+mod inspect_classification_tests {
+    use super::*;
+    use v2::InspectFailure as F;
+    #[test]
+    fn each_tagged_step_maps_to_its_closed_variant_and_keeps_the_original_error() {
+        for failure in F::ALL {
+            let error = classify::<()>(
+                failure,
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "native detail",
+                )),
+            )
+            .unwrap_err();
+            assert_eq!(inspect_failure(&error), failure);
+            // The retained helper error is unchanged; nothing derives from it.
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(error.to_string(), "native detail");
+        }
+        assert_eq!(classify(F::ManagerQuery, Ok(7)).unwrap(), 7);
+    }
+    #[test]
+    fn innermost_step_wins_and_untagged_errors_are_unclassified() {
+        // SCM nesting: a transition admission failure inside a later step.
+        let inner = classify::<()>(F::TransitionAdmission, Err(io::Error::other("x")));
+        let outer = classify(F::ObservationBinding, inner).unwrap_err();
+        assert_eq!(inspect_failure(&outer), F::TransitionAdmission);
+        assert_eq!(
+            inspect_failure(&io::Error::other("untagged")),
+            F::Unclassified
+        );
+    }
+    #[test]
+    fn scm_inspect_steps_use_distinct_closed_names() {
+        let scm = [
+            F::SlotUndeclared,
+            F::ReadinessBind,
+            F::ReadinessRenewal,
+            F::ManagerConnect,
+            F::UninstallTransition,
+            F::TransitionDefinition,
+            F::TransitionAdmission,
+            F::DeletionProgress,
+            F::ManagerQuery,
+            F::RegistrationQualification,
+            F::ActivationPid,
+            F::ObservationBinding,
+        ];
+        let names: std::collections::BTreeSet<_> = scm.iter().map(|f| f.name()).collect();
+        assert_eq!(names.len(), scm.len());
+        assert!(!scm.contains(&F::Unclassified));
     }
 }

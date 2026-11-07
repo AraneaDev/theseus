@@ -216,6 +216,59 @@ pub enum UnknownReason {
     ProcessStateUnproved,
     FileEffectUncertain,
 }
+/// Closed, fixed classification of a refused manager inspection step. It
+/// names only which helper step failed; it never carries native text, error
+/// codes, paths or identities, and never changes the refusal semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InspectFailure {
+    SlotUndeclared,
+    ReadinessBind,
+    ReadinessRenewal,
+    ManagerConnect,
+    UninstallTransition,
+    TransitionDefinition,
+    TransitionAdmission,
+    DeletionProgress,
+    ManagerQuery,
+    RegistrationQualification,
+    ActivationPid,
+    ObservationBinding,
+    Unclassified,
+}
+impl InspectFailure {
+    pub const ALL: [Self; 13] = [
+        Self::SlotUndeclared,
+        Self::ReadinessBind,
+        Self::ReadinessRenewal,
+        Self::ManagerConnect,
+        Self::UninstallTransition,
+        Self::TransitionDefinition,
+        Self::TransitionAdmission,
+        Self::DeletionProgress,
+        Self::ManagerQuery,
+        Self::RegistrationQualification,
+        Self::ActivationPid,
+        Self::ObservationBinding,
+        Self::Unclassified,
+    ];
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::SlotUndeclared => "slot_undeclared",
+            Self::ReadinessBind => "readiness_bind",
+            Self::ReadinessRenewal => "readiness_renewal",
+            Self::ManagerConnect => "manager_connect",
+            Self::UninstallTransition => "uninstall_transition",
+            Self::TransitionDefinition => "transition_definition",
+            Self::TransitionAdmission => "transition_admission",
+            Self::DeletionProgress => "deletion_progress",
+            Self::ManagerQuery => "manager_query",
+            Self::RegistrationQualification => "registration_qualification",
+            Self::ActivationPid => "activation_pid",
+            Self::ObservationBinding => "observation_binding",
+            Self::Unclassified => "unclassified",
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefusalCode {
     WrongBinding,
@@ -564,6 +617,9 @@ pub enum Reply {
     },
     Refused {
         code: RefusalCode,
+        /// Present only with `OwnershipPending` from a refused manager
+        /// inspection; a closed step name, never native text.
+        inspect_failure: Option<InspectFailure>,
     },
 }
 #[derive(Clone, Debug, PartialEq, Eq)]

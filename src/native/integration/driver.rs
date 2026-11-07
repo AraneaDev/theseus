@@ -142,12 +142,21 @@ impl<'a, 'b, 's> IntegrationDriver<'a, 'b, 's> {
             slot: v2::ResourceSlot::new(slot.as_str())?,
         })?;
         let reply = self.core.wait_reply(request)?;
-        let v2::Reply::ServiceObservation {
-            lease: observed,
-            observation,
-        } = reply
-        else {
-            bail!("service inspection refused or unavailable")
+        let (observed, observation) = match reply {
+            v2::Reply::ServiceObservation { lease, observation } => (lease, observation),
+            // The fixed refusal class is a closed protocol enum, never raw
+            // native text; naming it separates manager-inspection failure
+            // (OwnershipPending) from Busy/Unsupported/lease refusals.
+            v2::Reply::Refused {
+                code,
+                inspect_failure,
+            } => match inspect_failure {
+                Some(failure) => {
+                    bail!("service inspection refused: {code:?} at {}", failure.name())
+                }
+                None => bail!("service inspection refused: {code:?}"),
+            },
+            _ => bail!("service inspection unavailable"),
         };
         ensure!(
             observed == lease && observation.slot.as_str() == slot.as_str(),
@@ -577,7 +586,7 @@ impl<'a, 'b, 's> IntegrationDriver<'a, 'b, 's> {
                     ..
                 }) if l == lease && o == operation => break outcome,
                 Poll::Event(Event::Reply {
-                    reply: v2::Reply::Refused { code },
+                    reply: v2::Reply::Refused { code, .. },
                     ..
                 }) => bail!("service control refused: {code:?}"),
                 Poll::Event(Event::ConnectionLost | Event::PeerClosed(_))

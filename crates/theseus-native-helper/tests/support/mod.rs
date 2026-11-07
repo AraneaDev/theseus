@@ -344,6 +344,7 @@ impl Peer {
                 }
                 Reply::Refused {
                     code: RefusalCode::OwnershipPending,
+                    ..
                 } => {
                     assert!(Instant::now() < deadline);
                     std::thread::sleep(Duration::from_millis(2));
@@ -451,6 +452,7 @@ impl Peer {
                 }
                 | Reply::Refused {
                     code: RefusalCode::OwnershipPending,
+                    ..
                 } => std::thread::sleep(Duration::from_millis(2)),
                 other => panic!("terminal {other:?}"),
             }

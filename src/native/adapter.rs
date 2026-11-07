@@ -207,6 +207,7 @@ impl<'a, 's> NativeDriver<'a, 's> {
                     reply:
                         v2::Reply::Refused {
                             code: v2::RefusalCode::OwnershipPending,
+                            ..
                         },
                     ..
                 }) => {

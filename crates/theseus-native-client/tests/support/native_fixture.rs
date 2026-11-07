@@ -508,6 +508,7 @@ impl OwnedClient {
                 }
                 | Reply::Refused {
                     code: RefusalCode::OwnershipPending,
+                    ..
                 } => {}
                 other => panic!("native terminal: {other:?}"),
             }

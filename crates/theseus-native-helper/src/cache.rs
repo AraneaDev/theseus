@@ -384,7 +384,10 @@ impl Cache {
     }
 }
 pub(crate) fn refused(code: v2::RefusalCode) -> v2::Reply {
-    v2::Reply::Refused { code }
+    v2::Reply::Refused {
+        code,
+        inspect_failure: None,
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -420,6 +423,7 @@ mod tests {
         let mut c = Cache::new();
         c.description = Some(v2::Reply::Refused {
             code: v2::RefusalCode::Unsupported,
+            inspect_failure: None,
         });
         assert_eq!(
             c.query(&v2::Request::InspectFile {

@@ -292,7 +292,14 @@ impl Worker {
         });
     }
     fn refuse(&mut self, ticket: ResponseTicket, code: v2::RefusalCode) {
-        self.respond(ticket, v2::Reply::Refused { code }, None);
+        self.respond(
+            ticket,
+            v2::Reply::Refused {
+                code,
+                inspect_failure: None,
+            },
+            None,
+        );
     }
     fn run(&mut self) {
         loop {
@@ -674,6 +681,7 @@ impl Worker {
             } else {
                 v2::Reply::Refused {
                     code: v2::RefusalCode::Busy,
+                    inspect_failure: None,
                 }
             };
             self.respond(ticket, reply, None);
@@ -1144,6 +1152,7 @@ impl Worker {
                 }
                 Err(_) => v2::Reply::Refused {
                     code: v2::RefusalCode::Unsupported,
+                    inspect_failure: None,
                 },
             }
         };
@@ -1236,6 +1245,7 @@ impl Worker {
                 } else {
                     v2::RefusalCode::Unsupported
                 },
+                inspect_failure: None,
             },
         };
         let pending = self.file.as_mut().unwrap();
@@ -3033,7 +3043,7 @@ mod private_barrier_tests {
                 )
                 .unwrap_or_else(|_| panic!("authorization"));
             assert!(
-                matches!(ports.events.try_recv().unwrap(),WorkerEvent::ResponseReady { reply:v2::Reply::Refused { code },.. } if code==expected)
+                matches!(ports.events.try_recv().unwrap(),WorkerEvent::ResponseReady { reply:v2::Reply::Refused { code, .. },.. } if code==expected)
             );
             assert!(
                 !worker.stopping,
@@ -3087,7 +3097,8 @@ mod private_barrier_tests {
                 ports.events.try_recv().unwrap(),
                 WorkerEvent::ResponseReady {
                     reply: v2::Reply::Refused {
-                        code: v2::RefusalCode::Unsupported
+                        code: v2::RefusalCode::Unsupported,
+                        ..
                     },
                     ..
                 }
@@ -3946,6 +3957,7 @@ mod private_barrier_tests {
                     },
                     1 => v2::Reply::Refused {
                         code: v2::RefusalCode::ReplayConflict,
+                        inspect_failure: None,
                     },
                     _ => v2::Reply::Refused {
                         code: if quarantine {
@@ -3953,6 +3965,7 @@ mod private_barrier_tests {
                         } else {
                             v2::RefusalCode::AwaitingExternalReset
                         },
+                        inspect_failure: None,
                     },
                 };
                 assert_eq!(actual, wanted);
@@ -4107,8 +4120,18 @@ impl Worker {
                 None,
             ),
             Err(error) => {
+                // Same OwnershipPending refusal; only the closed step name of
+                // the failed inspection travels, never the retained error text.
+                let failure = crate::integration::service::inspect_failure(&error);
                 service.errors.push(error);
-                self.refuse(ticket, v2::RefusalCode::OwnershipPending);
+                self.respond(
+                    ticket,
+                    v2::Reply::Refused {
+                        code: v2::RefusalCode::OwnershipPending,
+                        inspect_failure: Some(failure),
+                    },
+                    None,
+                );
             }
         }
         Ok(())

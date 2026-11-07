@@ -308,6 +308,7 @@ fn operations(
                 } if l == lease && o == operation => state,
                 v2::Reply::Refused {
                     code: v2::RefusalCode::OwnershipPending,
+                    ..
                 } => {
                     std::thread::yield_now();
                     continue;
@@ -403,6 +404,7 @@ fn operations(
                     } if l == lease && o == operation => cancellation = true,
                     v2::Reply::Refused {
                         code: v2::RefusalCode::OwnershipPending,
+                        ..
                     } => {}
                     _ => bail!("original operation cancellation refused"),
                 }

@@ -152,6 +152,7 @@ fn exercise_native_process(replace: bool) {
             }
             Reply::Refused {
                 code: RefusalCode::OwnershipPending,
+                ..
             } => std::thread::yield_now(),
             r => panic!("native description required {r:?}"),
         }

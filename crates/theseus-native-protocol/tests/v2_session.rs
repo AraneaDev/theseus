@@ -344,6 +344,7 @@ fn describe_is_mandatory_one_outstanding_refusal_consumes_and_all_fields_are_imm
             seq,
             Reply::Refused {
                 code: RefusalCode::Busy,
+                inspect_failure: None,
             },
         )
         .unwrap();
@@ -404,6 +405,7 @@ fn four_pending_requests_out_of_order_exactly_once_and_refused() {
             seq,
             Reply::Refused {
                 code: RefusalCode::Busy,
+                inspect_failure: None,
             },
         )
         .unwrap();
@@ -1203,6 +1205,7 @@ fn known_terminal_mutation_can_only_be_refused_but_new_session_can_replay_termin
                 if refuse {
                     Reply::Refused {
                         code: RefusalCode::InvalidRequest,
+                        inspect_failure: None,
                     }
                 } else {
                     operation(terminal.clone())

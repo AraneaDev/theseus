@@ -65,7 +65,8 @@ fn explicit_config_and_wrong_lease_file_requests_never_create_authority() {
         assert_eq!(
             peer.request(request),
             Reply::Refused {
-                code: RefusalCode::WrongLease
+                code: RefusalCode::WrongLease,
+                inspect_failure: None
             }
         );
     }
@@ -829,7 +830,8 @@ fn native_leaf_files_exclusive_create_quarantines_and_restarts_exact_reason() {
             path: LeafName::new("existing").unwrap()
         }),
         Reply::Refused {
-            code: RefusalCode::LeaseQuarantined
+            code: RefusalCode::LeaseQuarantined,
+            inspect_failure: None
         }
     );
     restarted.close();
@@ -862,7 +864,8 @@ fn native_leaf_files_wrong_closed_lease_and_run_busy_preserve_workspace() {
         assert_eq!(
             peer.request(request),
             Reply::Refused {
-                code: RefusalCode::WrongLease
+                code: RefusalCode::WrongLease,
+                inspect_failure: None
             }
         );
     }
@@ -873,7 +876,8 @@ fn native_leaf_files_wrong_closed_lease_and_run_busy_preserve_workspace() {
         assert_eq!(
             peer.request(request),
             Reply::Refused {
-                code: RefusalCode::Busy
+                code: RefusalCode::Busy,
+                inspect_failure: None
             }
         );
     }
@@ -891,7 +895,8 @@ fn native_leaf_files_wrong_closed_lease_and_run_busy_preserve_workspace() {
         assert_eq!(
             peer.request(request),
             Reply::Refused {
-                code: RefusalCode::AwaitingExternalReset
+                code: RefusalCode::AwaitingExternalReset,
+                inspect_failure: None
             }
         );
     }
@@ -922,13 +927,15 @@ fn native_leaf_files_replay_conflict_and_run_generations_retire() {
     assert_eq!(
         peer.request(request.clone()),
         Reply::Refused {
-            code: RefusalCode::InvalidRequest
+            code: RefusalCode::InvalidRequest,
+            inspect_failure: None
         }
     );
     assert_eq!(
         peer.request(create_request(lease, 27, "first", b"conflict")),
         Reply::Refused {
-            code: RefusalCode::InvalidRequest
+            code: RefusalCode::InvalidRequest,
+            inspect_failure: None
         }
     );
     let run = OperationId::from_bytes([28; 16]);
@@ -948,14 +955,16 @@ fn native_leaf_files_replay_conflict_and_run_generations_retire() {
     assert_eq!(
         restarted.request(create_request(lease, 27, "first", b"conflict")),
         Reply::Refused {
-            code: RefusalCode::ReplayConflict
+            code: RefusalCode::ReplayConflict,
+            inspect_failure: None
         }
     );
     assert_eq!(restarted.request(request.clone()), replay);
     assert_eq!(
         restarted.request(request),
         Reply::Refused {
-            code: RefusalCode::InvalidRequest
+            code: RefusalCode::InvalidRequest,
+            inspect_failure: None
         }
     );
     assert_observed(&mut restarted, lease, "after-run", b"next generation");
@@ -1175,7 +1184,8 @@ fn native_leaf_files_real_write_failure_quarantines_and_restarts() {
     assert_eq!(
         restarted.request(create_request(lease, 33, "second-create", b"denied")),
         Reply::Refused {
-            code: RefusalCode::LeaseQuarantined
+            code: RefusalCode::LeaseQuarantined,
+            inspect_failure: None
         }
     );
     restarted.close();

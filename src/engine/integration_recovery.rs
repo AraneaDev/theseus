@@ -243,6 +243,7 @@ fn query_original_action(
             } if l == lease && o == operation => state,
             v2::Reply::Refused {
                 code: v2::RefusalCode::OwnershipPending,
+                ..
             } => {
                 std::thread::yield_now();
                 continue;
@@ -312,6 +313,7 @@ fn query_original_action(
                 } if l == lease && o == operation => cancelled = true,
                 v2::Reply::Refused {
                     code: v2::RefusalCode::OwnershipPending,
+                    ..
                 } => {}
                 _ => bail!("original integration cancellation identity refused"),
             }

@@ -551,7 +551,7 @@ impl<'a, 'b, 's> DesktopDriver<'a, 'b, 's> {
         let reply = self.core.wait_reply(id)?;
         let (observed, observation) = match reply {
             v2::Reply::DesktopObservation { lease, observation } => (lease, observation),
-            v2::Reply::Refused { code } => bail!("desktop entry inspection refused: {code:?}"),
+            v2::Reply::Refused { code, .. } => bail!("desktop entry inspection refused: {code:?}"),
             _ => bail!("desktop entry inspection unavailable"),
         };
         ensure!(

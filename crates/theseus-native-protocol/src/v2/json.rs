@@ -648,6 +648,18 @@ impl Wire for UnknownReason {
         }
     }
 }
+impl Wire for InspectFailure {
+    fn read(value: Value) -> Result<Self, Error> {
+        let value = String::read(value)?;
+        InspectFailure::ALL
+            .into_iter()
+            .find(|f| f.name() == value)
+            .ok_or(Error::InvalidValue)
+    }
+    fn write<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.name())
+    }
+}
 impl Wire for RefusalCode {
     fn read(value: Value) -> Result<Self, Error> {
         let value = String::read(value)?;
@@ -1447,9 +1459,20 @@ impl Wire for Reply {
                 length: object.take::<u16>("length")?,
                 digest: object.take::<Digest>("digest")?,
             },
-            "refused" => Self::Refused {
-                code: object.take::<RefusalCode>("code")?,
-            },
+            "refused" => {
+                let code = object.take::<RefusalCode>("code")?;
+                let inspect_failure = match object.0.remove("inspect_failure") {
+                    None => None,
+                    Some(value) => Some(InspectFailure::read(value)?),
+                };
+                if inspect_failure.is_some() && code != RefusalCode::OwnershipPending {
+                    return Err(Error::InvalidValue);
+                }
+                Self::Refused {
+                    code,
+                    inspect_failure,
+                }
+            }
             _ => return Err(Error::InvalidEnvelope),
         };
         object.end()?;
@@ -1669,10 +1692,16 @@ impl Wire for Reply {
                 map.serialize_entry("digest", &Ref(digest))?;
                 map.end()
             }
-            Self::Refused { code } => {
-                let mut map = s.serialize_map(Some(2))?;
+            Self::Refused {
+                code,
+                inspect_failure,
+            } => {
+                let mut map = s.serialize_map(Some(2 + usize::from(inspect_failure.is_some())))?;
                 map.serialize_entry("kind", "refused")?;
                 map.serialize_entry("code", &Ref(code))?;
+                if let Some(failure) = inspect_failure {
+                    map.serialize_entry("inspect_failure", &Ref(failure))?;
+                }
                 map.end()
             }
         }

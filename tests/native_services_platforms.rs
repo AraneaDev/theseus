@@ -506,6 +506,38 @@ fn launchd_running_wrong_native_peer_never_passes_readiness() {
     assert!(!output.status.success());
     assert_ne!(report.outcome, theseus::model::RunOutcome::Passed);
     native::assert_readiness_fault(&fixture, &report, "WrongPeer");
+    // Unlike wrong version/data/nonce, a wrong native peer permanently revokes the
+    // readiness endpoint authority (fail closed). The run ends Incomplete before
+    // SUT Uninstall, so the original creator is retained for separate teardown,
+    // which must itself complete without any unresolved mutation.
+    assert_eq!(report.outcome, theseus::model::RunOutcome::Incomplete);
     views::assert_service_views(report, &directory);
-    native::assert_sut_removed_registration_teardown(&fixture);
+    assert!(
+        fixture.finish_native_fixture().unwrap(),
+        "wrong-peer revocation stops before SUT Uninstall; the original creator is retained for separate teardown"
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            fixture
+                .root
+                .path()
+                .join("native-operator")
+                .join("fixture-teardown.json"),
+        )
+        .expect("original teardown receipt published"),
+    )
+    .expect("teardown receipt JSON");
+    assert_eq!(receipt["kind"], "fixture_original_creator_teardown");
+    assert_eq!(receipt["had_original_registration"], true);
+    assert_eq!(receipt["success"], true);
+    assert!(receipt["sut_failure"].is_null() && receipt["detail"].is_null());
+    let evidence = &receipt["creation_evidence"];
+    assert!(
+        evidence["retained_created_files"] == 1
+            && evidence["revoked"] == false
+            && evidence["unresolved_native_operation"] == false
+            && evidence["sut_mutation_unresolved"] == false
+            && evidence["publication_failure"].is_null(),
+        "exactly the original creator, removed without unresolved mutation: {evidence}"
+    );
 }

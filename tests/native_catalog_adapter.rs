@@ -313,6 +313,7 @@ fn actual_native_helper_executes_installed_reader_and_hashes_settled_absence() {
                     reply:
                         v2::Reply::Refused {
                             code: v2::RefusalCode::OwnershipPending,
+                            ..
                         },
                     ..
                 } => {

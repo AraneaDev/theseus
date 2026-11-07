@@ -821,6 +821,7 @@ impl BrokerServer {
                         sequence,
                         v2::Reply::Refused {
                             code: v2::RefusalCode::InvalidRequest,
+                            inspect_failure: None,
                         },
                     )?;
                 }
@@ -849,6 +850,7 @@ impl BrokerServer {
                 sequence,
                 v2::Reply::Refused {
                     code: v2::RefusalCode::Busy,
+                    inspect_failure: None,
                 },
             );
         }
@@ -1340,6 +1342,7 @@ impl BrokerServer {
                 sequence,
                 v2::Reply::Refused {
                     code: v2::RefusalCode::Unsupported,
+                    inspect_failure: None,
                 },
             ),
         }

@@ -268,7 +268,17 @@ at `063351a` passed all eight Docker suites and the complete Linux native job.
 macOS ran all seven real launchd cases; the wrong-peer case's own assertion still
 compared only the UID, which the fixture now keeps valid, and now requires the
 measured credentials as a whole to differ. Windows' copied-artifact byte check
-retained one path-versus-handle stat comparison, now aligned with the guard. Final
+retained one path-versus-handle stat comparison, now aligned with the guard.
+
+The [nineteenth combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42373902943)
+at `414b7ea` passed all eight Docker suites and the complete Linux native job.
+macOS passed six of seven real launchd cases; in the wrong-peer case a wrong peer
+permanently revokes the readiness endpoint, so the run ends incomplete before the
+SUT uninstall and the creator is removed by the separate fixture teardown, which
+the case now asserts exactly. Windows passed its SCM operator guards and ran its
+first real SCM case, whose post-upgrade inspection was refused for a reason the
+helper deliberately does not export; refused inspections now carry a closed,
+text-free step classification so the next run names the failing step. Final
 corrected-source native acceptance remains pending.
 
 Keep this queue and the checklists below current as work lands. Record source

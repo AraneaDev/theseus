@@ -187,6 +187,7 @@ fn pending(
                         reply:
                             v2::Reply::Refused {
                                 code: v2::RefusalCode::OwnershipPending,
+                                ..
                             },
                         ..
                     }) => {
