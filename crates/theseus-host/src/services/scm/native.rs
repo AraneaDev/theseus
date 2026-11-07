@@ -47,9 +47,90 @@ unsafe extern "system" {
     fn StartServiceW(service: Handle, argc: u32, argv: *const *const u16) -> i32;
     fn ControlService(service: Handle, control: u32, status: *mut ControlStatus) -> i32;
 }
+// Read-only registry subset (winreg.h) for the services.exe DeleteFlag.
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn RegOpenKeyExW(
+        key: Handle,
+        subkey: *const u16,
+        options: u32,
+        sam: u32,
+        out: *mut Handle,
+    ) -> i32;
+    fn RegQueryValueExW(
+        key: Handle,
+        name: *const u16,
+        reserved: *mut u32,
+        kind: *mut u32,
+        data: *mut u8,
+        size: *mut u32,
+    ) -> i32;
+    fn RegCloseKey(key: Handle) -> i32;
+}
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetLastError() -> u32;
+}
+const HKEY_LOCAL_MACHINE: isize = 0x8000_0002u32 as i32 as isize;
+const KEY_QUERY_VALUE: u32 = 0x0001;
+const REG_DWORD: u32 = 4;
+const ERROR_FILE_NOT_FOUND: i32 = 2;
+/// Read-only DeleteFlag of exactly this validated service name. DeleteService
+/// makes services.exe set REG_DWORD DeleteFlag=1 on the record it keeps while
+/// handles remain open. Opens with KEY_QUERY_VALUE only; never creates/writes.
+fn delete_flag_observation(service_name: &str) -> NameObservation {
+    // The authority already admits only [A-Za-z0-9._-], max 128, no leading
+    // '-'. Refuse anything that could leave the exact Services\<name> key.
+    if service_name.is_empty()
+        || service_name.len() > 128
+        || matches!(service_name, "." | "..")
+        || !service_name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+    {
+        return NameObservation::Unknown(0);
+    }
+    let path = wide_name(&format!(
+        "SYSTEM\\CurrentControlSet\\Services\\{service_name}"
+    ));
+    let mut key: Handle = ptr::null_mut();
+    // SAFETY: nul-terminated owned path; out-pointer is a local.
+    let opened = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE as Handle,
+            path.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut key,
+        )
+    };
+    if opened != 0 {
+        return NameObservation::Unknown(opened as u32);
+    }
+    let value = wide_name("DeleteFlag");
+    let (mut kind, mut data, mut size) = (0u32, 0u32, size_of::<u32>() as u32);
+    // SAFETY: open key, nul-terminated name, 4-byte local buffer and size.
+    let queried = unsafe {
+        RegQueryValueExW(
+            key,
+            value.as_ptr(),
+            ptr::null_mut(),
+            &mut kind,
+            (&mut data as *mut u32).cast(),
+            &mut size,
+        )
+    };
+    // SAFETY: closes exactly the key opened above, on every path.
+    let closed = unsafe { RegCloseKey(key) };
+    if closed != 0 {
+        return NameObservation::Unknown(closed as u32);
+    }
+    match queried {
+        0 if kind == REG_DWORD && size == 4 && data == 1 => NameObservation::MarkedForDeletion,
+        0 => NameObservation::Unknown(0),
+        ERROR_FILE_NOT_FOUND => NameObservation::Present,
+        code => NameObservation::Unknown(code as u32),
+    }
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -771,29 +852,14 @@ impl ScmManager {
                 raw,
                 errors: self.errors.clone(),
             };
-            // OpenServiceW still succeeds on a record that is marked for
-            // deletion while any handle (or services.exe cleanup) keeps it.
-            // Only a read-only config query on this observation handle that
-            // fails with exactly ERROR_SERVICE_MARKED_FOR_DELETE proves the
-            // delete-pending record; no new same-name service can be created
-            // while it exists. A readable configuration is a live same-name
-            // object and stays terminal. Nothing is adopted or mutated.
-            // One QueryServiceConfigW distinguishes the two states. The
-            // expected 1072 is not retained (it recurs every poll); any other
-            // native error is retained exactly as before.
-            let probe: Errors = Rc::default();
-            let name = match config_buffer(raw, None, &probe) {
-                Err(e) if e.raw_os_error() == Some(MARKED_FOR_DELETE as i32) => {
-                    NameObservation::MarkedForDeletion
-                }
-                Ok(_) => NameObservation::Present,
-                Err(e) => {
-                    self.errors
-                        .borrow_mut()
-                        .extend(probe.borrow_mut().drain(..));
-                    NameObservation::Unknown(e.raw_os_error().unwrap_or(0) as u32)
-                }
-            };
+            // OpenServiceW and read-only config queries still succeed on a
+            // record that DeleteService marked while handles keep it. Only the
+            // exact services.exe DeleteFlag=1 proves that delete-pending
+            // record (no new same-name service exists while it does). An absent
+            // value means a live same-name object, which stays terminal; any
+            // other value, including zero, is Unknown.
+            // Nothing is adopted or mutated.
+            let name = delete_flag_observation(&self.authority.service_name);
             if let Err(e) = observation.close() {
                 owner.progress = DeletionProgress::Unknown(e.raw_os_error().unwrap_or(0) as u32);
                 return Ok(owner.progress);
@@ -1171,6 +1237,17 @@ pub fn verify_platform_version(expected: &str) -> io::Result<()> {
 #[cfg(test)]
 mod qualification_tests {
     use super::*;
+    #[test]
+    fn delete_flag_reads_only_the_exact_validated_service_key() {
+        for name in ["", ".", "..", "a\\b", "a/b", "..\\Tcpip", "x\0"] {
+            assert_eq!(delete_flag_observation(name), NameObservation::Unknown(0));
+        }
+        // A real absent key is an error, never Present or MarkedForDeletion.
+        assert_eq!(
+            delete_flag_observation("TheseusAbsentDeleteFlagProbe_7f3a"),
+            NameObservation::Unknown(2)
+        );
+    }
     #[test]
     fn released_runtime_pin_admits_exactly_one_new_pid_then_detects_changes() {
         let status = |state, process_id| ServiceStatus {

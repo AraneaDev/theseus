@@ -296,8 +296,16 @@ running service. The remaining case showed that a service record marked for
 deletion still opens by name while handles keep it alive, which deletion polling
 had classified as an unrelated same-name object; a read-only configuration query
 now distinguishes the delete-pending record (exactly `ERROR_SERVICE_MARKED_FOR_DELETE`)
-from a live same-name service, which remains a terminal refusal. Final
-corrected-source native acceptance remains pending.
+from a live same-name service, which remains a terminal refusal.
+
+The [twenty-second combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42398726562)
+at `0df8659` again passed Docker, Linux, macOS and five of six real SCM cases, and
+proved that a marked record's configuration stays readable. Deletion polling now
+reads only the services.exe `DeleteFlag` (exactly `REG_DWORD` 1) with query-only
+registry access to identify the delete-pending record; an absent flag remains a
+terminal same-name refusal and any other value is unknown. `DeleteFlag` is
+long-standing but undocumented behaviour, and the probe fails closed if it
+changes. Final corrected-source native acceptance remains pending.
 
 Keep this queue and the checklists below current as work lands. Record source
 implementation, review, local verification, CI acceptance and merge separately.
