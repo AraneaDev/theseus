@@ -42,7 +42,10 @@ pub(super) fn run(mode: &str, root: &Path, args: &[OsString]) -> io::Result<i32>
         }
         if args[0] == "container" && args.get(1).map(String::as_str) == Some("inspect") {
             if mode == "mcp-emergency" {
-                std::thread::sleep(Duration::from_millis(1200));
+                // Alone this emergency inspection exceeds both the 3 s exchange
+                // window and the 4 s execution budget, so counting it against
+                // either manufactures a timeout; exec plus startup stays within.
+                std::thread::sleep(Duration::from_millis(3500));
             }
             eprintln!("Error: No such object: {}", args.last().unwrap());
             return Ok(1);

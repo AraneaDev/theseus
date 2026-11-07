@@ -1457,23 +1457,35 @@ fn validate_session(header: &IntegrationBrokerHeader, session: &BoundSession) ->
         .map_err(io::Error::from)?;
     validate_session_binding(header, session.binding())
 }
+/// Protocol projection of the host session's broker endpoint, compared
+/// exactly with the admitted header endpoint.
+fn session_endpoint(
+    endpoint: &theseus_host::desktop::session::BrokerEndpoint,
+) -> io::Result<v2::LocalEndpoint> {
+    use theseus_host::desktop::session::BrokerEndpoint;
+    Ok(match endpoint {
+        BrokerEndpoint::Unix(path) => v2::LocalEndpoint::UnixPath {
+            path: path.as_str().into(),
+        },
+        // The protocol's canonical NamedPipe path is the full closed
+        // `\\.\pipe\theseus.<name>` form (see `validate_endpoint`), so the
+        // header compares against the full host pipe name, never its suffix.
+        BrokerEndpoint::Pipe(name) => {
+            let endpoint = v2::LocalEndpoint::NamedPipe {
+                path: name.as_str().into(),
+            };
+            v2::broker::validate_endpoint(&endpoint)
+                .map_err(|_| invalid("invalid closed broker pipe"))?;
+            endpoint
+        }
+    })
+}
 fn validate_session_binding(
     header: &IntegrationBrokerHeader,
     b: &SessionBinding,
 ) -> io::Result<()> {
-    use theseus_host::desktop::session::{BrokerEndpoint, SuppliedDisplay as HostDisplay};
-    let endpoint = match &b.broker_endpoint {
-        BrokerEndpoint::Unix(path) => v2::LocalEndpoint::UnixPath {
-            path: path.as_str().into(),
-        },
-        BrokerEndpoint::Pipe(name) => v2::LocalEndpoint::NamedPipe {
-            path: name
-                .as_str()
-                .strip_prefix(r"\\.\pipe\theseus.")
-                .ok_or_else(|| invalid("invalid closed broker pipe"))?
-                .into(),
-        },
-    };
+    use theseus_host::desktop::session::SuppliedDisplay as HostDisplay;
+    let endpoint = session_endpoint(&b.broker_endpoint)?;
     // A workspace dependency can unify Host's test-support independently of
     // this crate. Such source-only authority must still refuse shipping code.
     #[allow(unreachable_patterns)]
@@ -1544,4 +1556,28 @@ fn validate_session_binding(
         return Err(invalid("supplied broker session mismatch"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod session_endpoint_tests {
+    use super::*;
+    use theseus_host::{desktop::session::BrokerEndpoint, services::readiness::NamedPipe};
+    #[test]
+    fn windows_broker_pipe_projects_to_the_canonical_full_header_endpoint() {
+        let full = r"\\.\pipe\theseus.824e7d58760e034d3ebabc77-broker";
+        let projected =
+            session_endpoint(&BrokerEndpoint::Pipe(NamedPipe::new(full.into()).unwrap())).unwrap();
+        // Exactly the header form the integration setup publishes.
+        assert_eq!(
+            projected,
+            v2::LocalEndpoint::NamedPipe { path: full.into() }
+        );
+        assert!(v2::broker::validate_endpoint(&projected).is_ok());
+        assert_ne!(
+            projected,
+            v2::LocalEndpoint::NamedPipe {
+                path: "824e7d58760e034d3ebabc77-broker".into()
+            }
+        );
+    }
 }

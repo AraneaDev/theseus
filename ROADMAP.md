@@ -214,7 +214,16 @@ succeeded, and the product parser then refused the first real loaded-job print
 fields); the parser now admits exactly that observed form, and a running job's
 print remains unobserved. Windows desktop steps had succeeded but were scored as
 failed because the recipe expected POSIX exit statuses; the Windows desktop setup
-now names the Windows exit kind, keeping each expected code. Final
+now names the Windows exit kind, keeping each expected code.
+
+The [thirteenth combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42339737863)
+at `118e434` passed all eight Docker suites and the complete Linux native job for
+the third time. Windows exposed a product defect: broker session validation
+compared a stripped pipe suffix with the admitted header's full canonical pipe
+path, so every Windows broker session was refused; the comparison now uses the
+full validated path exactly. The macOS emergency-cleanup control's margins were
+too tight for the duplex exchange window; it now uses a 4 s budget and an
+emergency inspection that alone exceeds both the window and the budget. Final
 corrected-source native acceptance remains pending.
 
 Keep this queue and the checklists below current as work lands. Record source

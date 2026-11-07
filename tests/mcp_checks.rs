@@ -642,7 +642,8 @@ fn emergency_cleanup_time_does_not_manufacture_an_execution_timeout() {
     let script = native::docker(root.path(), "mcp-emergency");
     let calls = root.path().join("calls");
     let (_, o) = observation("hello_v2");
-    let probe = o.evidence.probe;
+    let mut probe = o.evidence.probe;
+    probe.timeout_seconds = 4;
     let request = theseus::runner::CommandRequest {
         id: "preparation".into(),
         phase: "check:discovery".into(),
@@ -650,7 +651,8 @@ fn emergency_cleanup_time_does_not_manufacture_an_execution_timeout() {
         argv: probe.argv.clone(),
         env: probe.env.clone(),
         pass_env: vec![],
-        timeout_seconds: 3,
+        // Exchange window is timeout - 1 s; slow runners need startup headroom.
+        timeout_seconds: 4,
         expected_exit: 0,
         log_limit: 1024,
     };
@@ -674,7 +676,7 @@ fn emergency_cleanup_time_does_not_manufacture_an_execution_timeout() {
             &theseus::engine::CancellationToken::default(),
         )
         .unwrap();
-    assert!(started.elapsed() < std::time::Duration::from_secs(6));
+    assert!(started.elapsed() < std::time::Duration::from_secs(9));
     assert!(!observed.container_available);
     assert!(!observed.command.record.timed_out);
     assert_eq!(observed.command.record.outcome, CommandOutcome::Error);
