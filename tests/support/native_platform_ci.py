@@ -265,6 +265,12 @@ class ArtifactGuard:
                 write_new(evidence_path, evidence)
 
 
+def stable_identity(st):
+    """Object identity without access time: reading for the pin digest updates
+    st_atime on Windows (CI15), which must not read as a change."""
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_mode, st.st_nlink, st.st_uid)
+
+
 def pin_artifacts(plan, destination, secure=None):
     """Copy exclusive leaves; retain original source descriptors through copying."""
     result, identities, original_files = {}, [], set()
@@ -293,7 +299,7 @@ def pin_artifacts(plan, destination, secure=None):
                 os.fsync(output.fileno())
                 copied_identity = object_identity(os.fstat(output.fileno()))
             after = os.fstat(handle.fileno())
-            require((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) and source.stat() == after, "source artifact changed during pin")
+            require((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) and stable_identity(source.stat()) == stable_identity(after), "source artifact changed during pin")
             require(count == pin["length"] and h.hexdigest() == pin["sha256"], "artifact digest differs from exact pin")
             if secure:
                 secure(target, "executable")

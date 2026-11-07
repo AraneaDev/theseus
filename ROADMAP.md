@@ -233,7 +233,18 @@ another owner still held the file, so later absence checks and reinstalls failed
 with access denied; deletion now uses POSIX semantics after the same identity
 proof. macOS completed real launchd install, configure and start for the first
 time; the running-job print adds seven inert scalar rows that the closed parser
-now admits exactly. Final corrected-source native acceptance remains pending.
+now admits exactly.
+
+The [fifteenth combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42353351670)
+at `86e8f5b` passed all eight Docker suites and the complete Linux native job,
+and Windows passed all six Source-owned desktop and all three owned native-entry
+cases natively for the first time. The Windows SCM operator then refused its own
+artifact pin because whole stat comparison included access time, which the pin
+digest read updates; it now compares stable identity fields only. macOS's client
+recovery control observed a truthful `NotStarted(CancelRequested)` recovery after
+its own join cancelled the accepted create; the control now admits it only with
+the matching durable ledger outcome and no physical file. Final corrected-source
+native acceptance remains pending.
 
 Keep this queue and the checklists below current as work lands. Record source
 implementation, review, local verification, CI acceptance and merge separately.

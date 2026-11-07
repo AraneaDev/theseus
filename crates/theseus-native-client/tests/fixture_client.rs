@@ -620,12 +620,40 @@ fn native_client_file_connection_loss_queries_original_without_second_create() {
             Reply::Operation {
                 state: OperationView::Finished {
                     outcome: Outcome::FileCreated { .. }
+                        // The join may cancel the accepted create before it
+                        // starts (CI15 macOS); recovery then truthfully reports it.
+                        | Outcome::NotStarted {
+                            reason: NotStartedReason::CancelRequested
+                        }
                 } | OperationView::Unknown { .. },
                 ..
             }
         ),
         "actual recovered query reply: {reply:?}"
     );
+    if let Reply::Operation {
+        state:
+            OperationView::Finished {
+                outcome: outcome @ Outcome::NotStarted { .. },
+            },
+        ..
+    } = &reply
+    {
+        assert!(fixture.records().iter().any(|e| matches!(
+            e,
+            ledger::Entry::OperationFinished { operation: op, outcome: found, .. }
+                if *op == operation && found == outcome
+        )));
+        // Truthful only if the original create never physically ran.
+        assert!(
+            !fixture
+                .root
+                .path()
+                .join("workspace")
+                .join("recover-file")
+                .exists()
+        );
+    }
     if matches!(
         reply,
         Reply::Operation {
