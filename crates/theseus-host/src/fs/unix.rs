@@ -69,6 +69,37 @@ pub(super) fn open_file(parent: &File, name: &OsStr, create: bool) -> io::Result
     }
     Ok(file)
 }
+pub(super) fn open_leaf_classified(parent: &File, name: &OsStr) -> super::LeafOpenResult {
+    use super::LeafOpenResult;
+    // Only this synchronous, single-component openat ENOENT proves absence.
+    let file = match openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => File::from(fd),
+        Err(rustix::io::Errno::NOENT) => return LeafOpenResult::MissingSettled,
+        Err(error) => return LeafOpenResult::FailedSettled(error.into()),
+    };
+    match file.metadata() {
+        Ok(metadata) if metadata.is_file() => LeafOpenResult::Opened(file),
+        Ok(_) => LeafOpenResult::FailedSettled(super::invalid("expected a regular file")),
+        Err(error) => LeafOpenResult::FailedSettled(error),
+    }
+}
+pub(super) fn open_ledger(parent: &File, name: &OsStr) -> io::Result<File> {
+    let file = File::from(openat(
+        parent,
+        name,
+        OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+    if !file.metadata()?.is_file() {
+        return Err(super::invalid("expected a regular file"));
+    }
+    Ok(file)
+}
 pub(super) fn entries(directory: &File) -> io::Result<Vec<OsString>> {
     let mut names = Vec::new();
     for entry in Dir::read_from(directory)? {

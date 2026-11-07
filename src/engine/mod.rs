@@ -1,8 +1,28 @@
 //! Blocking scenario engine. Call on a worker thread; event callbacks must not block.
+pub(crate) mod common;
+pub mod domain;
+mod integration_recovery;
+mod recovery;
+pub use integration_recovery::{
+    IntegrationRecoveryResult, RecoveredResourceDisposition, SelectedNativeRecoveryResult,
+    recover_selected_native,
+};
+mod selected;
+pub use recovery::{NativeRecoveryResult, recover_native};
+pub use selected::run_selected;
+pub(crate) use selected::{
+    NativeCleanupFacts, finalize_native_cleanup, native_cleanup_facts, native_cleanup_pending,
+    run_selected_with_parent,
+};
+#[cfg(feature = "native-catalog-test-support")]
+pub use selected::{
+    fixture_finalize_native_cleanup, fixture_native_cleanup_facts, fixture_retained_native_session,
+};
 mod downgrade;
 mod interrupted_rollback;
 mod interruption;
 mod plugin;
+pub mod projector;
 mod rollback;
 mod rollback_checks;
 mod stages;

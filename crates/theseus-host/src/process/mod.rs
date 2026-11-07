@@ -6,6 +6,8 @@ mod unix;
 mod windows;
 pub use command::{ChildEnvironment, NativeCommand};
 #[cfg(unix)]
+pub(crate) use unix::OriginalChildRetirement;
+#[cfg(unix)]
 pub use unix::{OwnedChild, PipeReader, PipeWriter};
 #[cfg(windows)]
 pub use windows::{OwnedChild, PipeReader, PipeWriter};

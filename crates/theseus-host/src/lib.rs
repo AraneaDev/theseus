@@ -2,9 +2,12 @@
 pub mod cancel;
 #[cfg(windows)]
 pub mod console;
+pub mod desktop;
 pub mod fs;
+pub mod principal;
 pub mod process;
 mod random;
+pub mod services;
 pub mod stdio;
 pub use random::random_bytes;
 

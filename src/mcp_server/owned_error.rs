@@ -72,8 +72,10 @@ impl OwnedError {
             // Settle only freshly retained shared references. Their authoritative
             // primary and panic siblings, and the previous retention bundle,
             // all stay in self outside this potentially unwinding closure.
+            let _ = crate::engine::finalize_native_cleanup(&self.error.source);
             let (mut cleanup, _) = CleanupFailures::capture_on_worker(&self.error.source);
             for panic in &self.panics {
+                let _ = crate::engine::finalize_native_cleanup(panic);
                 cleanup.retain(panic);
             }
             let remaining = cleanup.settled();
@@ -95,9 +97,11 @@ impl OwnedError {
         // Only borrow the original: source() and Display are user implementations
         // and can unwind. The original and every panic sibling remain outside.
         let sampled = catch_unwind(AssertUnwindSafe(|| {
-            CleanupFailures::capture_on_worker(&self.error.source)
+            let (cleanup, facts) = CleanupFailures::capture_on_worker(&self.error.source);
+            let selected = crate::engine::native_cleanup_facts(&self.error.source);
+            (cleanup, facts, selected)
         }));
-        let (cleanup, facts) = match sampled {
+        let (cleanup, facts, selected) = match sampled {
             Ok(sampled) => sampled,
             Err(payload) => {
                 self.record_panic(payload, true);
@@ -113,12 +117,18 @@ impl OwnedError {
             NativeCleanup::Complete
         };
         self.view.cleanup_blocked = facts.pending || facts.publication_unknown;
+        if let Some(selected) = selected {
+            self.record_native_cleanup(selected);
+        }
         self.record_launch(facts.launch);
         // Sibling panic authority need not appear in the primary's source chain.
         for index in 0..self.panics.len() {
             let (_, facts) = CleanupFailures::capture_on_worker(&self.panics[index]);
             self.cleanup.retain(&self.panics[index]);
             self.record_launch(facts.launch);
+            if let Some(selected) = crate::engine::native_cleanup_facts(&self.panics[index]) {
+                self.record_native_cleanup(selected);
+            }
             if facts.pending {
                 self.view.native = NativeCleanup::Pending;
                 self.view.cleanup_blocked = true;
@@ -137,6 +147,16 @@ impl OwnedError {
                 Err(payload) => self.record_panic(payload, false),
             }
         }
+    }
+    fn record_native_cleanup(&mut self, facts: crate::engine::NativeCleanupFacts) {
+        if facts.local_pending {
+            self.view.native = NativeCleanup::Pending;
+        } else if (facts.remote_unknown || facts.publication_unknown)
+            && self.view.native != NativeCleanup::Pending
+        {
+            self.view.native = NativeCleanup::Unknown;
+        }
+        self.view.cleanup_blocked |= facts.pending();
     }
     fn record_panic(&mut self, payload: Box<dyn std::any::Any + Send>, unknown: bool) {
         // worker_panic uses its concrete ownership wrapper, not the panicking

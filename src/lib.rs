@@ -6,11 +6,13 @@ pub mod cli;
 pub mod comparison;
 pub mod engine;
 pub mod model;
+pub mod native;
 pub mod preview;
 pub mod recipe;
 pub mod report;
 pub mod runner;
 pub mod snapshot;
+pub mod target_authority;
 pub mod tui;
 
 pub(crate) mod shell;

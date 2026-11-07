@@ -86,6 +86,8 @@ impl std::error::Error for Primary {}
 fn snapshot(outcome: RunOutcome, hint: u64, guest: GuestCleanup) -> SavedProjection {
     SavedProjection {
         saved: SavedView {
+            integration: None,
+            native_dispositions: None,
             revision: Revision::parse(&"a".repeat(64)).unwrap(),
             schema_version: 8,
             outcome,
@@ -244,7 +246,7 @@ fn new_key_rejection_precedence_and_invalid_calls_never_reserve() {
         ErrorCode::QueryBusy
     );
     let mut bad = args("bad");
-    bad.profiles.clear();
+    bad.scenarios.clear();
     assert_eq!(
         r.admit(bad, true).unwrap_err().error.code,
         ErrorCode::InvalidArguments

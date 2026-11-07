@@ -4,7 +4,7 @@ use super::{
     cursor::CursorRecord,
     inspection_records,
     range_writer::RangeWriter,
-    roots::{Roots, error, read_recipe},
+    roots::{Roots, error, read_selected_recipe},
     types::*,
 };
 
@@ -24,7 +24,16 @@ pub(crate) fn inspect(
         .map(|c| CursorRecord::decode(c, &reply.instance))
         .transpose()
         .map_err(error)?;
-    let validated = read_recipe(roots, &args.recipe_path)?;
+    let selected = read_selected_recipe(roots, &args.recipe_path)?;
+    let validated = match selected {
+        crate::engine::domain::SelectedRecipe::Docker(r) => r,
+        crate::engine::domain::SelectedRecipe::Native(r) => {
+            return super::native_inspection::inspect(&r, args, max_run_seconds, reply);
+        }
+        crate::engine::domain::SelectedRecipe::NativeIntegration(r) => {
+            return super::native_inspection::inspect_integration(&r, args, max_run_seconds, reply);
+        }
+    };
     if args
         .recipe_digest
         .as_ref()

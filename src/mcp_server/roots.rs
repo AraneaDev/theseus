@@ -1,9 +1,6 @@
 //! Retained startup directory authority and bounded recipe acquisition.
 use super::types::{ErrorCode, InspectArgs, InspectSelector, QueryError, ToolCall};
-use crate::{
-    recipe::{self, ValidatedRecipe},
-    report::ReportStore,
-};
+use crate::report::ReportStore;
 use std::{
     io::{self, Read},
     path::{Component, Path, PathBuf},
@@ -12,6 +9,7 @@ use std::{
 use theseus_host::fs::{HostDir, RelativePath, RootPolicy, fingerprint};
 
 pub(crate) struct Roots {
+    pub native_target: Option<Arc<crate::native::launch::LaunchAuthority>>,
     pub project: Arc<HostDir>,
     pub output: Arc<ReportStore>,
     pub project_path: PathBuf,
@@ -70,6 +68,7 @@ impl Roots {
                 .map_err(|e| QueryError::new(ErrorCode::UnsafePath, e))?,
         );
         Ok(Self {
+            native_target: None,
             project,
             output,
             project_path: canonical,
@@ -105,7 +104,23 @@ impl Roots {
         Ok(())
     }
 }
-pub(crate) fn read_recipe(roots: &Roots, path: &str) -> Result<ValidatedRecipe, QueryError> {
+#[cfg(test)]
+pub(crate) fn read_recipe(
+    roots: &Roots,
+    path: &str,
+) -> Result<crate::recipe::ValidatedRecipe, QueryError> {
+    match read_selected_recipe(roots, path)? {
+        crate::engine::domain::SelectedRecipe::Docker(recipe) => Ok(recipe),
+        crate::engine::domain::SelectedRecipe::Native(_)
+        | crate::engine::domain::SelectedRecipe::NativeIntegration(_) => {
+            Err(error(ErrorCode::RecipeInvalid))
+        }
+    }
+}
+pub(crate) fn read_selected_recipe(
+    roots: &Roots,
+    path: &str,
+) -> Result<crate::engine::domain::SelectedRecipe, QueryError> {
     // Reuse the public portable path rule as well as RelativePath's native rule.
     let args = InspectArgs {
         recipe_path: path.into(),
@@ -153,9 +168,9 @@ pub(crate) fn read_recipe(roots: &Roots, path: &str) -> Result<ValidatedRecipe, 
         return Err(error(ErrorCode::RecipeChanged));
     }
     roots.verify_parent(parent_path.as_ref(), &parent, &canonical_parent)?;
-    let parsed = recipe::parse_bytes(
-        &canonical_parent.join(source_path.file_name().expect("portable leaf")),
+    let parsed = crate::native::storage::decode_recipe(
         &bytes,
+        canonical_parent.join(source_path.file_name().expect("portable leaf")),
     );
     // The parser's artifact validation uses pathname context. Validate that
     // context even on parse failure, retaining the more specific namespace error.

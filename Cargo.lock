@@ -778,6 +778,10 @@ dependencies = [
  "sha2",
  "tempfile",
  "theseus-host",
+ "theseus-native-client",
+ "theseus-native-helper",
+ "theseus-native-helper-store",
+ "theseus-native-protocol",
  "tokio",
  "toml",
 ]
@@ -791,9 +795,57 @@ dependencies = [
  "rustix 1.1.5",
  "serde",
  "serde_json",
+ "sha2",
  "signal-hook",
  "tempfile",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "theseus-native-client"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "theseus-host",
+ "theseus-native-helper-store",
+ "theseus-native-protocol",
+]
+
+[[package]]
+name = "theseus-native-helper"
+version = "0.1.0"
+dependencies = [
+ "rustix 1.1.5",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "theseus-host",
+ "theseus-native-client",
+ "theseus-native-helper-store",
+ "theseus-native-protocol",
+]
+
+[[package]]
+name = "theseus-native-helper-store"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "theseus-host",
+ "theseus-native-protocol",
+]
+
+[[package]]
+name = "theseus-native-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

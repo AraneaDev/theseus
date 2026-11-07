@@ -39,6 +39,7 @@ pub struct App {
     pub(super) filter_draft: String,
     pub(super) edit_session: Option<super::preview_edit::Session>,
     pub comparison: Option<super::comparison::ComparisonView>,
+    pub native: Option<super::native::NativeView>,
     pub recipe: Option<ValidatedRecipe>,
     pub options: Option<RunOptions>,
     pub report: Option<RunReport>,
@@ -69,6 +70,7 @@ impl App {
             filter_draft: String::new(),
             edit_session: None,
             comparison: None,
+            native: None,
             recipe: None,
             options: None,
             report: Some(report),
@@ -89,6 +91,52 @@ impl App {
             cancel_requested: false,
             quit_requested: false,
         }
+    }
+    pub fn native_offline(report: crate::native::model::NativeReport, root: PathBuf) -> Self {
+        let mut app = Self::offline(RunReport::new("unused"), root);
+        app.report = None;
+        app.native = Some(super::native::NativeView::offline(report));
+        app.status = "Offline native report".into();
+        app
+    }
+    pub fn set_native_report(&mut self, report: crate::native::model::NativeReport, root: PathBuf) {
+        if let Some(view) = &mut self.native {
+            view.set_report(report);
+        } else {
+            self.native = Some(super::native::NativeView::offline(report));
+        }
+        self.root = root;
+        self.view_revision = self.view_revision.wrapping_add(1);
+    }
+    pub fn integration_offline(
+        report: crate::native::integration::model::NativeIntegrationReport,
+        root: PathBuf,
+    ) -> Self {
+        let mut app = Self::offline(RunReport::new("unused"), root);
+        app.report = None;
+        app.native = Some(super::native::NativeView::integration_offline(report));
+        app.status = "Offline native integration report".into();
+        app
+    }
+    pub fn set_integration_report(
+        &mut self,
+        report: crate::native::integration::model::NativeIntegrationReport,
+        root: PathBuf,
+    ) {
+        if let Some(view) = &mut self.native {
+            view.set_integration_report(report);
+        } else {
+            self.native = Some(super::native::NativeView::integration_offline(report));
+        }
+        self.root = root;
+        self.view_revision = self.view_revision.wrapping_add(1);
+    }
+    pub fn native_preview(text: String) -> Self {
+        let mut app = Self::offline(RunReport::new("unused"), PathBuf::new());
+        app.report = None;
+        app.native = Some(super::native::NativeView::preview(text));
+        app.status = "Native preview".into();
+        app
     }
     pub fn preview(recipe: ValidatedRecipe, options: RunOptions) -> Self {
         let mut app = Self::offline(RunReport::new("preview"), PathBuf::new());
@@ -123,6 +171,8 @@ impl App {
     pub fn outcome(&self) -> RunOutcome {
         if self.terminal_error.is_some() {
             RunOutcome::Incomplete
+        } else if let Some(view) = &self.native {
+            view.outcome()
         } else if let Some(view) = &self.comparison {
             view.report
                 .as_ref()

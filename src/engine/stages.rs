@@ -91,54 +91,22 @@ pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
             super::interruption::run(c, &mut state, kind)?
         }
         ScenarioKind::Clean | ScenarioKind::Upgrade | ScenarioKind::Reinstall => {
-            let (first, first_cp) = match kind {
-                ScenarioKind::Clean | ScenarioKind::Reinstall => {
-                    (StepName::InstallTarget, Checkpoint::TargetInstalled)
-                }
-                ScenarioKind::Upgrade => (StepName::InstallBase, Checkpoint::BaseInstalled),
-                ScenarioKind::InterruptedInstall
-                | ScenarioKind::InterruptedUpgrade
-                | ScenarioKind::Downgrade
-                | ScenarioKind::Rollback
-                | ScenarioKind::PluginLifecycle
-                | ScenarioKind::InterruptedRollback => {
-                    unreachable!("handled explicitly above")
-                }
-            };
-            c.step(&mut state, first)?;
-            c.checkpoint(&mut state, first_cp, false)?;
-            c.step(&mut state, StepName::Configure)?;
-            c.checkpoint(&mut state, Checkpoint::Configured, true)?;
-            match kind {
-                ScenarioKind::Upgrade => {
-                    c.step(&mut state, StepName::Upgrade)?;
-                    c.checkpoint(&mut state, Checkpoint::TargetInstalled, false)?;
-                    c.step(&mut state, StepName::Exercise)?;
-                }
-                ScenarioKind::Clean => c.step(&mut state, StepName::Exercise)?,
-                ScenarioKind::InterruptedInstall
-                | ScenarioKind::InterruptedUpgrade
-                | ScenarioKind::Downgrade
-                | ScenarioKind::Rollback
-                | ScenarioKind::PluginLifecycle
-                | ScenarioKind::InterruptedRollback => {
-                    unreachable!("handled explicitly above")
-                }
-                ScenarioKind::Reinstall => {
-                    c.step_named(&mut state, StepName::Exercise, "exercise_before_reinstall")?;
-                    let mut reference = StageReport::new("before_reinstall");
-                    c.capture(&mut state, &mut reference);
-                    state.before_reinstall = Some(reference.snapshots.clone());
-                    c.finish(reference)?;
-                    c.step(&mut state, StepName::Reinstall)?;
-                    c.checkpoint(&mut state, Checkpoint::Reinstalled, false)?;
-                    c.step_named(&mut state, StepName::Exercise, "exercise_after_reinstall")?;
-                }
-            }
+            super::common::run_common(
+                &mut LegacyLifecycleBackend {
+                    context: c,
+                    state: &mut state,
+                },
+                kind,
+            )?;
         }
     }
-    c.step(&mut state, StepName::Uninstall)?;
-    c.checkpoint(&mut state, Checkpoint::Uninstalled, false)?;
+    if !matches!(
+        kind,
+        ScenarioKind::Clean | ScenarioKind::Upgrade | ScenarioKind::Reinstall
+    ) {
+        c.step(&mut state, StepName::Uninstall)?;
+        c.checkpoint(&mut state, Checkpoint::Uninstalled, false)?;
+    }
     let mut final_stage = StageReport::new("final");
     c.capture(&mut state, &mut final_stage);
     let final_state = final_stage.snapshots.clone();
@@ -148,6 +116,29 @@ pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
         checks::review_findings(&state.baseline, &final_state, &profile.checks);
     Ok(())
 }
+/// Legacy bridge leaves the specialized Docker state and its safety semantics intact.
+struct LegacyLifecycleBackend<'a, 'b, E, F> {
+    context: &'a mut ScenarioContext<'b, E, F>,
+    state: &'a mut State,
+}
+impl<E, F> super::common::sealed::Sealed for LegacyLifecycleBackend<'_, '_, E, F> {}
+impl<E: Environment, F: FnMut(EngineEvent)> super::common::LifecycleBackend
+    for LegacyLifecycleBackend<'_, '_, E, F>
+{
+    fn step(&mut self, step: StepName, name: &str) -> Result<()> {
+        self.context.step_named(self.state, step, name)
+    }
+    fn checkpoint(&mut self, checkpoint: Checkpoint, configured: bool) -> Result<()> {
+        self.context.checkpoint(self.state, checkpoint, configured)
+    }
+    fn before_reinstall(&mut self) -> Result<()> {
+        let mut reference = StageReport::new("before_reinstall");
+        self.context.capture(self.state, &mut reference);
+        self.state.before_reinstall = Some(reference.snapshots.clone());
+        self.context.finish(reference)
+    }
+}
+
 impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
     fn save(&mut self, kind: EventKind, stage: Option<String>) -> Result<()> {
         let sid = self.report.scenarios[self.index].id.clone();

@@ -1,0 +1,27 @@
+{
+  "kind": "theseus_native_launch",
+  "schema": 1,
+  "profile": "openssh_subsystem_v1",
+  "target_id": "replace-with-disposable-target",
+  "baseline_label": "replace-with-baseline",
+  "os": "linux",
+  "ssh_program": "/absolute/path/to/ssh",
+  "openssh_version": "OpenSSH_10.0 REPLACE_WITH_EXACT_VERSION_OUTPUT",
+  "provider": {
+    "name": "replace-with-provider",
+    "program": "/absolute/path/to/provider",
+    "args": [],
+    "environment": []
+  },
+  "host": "disposable.example.invalid",
+  "port": 22,
+  "user": "theseus",
+  "subsystem": "theseus",
+  "private_key": "/absolute/private/identity",
+  "host_keys": "/absolute/private/known_hosts",
+  "runtime_directory": "/absolute/private/theseus-runtime",
+  "binding": "00000000000000000000000000000000",
+  "manifest_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+  "workspace_marker": "00000000000000000000000000000000",
+  "provider_epoch": "0000000000000000000000000000000000000000000000000000000000000000"
+}

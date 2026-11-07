@@ -1,0 +1,16 @@
+[package]
+name = "theseus-native-helper-store"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "Private bootstrap, ledger persistence and controller intent foundation"
+
+[dependencies]
+sha2 = "0.10.9"
+theseus-host = { path = "../theseus-host" }
+theseus-native-protocol = { path = "../theseus-native-protocol" }
+
+[dev-dependencies]
+serde_json = "1.0.151"
+tempfile = "3.27.0"

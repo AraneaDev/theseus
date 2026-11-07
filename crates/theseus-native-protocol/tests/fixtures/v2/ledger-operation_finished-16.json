@@ -1,0 +1,1 @@
+{"schema":1,"index":257,"record":{"kind":"operation_finished","lease":"ffffffffffffffffffffffffffffffff","operation":"ffffffffffffffffffffffffffffffff","outcome":{"kind":"file_created","length":4096,"digest":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}}}

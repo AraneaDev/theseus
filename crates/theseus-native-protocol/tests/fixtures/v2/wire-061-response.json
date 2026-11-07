@@ -1,0 +1,1 @@
+{"version":2,"session":"ffffffffffffffffffffffffffffffff","sequence":18446744073709551615,"message":{"kind":"response","reply_to":18446744073709551615,"result":{"kind":"refused","code":"wrong_lease"}}}

@@ -52,7 +52,25 @@ fn decimal(value: &str) -> bool {
 fn valid_record(value: &str) -> bool {
     let c: Vec<_> = value.split('/').collect();
     match c.as_slice() {
-        ["run"] => true,
+        ["run" | "native_recipe"] => true,
+        ["native", "leaves" | "limits"] => true,
+        ["native", "artifact", "base" | "target"] => true,
+        ["native", "check", i] => decimal(i),
+        ["native", "step", step] => {
+            serde_json::from_value::<crate::model::StepName>(Value::String((*step).into())).is_ok()
+        }
+        [
+            "native_identity"
+            | "native_disposition"
+            | "service"
+            | "readiness"
+            | "integration_check"
+            | "integration_disposition"
+            | "desktop",
+            i,
+        ] => decimal(i),
+        ["integration", "requirements"] => true,
+        ["integration", "check", i] => decimal(i),
         ["artifact", "base" | "target"] => true,
         ["env" | "observe" | "error" | "artifact", i] | ["s", i] => decimal(i),
         ["artifact", a, "file", b] => decimal(a) && decimal(b),
@@ -72,7 +90,7 @@ fn valid_record(value: &str) -> bool {
             s,
             "stage",
             t,
-            "command" | "check" | "snapshot" | "baseline" | "change" | "error",
+            "command" | "check" | "snapshot" | "baseline" | "change" | "error" | "native_file",
             i,
         ] => decimal(s) && decimal(t) && decimal(i),
         ["s", s, "stage", t, "snapshot", i, "entry", j] => {
@@ -356,12 +374,28 @@ pub(crate) struct StartArgs {
     pub request_key: Key,
     pub recipe_path: String,
     pub recipe_digest: Digest,
+    #[serde(
+        default,
+        deserialize_with = "explicit_profiles",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub profiles: Vec<ProfileName>,
     pub scenarios: Vec<ScenarioKind>,
     #[serde(default)]
     pub pull: bool,
     #[serde(default = "default_log_limit")]
     pub log_limit: UInt,
+}
+fn explicit_profiles<'de, D: serde::Deserializer<'de>>(
+    decoder: D,
+) -> Result<Vec<ProfileName>, D::Error> {
+    let profiles = Vec::<ProfileName>::deserialize(decoder)?;
+    if profiles.is_empty() {
+        return Err(serde::de::Error::custom(
+            "omit profiles for the native current-helper role",
+        ));
+    }
+    Ok(profiles)
 }
 fn default_log_limit() -> UInt {
     UInt(16_777_216)
@@ -420,7 +454,12 @@ named_enum!(RootCollection {
     Run,
     Scenarios,
     Artifacts,
-    Errors
+    Errors,
+    Services,
+    Readiness,
+    IntegrationChecks,
+    IntegrationDispositions,
+    Desktop
 });
 named_enum!(ScenarioCollection {
     Stages,
@@ -433,7 +472,8 @@ named_enum!(StageCollection {
     Snapshots,
     BaselineChanges,
     StageChanges,
-    StageErrors
+    StageErrors,
+    NativeFiles
 });
 named_enum!(ArtifactCollection { ArtifactFiles });
 named_enum!(SnapshotCollection { SnapshotEntries });
@@ -591,7 +631,7 @@ impl ToolCall {
             }
             Self::RunStart(a) => {
                 path_valid(&a.recipe_path)
-                    && (1..=2).contains(&a.profiles.len())
+                    && a.profiles.len() <= 2
                     && (1..=9).contains(&a.scenarios.len())
                     && a.profiles
                         .iter()
@@ -682,6 +722,15 @@ named_enum!(Lifetime { ServerProcess });
 named_enum!(Network { None, Bridge });
 named_enum!(Encoding { JsonUtf8 });
 named_enum!(RecordKind {
+    Service,
+    Readiness,
+    IntegrationCheck,
+    IntegrationDisposition,
+    Desktop,
+    NativeRecipe,
+    NativeFile,
+    NativeDisposition,
+    NativeIdentity,
     RecipeStep,
     RecipeCheck,
     RecipeArtifact,
@@ -712,8 +761,29 @@ pub(crate) struct CleanupView {
     pub recovery_required: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum NativeDispositionView {
+    NotStarted,
+    Complete { receipt: TextPreview },
+    Unknown { reason: TextPreview },
+    Failed { reason: TextPreview },
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeScenarioDispositions {
+    pub scenario_id: TextPreview,
+    pub local: NativeDispositionView,
+    pub remote: NativeDispositionView,
+    pub release: NativeDispositionView,
+    pub reset: NativeDispositionView,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SavedView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration: Option<crate::native::integration::view::Summary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_dispositions: Option<Vec<NativeScenarioDispositions>>,
     pub revision: Revision,
     pub schema_version: u8,
     pub outcome: RunOutcome,
@@ -776,6 +846,20 @@ pub(crate) struct OverviewData {
     pub lifetime: Lifetime,
     pub max_run_seconds: UInt,
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeOverviewData {
+    pub kind: NativeOverviewKind,
+    pub recipe_path: String,
+    pub recipe_digest: Digest,
+    pub schema: u8,
+    pub os: crate::native::recipe::NativeOs,
+    pub role: String,
+    pub scenarios: Vec<ScenarioKind>,
+    pub lifetime: Lifetime,
+    pub max_run_seconds: UInt,
+}
+named_enum!(NativeOverviewKind { NativeOverview });
 named_enum!(OverviewKind { Overview });
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -862,6 +946,7 @@ pub(crate) struct LogPage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum InspectData {
+    NativeOverview(NativeOverviewData),
     Overview(OverviewData),
     Catalog(CatalogPage),
     Record(RecordPage),

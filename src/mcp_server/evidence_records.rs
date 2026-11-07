@@ -114,6 +114,11 @@ impl<'a> Catalog<'a> {
                 RootCollection::Scenarios => Self::Scenarios(&report.scenarios),
                 RootCollection::Artifacts => Self::Artifacts(&report.artifacts),
                 RootCollection::Errors => Self::Errors(String::new(), &report.errors),
+                RootCollection::Services
+                | RootCollection::Readiness
+                | RootCollection::IntegrationChecks
+                | RootCollection::IntegrationDispositions
+                | RootCollection::Desktop => return Err(error(ErrorCode::InvalidArguments)),
             },
             EvidenceSelector::Scenario(s) => {
                 let (index, scenario) = scenario(report, &s.scenario_id)?;
@@ -131,6 +136,7 @@ impl<'a> Catalog<'a> {
                 let stage = get(&scenario.stages, ti)?;
                 let prefix = format!("s/{index}/stage/{ti}");
                 match s.collection {
+                    StageCollection::NativeFiles => return Err(error(ErrorCode::InvalidArguments)),
                     StageCollection::Commands => Self::Commands(prefix, &stage.commands),
                     StageCollection::Checks => Self::Checks(prefix, &stage.checks),
                     StageCollection::Snapshots => Self::Snapshots(prefix, &stage.snapshots),

@@ -16,6 +16,9 @@ fn block(title: &str, focused: bool) -> Block<'_> {
         }))
 }
 pub fn render(frame: &mut Frame, app: &App) {
+    if super::native::render(frame, app) {
+        return;
+    }
     if super::preview_edit::render(frame, app) {
         return;
     }

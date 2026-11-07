@@ -68,6 +68,92 @@ fn ordinary() -> Result<QueryValue, QueryError> {
     ))
 }
 
+#[test]
+fn integration_admission_pins_outer_source_and_inspection_stays_offline() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let catalog: serde_json::Value =
+        serde_json::from_slice(&super::super::worker::native_execution_tests::recipe_bytes())
+            .unwrap();
+    let example: serde_json::Value = serde_json::from_str(include_str!(
+        "../../examples/native/service-recipe.example.json"
+    ))
+    .unwrap();
+    let requirements = example["integrations"].clone();
+    let mut value = serde_json::json!({"kind":"theseus_native_recipe","schema":2,"integration_manifest_digest":"2".repeat(64),"catalog":catalog,"integrations":requirements});
+    let path = root.join("integration.json");
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let roots = Roots::open(&root, &root.join("out")).unwrap();
+    assert!(roots.native_target.is_none());
+    let args = InspectArgs {
+        recipe_path: "integration.json".into(),
+        recipe_digest: None,
+        selector: InspectSelector::Overview,
+        limit: None,
+        cursor: None,
+    };
+    let InspectData::NativeOverview(first) =
+        super::super::inspection::inspect(&roots, &args, 30, &reply()).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(first.schema, 2);
+    assert_eq!(first.role, "current_helper_account");
+    let catalog_args = InspectArgs {
+        recipe_digest: Some(first.recipe_digest.clone()),
+        selector: InspectSelector::Catalog {
+            profile: None,
+            collection: InspectCollection::Policies,
+        },
+        limit: Some(UInt::new(32).unwrap()),
+        ..args.clone()
+    };
+    let InspectData::Catalog(policies) =
+        super::super::inspection::inspect(&roots, &catalog_args, 30, &reply()).unwrap()
+    else {
+        panic!()
+    };
+    let required = policies
+        .records
+        .iter()
+        .find(|r| r.record_id.as_str() == "integration/requirements")
+        .unwrap();
+    let detail_args = InspectArgs {
+        selector: InspectSelector::Record {
+            record_id: required.record_id.clone(),
+        },
+        limit: Some(UInt::new(4096).unwrap()),
+        ..catalog_args
+    };
+    let InspectData::Record(detail) =
+        super::super::inspection::inspect(&roots, &detail_args, 30, &reply()).unwrap()
+    else {
+        panic!()
+    };
+    let requirements: serde_json::Value = serde_json::from_slice(&detail.bytes).unwrap();
+    assert_eq!(requirements["service"]["managed_by"], "installer");
+    let original =
+        match super::super::roots::read_selected_recipe(&roots, "integration.json").unwrap() {
+            crate::engine::domain::SelectedRecipe::NativeIntegration(r) => r,
+            _ => panic!(),
+        };
+    value["integrations"]["service"]["readiness"]["deadline_ms"] = serde_json::json!(2000);
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let edited =
+        match super::super::roots::read_selected_recipe(&roots, "integration.json").unwrap() {
+            crate::engine::domain::SelectedRecipe::NativeIntegration(r) => r,
+            _ => panic!(),
+        };
+    assert_eq!(original.core.digest, edited.core.digest);
+    assert_ne!(original.digest, edited.digest);
+    let start:StartArgs = serde_json::from_value(serde_json::json!({"server_instance":reply().instance,"request_key":"outer-source","recipe_path":"integration.json","recipe_digest":first.recipe_digest,"scenarios":["clean"]})).unwrap();
+    assert_eq!(
+        validate_selected_start(&roots, &start).unwrap_err().code,
+        ErrorCode::RecipeChanged
+    );
+    assert!(roots.native_target.is_none());
+}
+
 // Break caught: treating cancellation as completion frees capacity while native work still runs.
 #[test]
 fn cancellation_does_not_free_capacity_before_actual_completion_collection() {

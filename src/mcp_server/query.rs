@@ -48,6 +48,8 @@ pub(crate) enum QueryWork {
 pub(crate) enum QueryValue {
     Inspect(InspectData),
     Validated(ValidatedRecipe),
+    ValidatedNative(crate::native::recipe::ValidatedNativeRecipe),
+    ValidatedIntegration(Box<crate::native::integration::recipe::ValidatedIntegrationRecipe>),
     Refreshed(SavedProjection),
     Evidence(EvidenceData),
 }
@@ -290,6 +292,69 @@ fn bound_store(
         .open_child(&binding.report_id)
         .map_err(|e| QueryError::new(ErrorCode::IoError, e))
 }
+pub(crate) fn validate_selected_start(
+    roots: &Roots,
+    args: &StartArgs,
+) -> Result<crate::engine::domain::SelectedRecipe, QueryError> {
+    use crate::engine::domain::SelectedRecipe;
+    ToolCall::RunStart(args.clone())
+        .validate()
+        .map_err(|_| super::roots::error(ErrorCode::InvalidArguments))?;
+    let selected = super::roots::read_selected_recipe(roots, &args.recipe_path)?;
+    let digest = match &selected {
+        SelectedRecipe::Docker(r) => &r.digest,
+        SelectedRecipe::Native(r) => &r.digest,
+        SelectedRecipe::NativeIntegration(r) => &r.digest,
+    };
+    if digest != args.recipe_digest.as_str() {
+        return Err(super::roots::error(ErrorCode::RecipeChanged));
+    }
+    match &selected {
+        SelectedRecipe::Docker(recipe) => recipe
+            .validate_selection(&args.profiles, &args.scenarios)
+            .map_err(|e| QueryError::new(ErrorCode::RecipeInvalid, e))?,
+        SelectedRecipe::Native(recipe) => {
+            if !args.profiles.is_empty() || args.pull || roots.native_target.is_none() {
+                return Err(super::roots::error(ErrorCode::InvalidArguments));
+            }
+            let launch = roots
+                .native_target
+                .as_ref()
+                .expect("native ceiling presence checked");
+            let os = match recipe.recipe.os {
+                crate::native::recipe::NativeOs::Linux => theseus_native_protocol::v2::Os::Linux,
+                crate::native::recipe::NativeOs::Macos => theseus_native_protocol::v2::Os::Macos,
+                crate::native::recipe::NativeOs::Windows => {
+                    theseus_native_protocol::v2::Os::Windows
+                }
+            };
+            if launch.integration_components().is_some()
+                || launch.binding().os != os
+                || launch.binding().manifest_digest.to_hex() != recipe.recipe.manifest_digest
+            {
+                return Err(super::roots::error(ErrorCode::RecipeInvalid));
+            }
+            recipe
+                .validate_selection(&args.scenarios, &recipe.recipe.limits)
+                .map_err(|e| QueryError::new(ErrorCode::RecipeInvalid, e))?;
+        }
+        SelectedRecipe::NativeIntegration(recipe) => {
+            if !args.profiles.is_empty() || args.pull {
+                return Err(super::roots::error(ErrorCode::InvalidArguments));
+            }
+            let launch = roots
+                .native_target
+                .as_ref()
+                .ok_or_else(|| super::roots::error(ErrorCode::InvalidArguments))?;
+            recipe
+                .validate_selection(&args.scenarios, &recipe.core.recipe.limits)
+                .map_err(|e| QueryError::new(ErrorCode::RecipeInvalid, e))?;
+            crate::native::integration::view::validate_authority(recipe, launch)
+                .map_err(|e| QueryError::new(ErrorCode::RecipeInvalid, e))?;
+        }
+    }
+    Ok(selected)
+}
 fn execute(
     roots: &Roots,
     max_run_seconds: u64,
@@ -306,15 +371,19 @@ fn execute(
             ToolCall::RunStart(args.clone())
                 .validate()
                 .map_err(|_| super::roots::error(ErrorCode::InvalidArguments))?;
-            let validated = super::roots::read_recipe(roots, &args.recipe_path)?;
-            if validated.digest != args.recipe_digest.as_str() {
-                return Err(super::roots::error(ErrorCode::RecipeChanged));
-            }
+            let selected = validate_selected_start(roots, &args)?;
             cancelled(cancel)?;
-            validated
-                .validate_selection(&args.profiles, &args.scenarios)
-                .map_err(|e| QueryError::new(ErrorCode::RecipeInvalid, e))?;
-            Ok(QueryValue::Validated(validated))
+            match selected {
+                crate::engine::domain::SelectedRecipe::Docker(recipe) => {
+                    Ok(QueryValue::Validated(recipe))
+                }
+                crate::engine::domain::SelectedRecipe::Native(recipe) => {
+                    Ok(QueryValue::ValidatedNative(recipe))
+                }
+                crate::engine::domain::SelectedRecipe::NativeIntegration(recipe) => {
+                    Ok(QueryValue::ValidatedIntegration(Box::new(recipe)))
+                }
+            }
         }
         QueryWork::RefreshStatus {
             binding,
@@ -322,6 +391,15 @@ fn execute(
         } => {
             let store = bound_store(roots, &binding)?;
             cancelled(cancel)?;
+            if store
+                .artifact_family()
+                .map_err(|e| QueryError::new(ErrorCode::EvidenceInvalid, e))?
+                == crate::native::storage::ArtifactFamily::Native
+            {
+                let snapshot = super::native_evidence::load(&store, sampled_hint)?;
+                return super::status_projection::project_native_snapshot(&snapshot)
+                    .map(QueryValue::Refreshed);
+            }
             let snapshot = super::evidence::load_snapshot(&store, sampled_hint)?;
             super::status_projection::project_snapshot(&snapshot).map(QueryValue::Refreshed)
         }
@@ -349,6 +427,16 @@ fn execute(
                 .map_err(|_| super::roots::error(ErrorCode::InvalidArguments))?;
             let store = bound_store(roots, &binding)?;
             cancelled(cancel)?;
+            if store
+                .artifact_family()
+                .map_err(|e| QueryError::new(ErrorCode::EvidenceInvalid, e))?
+                == crate::native::storage::ArtifactFamily::Native
+            {
+                let snapshot = super::native_evidence::load(&store, sampled_hint)?;
+                cancelled(cancel)?;
+                return super::native_evidence::evidence(&store, &snapshot, &args, &reply)
+                    .map(QueryValue::Evidence);
+            }
             let snapshot = super::evidence::load_snapshot(&store, sampled_hint)?;
             cancelled(cancel)?;
             super::evidence::evidence(&store, &snapshot, &args, &reply).map(QueryValue::Evidence)
