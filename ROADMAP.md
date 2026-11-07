@@ -252,8 +252,17 @@ registration cases; the readiness-rejection cases then asserted that a creator
 remains, contradicting their own SUT, which uninstalls in every case except a
 deliberately leaked one; they now assert verified SUT removal through the
 published teardown receipt. The Windows SCM artifact pin still disagreed between
-path and handle stat APIs; it now compares two handle observations. Final
-corrected-source native acceptance remains pending.
+path and handle stat APIs; it now compares two handle observations.
+
+The [seventeenth combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42360839575)
+at `a171395` passed all eight Docker suites and the complete Linux native job.
+macOS passed six of seven real launchd cases (upgrade, reinstall, missing/leaked,
+readiness rejection, clean, and wrong domain/replaced plist); the wrong-peer case
+built a protocol-invalid readiness uid, which the User-domain rule correctly
+refuses, and now injects a valid but wrong gid. Windows passed its artifact pin and
+then hit the same path-versus-handle stat difference in the copied-artifact guard,
+which now observes the path through a fresh handle and refuses reparse points.
+Final corrected-source native acceptance remains pending.
 
 Keep this queue and the checklists below current as work lands. Record source
 implementation, review, local verification, CI acceptance and merge separately.

@@ -913,14 +913,26 @@ impl IntegrationFixture {
                 cooperative_instance: instance.clone(),
                 endpoint,
                 root: ready_root.path().display().to_string(),
+                // A valid but wrong expected peer. launchd pins the readiness
+                // UID to the explicit User domain (protocol-validated), so the
+                // launchd fault expects the wrong GID instead; the host probe
+                // compares UID, GID and PID of the actual peer.
                 peer_uid: peer_uid.map(|uid| {
-                    if matches!(fault, Fault::WrongPeer) {
+                    if matches!(fault, Fault::WrongPeer) && platform != v2::ManagerPlatform::Launchd
+                    {
                         uid.checked_add(1).expect("peer UID")
                     } else {
                         uid
                     }
                 }),
-                peer_gid: peer_uid.map(|_| gid),
+                peer_gid: peer_uid.map(|_| {
+                    if matches!(fault, Fault::WrongPeer) && platform == v2::ManagerPlatform::Launchd
+                    {
+                        u32::checked_add(gid, 1).expect("peer GID")
+                    } else {
+                        gid
+                    }
+                }),
                 expectations,
             }),
         };

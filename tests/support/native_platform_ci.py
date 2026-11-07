@@ -163,6 +163,22 @@ def object_identity(metadata):
             "attributes": getattr(metadata, "st_file_attributes", 0)}
 
 
+def path_identity(path):
+    """What `path` currently names. POSIX keeps lstat (a link is its own
+    object). Windows path stat and handle fstat are filled by different APIs
+    (CI16/CI17), so observe the path through a fresh handle of the same API."""
+    if os.name != "nt":
+        return object_identity(Path(path).lstat())
+    # The fresh open would follow a reparse point, so refuse one at the name.
+    require(not (getattr(Path(path).lstat(), "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)),
+            "copied artifact path became a link or reparse point")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    try:
+        return object_identity(os.fstat(descriptor))
+    finally:
+        os.close(descriptor)
+
+
 def same_object(left, right):
     return (left["dev"], left["inode"]) == (right["dev"], right["inode"])
 
@@ -238,10 +254,10 @@ class ArtifactGuard:
             for pin in self.pins:
                 role, file, path = pin["role"], self.files[pin["role"]], Path(pin["copy"])
                 require(path.resolve() == path, "copied artifact canonical identity lost")
-                held, current = object_identity(os.fstat(file.fileno())), object_identity(path.lstat())
+                held, current = object_identity(os.fstat(file.fileno())), path_identity(path)
                 observed = {"role": role, "held": held, "path": current}
                 evidence["observed"].append(observed)
-                require(stat.S_ISREG(held["mode"]) and current == held == self.metadata[role], "copied artifact missing, replaced or metadata changed")
+                require(stat.S_ISREG(held["mode"]) and current == held == self.metadata[role], f"copied artifact missing, replaced or metadata changed: {observed} expected {self.metadata[role]}")
                 if self.native:
                     handle = self.native.file_handle(file)
                     require(self.native.file_identity(handle) == self.native_ids[role] and held["attributes"] & 1, "copied native artifact must remain original and readonly")
