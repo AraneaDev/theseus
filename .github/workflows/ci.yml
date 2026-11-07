@@ -260,6 +260,8 @@ jobs:
           path: ${{ env.THESEUS_HOST_EVIDENCE }}
           retention-days: 7
           if-no-files-found: error
+          # Retained run directories (.theseus-runs) hold the native reports.
+          include-hidden-files: true
 
   docker:
     name: docker (all eight required suites)

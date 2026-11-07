@@ -446,11 +446,14 @@ fn actual_native_helper_executes_installed_reader_and_hashes_settled_absence() {
 #[test]
 fn fake_ssh_argv_preparation_uses_only_synthetic_private_material() {
     let temp = tempfile::tempdir().unwrap();
-    let key = temp.path().join("synthetic-key");
+    // Canonical long-name root: Windows runners hand out 8.3 TEMP names
+    // (RUNNER~1) whose `~` the SSH option grammar correctly refuses.
+    let root = temp.path().canonicalize().unwrap();
+    let key = root.join("synthetic-key");
     std::fs::write(&key,b"-----BEGIN RSA PRIVATE KEY-----\nINERT TEST BYTES; NOT A REAL KEY\n-----END RSA PRIVATE KEY-----\n").unwrap();
-    let pins = temp.path().join("synthetic-pins");
+    let pins = root.join("synthetic-pins");
     std::fs::write(&pins, b"fixture.example ssh-ed25519 AAAA\n").unwrap();
-    let runtime = temp.path().join("private-runtime");
+    let runtime = root.join("private-runtime");
     let config = serde_json::json!({"kind":"theseus_native_launch","schema":1,"profile":"openssh_subsystem_v1","target_id":"fake-argv-only","baseline_label":"inert-base","os":"linux","ssh_program":binary("THESEUS_NATIVE_CATALOG_FIXTURE"),"openssh_version":"OpenSSH_10.0 fixture-only","provider":{"name":"inert-provider","program":binary("THESEUS_NATIVE_CATALOG_FIXTURE"),"args":[]},"host":"fixture.example","port":22,"user":"helper","subsystem":"theseus","private_key":key,"host_keys":pins,"runtime_directory":runtime,"binding":"01".repeat(16),"manifest_digest":"02".repeat(32),"workspace_marker":"03".repeat(16),"provider_epoch":"08".repeat(32)});
     let launch =
         theseus::native::launch::LaunchAuthority::decode(&serde_json::to_vec(&config).unwrap())

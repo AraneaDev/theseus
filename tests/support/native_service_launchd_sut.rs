@@ -90,7 +90,11 @@ impl NativeServiceSut {
             .iter()
             .map(|d| {
                 use sha2::{Digest as _, Sha256};
-                let bytes = definition::launchd_definition_bytes(label, d);
+                let bytes = definition::launchd_definition_bytes(
+                    label,
+                    &v2::LaunchdDomain::User { uid: *uid },
+                    d,
+                );
                 ensure!(
                     format!("{:x}", Sha256::digest(&bytes)) == d.definition_sha256,
                     "fixture plist commitment differs"

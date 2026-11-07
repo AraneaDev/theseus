@@ -171,6 +171,17 @@ class Planners(unittest.TestCase):
             with self.subTest(stderr=stderr, status=status), self.assertRaises(ValueError):
                 self.mac.validate_absence(name, uid, status, stdout, stderr)
 
+    def test_launchd_log_diagnostic_is_bounded_read_only_and_exact(self):
+        args = self.mac.launchd_log_arguments(0, ["theseus.ci.4b149e0bbedf8e2b-00", "theseus.ci.4b149e0bbedf8e2b-01"], ["/private/tmp/th-ci-4b149e0bbedf8e2b"])
+        self.assertEqual(args[0], "show")
+        predicate = args[args.index("--predicate") + 1]
+        self.assertIn('eventMessage CONTAINS "theseus.ci.4b149e0bbedf8e2b-00"', predicate)
+        self.assertIn('eventMessage CONTAINS "/private/tmp/th-ci-4b149e0bbedf8e2b"', predicate)
+        self.assertTrue(predicate.startswith('(process == "launchd" OR process == "launchctl") AND ('))
+        for labels, roots in [([], ["/r"]), (['x" OR 1'], ["/r"]), (["theseus.ci.4b149e0bbedf8e2b-00"], ['/r" OR "']), (["theseus.ci.4b149e0bbedf8e2b-00"], ["relative"])]:
+            with self.subTest(labels=labels, roots=roots), self.assertRaises(ValueError):
+                self.mac.launchd_log_arguments(0, labels, roots)
+
     def test_scm_receipt_binds_actual_exact_path_acl_probes_and_original_manager(self):
         plan = self.win.make_plan(manifest(True), "abcd1234abcd1234")
         reservation = plan["cases"][0]["reservations"][0]

@@ -747,7 +747,7 @@ def present_unit_probe(dbus, connection, manager_object, bus_name, unit_root, na
         with path.open("x") as handle:
             handle.write(PRESENT_PROBE_UNIT)
         manager = dbus.Interface(manager_object, IFACE)
-        record["unit_files"] = repr(manager.ListUnitFilesByPatterns([], [name], timeout=5))[:1024]
+        record["unit_files"] = repr(manager.ListUnitFilesByPatterns(dbus.Array([], signature="s"), dbus.Array([name], signature="s"), timeout=5))[:1024]
         record.update(absent_unit_probe(dbus, connection, manager_object, bus_name, name))
     except Exception as error:
         record["error"] = repr(error)[:1024]

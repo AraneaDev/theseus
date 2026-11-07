@@ -836,11 +836,11 @@ impl IntegrationFixture {
                 v2::ServiceAuthority::Systemd { .. } => {
                     format!("{:x}", Sha256::digest(definition_bytes(&d)))
                 }
-                v2::ServiceAuthority::Launchd { label, .. } => {
+                v2::ServiceAuthority::Launchd { label, domain, .. } => {
                     d.arguments.push(instance.clone().expect("native instance"));
                     format!(
                         "{:x}",
-                        Sha256::digest(definition::launchd_definition_bytes(label, &d))
+                        Sha256::digest(definition::launchd_definition_bytes(label, domain, &d))
                     )
                 }
                 v2::ServiceAuthority::Scm { service_name, .. } => {

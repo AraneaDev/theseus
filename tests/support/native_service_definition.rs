@@ -37,13 +37,24 @@ fn xml(value: &str) -> String {
 }
 /// No launchd defaults/environment or run-at-load behavior. The exact template
 /// is hashed into each manifest; bootstrap leaves the foreground job dormant.
-pub fn launchd_definition_bytes(label: &str, definition: &v2::ServiceDefinition) -> Vec<u8> {
+/// The explicit `user/<uid>` domain is a Background session, so a User-domain
+/// job declares exactly that session type (an undeclared job defaults to Aqua).
+pub fn launchd_definition_bytes(
+    label: &str,
+    domain: &v2::LaunchdDomain,
+    definition: &v2::ServiceDefinition,
+) -> Vec<u8> {
     let args = definition
         .arguments
         .iter()
         .map(|arg| format!("<string>{}</string>", xml(arg)))
         .collect::<String>();
-    format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>Label</key><string>{}</string><key>ProgramArguments</key><array>{args}</array><key>WorkingDirectory</key><string>{}</string><key>RunAtLoad</key><false/><key>KeepAlive</key><false/></dict></plist>\n", xml(label), xml(&definition.working_directory)).into_bytes()
+    let session = if matches!(domain, v2::LaunchdDomain::User { .. }) {
+        "<key>LimitLoadToSessionType</key><string>Background</string>"
+    } else {
+        ""
+    };
+    format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>Label</key><string>{}</string><key>ProgramArguments</key><array>{args}</array><key>WorkingDirectory</key><string>{}</string>{session}<key>RunAtLoad</key><false/><key>KeepAlive</key><false/></dict></plist>\n", xml(label), xml(&definition.working_directory)).into_bytes()
 }
 
 /// Immutable, provider-attested input to the SCM executable's no-argument entry.
@@ -279,6 +290,37 @@ mod platform_tests {
                     .is_err(),
                 "{field}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod launchd_session_tests {
+    use super::*;
+    fn definition() -> v2::ServiceDefinition {
+        serde_json::from_value(serde_json::json!({"role":"configured","artifact":"target","executable":"/fixture/service","arguments":["/fixture/service","x"],"environment":[],"working_directory":"/fixture","definition_sha256":"00".repeat(32)})).unwrap()
+    }
+    #[test]
+    fn user_domain_plist_declares_exact_background_session_only() {
+        let key = "<key>LimitLoadToSessionType</key><string>Background</string>";
+        let user = String::from_utf8(launchd_definition_bytes(
+            "org.theseus.fixture",
+            &v2::LaunchdDomain::User { uid: 501 },
+            &definition(),
+        ))
+        .unwrap();
+        assert_eq!(user.matches(key).count(), 1);
+        for domain in [
+            v2::LaunchdDomain::Gui { uid: 501 },
+            v2::LaunchdDomain::System,
+        ] {
+            let other = String::from_utf8(launchd_definition_bytes(
+                "org.theseus.fixture",
+                &domain,
+                &definition(),
+            ))
+            .unwrap();
+            assert!(!other.contains("LimitLoadToSessionType"));
         }
     }
 }

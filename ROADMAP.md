@@ -168,7 +168,19 @@ from those bytes (exact header flags, size-checked target ID list proven by the
 exact COM target, local-drive LinkInfo and an exact ExtraData allowlist). Linux
 showed that real and model not-found units now agree, and that the real
 installer stops after observing its freshly written unit; the operator now
-records the real manager's view of a present never-started unit. Final
+records the real manager's view of a present never-started unit.
+
+The [ninth combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42309766740)
+at `d93ca45` passed all eight Docker suites, and every Windows shortcut test now
+passes natively against the closed profile. Windows next reached the catalog
+adapter, where an SSH fixture used a short 8.3 temp path whose `~` the SSH option
+grammar correctly refuses; the test now uses the canonical long-name root.
+macOS passed real launchd qualification for the first time, then `launchctl
+bootstrap` refused the first SUT plist with I/O error 5. User-domain plists now
+declare exactly `LimitLoadToSessionType=Background` (required for the User
+domain, refused elsewhere); this is the leading hypothesis and pending
+confirmation, with launchd's own log retained as evidence. The Linux probe failed
+on an untyped empty D-Bus array and now passes typed arrays. Final
 corrected-source native acceptance remains pending.
 
 Keep this queue and the checklists below current as work lands. Record source

@@ -265,6 +265,7 @@ pub fn validate_plist(
     let mut label = None;
     let mut args = None;
     let mut cwd = None;
+    let mut session = None;
     while !xml.0.starts_with("</dict>") {
         let key = xml.string("key")?;
         if !seen.insert(key.clone()) {
@@ -286,11 +287,25 @@ pub fn validate_plist(
                 args = Some(values);
             }
             "RunAtLoad" | "KeepAlive" => xml.take("<false/>")?,
+            // Only the scalar string form; the array form and any other session
+            // type stay outside the closed profile.
+            "LimitLoadToSessionType" => session = Some(xml.string("string")?),
             _ => return Err(invalid("unsupported plist key")),
         }
     }
     xml.take("</dict>")?;
     xml.take("</plist>")?;
+    // The explicit `user/<uid>` domain is a Background session: a User-domain
+    // job must declare exactly that session type; no other domain admits the key.
+    let required_session = match authority.domain {
+        LaunchdDomain::User(_) => Some("Background"),
+        LaunchdDomain::System | LaunchdDomain::Gui(_) => None,
+    };
+    if session.as_deref() != required_session {
+        return Err(invalid(
+            "plist session type does not match the exact domain",
+        ));
+    }
     if !xml.0.is_empty()
         || label.as_ref() != Some(&authority.label)
         || args.as_ref() != Some(&expected.arguments)
@@ -392,7 +407,7 @@ pub(super) mod tests {
             assert_eq!(a.plist_origin(), None, "{root}");
         }
     }
-    const PLIST: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>Label</key><string>org.theseus.fixture</string><key>ProgramArguments</key><array><string>/fixture/service</string><string>literal $x; *</string></array><key>WorkingDirectory</key><string>/fixture</string><key>RunAtLoad</key><false/><key>KeepAlive</key><false/></dict></plist>";
+    const PLIST: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>Label</key><string>org.theseus.fixture</string><key>ProgramArguments</key><array><string>/fixture/service</string><string>literal $x; *</string></array><key>WorkingDirectory</key><string>/fixture</string><key>LimitLoadToSessionType</key><string>Background</string><key>RunAtLoad</key><false/><key>KeepAlive</key><false/></dict></plist>";
     #[test]
     fn launchd_commands_use_exact_explicit_user_domain_and_literal_argv() {
         let a = authority();
@@ -437,6 +452,40 @@ pub(super) mod tests {
         let mut a = authority();
         a.qualification.api_profile = "unknown".into();
         assert!(a.validate().is_err());
+    }
+    #[test]
+    fn launchd_user_plist_requires_exact_background_session_type() {
+        const KEY: &str = "<key>LimitLoadToSessionType</key><string>Background</string>";
+        assert!(PLIST.contains(KEY));
+        assert!(validate_plist(PLIST.as_bytes(), &authority(), &definition()).is_ok());
+        for text in [
+            // Missing where the User domain now requires it.
+            PLIST.replace(KEY, ""),
+            // Any other session type.
+            PLIST.replace(">Background<", ">Aqua<"),
+            PLIST.replace(">Background<", ">LoginWindow<"),
+            PLIST.replace(">Background<", ">background<"),
+            PLIST.replace(">Background<", "> Background<"),
+            // Array form, even of exactly Background.
+            PLIST.replace(
+                "<string>Background</string>",
+                "<array><string>Background</string></array>",
+            ),
+            // Duplicate declaration.
+            PLIST.replace(KEY, &format!("{KEY}{KEY}")),
+        ] {
+            assert!(
+                validate_plist(text.as_bytes(), &authority(), &definition()).is_err(),
+                "{text}"
+            );
+        }
+        // No non-User domain admits the key (or any plist): authority is User-only.
+        for domain in [LaunchdDomain::System, LaunchdDomain::Gui(501)] {
+            let mut a = authority();
+            a.domain = domain;
+            assert!(validate_plist(PLIST.as_bytes(), &a, &definition()).is_err());
+            assert!(validate_plist(PLIST.replace(KEY, "").as_bytes(), &a, &definition()).is_err());
+        }
     }
     #[test]
     fn launchd_plist_closed_profile_rejects_automatic_activation_and_hidden_configuration() {

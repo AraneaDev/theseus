@@ -244,6 +244,30 @@ class Planning(unittest.TestCase):
         failing = SimpleNamespace(Interface=lambda obj, iface: SimpleNamespace(LoadUnit=broken))
         self.assertIn("no reply", fixture.absent_unit_probe(failing, connection, object(), ":1.1", "x.service")["error"])
 
+    def test_present_unit_probe_passes_typed_empty_state_filter(self):
+        calls = {}
+        class Manager:
+            def ListUnitFilesByPatterns(self, states, patterns, timeout):
+                calls["states"], calls["patterns"] = states, patterns
+                return [("/r/units/x.service", "static")]
+            def LoadUnit(self, name, timeout):
+                return "/unit/x"
+        class Props:
+            def GetAll(self, interface, timeout):
+                return {"LoadState": "loaded"}
+        class Array(list):
+            def __init__(self, items, signature):
+                super().__init__(items); self.signature = signature
+        dbus = SimpleNamespace(Array=Array, Interface=lambda obj, iface: Props() if iface.endswith("Properties") else Manager())
+        connection = SimpleNamespace(get_object=lambda *a, **k: object())
+        with tempfile.TemporaryDirectory() as directory:
+            record = fixture.present_unit_probe(dbus, connection, object(), ":1.1", Path(directory), "x.service")
+            self.assertEqual(list(Path(directory).iterdir()), [])
+        self.assertNotIn("error", record)
+        self.assertEqual((calls["states"].signature, calls["patterns"].signature), ("s", "s"))
+        self.assertIn("static", record["unit_files"])
+        self.assertIn("after_unlink", record)
+
     def test_unreadable_worker_cleanup_is_uncertainty_not_a_lost_receipt(self):
         good = {"kind": "theseus_original_manager_cleanup_v1", "manager_started": True, "manager": {"joined_status": 0}, "manager_scope_empty": True, "errors": []}
         with tempfile.TemporaryDirectory() as directory:

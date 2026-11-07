@@ -15,6 +15,7 @@ import stat
 import struct
 import subprocess
 import sys
+import time
 
 import native_platform_ci as common
 from native_platform_ci import require
@@ -112,6 +113,26 @@ class ToolOwner:
         return child.returncode, stdout.decode("utf-8", "strict"), stderr.decode("utf-8", "strict")
 
 
+def launchd_log_arguments(started, labels, roots):
+    """Read-only bounded unified-log query for launchd's own reason behind a
+    failed native bootstrap/bootout of THIS invocation's exact labels/paths.
+    It observes only; it never authorizes absence, cleanup or adoption."""
+    require(labels and all(re.fullmatch(r"theseus\.ci\.[a-f0-9]{16}-[0-9]{2}", label) for label in labels), "exact reserved labels required")
+    require(roots and all(re.fullmatch(r"/[A-Za-z0-9._/-]+", root) and '"' not in root for root in roots), "plain absolute roots required")
+    terms = " OR ".join(f'eventMessage CONTAINS "{term}"' for term in [*sorted(set(labels)), *sorted(set(roots))])
+    return ["show", "--style", "compact", "--info", "--start", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started)),
+            "--predicate", f'(process == "launchd" OR process == "launchctl") AND ({terms})']
+
+
+def retain_launchd_log(started, plan, env, root):
+    labels = [r["name"] for case in plan["cases"] for r in case["reservations"]]
+    try:
+        with ExitStack() as stack:
+            ToolOwner("/usr/bin/log", stack).run(launchd_log_arguments(started, labels, [plan["root"]]), env, root / "launchd-unified-log.json")
+    except Exception as error:  # diagnostic only; never changes the native outcome
+        common.write_new(root / "launchd-unified-log-unavailable.json", {"error": f"{type(error).__name__}: {error}"[:4096]})
+
+
 def private_root(path, stack):
     path = Path(path)
     path.mkdir(mode=0o700)
@@ -124,6 +145,7 @@ def private_root(path, stack):
 
 def operator(plan, source_env):
     env = common.qualified_env(plan, source_env)
+    started = time.time() - 5
     uid = os.geteuid()
     require(uid > 0, "native tests must run under the actual non-root explicit User domain; never elevates")
     root = Path(plan["root"])
@@ -186,6 +208,9 @@ def operator(plan, source_env):
                         all_absent = False
                     observations.append({"name": reservation["name"], "absent": absent, "status": status})
             common.write_new(root / "cleanup.json", {"all_exact_reserved_names_absent": all_absent, "observations": observations, "registrations_mutated_by_operator": False, "roots_and_raw_logs_retained": True, "original_root_inode": os.fstat(root_fd).st_ino})
+            # Diagnostic only, after the cleanup receipt so it can never delay or
+            # displace the exact absence observations.
+            retain_launchd_log(started, plan, env, root)
         require(all_absent, "native fixture registration remains or is unknown; preserved for disposable runner teardown, never adopted")
         common.write_new(root / "result.json", {"source_sha": plan["manifest"]["source_sha"], "cases": results, "native_manager": "launchd-user", "external_gui_ssh_reset": "Pending"})
     return str(root)
