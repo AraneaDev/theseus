@@ -204,8 +204,18 @@ test now uses a 2 s deadline. Windows desktop cases still fail: removal now
 deletes through an identity-checked delete-access handle, the controller image
 comparison accepts only the exact verbatim form of a plain drive path, and the
 evidence collector (whose pattern never matched libtest's same-line output) now
-retains the native reports. Final corrected-source native acceptance remains
-pending.
+retains the native reports.
+
+The [twelfth combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42335353834)
+at `3fe1cc5` passed all eight Docker suites and the complete Linux native job
+again. On macOS the `Background` session type was confirmed: `launchctl bootstrap`
+succeeded, and the product parser then refused the first real loaded-job print
+(blank group separators, a separate `asid`, an exact property set and three new
+fields); the parser now admits exactly that observed form, and a running job's
+print remains unobserved. Windows desktop steps had succeeded but were scored as
+failed because the recipe expected POSIX exit statuses; the Windows desktop setup
+now names the Windows exit kind, keeping each expected code. Final
+corrected-source native acceptance remains pending.
 
 Keep this queue and the checklists below current as work lands. Record source
 implementation, review, local verification, CI acceptance and merge separately.

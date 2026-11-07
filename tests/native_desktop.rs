@@ -56,10 +56,13 @@ fn cli_scenario(
         anyhow::bail!("schema2 desktop evidence required")
     };
     if matches!(f.fault, Fault::None) {
+        // An incomplete run reports only on stdout; never render it empty.
         ensure!(
             output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+            "CLI run failed ({}): stdout: {} stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
         );
     } else {
         ensure!(!output.status.success(), "broken SUT cannot pass");

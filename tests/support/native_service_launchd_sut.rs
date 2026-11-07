@@ -141,7 +141,12 @@ impl NativeServiceSut {
         if let Some(d) = expected {
             ensure!(
                 observation.registration == host::Fact::Known(true),
-                "original fixture job registration unproved"
+                "original fixture job registration unproved: {}",
+                {
+                    let mut text = format!("{:?}", observation.registration);
+                    text.truncate(text.floor_char_boundary(512));
+                    text
+                }
             );
             ensure!(
                 matches!(observation.loaded, host::Fact::Known(ref loaded) if loaded.label == self.authority.label && loaded.domain == self.authority.domain && loaded.origin == self.authority.plist_path().to_string_lossy() && loaded.definition == raw(d)),

@@ -83,6 +83,11 @@ fn parse(authority: &LaunchdAuthority, bytes: &[u8]) -> io::Result<LoadedService
             closed = true;
             break;
         }
+        // Real launchctl (macOS 15.8.2) separates field groups with exactly
+        // empty lines; nothing else is skipped.
+        if line.is_empty() {
+            continue;
+        }
         let (key, value) = line
             .strip_prefix('\t')
             .and_then(|s| s.split_once(" = "))
@@ -146,6 +151,33 @@ fn parse(authority: &LaunchdAuthority, bytes: &[u8]) -> io::Result<LoadedService
                     return Err(invalid("truncated environment"));
                 }
             }
+            // Real launchctl renders this as a nested block of
+            // `\t\t<name> = <value>` rows; only these exact rows are admitted.
+            "probabilistic guard malloc policy" if value == "{" => {
+                let mut rows = std::collections::BTreeSet::new();
+                let mut ended = false;
+                for line in lines.by_ref() {
+                    if line == "\t}" {
+                        ended = true;
+                        break;
+                    }
+                    let (name, value) = line
+                        .strip_prefix("\t\t")
+                        .and_then(|s| s.split_once(" = "))
+                        .ok_or_else(|| invalid("unsupported guard malloc policy row"))?;
+                    if !matches!(name, "activation rate" | "sample rate")
+                        || !rows.insert(name)
+                        || value.is_empty()
+                        || value.contains(['{', '}'])
+                        || value.chars().any(char::is_control)
+                    {
+                        return Err(invalid("unadmitted guard malloc policy row"));
+                    }
+                }
+                if !ended {
+                    return Err(invalid("truncated guard malloc policy"));
+                }
+            }
             "active count"
             | "runs"
             | "pid"
@@ -169,6 +201,8 @@ fn parse(authority: &LaunchdAuthority, bytes: &[u8]) -> io::Result<LoadedService
             | "program"
             | "working directory"
             | "domain"
+            | "jetsamproperties category"
+            | "cpumon"
             | "properties" => {
                 if value.is_empty()
                     || value.contains(['{', '}'])
@@ -177,7 +211,12 @@ fn parse(authority: &LaunchdAuthority, bytes: &[u8]) -> io::Result<LoadedService
                     return Err(invalid("unsupported scalar value"));
                 }
             }
-            _ => return Err(invalid("unknown print field in finite profile")),
+            _ => {
+                return Err(invalid(&format!(
+                    "unknown print field in finite profile: {:?}",
+                    key.chars().take(64).collect::<String>()
+                )));
+            }
         }
     }
     if !closed || lines.next().is_some() {
@@ -195,17 +234,26 @@ fn parse(authority: &LaunchdAuthority, bytes: &[u8]) -> io::Result<LoadedService
         return Err(invalid("wrong loaded definition origin/type"));
     }
     let domain = required("domain")?;
-    let (target, asid) = domain
-        .split_once(" [")
-        .ok_or_else(|| invalid("unqualified domain projection"))?;
-    if target != authority.domain.target() {
-        return Err(invalid("wrong loaded domain"));
-    }
-    decimal(
-        asid.strip_suffix(']')
-            .ok_or_else(|| invalid("invalid domain audit session"))?,
-    )?;
-    if required("properties")? != "inferred program" {
+    // Either the modelled `user/<uid> [<asid>]` projection, or the real
+    // macOS 15.8.2 form: `domain = user/<uid>` plus a separate `asid = <n>`.
+    let asid = match domain.split_once(" [") {
+        Some((target, asid)) => {
+            if target != authority.domain.target() || fields.contains_key("asid") {
+                return Err(invalid("wrong loaded domain"));
+            }
+            asid.strip_suffix(']')
+                .ok_or_else(|| invalid("invalid domain audit session"))?
+        }
+        None if domain == authority.domain.target() => required("asid")?,
+        None => return Err(invalid("wrong loaded domain")),
+    };
+    decimal(asid)?;
+    // Exactly the modelled projection or the one observed on a real runner for
+    // the dormant (RunAtLoad/KeepAlive false) fixture job; nothing else.
+    if !matches!(
+        required("properties")?,
+        "inferred program" | "inferred program | system service | tle system"
+    ) {
         return Err(invalid("unsupported job properties/automatic activation"));
     }
     let definition = LaunchdDefinition {
@@ -281,6 +329,123 @@ mod tests {
             truncated: false,
             qualification: authority().qualification,
         }
+    }
+    /// Exact stdout of `launchctl print user/501/<label>` on a real macOS 15.8.2
+    /// (24H232) GitHub runner for the dormant fixture job (CI12 run 42335353834).
+    const REAL_PRINT: &str = r#"user/501/theseus.ci.df32fa6e6b81c188-00 = {
+	active count = 0
+	path = /private/tmp/th-ci-df32fa6e6b81c188/definitions-0/theseus.ci.df32fa6e6b81c188-00.plist
+	type = LaunchAgent
+	state = not running
+
+	program = /private/tmp/th-ci-df32fa6e6b81c188/fixture-0/workspace/reader
+	arguments = {
+		/private/tmp/th-ci-df32fa6e6b81c188/fixture-0/workspace/reader
+		service
+		/private/tmp/th-ci-df32fa6e6b81c188/ready-0/ready
+		/private/tmp/th-ci-df32fa6e6b81c188/fixture-0/workspace/data
+		none
+		theseus-ci-original-df32fa6e6b81c188-00
+	}
+
+	working directory = /private/tmp/th-ci-df32fa6e6b81c188/fixture-0/workspace
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		XPC_SERVICE_NAME => theseus.ci.df32fa6e6b81c188-00
+	}
+
+	domain = user/501
+	asid = 100011
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 0
+	last exit code = (never exited)
+
+	spawn type = daemon (3)
+	jetsam priority = 40
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+	probabilistic guard malloc policy = {
+		activation rate = 1/1000
+		sample rate = 1/0
+	}
+
+	properties = inferred program | system service | tle system
+}
+"#;
+    fn real_authority() -> LaunchdAuthority {
+        let mut a = authority();
+        a.label = "theseus.ci.df32fa6e6b81c188-00".into();
+        a.definition_root = "/private/tmp/th-ci-df32fa6e6b81c188/definitions-0".into();
+        a.exclusive_load_roots = vec![a.definition_root.clone()];
+        a
+    }
+    #[test]
+    fn real_runner_dormant_print_parses_exactly() {
+        let a = real_authority();
+        let loaded = parse(&a, REAL_PRINT.as_bytes()).expect("real runner print");
+        assert_eq!(loaded.domain, LaunchdDomain::User(501));
+        assert_eq!(
+            loaded.origin,
+            "/private/tmp/th-ci-df32fa6e6b81c188/definitions-0/theseus.ci.df32fa6e6b81c188-00.plist"
+        );
+        assert_eq!(loaded.state, RuntimeState::NotRunning);
+        assert!(matches!(loaded.pid, Fact::Unavailable(_)));
+        assert_eq!(
+            loaded.definition.executable,
+            std::path::PathBuf::from(
+                "/private/tmp/th-ci-df32fa6e6b81c188/fixture-0/workspace/reader"
+            )
+        );
+        assert_eq!(loaded.definition.arguments.len(), 6);
+        for (from, to) in [
+            ("\tdomain = user/501\n", "\tdomain = user/502\n"),
+            ("\tdomain = user/501\n", "\tdomain = gui/501\n"),
+            ("\tasid = 100011\n", ""),
+            ("\tasid = 100011\n", "\tasid = x\n"),
+            (
+                "inferred program | system service | tle system",
+                "inferred program | system service | tle system | keepalive",
+            ),
+            (
+                "inferred program | system service | tle system",
+                "system service",
+            ),
+            (
+                "\t\tactivation rate = 1/1000\n",
+                "\t\tother rate = 1/1000\n",
+            ),
+            (
+                "\t\tsample rate = 1/0\n",
+                "\t\tsample rate = 1/0\n\t\tsample rate = 1/0\n",
+            ),
+            (
+                "\tcpumon = default\n",
+                "\tcpumon = default\n\tunknown field = x\n",
+            ),
+            ("\n\n", "\n \n"),
+            (
+                "\tstate = not running\n",
+                "\tstate = not running\n\tdomain = user/501 [1]\n",
+            ),
+        ] {
+            assert!(REAL_PRINT.contains(from), "{from:?}");
+            let bad = REAL_PRINT.replacen(from, to, 1);
+            assert!(parse(&a, bad.as_bytes()).is_err(), "{from:?} -> {to:?}");
+        }
+        // Bracket form may not also carry a separate asid.
+        let both =
+            REAL_PRINT.replacen("\tdomain = user/501\n", "\tdomain = user/501 [100011]\n", 1);
+        assert!(parse(&a, both.as_bytes()).is_err());
+        let bracket = both.replacen("\tasid = 100011\n", "", 1);
+        assert!(parse(&a, bracket.as_bytes()).is_ok());
     }
     #[test]
     fn launchd_model_running_keeps_configuration_runtime_and_readiness_distinct() {

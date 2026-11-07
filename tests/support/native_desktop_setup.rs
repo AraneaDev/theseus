@@ -745,6 +745,24 @@ impl DesktopFixture {
             serde_json::from_str(include_str!("../../examples/native/recipe.json"))?;
         catalog["os"] = installer::os_name(installer::current_os()).into();
         catalog["leaves"]["reader"] = reader_leaf.into();
+        // The example catalog commits POSIX exit statuses. Windows processes
+        // report windows_exit, so the expected status must name that kind
+        // exactly (as the SCM service setup does); a kind mismatch fails a
+        // successful step.
+        if cfg!(windows) {
+            for step in catalog["steps"]
+                .as_object_mut()
+                .context("catalog steps")?
+                .values_mut()
+            {
+                step["expected_status"]["kind"] = json!("windows_exit");
+            }
+            for check in catalog["checks"].as_array_mut().context("catalog checks")? {
+                if check["command"].get("expected_status").is_some() {
+                    check["command"]["expected_status"]["kind"] = json!("windows_exit");
+                }
+            }
+        }
         catalog["manifest_digest"] = core.to_hex().into();
         catalog["base"] = artifact(&base)?;
         catalog["target"] = artifact(&target)?;

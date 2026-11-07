@@ -977,12 +977,11 @@ impl IntegrationFixture {
                 .expect("catalog steps")
                 .values_mut()
             {
-                step["expected_status"] = serde_json::json!({"kind":"windows_exit","code":0});
+                step["expected_status"]["kind"] = serde_json::json!("windows_exit");
             }
             for check in catalog["checks"].as_array_mut().expect("catalog checks") {
                 if check["command"].get("expected_status").is_some() {
-                    check["command"]["expected_status"] =
-                        serde_json::json!({"kind":"windows_exit","code":0});
+                    check["command"]["expected_status"]["kind"] = serde_json::json!("windows_exit");
                 }
             }
         }
