@@ -267,9 +267,12 @@ mod native {
                 ready.peer_uid.is_some(),
                 "actual Unix peer credentials measured"
             );
+            // The fault makes exactly one credential wrong: the UID (systemd)
+            // or, where the protocol pins the UID to the domain user, the GID.
             assert_ne!(
-                ready.peer_uid, configured_peer.peer_uid,
-                "measured peer must differ from the deliberately wrong expected UID"
+                (ready.peer_uid, ready.peer_gid),
+                (configured_peer.peer_uid, configured_peer.peer_gid),
+                "measured peer must differ from the deliberately wrong expected credentials"
             );
         } else {
             assert!(

@@ -271,7 +271,7 @@ class ArtifactGuard:
                     require(count <= pin["length"], "copied artifact grew while checking")
                     hasher.update(chunk)
                 observed["sha256"], observed["length"] = hasher.hexdigest(), count
-                require(count == pin["length"] and hasher.hexdigest() == pin["sha256"] and object_identity(os.fstat(file.fileno())) == held and object_identity(path.lstat()) == held, "copied artifact bytes differ from original exact source pin")
+                require(count == pin["length"] and hasher.hexdigest() == pin["sha256"] and object_identity(os.fstat(file.fileno())) == held and path_identity(path) == held, "copied artifact bytes differ from original exact source pin")
             evidence["status"] = "verified"
         except (OSError, ValueError) as error:
             evidence["error"] = str(error)

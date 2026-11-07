@@ -262,7 +262,14 @@ built a protocol-invalid readiness uid, which the User-domain rule correctly
 refuses, and now injects a valid but wrong gid. Windows passed its artifact pin and
 then hit the same path-versus-handle stat difference in the copied-artifact guard,
 which now observes the path through a fresh handle and refuses reparse points.
-Final corrected-source native acceptance remains pending.
+
+The [eighteenth combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42370487250)
+at `063351a` passed all eight Docker suites and the complete Linux native job.
+macOS ran all seven real launchd cases; the wrong-peer case's own assertion still
+compared only the UID, which the fixture now keeps valid, and now requires the
+measured credentials as a whole to differ. Windows' copied-artifact byte check
+retained one path-versus-handle stat comparison, now aligned with the guard. Final
+corrected-source native acceptance remains pending.
 
 Keep this queue and the checklists below current as work lands. Record source
 implementation, review, local verification, CI acceptance and merge separately.
