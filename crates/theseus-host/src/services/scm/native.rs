@@ -406,6 +406,15 @@ impl ScmManager {
                 "original action must settle before configuration transition",
             ));
         }
+        // The accepted, completed SUT run is the only authority for this
+        // transition, and an upgrade may stop and restart the service inside
+        // it (stop_for_transition/start_after_transition). Like the helper's
+        // own Start, it opens a fresh runtime interval: the previous PID pin
+        // is released here, and the first PID observed afterwards is pinned
+        // again, so any later unadmitted restart still revokes. The receipt is
+        // only format-checked here; its authenticity rests on the helper
+        // passing exclusively the accepted SUT run's receipt.
+        owner.original.runtime_pid.set(None);
         let observation = self.observe_original(&owner.original, deadline, cancel, false)?;
         self.check_owner(owner)?;
         if observation.registration != RegistrationState::Present
@@ -872,11 +881,15 @@ impl DeletionOwner {
     }
 }
 fn runtime_changed(o: &OriginalRegistration, status: ServiceStatus) -> bool {
+    pinned_pid_changed(&o.runtime_pid, status)
+}
+/// First observed live PID is pinned; any different live PID is a change.
+fn pinned_pid_changed(pin: &Cell<Option<u32>>, status: ServiceStatus) -> bool {
     if let Some(pid) = status.observed_process_id() {
-        if let Some(previous) = o.runtime_pid.get() {
+        if let Some(previous) = pin.get() {
             return previous != pid;
         }
-        o.runtime_pid.set(Some(pid));
+        pin.set(Some(pid));
     }
     false
 }
@@ -1135,6 +1148,32 @@ pub fn verify_platform_version(expected: &str) -> io::Result<()> {
 #[cfg(test)]
 mod qualification_tests {
     use super::*;
+    #[test]
+    fn released_runtime_pin_admits_exactly_one_new_pid_then_detects_changes() {
+        let status = |state, process_id| ServiceStatus {
+            service_type: 0x10,
+            state,
+            controls_accepted: 1,
+            win32_exit_code: 0,
+            service_specific_exit_code: 0,
+            checkpoint: 0,
+            wait_hint_ms: 0,
+            process_id,
+            service_flags: 0,
+        };
+        let pin = Cell::new(None);
+        assert!(!pinned_pid_changed(&pin, status(4, 8656)));
+        // A restart that is not released (no admitted transition) is a change.
+        assert!(pinned_pid_changed(&pin, status(4, 9001)));
+        // Stopped carries no live PID and never pins or changes.
+        assert!(!pinned_pid_changed(&pin, status(1, 0)));
+        // Admitted SUT transition releases the pin: the new PID is pinned once,
+        assert!(pin.replace(None).is_some());
+        assert!(!pinned_pid_changed(&pin, status(4, 9001)));
+        assert_eq!(pin.get(), Some(9001));
+        // and any later unadmitted restart is still detected.
+        assert!(pinned_pid_changed(&pin, status(4, 9100)));
+    }
     #[test]
     fn platform_version_parser_is_canonical_and_never_selects_a_default() {
         assert_eq!(

@@ -278,8 +278,16 @@ SUT uninstall and the creator is removed by the separate fixture teardown, which
 the case now asserts exactly. Windows passed its SCM operator guards and ran its
 first real SCM case, whose post-upgrade inspection was refused for a reason the
 helper deliberately does not export; refused inspections now carry a closed,
-text-free step classification so the next run names the failing step. Final
-corrected-source native acceptance remains pending.
+text-free step classification so the next run names the failing step.
+
+The [twentieth combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42379637778)
+at `ecbab9e` passed all eight Docker suites and the complete Linux and, for the
+first time, macOS native jobs, including all seven real launchd cases. Windows
+named the refused step `transition_admission`: an admitted SUT upgrade stops and
+restarts the service, but the retained SCM handle kept its earlier process pin, so
+the new process looked like an unadmitted restart. Admission now opens a fresh
+runtime interval exactly as the helper's own start does; any later unadmitted
+restart still revokes. Final corrected-source native acceptance remains pending.
 
 Keep this queue and the checklists below current as work lands. Record source
 implementation, review, local verification, CI acceptance and merge separately.
