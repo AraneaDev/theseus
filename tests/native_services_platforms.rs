@@ -442,11 +442,48 @@ mod native {
                 },
             );
             views::assert_service_views(report, &directory);
-            assert!(
-                fixture.finish_native_fixture().unwrap(),
-                "readiness rejection leaves the original fixture creator for separate teardown"
-            );
+            assert_sut_removed_registration_teardown(&fixture);
         }
+    }
+    /// Readiness rejection still lets the SUT remove its own registration, so
+    /// nothing remains for the separate teardown. `false` must be verified
+    /// absence: `finish` errors on any SUT/teardown failure, and the published
+    /// receipt proves no retained creator, revocation or unresolved mutation.
+    pub(super) fn assert_sut_removed_registration_teardown(fixture: &IntegrationFixture) {
+        assert!(
+            !fixture.finish_native_fixture().unwrap(),
+            "readiness rejection still lets the SUT remove its own registration; nothing remains for teardown"
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                fixture
+                    .root
+                    .path()
+                    .join("native-operator")
+                    .join("fixture-teardown.json"),
+            )
+            .expect("original teardown receipt published"),
+        )
+        .expect("teardown receipt JSON");
+        assert_eq!(receipt["kind"], "fixture_original_creator_teardown");
+        assert_eq!(receipt["had_original_registration"], false);
+        assert_eq!(receipt["success"], true);
+        assert!(receipt["sut_failure"].is_null() && receipt["detail"].is_null());
+        let evidence = &receipt["creation_evidence"];
+        #[cfg(target_os = "macos")]
+        assert!(
+            evidence["retained_created_files"] == 0
+                && evidence["revoked"] == false
+                && evidence["unresolved_native_operation"] == false
+                && evidence["sut_mutation_unresolved"] == false
+                && evidence["publication_failure"].is_null(),
+            "verified absence, never unknown: {evidence}"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            evidence["retained_original_scm_creator"], false,
+            "verified absence, never unknown: {evidence}"
+        );
     }
 }
 
@@ -467,8 +504,5 @@ fn launchd_running_wrong_native_peer_never_passes_readiness() {
     assert_ne!(report.outcome, theseus::model::RunOutcome::Passed);
     native::assert_readiness_fault(&fixture, &report, "WrongPeer");
     views::assert_service_views(report, &directory);
-    assert!(
-        fixture.finish_native_fixture().unwrap(),
-        "readiness rejection leaves the original fixture creator for separate teardown"
-    );
+    native::assert_sut_removed_registration_teardown(&fixture);
 }

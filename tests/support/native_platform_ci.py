@@ -271,6 +271,16 @@ def stable_identity(st):
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_mode, st.st_nlink, st.st_uid)
 
 
+def reopened_identity(path, flags):
+    """The path's current object, observed through a fresh handle: on Windows
+    path stat and handle fstat may be filled by different APIs (CI16)."""
+    descriptor = os.open(path, flags)
+    try:
+        return stable_identity(os.fstat(descriptor))
+    finally:
+        os.close(descriptor)
+
+
 def pin_artifacts(plan, destination, secure=None):
     """Copy exclusive leaves; retain original source descriptors through copying."""
     result, identities, original_files = {}, [], set()
@@ -299,7 +309,8 @@ def pin_artifacts(plan, destination, secure=None):
                 os.fsync(output.fileno())
                 copied_identity = object_identity(os.fstat(output.fileno()))
             after = os.fstat(handle.fileno())
-            require((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) and stable_identity(source.stat()) == stable_identity(after), "source artifact changed during pin")
+            current = reopened_identity(source, flags)
+            require((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) and current == stable_identity(after), f"source artifact changed during pin: {current} != {stable_identity(after)}")
             require(count == pin["length"] and h.hexdigest() == pin["sha256"], "artifact digest differs from exact pin")
             if secure:
                 secure(target, "executable")

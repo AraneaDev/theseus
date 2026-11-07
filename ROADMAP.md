@@ -243,8 +243,17 @@ artifact pin because whole stat comparison included access time, which the pin
 digest read updates; it now compares stable identity fields only. macOS's client
 recovery control observed a truthful `NotStarted(CancelRequested)` recovery after
 its own join cancelled the accepted create; the control now admits it only with
-the matching durable ledger outcome and no physical file. Final corrected-source
-native acceptance remains pending.
+the matching durable ledger outcome and no physical file.
+
+The [sixteenth combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42356492464)
+at `b456b88` passed all eight Docker suites and the complete Linux native job.
+macOS passed real launchd upgrade-from-running, reinstall and missing/leaked
+registration cases; the readiness-rejection cases then asserted that a creator
+remains, contradicting their own SUT, which uninstalls in every case except a
+deliberately leaked one; they now assert verified SUT removal through the
+published teardown receipt. The Windows SCM artifact pin still disagreed between
+path and handle stat APIs; it now compares two handle observations. Final
+corrected-source native acceptance remains pending.
 
 Keep this queue and the checklists below current as work lands. Record source
 implementation, review, local verification, CI acceptance and merge separately.
