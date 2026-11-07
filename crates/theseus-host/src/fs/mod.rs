@@ -260,7 +260,14 @@ impl HostDir {
         if let Err(error) = validate_name(name) {
             return R::StickyAuthorityFailure(error);
         }
-        let current = match self.open_leaf_classified(name) {
+        // Windows FileDispositionInfo requires DELETE access, which a retained
+        // read-only (e.g. classified-open) handle lacks. Delete through this
+        // fresh name-bound handle only after it proves the retained identity.
+        #[cfg(windows)]
+        let current = platform::open_leaf_for_delete_classified(&self.directory, name);
+        #[cfg(not(windows))]
+        let current = self.open_leaf_classified(name);
+        let current = match current {
             LeafOpenResult::Opened(current) => current,
             LeafOpenResult::MissingSettled => {
                 return R::StickyAuthorityFailure(io::Error::new(
@@ -286,8 +293,13 @@ impl HostDir {
             ));
         }
         // Both platform calls are synchronous and retain no operation storage:
-        // Unix unlinkat; Windows SetFileInformationByHandle(FileDispositionInfo).
-        match platform::remove_temporary(&self.directory, name, file) {
+        // Unix unlinkat; Windows SetFileInformationByHandle(FileDispositionInfo)
+        // on the identity-proven DELETE handle.
+        #[cfg(windows)]
+        let target = &current;
+        #[cfg(not(windows))]
+        let target = file;
+        match platform::remove_temporary(&self.directory, name, target) {
             Ok(()) => R::Removed,
             Err(error) => R::RetryableSettledDelete(error),
         }
@@ -1186,6 +1198,27 @@ mod classified_created_leaf_cleanup_tests {
 #[cfg(all(test, windows))]
 mod deny_write_inspection_tests {
     use super::*;
+    #[test]
+    fn retained_read_handle_removal_deletes_only_the_identity_proven_leaf() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("leaf"), b"owned").unwrap();
+        std::fs::write(temp.path().join("other"), b"owned").unwrap();
+        let root = HostDir::open(temp.path(), RootPolicy::LeafNoFollow).unwrap();
+        // A classified open has no DELETE access; removal must still work
+        // through the identity-proven DELETE handle, and only for that object.
+        let LeafOpenResult::Opened(leaf) = root.open_leaf_classified(OsStr::new("leaf")) else {
+            panic!("leaf open failed")
+        };
+        assert!(
+            root.remove_created_leaf(OsStr::new("other"), &leaf)
+                .is_err()
+        );
+        assert!(temp.path().join("other").exists());
+        root.remove_created_leaf(OsStr::new("leaf"), &leaf).unwrap();
+        drop(leaf);
+        assert!(!temp.path().join("leaf").exists());
+        assert!(temp.path().join("other").exists());
+    }
     const ERROR_SHARING_VIOLATION: i32 = 32;
     #[test]
     fn deny_write_open_refuses_writers_settled_and_keeps_default_open_unchanged() {

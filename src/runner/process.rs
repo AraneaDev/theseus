@@ -1707,14 +1707,16 @@ mod tests {
         let mut reached_barrier = false;
         let output = run_supervised(
             &mut held_child(&ready),
-            Duration::from_millis(150),
+            // Generous deadline: child startup on a loaded runner must not
+            // expire it before the stop callback; the callback sleeps past it.
+            Duration::from_secs(2),
             &CancellationToken::default(),
             None,
             128,
             |event| match event {
                 SupervisionEvent::Poll if ready.exists() => {
                     reached_barrier = true;
-                    thread::sleep(Duration::from_millis(160));
+                    thread::sleep(Duration::from_millis(2100));
                     Ok(SupervisionDecision::Stop)
                 }
                 SupervisionEvent::Poll => Ok(SupervisionDecision::Continue),

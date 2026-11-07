@@ -422,7 +422,10 @@ class Runner:
         return self.run(name, ['cargo', *arguments], timeout, required_cases=required_cases, require_tests=executing_tests)
 
 
-RETAINED_DESKTOP = re.compile(r'^retained desktop (?:fixture|endpoints): (.+?)\s*$', re.M)
+# Not anchored at line start: with --nocapture libtest prints the test name
+# and the fixture's eprintln on the same line ("test x ... retained desktop").
+# Line start, or libtest's `test <name> ... ` prefix under --nocapture; never mid-line.
+RETAINED_DESKTOP = re.compile(r'(?:^|\.\.\. )retained desktop (?:fixture|endpoints): (.+?)\s*$', re.M)
 
 
 def retain_desktop_evidence(evidence, name, file_limit=4 * 1024 * 1024, total_limit=128 * 1024 * 1024):

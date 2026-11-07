@@ -180,8 +180,32 @@ bootstrap` refused the first SUT plist with I/O error 5. User-domain plists now
 declare exactly `LimitLoadToSessionType=Background` (required for the User
 domain, refused elsewhere); this is the leading hypothesis and pending
 confirmation, with launchd's own log retained as evidence. The Linux probe failed
-on an untyped empty D-Bus array and now passes typed arrays. Final
-corrected-source native acceptance remains pending.
+on an untyped empty D-Bus array and now passes typed arrays.
+
+The [tenth combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42326310379)
+at `7f1fa00` passed all eight Docker suites. The Linux probe finally showed the
+real manager's view of a present unit: it reads path settings literally, so the
+fixture's quoted `WorkingDirectory` became a non-absolute directory that the
+product correctly refused, while the model's shell-style parsing had hidden it.
+The renderer now writes an unquoted literal, the closed grammar admits only that
+form and the model reads it literally; all eight private-model service cases pass.
+macOS exposed a real timing defect: after an abort, `Immediate` supervision
+recomputed the execution timeout including emergency cleanup time; the timeout is
+now judged at the abort decision. Windows reached its six Source-owned desktop
+cases for the first time; the desktop fixture now marks pinned images read-only
+and uses the long-name temp root, as the service fixture already did.
+
+The [eleventh combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42330968176)
+at `7f703ea` passed all eight Docker suites and, for the first time, the complete
+Linux native job, including every real private systemd manager case with the
+original managed bus, qualification and cleanup. macOS failed one supervision
+test whose 150 ms deadline expired before a slow runner started its child; the
+test now uses a 2 s deadline. Windows desktop cases still fail: removal now
+deletes through an identity-checked delete-access handle, the controller image
+comparison accepts only the exact verbatim form of a plain drive path, and the
+evidence collector (whose pattern never matched libtest's same-line output) now
+retains the native reports. Final corrected-source native acceptance remains
+pending.
 
 Keep this queue and the checklists below current as work lands. Record source
 implementation, review, local verification, CI acceptance and merge separately.

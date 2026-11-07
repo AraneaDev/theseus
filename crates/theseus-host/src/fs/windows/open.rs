@@ -308,6 +308,7 @@ pub(in crate::fs) fn open_leaf_classified(
     open_leaf_classified_shared(
         parent,
         name,
+        FILE_GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
     )
 }
@@ -320,11 +321,32 @@ pub(in crate::fs) fn open_leaf_deny_write_classified(
     parent: &File,
     name: &OsStr,
 ) -> crate::fs::LeafOpenResult {
-    open_leaf_classified_shared(parent, name, FILE_SHARE_READ | FILE_SHARE_DELETE)
+    open_leaf_classified_shared(
+        parent,
+        name,
+        FILE_GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_DELETE,
+    )
+}
+/// Identity-verified removal open: read plus DELETE access (needed by
+/// FileDispositionInfo), sharing like the default classified open. Used only
+/// by `remove_created_leaf_classified` after the caller's retained handle and
+/// this handle prove the same file identity; no content-write access.
+pub(in crate::fs) fn open_leaf_for_delete_classified(
+    parent: &File,
+    name: &OsStr,
+) -> crate::fs::LeafOpenResult {
+    open_leaf_classified_shared(
+        parent,
+        name,
+        FILE_GENERIC_READ | DELETE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )
 }
 fn open_leaf_classified_shared(
     parent: &File,
     name: &OsStr,
+    access: u32,
     share: u32,
 ) -> crate::fs::LeafOpenResult {
     use crate::fs::LeafOpenResult;
@@ -371,7 +393,7 @@ fn open_leaf_classified_shared(
         let mut status = unsafe {
             nt::NtCreateFile(
                 &mut call.handle,
-                FILE_GENERIC_READ,
+                access,
                 &call.attributes,
                 &mut call.status,
                 null(),

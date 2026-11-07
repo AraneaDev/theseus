@@ -1268,6 +1268,9 @@ mod definition_model_tests {
             "/fix\"ture",
             "/fixture/%h",
             "/fixture/$HOME",
+            "-/fixture",
+            "~/x",
+            "",
         ] {
             assert!(
                 validate_definition_source(format!("{base}WorkingDirectory={value}\n").as_bytes())

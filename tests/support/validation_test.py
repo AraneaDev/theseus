@@ -189,7 +189,8 @@ class ValidationTests(unittest.TestCase):
             except (OSError, NotImplementedError):
                 pass
             (evidence / 'source-desktop-product.log').write_text(
-                f'retained desktop fixture: {fixture}\nretained desktop endpoints: {root / "absent"}\nretained desktop fixture: relative\n')
+                # libtest --nocapture prints the test name on the same line.
+                f'test source_desktop_x ... retained desktop fixture: {fixture}\r\nretained desktop endpoints: {root / "absent"}\nretained desktop fixture: relative\n')
             result = validation.retain_desktop_evidence(evidence, 'source-desktop-product', file_limit=32)
             copied = evidence / 'retained-desktop/source-desktop-product/0/dot.theseus-runs/native-1/native-report.json'
             self.assertEqual(copied.read_text(), '{"error":"provider"}')

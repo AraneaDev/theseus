@@ -159,6 +159,42 @@ impl TargetAuthorityLoader for Loader {
         Ok(self.authority.clone())
     }
 }
+/// This process's own image path in plain absolute form. Rust's Windows
+/// process spawning passes a verbatim (`\\?\C:\...`) application name, so
+/// `current_exe` can report the verbatim spelling of the same drive path. Only
+/// that exact lexical prefix is removed (never UNC/device forms, and only
+/// when the remainder is already a normalized drive path); the result is
+/// still compared exactly with the pinned image path.
+fn current_image_path() -> Result<PathBuf> {
+    let current = std::env::current_exe()?;
+    #[cfg(windows)]
+    if let Some(plain) = current.to_str().and_then(|p| p.strip_prefix(r"\\?\")) {
+        let bytes = plain.as_bytes();
+        ensure!(
+            bytes.len() > 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && bytes[2] == b'\\'
+                && !plain[3..].split('\\').any(|c| {
+                    // Verbatim paths skip Win32 normalization; refuse every
+                    // form Win32 would reinterpret once the prefix is removed.
+                    let stem = c.split('.').next().unwrap_or(c).to_ascii_uppercase();
+                    c.is_empty()
+                        || c == "."
+                        || c == ".."
+                        || c.contains(['/', ':'])
+                        || c.ends_with(['.', ' '])
+                        || matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+                        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+                            && stem.len() == 4
+                            && stem.as_bytes()[3].is_ascii_digit())
+                }),
+            "fixture controller image path is not a plain drive path"
+        );
+        return Ok(PathBuf::from(plain));
+    }
+    Ok(current)
+}
 fn execute() -> Result<i32> {
     let mut args = std::env::args_os();
     let program = args.next().unwrap_or_default();
@@ -183,9 +219,12 @@ fn execute() -> Result<i32> {
         pin(&graph.config)?,
         pin(&graph.provider_template)?,
     ];
+    let current = current_image_path()?;
     ensure!(
-        std::env::current_exe()? == graph.controller.path,
-        "fixture controller differs from pinned image"
+        current == graph.controller.path,
+        "fixture controller differs from pinned image: running {:?}, pinned {:?}",
+        current,
+        graph.controller.path
     );
     let executables = std::sync::Arc::new(FixtureExecutablePins::retain(
         [
