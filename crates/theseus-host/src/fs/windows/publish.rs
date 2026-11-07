@@ -14,7 +14,10 @@ use windows_sys::{
         FileRenameInformationEx, NtSetInformationFile,
     },
     Win32::{
-        Foundation::{NTSTATUS, RtlNtStatusToDosError, STATUS_PENDING},
+        Foundation::{
+            ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, NTSTATUS,
+            RtlNtStatusToDosError, STATUS_PENDING,
+        },
         Storage::FileSystem::*,
         System::IO::IO_STATUS_BLOCK,
     },
@@ -160,17 +163,48 @@ pub(in crate::fs) fn remove_temporary(
     _name: &OsStr,
     file: &File,
 ) -> io::Result<()> {
-    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
-    // SAFETY: only the owned exclusive temporary is marked, then File closes it.
+    // POSIX semantics unlink the name immediately, as on Unix, even while
+    // other owners (e.g. an original broker's retained handles) keep the
+    // object open. Legacy disposition leaves a delete-pending name that
+    // refuses every later open/create with ERROR_ACCESS_DENIED, so a removed
+    // leaf could neither be observed absent nor be reinstalled.
+    let posix = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    // SAFETY: only the identity-proven handle is marked, then File closes it.
     // Unknown replacement never reaches this path. No destination deletion.
-    checked(unsafe {
+    let result = checked(unsafe {
         SetFileInformationByHandle(
             file.as_raw_handle(),
-            FileDispositionInfo,
-            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
-            size_of::<FILE_DISPOSITION_INFO>() as u32,
+            FileDispositionInfoEx,
+            (&posix as *const FILE_DISPOSITION_INFO_EX).cast(),
+            size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
         )
-    })
+    });
+    match result {
+        // Only a file system without the extended class falls back to the
+        // legacy disposition; every other refusal is returned unchanged.
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(code) if code == ERROR_INVALID_PARAMETER as i32
+                    || code == ERROR_NOT_SUPPORTED as i32
+                    || code == ERROR_INVALID_FUNCTION as i32
+            ) =>
+        {
+            let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+            // SAFETY: as above, same identity-proven handle and storage.
+            checked(unsafe {
+                SetFileInformationByHandle(
+                    file.as_raw_handle(),
+                    FileDispositionInfo,
+                    (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                    size_of::<FILE_DISPOSITION_INFO>() as u32,
+                )
+            })
+        }
+        other => other,
+    }
 }
 
 #[cfg(test)]

@@ -223,8 +223,17 @@ compared a stripped pipe suffix with the admitted header's full canonical pipe
 path, so every Windows broker session was refused; the comparison now uses the
 full validated path exactly. The macOS emergency-cleanup control's margins were
 too tight for the duplex exchange window; it now uses a 4 s budget and an
-emergency inspection that alone exceeds both the window and the budget. Final
-corrected-source native acceptance remains pending.
+emergency inspection that alone exceeds both the window and the budget.
+
+The [fourteenth combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42349360407)
+at `5273464` passed all eight Docker suites and the complete Linux native job for
+the fourth time; Windows passed its first Source-owned desktop case natively.
+Windows deletion used legacy delete-on-close, leaving names delete-pending while
+another owner still held the file, so later absence checks and reinstalls failed
+with access denied; deletion now uses POSIX semantics after the same identity
+proof. macOS completed real launchd install, configure and start for the first
+time; the running-job print adds seven inert scalar rows that the closed parser
+now admits exactly. Final corrected-source native acceptance remains pending.
 
 Keep this queue and the checklists below current as work lands. Record source
 implementation, review, local verification, CI acceptance and merge separately.

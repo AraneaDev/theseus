@@ -203,6 +203,14 @@ fn parse(authority: &LaunchdAuthority, bytes: &[u8]) -> io::Result<LoadedService
             | "domain"
             | "jetsamproperties category"
             | "cpumon"
+            // Additional rows of a real running job print (macOS 15.8.2).
+            | "immediate reason"
+            | "forks"
+            | "execs"
+            | "initialized"
+            | "trampolined"
+            | "started suspended"
+            | "proxy started suspended"
             | "properties" => {
                 if value.is_empty()
                     || value.contains(['{', '}'])
@@ -386,6 +394,93 @@ mod tests {
         a.definition_root = "/private/tmp/th-ci-df32fa6e6b81c188/definitions-0".into();
         a.exclusive_load_roots = vec![a.definition_root.clone()];
         a
+    }
+    /// Exact stdout of `launchctl print user/501/<label>` for the RUNNING fixture
+    /// job on a real macOS 15.8.2 runner (CI14 run 42349360407).
+    const REAL_RUNNING_PRINT: &str = r#"user/501/theseus.ci.36789ed80fc83e1e-00 = {
+	active count = 1
+	path = /private/tmp/th-ci-36789ed80fc83e1e/definitions-0/theseus.ci.36789ed80fc83e1e-00.plist
+	type = LaunchAgent
+	state = running
+
+	program = /private/tmp/th-ci-36789ed80fc83e1e/fixture-0/workspace/reader
+	arguments = {
+		/private/tmp/th-ci-36789ed80fc83e1e/fixture-0/workspace/reader
+		service
+		/private/tmp/th-ci-36789ed80fc83e1e/ready-0/ready
+		/private/tmp/th-ci-36789ed80fc83e1e/fixture-0/workspace/data
+		none
+		theseus-ci-original-36789ed80fc83e1e-00
+	}
+
+	working directory = /private/tmp/th-ci-36789ed80fc83e1e/fixture-0/workspace
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		XPC_SERVICE_NAME => theseus.ci.36789ed80fc83e1e-00
+	}
+
+	domain = user/501
+	asid = 100012
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 1
+	pid = 38925
+	immediate reason = non-ipc demand
+	forks = 0
+	execs = 1
+	initialized = 1
+	trampolined = 1
+	started suspended = 0
+	proxy started suspended = 0
+	last exit code = (never exited)
+
+	spawn type = daemon (3)
+	jetsam priority = 40
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+	probabilistic guard malloc policy = {
+		activation rate = 1/1000
+		sample rate = 1/0
+	}
+
+	properties = inferred program | system service | tle system
+}
+"#;
+    #[test]
+    fn real_runner_running_print_parses_exactly() {
+        let mut a = real_authority();
+        a.label = "theseus.ci.36789ed80fc83e1e-00".into();
+        a.definition_root = "/private/tmp/th-ci-36789ed80fc83e1e/definitions-0".into();
+        a.exclusive_load_roots = vec![a.definition_root.clone()];
+        let loaded = parse(&a, REAL_RUNNING_PRINT.as_bytes()).expect("real running print");
+        assert_eq!(loaded.state, RuntimeState::Running);
+        assert_eq!(loaded.pid, Fact::Known(38925));
+        assert_eq!(loaded.definition.arguments.len(), 6);
+        for (from, to) in [
+            ("\tpid = 38925\n", ""),
+            ("\tpid = 38925\n", "\tpid = 0\n"),
+            ("\tstate = running\n", "\tstate = not running\n"),
+            ("\tforks = 0\n", "\tforks = 0\n\tforks = 0\n"),
+            (
+                "\timmediate reason = non-ipc demand\n",
+                "\timmediate reason = {\n",
+            ),
+            (
+                "\texecs = 1\n",
+                "\texecs = 1\n\tunknown running field = 1\n",
+            ),
+        ] {
+            assert!(REAL_RUNNING_PRINT.contains(from), "{from:?}");
+            let bad = REAL_RUNNING_PRINT.replacen(from, to, 1);
+            assert!(parse(&a, bad.as_bytes()).is_err(), "{from:?} -> {to:?}");
+        }
     }
     #[test]
     fn real_runner_dormant_print_parses_exactly() {

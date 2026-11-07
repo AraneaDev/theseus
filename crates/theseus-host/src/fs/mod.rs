@@ -293,7 +293,9 @@ impl HostDir {
             ));
         }
         // Both platform calls are synchronous and retain no operation storage:
-        // Unix unlinkat; Windows SetFileInformationByHandle(FileDispositionInfo)
+        // Unix unlinkat; Windows POSIX-semantics FileDispositionInfoEx (legacy
+        // FileDispositionInfo only where the file system lacks it). An
+        // image-mapped (running) executable stays a settled retryable refusal.
         // on the identity-proven DELETE handle.
         #[cfg(windows)]
         let target = &current;
@@ -1198,6 +1200,32 @@ mod classified_created_leaf_cleanup_tests {
 #[cfg(all(test, windows))]
 mod deny_write_inspection_tests {
     use super::*;
+    #[test]
+    fn removal_unlinks_the_name_while_another_owner_keeps_the_object_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("reader.exe");
+        std::fs::write(&path, b"original").unwrap();
+        let root = HostDir::open(temp.path(), RootPolicy::LeafNoFollow).unwrap();
+        let LeafOpenResult::Opened(owner) = root.open_leaf_classified(OsStr::new("reader.exe"))
+        else {
+            panic!("owner open failed")
+        };
+        // Another owner (like an original broker's retained definition)
+        // still holds the object while the SUT removes and reinstalls it.
+        let LeafOpenResult::Opened(other) = root.open_leaf_classified(OsStr::new("reader.exe"))
+        else {
+            panic!("second owner open failed")
+        };
+        root.remove_created_leaf(OsStr::new("reader.exe"), &owner)
+            .unwrap();
+        assert!(matches!(
+            root.open_leaf_classified(OsStr::new("reader.exe")),
+            LeafOpenResult::MissingSettled
+        ));
+        std::fs::write(&path, b"replacement").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        drop((owner, other));
+    }
     #[test]
     fn retained_read_handle_removal_deletes_only_the_identity_proven_leaf() {
         let temp = tempfile::tempdir().unwrap();
