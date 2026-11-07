@@ -13,7 +13,51 @@ pub struct OwnedChild {
     termination_requested: bool,
     status: Option<ExitStatus>,
 }
+/// Original wait/group-right retirement fact. No constructor outside this
+/// process owner; metadata grants no PID/group control or descendant proof.
+pub(crate) struct OriginalChildRetirement {
+    pid: u32,
+    status: ExitStatus,
+}
+impl OriginalChildRetirement {
+    pub(crate) fn matches(&self, pid: u32, status: ExitStatus) -> bool {
+        self.pid == pid && self.status == status
+    }
+}
 impl OwnedChild {
+    pub(crate) fn retirement_witness(&self) -> Option<OriginalChildRetirement> {
+        if self.group.is_none() && self.termination_requested {
+            self.status.map(|status| OriginalChildRetirement {
+                pid: self.child.id(),
+                status,
+            })
+        } else {
+            None
+        }
+    }
+    /// Correlation metadata from the original still-reserved child. This number
+    /// is never authority to reopen, reattach, or control another process.
+    pub fn original_peer_pid(&self) -> io::Result<u32> {
+        if self.group.is_none() {
+            return Err(io::Error::other(
+                "original child identity is no longer reserved",
+            ));
+        }
+        Ok(self.child.id())
+    }
+
+    /// A process group cannot prove full descendant-tree settlement: an original
+    /// descendant can leave that group. Preserve the original rights and refuse
+    /// this stronger proof, independently of historical primary/group cleanup.
+    pub fn try_join_original_scope(&mut self) -> io::Result<Option<ExitStatus>> {
+        // Even a cached primary status is not a tree-completion receipt.
+        // Linux desktop callers use the separate dedicated subreaper owner.
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "original process-group descendant join proof unavailable",
+        ))
+    }
+
     /// Shared null/file launch primitive for owned endpoints and mechanism tests.
     #[doc(hidden)]
     pub fn spawn_files(
@@ -209,6 +253,34 @@ fn only_reserved_leader(group: Pid) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn original_retirement_witness_requires_actual_reap_and_disarmed_group() {
+        use std::time::{Duration, Instant};
+        let mut command = NativeCommand::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        let mut child = OwnedChild::spawn_files(&command, None, None, None).unwrap();
+        let original = child.original_peer_pid().unwrap();
+        assert!(child.retirement_witness().is_none());
+        let end = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_reap_and_release().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < end);
+            std::thread::yield_now();
+        };
+        let proof = child
+            .retirement_witness()
+            .expect("actual original rights retired");
+        assert!(proof.matches(original, status));
+        assert!(!proof.matches(original.wrapping_add(1), status));
+        assert!(child.original_peer_pid().is_err());
+        // Cached status and an empty group field alone are not retirement proof.
+        child.termination_requested = false;
+        assert!(child.retirement_witness().is_none());
+        child.termination_requested = true;
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_group_observation_requires_exact_reserved_leader() {

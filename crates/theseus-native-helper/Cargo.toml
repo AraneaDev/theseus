@@ -1,0 +1,43 @@
+[package]
+autobins = false
+name = "theseus-native-helper"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[features]
+test-support = ["theseus-host/desktop-test-support", "theseus-native-protocol/test-support"]
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.10.9"
+theseus-host = { path = "../theseus-host" }
+theseus-native-protocol = { path = "../theseus-native-protocol" }
+theseus-native-helper-store = { path = "../theseus-native-helper-store" }
+theseus-native-client = { path = "../theseus-native-client" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[[bin]]
+name = "theseus-native-helper"
+path = "src/main.rs"
+
+[[bin]]
+name = "theseus-native-helper-fixture"
+path = "src/bin/fixture_main.rs"
+required-features = ["test-support"]
+
+[[bin]]
+name = "theseus-native-desktop-broker"
+path = "src/broker_transport/main.rs"
+
+[[test]]
+name = "fixture_runtime"
+path = "tests/fixture_runtime.rs"
+required-features = ["test-support"]
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { version = "1.1.5", features = ["pipe"] }

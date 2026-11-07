@@ -1,0 +1,229 @@
+{
+  "outcome_branch_coverage": [
+    {
+      "kind": "run_completed",
+      "reason": "natural",
+      "status": {
+        "kind": "posix_exit",
+        "code": 255
+      },
+      "cleanup": "posix_leader_reaped_group_termination_requested",
+      "stdout_bytes": 18446744073709551615,
+      "stderr_bytes": 18446744073709551615,
+      "truncated": false
+    },
+    {
+      "kind": "run_completed",
+      "reason": "cancel_requested",
+      "status": {
+        "kind": "posix_exit",
+        "code": 255
+      },
+      "cleanup": "posix_leader_reaped_group_termination_requested",
+      "stdout_bytes": 18446744073709551615,
+      "stderr_bytes": 18446744073709551615,
+      "truncated": false
+    },
+    {
+      "kind": "run_completed",
+      "reason": "deadline",
+      "status": {
+        "kind": "posix_exit",
+        "code": 255
+      },
+      "cleanup": "posix_leader_reaped_group_termination_requested",
+      "stdout_bytes": 18446744073709551615,
+      "stderr_bytes": 18446744073709551615,
+      "truncated": false
+    },
+    {
+      "kind": "run_completed",
+      "reason": "natural",
+      "status": {
+        "kind": "posix_signal",
+        "signal": 255
+      },
+      "cleanup": "posix_leader_reaped_group_termination_requested",
+      "stdout_bytes": 18446744073709551615,
+      "stderr_bytes": 18446744073709551615,
+      "truncated": false
+    },
+    {
+      "kind": "run_completed",
+      "reason": "cancel_requested",
+      "status": {
+        "kind": "posix_signal",
+        "signal": 255
+      },
+      "cleanup": "posix_leader_reaped_group_termination_requested",
+      "stdout_bytes": 18446744073709551615,
+      "stderr_bytes": 18446744073709551615,
+      "truncated": false
+    },
+    {
+      "kind": "run_completed",
+      "reason": "deadline",
+      "status": {
+        "kind": "posix_signal",
+        "signal": 255
+      },
+      "cleanup": "posix_leader_reaped_group_termination_requested",
+      "stdout_bytes": 18446744073709551615,
+      "stderr_bytes": 18446744073709551615,
+      "truncated": false
+    },
+    {
+      "kind": "launch_failed",
+      "phase": "may_run",
+      "code": "invalid_catalog",
+      "cleanup": "posix_leader_reaped_group_termination_requested"
+    },
+    {
+      "kind": "run_completed",
+      "reason": "natural",
+      "status": {
+        "kind": "windows_exit",
+        "code": 4294967295
+      },
+      "cleanup": "windows_process_exited_job_empty",
+      "stdout_bytes": 18446744073709551615,
+      "stderr_bytes": 18446744073709551615,
+      "truncated": false
+    },
+    {
+      "kind": "run_completed",
+      "reason": "cancel_requested",
+      "status": {
+        "kind": "windows_exit",
+        "code": 4294967295
+      },
+      "cleanup": "windows_process_exited_job_empty",
+      "stdout_bytes": 18446744073709551615,
+      "stderr_bytes": 18446744073709551615,
+      "truncated": false
+    },
+    {
+      "kind": "run_completed",
+      "reason": "deadline",
+      "status": {
+        "kind": "windows_exit",
+        "code": 4294967295
+      },
+      "cleanup": "windows_process_exited_job_empty",
+      "stdout_bytes": 18446744073709551615,
+      "stderr_bytes": 18446744073709551615,
+      "truncated": false
+    },
+    {
+      "kind": "launch_failed",
+      "phase": "may_run",
+      "code": "invalid_catalog",
+      "cleanup": "windows_process_exited_job_empty"
+    },
+    {
+      "kind": "launch_failed",
+      "phase": "created_suspended",
+      "code": "invalid_catalog",
+      "cleanup": "windows_process_exited_job_empty"
+    },
+    {
+      "kind": "not_started",
+      "reason": "cancel_requested"
+    },
+    {
+      "kind": "not_started",
+      "reason": "deadline"
+    },
+    {
+      "kind": "file_create_failed",
+      "code": "already_exists"
+    },
+    {
+      "kind": "file_create_failed",
+      "code": "permission"
+    },
+    {
+      "kind": "file_created",
+      "length": 4096,
+      "digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    },
+    {
+      "kind": "launch_failed",
+      "phase": "never_created",
+      "code": "invalid_catalog",
+      "cleanup": "no_child_created"
+    }
+  ],
+  "purpose": "private independent schema arithmetic; no runtime/native proof",
+  "record_maxima": {
+    "header": {
+      "body_bytes": 321,
+      "framed_bytes": 357,
+      "maximizing_body_ascii": "{\"schema\":1,\"index\":0,\"record\":{\"kind\":\"header\",\"profile\":\"trusted_fixture_v1\",\"binding\":\"ffffffffffffffffffffffffffffffff\",\"manifest_digest\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"workspace_marker\":\"ffffffffffffffffffffffffffffffff\",\"os\":\"windows\",\"durability\":\"file_flushed_process_crash\"}}"
+    },
+    "lease_reserved": {
+      "body_bytes": 144,
+      "framed_bytes": 180,
+      "maximizing_body_ascii": "{\"schema\":1,\"index\":1,\"record\":{\"kind\":\"lease_reserved\",\"intent\":\"ffffffffffffffffffffffffffffffff\",\"lease\":\"ffffffffffffffffffffffffffffffff\"}}"
+    },
+    "operation_accepted": {
+      "body_bytes": 268,
+      "framed_bytes": 304,
+      "maximizing_body_ascii": "{\"schema\":1,\"index\":256,\"record\":{\"kind\":\"operation_accepted\",\"lease\":\"ffffffffffffffffffffffffffffffff\",\"operation\":\"ffffffffffffffffffffffffffffffff\",\"request_digest\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"operation_kind\":\"create_file\"}}"
+    },
+    "operation_finished": {
+      "body_bytes": 412,
+      "framed_bytes": 448,
+      "maximizing_body_ascii": "{\"schema\":1,\"index\":257,\"record\":{\"kind\":\"operation_finished\",\"lease\":\"ffffffffffffffffffffffffffffffff\",\"operation\":\"ffffffffffffffffffffffffffffffff\",\"outcome\":{\"kind\":\"run_completed\",\"reason\":\"cancel_requested\",\"status\":{\"kind\":\"posix_signal\",\"signal\":255},\"cleanup\":\"posix_leader_reaped_group_termination_requested\",\"stdout_bytes\":18446744073709551615,\"stderr_bytes\":18446744073709551615,\"truncated\":false}}}"
+    },
+    "lease_closed": {
+      "body_bytes": 191,
+      "framed_bytes": 227,
+      "maximizing_body_ascii": "{\"schema\":1,\"index\":258,\"record\":{\"kind\":\"lease_closed\",\"lease\":\"ffffffffffffffffffffffffffffffff\",\"disposition\":{\"kind\":\"quarantined\",\"reason\":\"helper_restarted_with_unfinished_operation\"}}}"
+    }
+  },
+  "conservative_full_history_bytes": 97020,
+  "finish_reservation_bytes": 4096,
+  "close_reservation_bytes": 8192,
+  "request_digest_oracles": [
+    {
+      "request_ascii": "{\"kind\":\"run\",\"lease\":\"22222222222222222222222222222222\",\"operation\":\"33333333333333333333333333333333\",\"program\":\"probe_success\"}",
+      "domain_hex": "746865736575732d6e61746976652d726571756573742d763200",
+      "digest_hex": "c75e02da2d19356ec35e0f4114228f39fca7b71257673eb4d26a2becf2c60e5a"
+    },
+    {
+      "request_ascii": "{\"kind\":\"create_file\",\"lease\":\"22222222222222222222222222222222\",\"operation\":\"44444444444444444444444444444444\",\"path\":\"probe.bin\",\"bytes\":\"00ff\"}",
+      "domain_hex": "746865736575732d6e61746976652d726571756573742d763200",
+      "digest_hex": "28aaac294213674416d991c389734bd950438e2fcfe13f52fa254e2ec80eb846"
+    }
+  ],
+  "literal_header_body_ascii": "{\"schema\":1,\"index\":0,\"record\":{\"kind\":\"header\",\"profile\":\"trusted_fixture_v1\",\"binding\":\"ffffffffffffffffffffffffffffffff\",\"manifest_digest\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"workspace_marker\":\"ffffffffffffffffffffffffffffffff\",\"os\":\"windows\",\"durability\":\"file_flushed_process_crash\"}}",
+  "literal_header_digest_hex": "dd63e9eb1dd2ec3d2e0b78f3ace1fbdcaaad963fd1f4f1d949712e12f51c831f",
+  "literal_header_frame_hex": "000001417b22736368656d61223a312c22696e646578223a302c227265636f7264223a7b226b696e64223a22686561646572222c2270726f66696c65223a22747275737465645f666978747572655f7631222c2262696e64696e67223a226666666666666666666666666666666666666666666666666666666666666666222c226d616e69666573745f646967657374223a2266666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666222c22776f726b73706163655f6d61726b6572223a226666666666666666666666666666666666666666666666666666666666666666222c226f73223a2277696e646f7773222c226475726162696c697479223a2266696c655f666c75736865645f70726f636573735f6372617368227d7ddd63e9eb1dd2ec3d2e0b78f3ace1fbdcaaad963fd1f4f1d949712e12f51c831f",
+  "wire_message_width_bounds": {
+    "hello": {
+      "body_bytes": 152,
+      "framed_bytes": 156
+    },
+    "request": {
+      "body_bytes": 8519,
+      "framed_bytes": 8523
+    },
+    "response": {
+      "body_bytes": 8545,
+      "framed_bytes": 8549
+    },
+    "output": {
+      "body_bytes": 8460,
+      "framed_bytes": 8464
+    },
+    "log": {
+      "body_bytes": 231,
+      "framed_bytes": 235
+    },
+    "closed": {
+      "body_bytes": 146,
+      "framed_bytes": 150
+    }
+  }
+}

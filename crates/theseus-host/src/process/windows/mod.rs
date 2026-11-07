@@ -13,7 +13,7 @@ use std::os::windows::process::ExitStatusExt;
 use std::process::ExitStatus;
 use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Threading::{
-    GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
+    GetExitCodeProcess, GetProcessId, TerminateProcess, WaitForSingleObject,
 };
 
 #[derive(Debug)]
@@ -27,6 +27,23 @@ pub struct OwnedChild {
     process_termination_requested: bool,
 }
 impl OwnedChild {
+    /// Correlation metadata queried only from the original retained handle.
+    /// It never grants PID-based reopening, reattachment, or process control.
+    pub fn original_peer_pid(&self) -> io::Result<u32> {
+        let pid = unsafe { GetProcessId(self.process.as_raw_handle()) };
+        if pid == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(pid)
+        }
+    }
+
+    /// Completion requires the original retained process plus zero active job
+    /// members; a primary process exit alone is never descendant completion.
+    pub fn try_join_original_scope(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.try_reap_and_release()
+    }
+
     /// Shared null/file launch primitive for owned endpoints and mechanism tests.
     #[doc(hidden)]
     pub fn spawn_files(

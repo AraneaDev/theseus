@@ -1,0 +1,1 @@
+{"schema":1,"index":257,"record":{"kind":"operation_finished","lease":"ffffffffffffffffffffffffffffffff","operation":"ffffffffffffffffffffffffffffffff","outcome":{"kind":"launch_failed","phase":"may_run","code":"invalid_catalog","cleanup":"posix_leader_reaped_group_termination_requested"}}}

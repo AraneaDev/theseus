@@ -7,6 +7,7 @@ use tokio::{runtime::Handle, sync::oneshot};
 #[derive(Clone, Copy)]
 pub(super) enum Kind {
     Run,
+    Native,
     Suite,
 }
 #[derive(Clone)]
@@ -17,11 +18,22 @@ struct Request {
 }
 enum Loaded {
     Run(Box<crate::model::RunReport>),
+    Native(Box<crate::native::model::NativeReport>),
+    Integration(Box<crate::native::integration::model::NativeIntegrationReport>),
     Suite(Box<crate::comparison::LoadedComparison>),
 }
 impl Loaded {
     fn read(request: &Request) -> Result<Self> {
         match request.kind {
+            Kind::Native => match crate::native::storage::load_run(&request.path)? {
+                crate::engine::domain::StoredRun::Native(report) => {
+                    Ok(Self::Native(Box::new(report)))
+                }
+                crate::engine::domain::StoredRun::NativeIntegration(report) => {
+                    Ok(Self::Integration(Box::new(report)))
+                }
+                _ => anyhow::bail!("native refresh family mismatch"),
+            },
             Kind::Run => crate::report::load(&request.path).map(|r| Self::Run(Box::new(r))),
             Kind::Suite => {
                 crate::comparison::load_document(&request.path).map(|r| Self::Suite(Box::new(r)))
@@ -140,6 +152,7 @@ impl Coordinator {
             let kind = latest.kind;
             let path = app.root.join(match kind {
                 Kind::Run => "report.json",
+                Kind::Native => crate::native::model::REPORT_FILENAME,
                 Kind::Suite => "comparison.json",
             });
             self.request(app, kind, path);
@@ -177,6 +190,8 @@ impl Coordinator {
                 .unwrap_or(std::path::Path::new("."))
                 .to_path_buf();
             match completion.result {
+                Ok(Loaded::Native(report)) => app.set_native_report(*report, root),
+                Ok(Loaded::Integration(report)) => app.set_integration_report(*report, root),
                 Ok(Loaded::Run(report)) => app.set_report(*report, root),
                 Ok(Loaded::Suite(document)) => {
                     if let Some(view) = &mut app.comparison {

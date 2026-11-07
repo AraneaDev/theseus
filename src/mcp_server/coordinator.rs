@@ -939,22 +939,74 @@ impl<T: Transport> ServerRuntime<T> {
         }
         match completion.destination {
             QueryDestination::Admission(handle) => {
-                let result = match completion.result {
-                    Ok(QueryValue::Validated(recipe)) => Ok(recipe),
-                    Err(owner) => Err(owner),
+                let update = match completion.result {
+                    Ok(QueryValue::Validated(recipe)) => RegistryUpdate::Validation {
+                        generation: completion.generation,
+                        result: Ok(recipe),
+                    },
+                    Ok(QueryValue::ValidatedIntegration(recipe)) => {
+                        RegistryUpdate::IntegrationValidation {
+                            generation: completion.generation,
+                            result: Ok(*recipe),
+                        }
+                    }
+                    Ok(QueryValue::ValidatedNative(recipe)) => RegistryUpdate::NativeValidation {
+                        generation: completion.generation,
+                        result: Ok(recipe),
+                    },
+                    Err(owner) => RegistryUpdate::Validation {
+                        generation: completion.generation,
+                        result: Err(owner),
+                    },
                     Ok(_) => {
                         self.fatal(now, "invalid admission completion");
                         return;
                     }
                 };
-                self.apply(
-                    &handle,
-                    RegistryUpdate::Validation {
-                        generation: completion.generation,
-                        result,
-                    },
-                );
-                if let Some(run) = self.registry.take_dispatch(&handle) {
+                self.apply(&handle, update);
+                if let Some(run) = self.registry.take_native_dispatch(&handle) {
+                    if self.engine.is_some() {
+                        self.fatal(now, "engine slot already occupied");
+                        return;
+                    }
+                    let Some(roots) = self.roots.as_ref() else {
+                        self.fatal(now, "missing opened roots");
+                        return;
+                    };
+                    let token = run.token.clone();
+                    let spawned = match roots.native_target.clone() {
+                        Some(launch) => EngineWorker::spawn_selected_native(
+                            run.handle.clone(),
+                            run.recipe,
+                            run.options,
+                            run.token,
+                            roots.output.clone(),
+                            launch,
+                        ),
+                        None => Err(QueryError::new(
+                            ErrorCode::InvalidArguments,
+                            anyhow::anyhow!("native server target unavailable"),
+                        )),
+                    };
+                    match spawned {
+                        Ok(worker) => {
+                            self.engine = Some(worker);
+                            self.active_run = Some(ActiveRun {
+                                handle: handle.clone(),
+                                token,
+                                deadline: now + Duration::from_secs(self.max_run_seconds),
+                            });
+                            self.apply(&handle, RegistryUpdate::Dispatched);
+                        }
+                        Err(error) => {
+                            self.worker_failed = true;
+                            self.apply(
+                                &handle,
+                                RegistryUpdate::SpawnFailed(OwnedError::deferred(error)),
+                            );
+                        }
+                    }
+                } else if let Some(run) = self.registry.take_dispatch(&handle) {
                     if self.engine.is_some() {
                         self.fatal(now, "engine slot already occupied");
                         return;
@@ -1032,7 +1084,11 @@ impl<T: Transport> ServerRuntime<T> {
                             })
                         })
                     }
-                    Ok(QueryValue::Validated(_)) => {
+                    Ok(
+                        QueryValue::Validated(_)
+                        | QueryValue::ValidatedNative(_)
+                        | QueryValue::ValidatedIntegration(_),
+                    ) => {
                         self.fatal(now, "invalid request completion");
                         return;
                     }
@@ -1045,6 +1101,12 @@ impl<T: Transport> ServerRuntime<T> {
         if let Err(update) = self.registry.apply(handle, update) {
             match update {
                 RegistryUpdate::Validation {
+                    result: Err(owner), ..
+                }
+                | RegistryUpdate::NativeValidation {
+                    result: Err(owner), ..
+                }
+                | RegistryUpdate::IntegrationValidation {
                     result: Err(owner), ..
                 }
                 | RegistryUpdate::SpawnFailed(owner) => self.owners.push(owner),

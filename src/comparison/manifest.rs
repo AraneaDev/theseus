@@ -1,6 +1,6 @@
 //! Bounded manifest validation; offline structural checks never open recipe paths.
 use super::model::*;
-use crate::recipe::{self, ValidatedRecipe, normalize_container_path, validate::contained};
+use crate::recipe::{ValidatedRecipe, normalize_container_path, validate::contained};
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 use std::{
@@ -159,8 +159,14 @@ pub fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<ValidatedSuite> {
     validate_manifest(&manifest)?;
     let mut variants = Vec::with_capacity(manifest.variants.len());
     for variant in &manifest.variants {
-        let recipe = recipe::load(&project_root.join(&variant.recipe))
+        let selected = crate::native::storage::load_recipe(&project_root.join(&variant.recipe))
             .with_context(|| format!("load variant {}", variant.id))?;
+        let crate::engine::domain::SelectedRecipe::Docker(recipe) = selected else {
+            anyhow::bail!(
+                "native comparisons are unsupported (variant {})",
+                variant.id
+            );
+        };
         recipe
             .validate_selection(&manifest.profiles, &manifest.scenarios)
             .with_context(|| format!("variant {} matrix", variant.id))?;

@@ -84,6 +84,10 @@ fn validate(artifact: &ComparisonArtifact) -> Result<()> {
 }
 pub(super) fn save(store: &ReportStore, artifact: &ComparisonArtifact) -> Result<()> {
     validate(artifact)?;
+    crate::native::storage::require_family(
+        store.artifact_family()?,
+        crate::native::storage::ArtifactFamily::Comparison,
+    )?;
     store.atomic_json("comparison.json", artifact)
 }
 fn open(path: &Path) -> Result<(ReportStore, ComparisonArtifact)> {
@@ -98,6 +102,10 @@ fn open(path: &Path) -> Result<(ReportStore, ComparisonArtifact)> {
         path
     };
     let store = ReportStore::safe_root(root, false)?;
+    crate::native::storage::require_family(
+        store.artifact_family()?,
+        crate::native::storage::ArtifactFamily::Comparison,
+    )?;
     let artifact: ComparisonArtifact = store.read_json("comparison.json")?;
     validate(&artifact)?;
     Ok((store, artifact))
@@ -115,9 +123,13 @@ pub(super) fn read_sources(
         .sources
         .iter()
         .map(|source| {
-            let read = store
-                .open_child(&source.path)
-                .and_then(|store| store.read_bytes("report.json"));
+            let read = store.open_child(&source.path).and_then(|store| {
+                crate::native::storage::require_family(
+                    store.artifact_family()?,
+                    crate::native::storage::ArtifactFamily::Docker,
+                )?;
+                store.read_bytes("report.json")
+            });
             let bytes = match read {
                 Ok(bytes) => bytes,
                 Err(error) if missing(&error) && source.report_digest.is_none() => {

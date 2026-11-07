@@ -394,8 +394,11 @@ impl HostProcess {
                 }
             }
             if cancellation_requires_abort || timed_out || grace_expired || error.is_some() {
+                // The execution deadline is judged at the abort decision; the
+                // emergency cleanup that follows has its own budget.
+                let decided = now();
                 self.stop.store(true, Ordering::SeqCst);
-                self.begin_cleanup_at(now());
+                self.begin_cleanup_at(decided);
                 // The exited leader stays unreaped throughout container abort,
                 // so even its control-operation deadlines cannot expose reuse.
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -421,7 +424,7 @@ impl HostProcess {
                 // Duplex abort owns a separate emergency cleanup budget. Its
                 // elapsed time cannot change the execution/shutdown decision.
                 if matches!(policy, MonitorPolicy::Immediate) {
-                    timed_out |= now().saturating_duration_since(self.started) >= timeout;
+                    timed_out |= decided.saturating_duration_since(self.started) >= timeout;
                 }
                 break;
             }
@@ -1704,14 +1707,16 @@ mod tests {
         let mut reached_barrier = false;
         let output = run_supervised(
             &mut held_child(&ready),
-            Duration::from_millis(150),
+            // Generous deadline: child startup on a loaded runner must not
+            // expire it before the stop callback; the callback sleeps past it.
+            Duration::from_secs(2),
             &CancellationToken::default(),
             None,
             128,
             |event| match event {
                 SupervisionEvent::Poll if ready.exists() => {
                     reached_barrier = true;
-                    thread::sleep(Duration::from_millis(160));
+                    thread::sleep(Duration::from_millis(2100));
                     Ok(SupervisionDecision::Stop)
                 }
                 SupervisionEvent::Poll => Ok(SupervisionDecision::Continue),

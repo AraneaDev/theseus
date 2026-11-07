@@ -55,6 +55,58 @@ impl EngineWorker {
         Self::start(handle, recipe, options, token, output, Docker::default)
     }
 
+    #[cfg(test)]
+    pub(crate) fn spawn_native(
+        handle: Handle,
+        recipe: engine::domain::SelectedRecipe,
+        options: engine::domain::NativeRunOptions,
+        token: CancellationToken,
+        output: Arc<ReportStore>,
+        launch: Arc<crate::native::launch::LaunchAuthority>,
+    ) -> Result<Self, QueryError> {
+        Self::spawn_selected_native(handle, recipe, options, token, output, launch)
+    }
+    pub(crate) fn spawn_selected_native(
+        handle: Handle,
+        recipe: engine::domain::SelectedRecipe,
+        mut options: engine::domain::NativeRunOptions,
+        token: CancellationToken,
+        output: Arc<ReportStore>,
+        launch: Arc<crate::native::launch::LaunchAuthority>,
+    ) -> Result<Self, QueryError> {
+        options.output_root = output.root().to_path_buf();
+        engine::domain::compile(&recipe, &native_options(&recipe, options.clone()))
+            .map_err(failure)?;
+        let bindings = Arc::new(Mutex::new(Bindings::default()));
+        let worker_bindings = bindings.clone();
+        let worker_handle = handle.clone();
+        let thread = thread::Builder::new()
+            .name("theseus-engine".into())
+            .spawn(move || {
+                let mut observer = Observer {
+                    handle: worker_handle.clone(),
+                    output,
+                    bindings: worker_bindings,
+                    binding: None,
+                    sequence: 0,
+                };
+                let result = execute_native(recipe, options, &launch, token, &mut observer);
+                WorkerCompletion::Engine(EngineCompletion {
+                    handle: worker_handle,
+                    result,
+                })
+            })
+            .map_err(|e| failure(e.into()))?;
+        Ok(Self {
+            owner: Some(Box::new(WorkerOwner {
+                thread: Some(thread),
+                bindings,
+                handle: Some(handle),
+                finalizer_handoff: None,
+            })),
+        })
+    }
+
     fn start<E: Environment + 'static>(
         handle: Handle,
         recipe: ValidatedRecipe,
@@ -282,9 +334,12 @@ impl Observer {
                 .next()
                 .and_then(|c| c.as_os_str().to_str())
                 .expect("engine child name is UTF-8");
-            assert_eq!(
-                components.next().map(|c| c.as_os_str()),
-                Some(std::ffi::OsStr::new("report.json"))
+            let filename = components.next().map(|c| c.as_os_str());
+            assert!(
+                filename.is_some_and(
+                    |n| n == "report.json" || n == crate::native::model::REPORT_FILENAME
+                ),
+                "known selected report filename"
             );
             assert!(components.next().is_none(), "exact saved child report path");
             SavedBinding {
@@ -374,6 +429,70 @@ fn execute<E: Environment>(
         }
     }
 }
+fn native_options(
+    recipe: &engine::domain::SelectedRecipe,
+    options: engine::domain::NativeRunOptions,
+) -> engine::domain::SelectedRunOptions {
+    if matches!(recipe, engine::domain::SelectedRecipe::NativeIntegration(_)) {
+        engine::domain::SelectedRunOptions::NativeIntegration(options)
+    } else {
+        engine::domain::SelectedRunOptions::Native(options)
+    }
+}
+#[allow(
+    clippy::result_large_err,
+    reason = "the exact original error owner transfers to the existing worker handoff"
+)]
+fn execute_native(
+    recipe: engine::domain::SelectedRecipe,
+    options: engine::domain::NativeRunOptions,
+    launch: &crate::native::launch::LaunchAuthority,
+    token: CancellationToken,
+    observer: &mut Observer,
+) -> Result<FinalSummary, OwnedError> {
+    let parent = observer.output.clone();
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        engine::run_selected_with_parent(
+            &recipe,
+            native_options(&recipe, options),
+            Some(launch),
+            token,
+            Some(&parent),
+            |e| observer.emit(e),
+        )
+    }));
+    let result = match result {
+        Ok(result) => result,
+        Err(payload) => Err(worker_panic(payload)),
+    };
+    match result {
+        Err(error) => Err(OwnedError::capture(failure(error))),
+        Ok(run) => {
+            let projection = catch_unwind(AssertUnwindSafe(|| {
+                let (outcome, counts) = match &run.report {
+                    engine::domain::StoredRun::Native(report) => (
+                        report.outcome,
+                        crate::native::integration::view::catalog_counts(&report.scenarios),
+                    ),
+                    engine::domain::StoredRun::NativeIntegration(report) => (
+                        report.outcome,
+                        crate::native::integration::view::integration_counts(report),
+                    ),
+                    _ => panic!("native engine returned a different backend"),
+                };
+                FinalSummary {
+                    outcome,
+                    counts,
+                    report_path: run.report_path.clone(),
+                    journal_path: run
+                        .report_path
+                        .with_file_name(crate::native::model::JOURNAL_FILENAME),
+                }
+            }));
+            projection.map_err(|payload| OwnedError::capture(failure(worker_panic(payload))))
+        }
+    }
+}
 fn retain_secondary(primary: anyhow::Error, secondary: anyhow::Error) -> anyhow::Error {
     let mut retained = CleanupFailures::default();
     retained.retain(&secondary);
@@ -383,3 +502,7 @@ fn retain_secondary(primary: anyhow::Error, secondary: anyhow::Error) -> anyhow:
 #[cfg(test)]
 #[path = "worker_tests/mod.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "native_execution_tests.rs"]
+pub(crate) mod native_execution_tests;

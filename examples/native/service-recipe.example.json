@@ -1,0 +1,239 @@
+{
+  "kind": "theseus_native_recipe",
+  "schema": 2,
+  "integration_manifest_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+  "catalog": {
+    "kind": "theseus_native_recipe",
+    "schema": 1,
+    "os": "linux",
+    "manifest_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+    "leaves": {
+      "reader": "reader",
+      "app": "app",
+      "data": "data"
+    },
+    "base": {
+      "length": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "target": {
+      "length": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "scenarios": [
+      "clean"
+    ],
+    "steps": {
+      "install_target": {
+        "id": "install_target",
+        "program": "install_target",
+        "expected_status": {
+          "kind": "posix_exit",
+          "code": 0
+        },
+        "stdout_literal": null
+      },
+      "configure": {
+        "id": "configure",
+        "program": "configure",
+        "expected_status": {
+          "kind": "posix_exit",
+          "code": 0
+        },
+        "stdout_literal": null
+      },
+      "exercise": {
+        "id": "exercise",
+        "program": "exercise",
+        "expected_status": {
+          "kind": "posix_exit",
+          "code": 0
+        },
+        "stdout_literal": null
+      },
+      "uninstall": {
+        "id": "uninstall",
+        "program": "uninstall",
+        "expected_status": {
+          "kind": "posix_exit",
+          "code": 0
+        },
+        "stdout_literal": null
+      }
+    },
+    "checks": [
+      {
+        "id": "target_version",
+        "checkpoint": "target_installed",
+        "command": {
+          "id": "target_version",
+          "program": "check_target",
+          "expected_status": {
+            "kind": "posix_exit",
+            "code": 0
+          },
+          "stdout_literal": "target\n"
+        }
+      },
+      {
+        "id": "configured_data",
+        "checkpoint": "configured",
+        "command": {
+          "id": "configured_data",
+          "program": "check_data",
+          "expected_status": {
+            "kind": "posix_exit",
+            "code": 0
+          },
+          "stdout_literal": "data\n"
+        }
+      }
+    ],
+    "limits": {
+      "run_seconds": 30,
+      "inspection_seconds": 30,
+      "max_operations": 128,
+      "output_bytes": 16384
+    }
+  },
+  "integrations": {
+    "service": {
+      "resource": "service",
+      "managed_by": "installer",
+      "controls": {
+        "configured_activation": "rehearsal_start",
+        "upgrade_precondition": "running",
+        "reinstall_precondition": "running",
+        "uninstall_precondition": "running"
+      },
+      "definitions": [
+        {
+          "role": "target",
+          "artifact": "target"
+        },
+        {
+          "role": "configured",
+          "artifact": "target"
+        }
+      ],
+      "checks": [
+        {
+          "id": "baseline-absent",
+          "scenarios": [
+            "clean"
+          ],
+          "phase": "baseline",
+          "role": null,
+          "artifact": null,
+          "predicate": "registration_absent"
+        },
+        {
+          "id": "installed-registration",
+          "scenarios": [
+            "clean"
+          ],
+          "phase": "target_installed_initial",
+          "role": "target",
+          "artifact": "target",
+          "predicate": "registration"
+        },
+        {
+          "id": "configured-fields",
+          "scenarios": [
+            "clean"
+          ],
+          "phase": "configured",
+          "role": "configured",
+          "artifact": "target",
+          "predicate": "configuration"
+        },
+        {
+          "id": "configured-running",
+          "scenarios": [
+            "clean"
+          ],
+          "phase": "configured",
+          "role": "configured",
+          "artifact": "target",
+          "predicate": "running"
+        },
+        {
+          "id": "configured-ready",
+          "scenarios": [
+            "clean"
+          ],
+          "phase": "configured",
+          "role": "configured",
+          "artifact": "target",
+          "predicate": "application_ready"
+        },
+        {
+          "id": "exercise-ready",
+          "scenarios": [
+            "clean"
+          ],
+          "phase": "exercise_final",
+          "role": "configured",
+          "artifact": "target",
+          "predicate": "application_ready"
+        },
+        {
+          "id": "sut-stopped",
+          "scenarios": [
+            "clean"
+          ],
+          "phase": "uninstalled",
+          "role": null,
+          "artifact": null,
+          "predicate": "stopped"
+        },
+        {
+          "id": "removed-absent",
+          "scenarios": [
+            "clean"
+          ],
+          "phase": "uninstalled",
+          "role": null,
+          "artifact": null,
+          "predicate": "registration_absent"
+        },
+        {
+          "id": "installed-fields",
+          "scenarios": [
+            "clean"
+          ],
+          "phase": "target_installed_initial",
+          "role": "target",
+          "artifact": "target",
+          "predicate": "configuration"
+        },
+        {
+          "id": "installed-stopped",
+          "scenarios": [
+            "clean"
+          ],
+          "phase": "target_installed_initial",
+          "role": "target",
+          "artifact": "target",
+          "predicate": "stopped"
+        },
+        {
+          "id": "exercise-running",
+          "scenarios": [
+            "clean"
+          ],
+          "phase": "exercise_final",
+          "role": "configured",
+          "artifact": "target",
+          "predicate": "running"
+        }
+      ],
+      "readiness": {
+        "kind": "local_challenge",
+        "protocol": "theseus_fixture_ready_v1",
+        "deadline_ms": 10000
+      }
+    },
+    "desktop": null
+  }
+}

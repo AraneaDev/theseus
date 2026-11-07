@@ -1,4 +1,6 @@
 //! Pinned directory authority. Paths retained here are diagnostic only.
+mod ledger;
+pub use ledger::LockedLedgerFile;
 mod path;
 pub use path::RelativePath;
 #[cfg(unix)]
@@ -17,6 +19,63 @@ use std::{
     io,
     path::{Path, PathBuf},
 };
+
+/// Cleanup through the original retained leaf, classified before errors erase phase.
+#[derive(Debug)]
+pub enum CreatedLeafRemovalResult {
+    Removed,
+    /// Only a terminal failure of the final synchronous deletion call.
+    RetryableSettledDelete(io::Error),
+    /// Name, mapping, open or identity authority was not proven; never auto-retry.
+    StickyAuthorityFailure(io::Error),
+    Unsettled(LeafOpenUncertainty),
+}
+
+/// Native single-leaf completion, classified before native status conversion.
+#[derive(Debug)]
+pub enum LeafOpenResult {
+    Opened(File),
+    MissingSettled,
+    FailedSettled(io::Error),
+    Unsettled(LeafOpenUncertainty),
+}
+
+/// Opaque original unresolved operation. Dropping it preserves both native
+/// storage and the original error until process exit; completion is unproved.
+pub struct LeafOpenUncertainty {
+    error: std::mem::ManuallyDrop<io::Error>,
+    _retained: std::mem::ManuallyDrop<Box<dyn std::any::Any + Send + Sync>>,
+}
+impl LeafOpenUncertainty {
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+    #[cfg(any(windows, test))]
+    fn retain(error: io::Error, retained: impl std::any::Any + Send + Sync) -> Self {
+        Self {
+            error: std::mem::ManuallyDrop::new(error),
+            _retained: std::mem::ManuallyDrop::new(Box::new(retained)),
+        }
+    }
+}
+impl std::fmt::Debug for LeafOpenUncertainty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LeafOpenUncertainty")
+            .field("error", self.error())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for LeafOpenUncertainty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error().fmt(f)
+    }
+}
+impl std::error::Error for LeafOpenUncertainty {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error())
+    }
+}
 
 /// Controls only initial root acquisition. Descendants always reject links.
 #[derive(Clone, Copy, Debug)]
@@ -39,6 +98,36 @@ impl HostDir {
     /// Failure to query or validate either directory is returned as an error.
     pub fn same_object(&self, other: &Self) -> io::Result<bool> {
         platform::same_directory(&self.directory, &other.directory)
+    }
+    /// Compare stable native directory identity, excluding mutable metadata.
+    pub fn same_directory_object(&self, other: &Self) -> io::Result<bool> {
+        platform::same_directory(&self.directory, &other.directory)
+    }
+    /// Open exactly one native file component through this retained directory.
+    pub fn open_leaf_classified(&self, name: &OsStr) -> LeafOpenResult {
+        if let Err(error) = validate_name(name) {
+            return LeafOpenResult::FailedSettled(error);
+        }
+        platform::open_leaf_classified(&self.directory, name)
+    }
+    /// Classified open for read-stable inspection. On Windows the handle
+    /// shares read and delete only, so while it is held no other handle can
+    /// gain write access, and an existing writer makes the open fail settled
+    /// (`FailedSettled`, sharing violation). Rename/replacement stays possible
+    /// and must be detected through file identity. POSIX has no mandatory
+    /// deny-write primitive; there this is exactly `open_leaf_classified`.
+    pub fn open_leaf_deny_write_classified(&self, name: &OsStr) -> LeafOpenResult {
+        if let Err(error) = validate_name(name) {
+            return LeafOpenResult::FailedSettled(error);
+        }
+        #[cfg(windows)]
+        {
+            platform::open_leaf_deny_write_classified(&self.directory, name)
+        }
+        #[cfg(not(windows))]
+        {
+            platform::open_leaf_classified(&self.directory, name)
+        }
     }
     pub fn open(path: &Path, policy: RootPolicy) -> io::Result<Self> {
         Ok(Self {
@@ -148,6 +237,76 @@ impl HostDir {
         }
         Ok(dir)
     }
+    /// Remove an exclusively created regular leaf using its retained directory
+    /// and original file handle. The caller must own this private namespace and
+    /// keep the handle until removal returns; this is not an atomic conditional
+    /// unlink against a concurrent namespace writer. Never follows a replacement.
+    pub fn remove_created_leaf(&self, name: &OsStr, file: &File) -> io::Result<()> {
+        match self.remove_created_leaf_classified(name, file) {
+            CreatedLeafRemovalResult::Removed => Ok(()),
+            CreatedLeafRemovalResult::RetryableSettledDelete(error)
+            | CreatedLeafRemovalResult::StickyAuthorityFailure(error) => Err(error),
+            CreatedLeafRemovalResult::Unsettled(owner) => Err(io::Error::other(owner)),
+        }
+    }
+    /// A settled final deletion error may retry this exact original authority.
+    /// Missing/replaced/unproved mappings and unresolved native calls remain sticky.
+    pub fn remove_created_leaf_classified(
+        &self,
+        name: &OsStr,
+        file: &File,
+    ) -> CreatedLeafRemovalResult {
+        use CreatedLeafRemovalResult as R;
+        if let Err(error) = validate_name(name) {
+            return R::StickyAuthorityFailure(error);
+        }
+        // Windows FileDispositionInfo requires DELETE access, which a retained
+        // read-only (e.g. classified-open) handle lacks. Delete through this
+        // fresh name-bound handle only after it proves the retained identity.
+        #[cfg(windows)]
+        let current = platform::open_leaf_for_delete_classified(&self.directory, name);
+        #[cfg(not(windows))]
+        let current = self.open_leaf_classified(name);
+        let current = match current {
+            LeafOpenResult::Opened(current) => current,
+            LeafOpenResult::MissingSettled => {
+                return R::StickyAuthorityFailure(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "created leaf mapping is absent; retained object was not removed",
+                ));
+            }
+            LeafOpenResult::FailedSettled(error) => return R::StickyAuthorityFailure(error),
+            LeafOpenResult::Unsettled(owner) => return R::Unsettled(owner),
+        };
+        let original = match fingerprint(file) {
+            Ok(f) => f,
+            Err(error) => return R::StickyAuthorityFailure(error),
+        };
+        let observed = match fingerprint(&current) {
+            Ok(f) => f,
+            Err(error) => return R::StickyAuthorityFailure(error),
+        };
+        if original != observed {
+            return R::StickyAuthorityFailure(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "created leaf no longer identifies the retained file",
+            ));
+        }
+        // Both platform calls are synchronous and retain no operation storage:
+        // Unix unlinkat; Windows POSIX-semantics FileDispositionInfoEx (legacy
+        // FileDispositionInfo only where the file system lacks it). An
+        // image-mapped (running) executable stays a settled retryable refusal.
+        // on the identity-proven DELETE handle.
+        #[cfg(windows)]
+        let target = &current;
+        #[cfg(not(windows))]
+        let target = file;
+        match platform::remove_temporary(&self.directory, name, target) {
+            Ok(()) => R::Removed,
+            Err(error) => R::RetryableSettledDelete(error),
+        }
+    }
+
     pub fn open_file(&self, path: &RelativePath) -> io::Result<File> {
         self.file(path, false)
     }
@@ -723,5 +882,406 @@ mod directory_identity_tests {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod leaf_completion_tests {
+    use super::*;
+    #[test]
+    fn native_missing_leaf_is_settled_absence() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = HostDir::open(temp.path(), RootPolicy::LeafNoFollow)?;
+        assert!(matches!(
+            root.open_leaf_classified(OsStr::new("missing")),
+            LeafOpenResult::MissingSettled
+        ));
+        Ok(())
+    }
+    #[test]
+    fn native_present_nonregular_and_invalid_names() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        std::fs::write(temp.path().join("reader"), b"native reader")?;
+        std::fs::create_dir(temp.path().join("directory"))?;
+        let root = HostDir::open(temp.path(), RootPolicy::LeafNoFollow)?;
+        match root.open_leaf_classified(OsStr::new("reader")) {
+            LeafOpenResult::Opened(mut file) => {
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)?;
+                assert_eq!(bytes, b"native reader");
+            }
+            other => panic!("expected present regular file: {other:?}"),
+        }
+        for name in [
+            "directory",
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a/../reader",
+            "reader/",
+            "a\0b",
+        ] {
+            assert!(
+                matches!(
+                    root.open_leaf_classified(OsStr::new(name)),
+                    LeafOpenResult::FailedSettled(_)
+                ),
+                "{name:?}"
+            );
+        }
+        Ok(())
+    }
+    #[test]
+    fn native_directory_identity_survives_changes_and_rename_but_not_replacement() -> io::Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("prefix");
+        std::fs::create_dir(&path)?;
+        let held = HostDir::open(&path, RootPolicy::LeafNoFollow)?;
+        let other = HostDir::open(&path, RootPolicy::LeafNoFollow)?;
+        std::fs::write(path.join("new-entry"), b"metadata changes")?;
+        assert!(held.same_directory_object(&other)?);
+        let renamed = temp.path().join("renamed");
+        std::fs::rename(&path, &renamed)?;
+        assert!(held.same_directory_object(&HostDir::open(&renamed, RootPolicy::LeafNoFollow)?)?);
+        std::fs::create_dir(&path)?;
+        assert!(!held.same_directory_object(&HostDir::open(&path, RootPolicy::LeafNoFollow)?)?);
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn native_symlink_and_permission_failure_are_never_absence() -> io::Result<()> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let temp = tempfile::tempdir()?;
+        std::fs::write(temp.path().join("denied"), b"private")?;
+        symlink("absent-target", temp.path().join("link"))?;
+        let root = HostDir::open(temp.path(), RootPolicy::LeafNoFollow)?;
+        assert!(matches!(
+            root.open_leaf_classified(OsStr::new("link")),
+            LeafOpenResult::FailedSettled(_)
+        ));
+        std::fs::set_permissions(
+            temp.path().join("denied"),
+            std::fs::Permissions::from_mode(0o0),
+        )?;
+        if unsafe { libc::geteuid() } != 0 {
+            match root.open_leaf_classified(OsStr::new("denied")) {
+                LeafOpenResult::FailedSettled(error) => {
+                    assert_eq!(error.raw_os_error(), Some(libc::EACCES))
+                }
+                other => panic!("permission failure must be settled failure: {other:?}"),
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn pending_retention_model_preserves_original_call_root_storage_and_error_on_propagation_and_drop()
+    -> io::Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        #[derive(Debug)]
+        struct TrackedError(Arc<AtomicUsize>);
+        impl std::fmt::Display for TrackedError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("original model error")
+            }
+        }
+        impl std::error::Error for TrackedError {}
+        impl Drop for TrackedError {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct ModelCall {
+            _root: File,
+            storage: Vec<u8>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl Drop for ModelCall {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let temp = tempfile::tempdir()?;
+        let root = HostDir::open(temp.path(), RootPolicy::LeafNoFollow)?;
+        let call_drops = Arc::new(AtomicUsize::new(0));
+        let error_drops = Arc::new(AtomicUsize::new(0));
+        let call = ModelCall {
+            _root: root.directory.try_clone()?,
+            storage: vec![17; 32],
+            drops: call_drops.clone(),
+        };
+        let original_storage = call.storage.as_ptr();
+        let error = io::Error::other(TrackedError(error_drops.clone()));
+        let original_error = error.get_ref().unwrap() as *const dyn std::error::Error;
+        let pending = LeafOpenUncertainty::retain(error, call);
+        let propagated = io::Error::other(pending);
+        let uncertainty = propagated
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<LeafOpenUncertainty>()
+            .unwrap();
+        assert!(std::ptr::addr_eq(
+            uncertainty.error().get_ref().unwrap(),
+            original_error
+        ));
+        let retained = uncertainty._retained.downcast_ref::<ModelCall>().unwrap();
+        assert_eq!(retained.storage.as_ptr(), original_storage);
+        assert!(retained._root.metadata()?.is_dir());
+        drop(root);
+        drop(propagated);
+        assert_eq!(call_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(error_drops.load(Ordering::SeqCst), 0);
+        // Synthetic ownership model only: no Windows operation was issued.
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn native_parent_failure_is_not_leaf_absence_and_identity_errors_propagate() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("regular");
+        std::fs::write(&path, b"not a directory")?;
+        // Deliberately invalid authority fixture: exercise the actual ENOTDIR
+        // syscall, rather than manufacturing an io::ErrorKind::NotFound.
+        let invalid_parent = HostDir {
+            directory: File::open(&path)?,
+            display: path,
+        };
+        match invalid_parent.open_leaf_classified(OsStr::new("missing")) {
+            LeafOpenResult::FailedSettled(error) => {
+                assert_eq!(error.raw_os_error(), Some(libc::ENOTDIR))
+            }
+            other => panic!("parent failure cannot prove leaf absence: {other:?}"),
+        }
+        let valid = HostDir::open(temp.path(), RootPolicy::LeafNoFollow)?;
+        assert!(invalid_parent.same_directory_object(&valid).is_err());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod owned_leaf_cleanup_tests {
+    use super::*;
+    use std::io::Write;
+
+    // POSIX permits renaming a directory while a created leaf beneath it is
+    // open, so cleanup must follow the retained identity, not the pathname.
+    // Windows refuses that rename (see the cfg(windows) counterpart below).
+    #[cfg(unix)]
+    #[test]
+    fn retained_leaf_cleanup_survives_root_rename_without_touching_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("auth");
+        let moved = temp.path().join("moved-auth");
+        let root = HostDir::create_private(&original).unwrap();
+        let mut file = root
+            .create_file(&RelativePath::parse("identity").unwrap())
+            .unwrap();
+        file.write_all(b"inert test material").unwrap();
+        file.sync_all().unwrap();
+        std::fs::rename(&original, &moved).unwrap();
+        let replacement = HostDir::create_private(&original).unwrap();
+        let mut other = replacement
+            .create_file(&RelativePath::parse("identity").unwrap())
+            .unwrap();
+        other.write_all(b"unrelated").unwrap();
+        other.sync_all().unwrap();
+        root.remove_created_leaf(OsStr::new("identity"), &file)
+            .unwrap();
+        drop(file);
+        assert!(!moved.join("identity").exists());
+        assert_eq!(
+            std::fs::read(original.join("identity")).unwrap(),
+            b"unrelated"
+        );
+    }
+
+    // Windows (NTFS) refuses to rename a directory while any handle to an
+    // object beneath it is open, even with FILE_SHARE_DELETE, so a retained
+    // created leaf pins its root's pathname. Cleanup then removes exactly the
+    // retained leaf under the unmoved root.
+    #[cfg(windows)]
+    #[test]
+    fn retained_leaf_pins_root_against_rename_and_cleanup_removes_only_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("auth");
+        let moved = temp.path().join("moved-auth");
+        let root = HostDir::create_private(&original).unwrap();
+        let mut file = root
+            .create_file(&RelativePath::parse("identity").unwrap())
+            .unwrap();
+        file.write_all(b"inert test material").unwrap();
+        file.sync_all().unwrap();
+        let mut sibling = root
+            .create_file(&RelativePath::parse("sibling").unwrap())
+            .unwrap();
+        sibling.write_all(b"unrelated").unwrap();
+        sibling.sync_all().unwrap();
+        drop(sibling);
+        let refused = std::fs::rename(&original, &moved).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!moved.exists());
+        root.remove_created_leaf(OsStr::new("identity"), &file)
+            .unwrap();
+        drop(file);
+        assert!(!original.join("identity").exists());
+        assert_eq!(
+            std::fs::read(original.join("sibling")).unwrap(),
+            b"unrelated"
+        );
+    }
+
+    #[test]
+    fn retained_leaf_cleanup_refuses_another_object_even_with_equal_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = HostDir::create_private(&temp.path().join("auth")).unwrap();
+        let first = root
+            .create_file(&RelativePath::parse("first").unwrap())
+            .unwrap();
+        let second = root
+            .create_file(&RelativePath::parse("second").unwrap())
+            .unwrap();
+        assert!(
+            root.remove_created_leaf(OsStr::new("second"), &first)
+                .is_err()
+        );
+        assert!(temp.path().join("auth/first").exists());
+        assert!(temp.path().join("auth/second").exists());
+        root.remove_created_leaf(OsStr::new("second"), &second)
+            .unwrap();
+        drop(second);
+        root.remove_created_leaf(OsStr::new("first"), &first)
+            .unwrap();
+        drop(first);
+        assert!(root.entries().unwrap().is_empty());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod classified_created_leaf_cleanup_tests {
+    use super::*;
+    use std::{io::Write, os::unix::fs::PermissionsExt};
+    #[test]
+    fn only_final_synchronous_delete_error_is_retryable_after_original_identity_proof() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("auth");
+        let root = HostDir::create_private(&path).unwrap();
+        let mut file = root
+            .create_file(&RelativePath::parse("identity").unwrap())
+            .unwrap();
+        file.write_all(b"synthetic").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = root.remove_created_leaf_classified(OsStr::new("identity"), &file);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        match result {
+            CreatedLeafRemovalResult::RetryableSettledDelete(error) => {
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied)
+            }
+            other => panic!("expected actual settled unlink denial, got {other:?}"),
+        }
+        assert!(matches!(
+            root.remove_created_leaf_classified(OsStr::new("identity"), &file),
+            CreatedLeafRemovalResult::Removed
+        ));
+        assert!(
+            matches!(
+                root.remove_created_leaf_classified(OsStr::new("identity"), &file),
+                CreatedLeafRemovalResult::StickyAuthorityFailure(_)
+            ),
+            "missing mapping cannot become a deletion receipt"
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod deny_write_inspection_tests {
+    use super::*;
+    #[test]
+    fn removal_unlinks_the_name_while_another_owner_keeps_the_object_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("reader.exe");
+        std::fs::write(&path, b"original").unwrap();
+        let root = HostDir::open(temp.path(), RootPolicy::LeafNoFollow).unwrap();
+        let LeafOpenResult::Opened(owner) = root.open_leaf_classified(OsStr::new("reader.exe"))
+        else {
+            panic!("owner open failed")
+        };
+        // Another owner (like an original broker's retained definition)
+        // still holds the object while the SUT removes and reinstalls it.
+        let LeafOpenResult::Opened(other) = root.open_leaf_classified(OsStr::new("reader.exe"))
+        else {
+            panic!("second owner open failed")
+        };
+        root.remove_created_leaf(OsStr::new("reader.exe"), &owner)
+            .unwrap();
+        assert!(matches!(
+            root.open_leaf_classified(OsStr::new("reader.exe")),
+            LeafOpenResult::MissingSettled
+        ));
+        std::fs::write(&path, b"replacement").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        drop((owner, other));
+    }
+    #[test]
+    fn retained_read_handle_removal_deletes_only_the_identity_proven_leaf() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("leaf"), b"owned").unwrap();
+        std::fs::write(temp.path().join("other"), b"owned").unwrap();
+        let root = HostDir::open(temp.path(), RootPolicy::LeafNoFollow).unwrap();
+        // A classified open has no DELETE access; removal must still work
+        // through the identity-proven DELETE handle, and only for that object.
+        let LeafOpenResult::Opened(leaf) = root.open_leaf_classified(OsStr::new("leaf")) else {
+            panic!("leaf open failed")
+        };
+        assert!(
+            root.remove_created_leaf(OsStr::new("other"), &leaf)
+                .is_err()
+        );
+        assert!(temp.path().join("other").exists());
+        root.remove_created_leaf(OsStr::new("leaf"), &leaf).unwrap();
+        drop(leaf);
+        assert!(!temp.path().join("leaf").exists());
+        assert!(temp.path().join("other").exists());
+    }
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    #[test]
+    fn deny_write_open_refuses_writers_settled_and_keeps_default_open_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("leaf");
+        std::fs::write(&path, b"original").unwrap();
+        let root = HostDir::open(temp.path(), RootPolicy::LeafNoFollow).unwrap();
+        // An existing writer makes the inspection open a settled refusal.
+        let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        match root.open_leaf_deny_write_classified(OsStr::new("leaf")) {
+            LeafOpenResult::FailedSettled(error) => {
+                assert_eq!(error.raw_os_error(), Some(ERROR_SHARING_VIOLATION))
+            }
+            other => panic!("existing writer must refuse settled, got {other:?}"),
+        }
+        // The default classified open still shares write with that writer.
+        assert!(matches!(
+            root.open_leaf_classified(OsStr::new("leaf")),
+            LeafOpenResult::Opened(_)
+        ));
+        drop(writer);
+        let held = match root.open_leaf_deny_write_classified(OsStr::new("leaf")) {
+            LeafOpenResult::Opened(file) => file,
+            other => panic!("inspection open failed: {other:?}"),
+        };
+        let refused = std::fs::write(&path, b"modified").unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(ERROR_SHARING_VIOLATION));
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        // A second deny-write reader is compatible; rename stays possible.
+        assert!(matches!(
+            root.open_leaf_deny_write_classified(OsStr::new("leaf")),
+            LeafOpenResult::Opened(_)
+        ));
+        std::fs::rename(&path, temp.path().join("moved")).unwrap();
+        drop(held);
+        std::fs::write(temp.path().join("moved"), b"modified").unwrap();
     }
 }
