@@ -18,40 +18,29 @@ checks; independent review and combined acceptance are separate unchecked gates.
 | Claude Code plugins and MCP lifecycle checks | Complete and merged |
 | Linux/macOS/Windows controllers and shared-engine MCP server | Complete and merged; same-source native and Docker CI passed |
 | README and documentation restructure | Complete and merged |
-| Native helper protocol, host primitives, durable store and runtime | Local complete; final cross-platform acceptance pending |
-| Typed native helper client | Local complete after review fixes; final cross-platform acceptance pending |
-| Native helper file operations | Local complete and reviewed; native macOS/Windows acceptance pending |
-| Native machine/VM adapter integration | Local complete and independently reviewed; native OS CI and real supplied-target acceptance pending |
-| Native services and desktop application observations | In progress: service scenarios and recovery source reviewed and locally tested; desktop Clean/Upgrade/Reinstall CLI and fresh MCP locally passed; native factory source review closed; combined CLI/MCP passed against the private model; native ordinary admission and final native acceptance remain in progress |
+| Native helper protocol, host primitives, durable store and runtime | Complete and merged; native Linux/macOS/Windows CI accepted |
+| Typed native helper client | Complete and merged; native Linux/macOS/Windows CI accepted |
+| Native helper file operations | Complete and merged; native Linux/macOS/Windows CI accepted |
+| Native machine/VM adapter integration | Merged; native OS CI accepted; real supplied-target acceptance pending (external) |
+| Native services and desktop application observations | Merged; real disposable systemd/launchd/SCM managers and Source-owned desktop cases accepted in native CI; supplied machines and interactive graphical sessions pending (external) |
 
-The latest accepted `main` is `d4e5304` (0.12). Native foundations,
-client/file operations, adapter integration and the earlier service checkpoint
-were committed through `2fb9c73`. Further service/desktop work continues on
-`feat/native-adapter` for [PR #1](https://github.com/AraneaDev/theseus/pull/1).
-The native work is not merged into `main`. Intermediate CI is deferred until the
-combined acceptance batch; feature pushes use the PR workflow instead of
-duplicating both push and PR runs.
+The native work from [PR #1](https://github.com/AraneaDev/theseus/pull/1) is
+merged into `main` as `d22822f`. The accepted source is `e181209`: combined CI
+[run 42402902817](https://github.com/AraneaDev/theseus/actions/runs/42402902817) passed all eight Docker suites and the complete native Linux,
+macOS and Windows jobs on that exact commit, including real private systemd,
+launchd and Windows SCM manager cases and the Source-owned desktop and owned
+native-entry cases. The previous accepted `main` was `d4e5304` (0.12).
 Existing Docker workflows remain the supported execution
 backend. A native controller is distinct from a native guest adapter.
 
 ### Work queue
 
-1. Desktop Clean is locally verified through the actual CLI, fresh six-tool MCP,
-   saved TUI and missing/leaked-entry negative cases; maintain these regressions.
-2. Native fixture creator-ownership review is closed; required launchd/SCM/systemd
-   acceptance is wired into the three-OS CI jobs, with execution still pending.
-3. Native activation and ordinary/combined admission source reviews are closed;
-   keep primary, manager-instance and descendant lifetime guarantees explicit.
-4. Windows retained-entry retirement is implemented, locally checked and
-   independently reviewed. Original parser handles settle before mutating SUT
-   commands; failed or uncertain retirement stays quarantined. Native execution
-   remains required in the combined CI batch.
-5. Fresh local acceptance passes at `1f812a0`: all six standalone Source-owned
-   desktop cases; combined CLI and fresh six-tool MCP each cover Clean, Upgrade
-   and Reinstall against the private D-Bus model. The clean build pins 19 separate
-   executable roles. Fresh original-input export, byte verification and production
-   CLI validate/preview pass. These model checks do not qualify a real manager.
-6. Run one combined CI batch, resolve failures and merge accepted work to `main`.
+1. Keep the accepted native Linux/macOS/Windows and Docker gates green; record
+   source implementation, review, local verification, CI acceptance and merge
+   separately for new work.
+2. Externally blocked acceptance stays visible below: supplied-machine SSH
+   lifecycle, VM reboot/reset, managers on supplied machines and interactive
+   graphical desktop sessions.
 
 The [first combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42224965159)
 exposed a Windows planning import, JSON error-source retention and three macOS
@@ -305,7 +294,12 @@ reads only the services.exe `DeleteFlag` (exactly `REG_DWORD` 1) with query-only
 registry access to identify the delete-pending record; an absent flag remains a
 terminal same-name refusal and any other value is unknown. `DeleteFlag` is
 long-standing but undocumented behaviour, and the probe fails closed if it
-changes. Final corrected-source native acceptance remains pending.
+changes.
+
+The [twenty-third combined CI run](https://github.com/AraneaDev/theseus/actions/runs/42402902817) at
+`e181209` passed every required gate: all eight Docker suites and the complete Linux,
+macOS and Windows native jobs, each including its real disposable manager cases.
+This is the accepted source merged into `main`.
 
 Keep this queue and the checklists below current as work lands. Record source
 implementation, review, local verification, CI acceptance and merge separately.
@@ -374,18 +368,17 @@ installation interface for the controller machine.
 - [x] **Local qualification:** reviewed helper/client source, actual Linux pipe
   fixtures and strict Linux/macOS/Windows compile checks. The integrated adapter
   also has a source-pinned native inventory and 33 validation controls.
-- [ ] **Native macOS/Windows execution:** qualify the new helper/client on both
-  actual OS runners in the final combined CI batch. Cross-compilation is not
-  native execution evidence.
-- [ ] **Integrate to main:** merge reviewed native work after the combined gates.
+- [x] **Native macOS/Windows execution:** qualified on actual OS runners in the
+  accepted combined CI [run 42402902817](https://github.com/AraneaDev/theseus/actions/runs/42402902817) at `e181209`.
+- [x] **Integrate to main:** merged as `d22822f` after the combined gates.
 
 ## Local complete: bounded native helper file operations
 
 Implementation checkmarks in this section describe reviewed, locally qualified
 source. All 14 helper and 9 client pipe cases passed on Linux; the final fixture
 ordering correction passed its targeted rerun. Strict compile checks passed for
-Linux/macOS/Windows. Actual native macOS/Windows execution remains pending the
-combined CI batch; neither compilation nor fixture boundary gates replace it.
+Linux/macOS/Windows. Native macOS/Windows execution passed in the accepted
+combined CI batch at `e181209`.
 
 - [x] Retain the validated workspace directory authority for all file requests.
 - [x] Implement existing typed `CreateFile`, `ReadFile` and `InspectFile` requests
@@ -476,9 +469,10 @@ Theseus observes it and performs only declared Start/Stop rehearsals.
 - [x] Verify the compiled installer/application through CLI and six-tool MCP
   against an explicitly labelled private model, including saved TUI/MCP evidence.
   Eight CLI lifecycle/failure cases and the fresh MCP context pass locally.
-- [ ] Exercise the compiled test installer and a real disposable systemd manager.
+- [x] Exercise the compiled test installer and a real disposable systemd manager
+  (native Linux CI at `e181209`).
 - [x] Independently review the systemd core, consumers and private-model slice;
-  all core and consumer findings are closed. Real-manager acceptance stays pending.
+  all core and consumer findings are closed; real-manager CI acceptance passed.
 - [x] Implement additive launchd/SCM contracts and shared helper integration,
   preserving the existing systemd and catalog wire formats. Focused shared and
   protocol tests and strict cross-platform compile checks pass locally.
@@ -494,10 +488,10 @@ Theseus observes it and performs only declared Start/Stop rehearsals.
   below; pure policy tests do not establish actual SCM/ACL behavior.
 - [x] Implement and review guarded macOS/Windows CI operator source, alongside
   the private-systemd operator. The copied artifact dispatch guards are reviewed;
-  27 pure operator tests pass locally. Native execution is still required.
+  27 pure operator tests pass locally; native execution passed in CI.
 - [x] Implement and independently review retained original native registration
   owners for negative-case fixture teardown. Fifteen pure tests and macOS/Windows
-  source checks pass; actual manager execution remains pending. Failed publication,
+  source checks pass; real manager execution passed in CI. Failed publication,
   revoked file authority and repeated finish errors retain original evidence;
   unknown leftovers never authorize cleanup reconstructed by registration name.
 - [x] Wire required source-pinned native manager cases into the existing Linux,
@@ -505,15 +499,15 @@ Theseus observes it and performs only declared Start/Stop rehearsals.
   controls verify artifact, feature, executed-case and source-drift boundaries.
   Linux requires all six desktop cases and both real-systemd combined CLI/MCP
   cases, with separately pinned source helper/broker and exact case/role sets.
-  This is reviewed CI source wiring; the combined online batch remains pending.
-- [ ] Qualify actual launchd format/domain and SCM rights, lifecycle and deletion
-  behavior on native OS runners. Cross-compilation does not satisfy this gate.
+  This CI wiring passed in the accepted combined batch.
+- [x] Qualify actual launchd format/domain and SCM rights, lifecycle and deletion
+  behavior on native OS runners (all real launchd and SCM cases at `e181209`).
 - [x] Implement ordinary upgrade/reinstall and original-identity service recovery.
   Compiled private-model CLI Upgrade, Reinstall and both HarnessStopped traces
   pass locally. Original-identity recovery review is closed, with 16 focused
   recovery tests and seven schema1 recovery regressions passing. All four
   service review findings are closed; compiled Configure-failure cleanup passes
-  for both runtime preconditions. Actual native OS acceptance remains open above.
+  for both runtime preconditions. Native OS acceptance passed above.
 - [x] Implement desktop Host session binding, original owned-process scopes and
   authenticated readiness/close mechanisms; 39 focused Linux tests pass,
   including fresh probes, cancellation/backpressure and escaped descendants.
@@ -540,26 +534,29 @@ Theseus observes it and performs only declared Start/Stop rehearsals.
   broker and shared driver.
   The mode-specific router is implemented and its replay-deadline review finding
   is closed. Mac/Windows original-object polling and Linux original-child source
-  are reviewed; actual SDK/session execution remains pending. The operational
+  are reviewed; SDK execution passed in native CI, while supplied interactive
+  sessions remain pending. The operational
   Linux provider-qualified bootstrap and stock SDK factory source are implemented
   and independently reviewed. The controller now retains the original authenticated
   admission before Acquire; this product seam and native ordinary/combined
   capability admission are independently reviewed. Missing original qualification
   still refuses. No actual SDK/graphical execution is claimed.
-- [ ] Finish integrated acceptance of the explicit macOS owned-primary contract.
+- [x] Finish integrated acceptance of the explicit macOS owned-primary contract
+  (native macOS Source-owned desktop cases at `e181209`).
   Protocol/store and Host/broker source reviews are closed; product/report
   integration passes 61 focused integration and 26 recovery tests; its source
   reviews are closed. Primary/local retirement stays separate from unavailable
-  tree authority. Fresh same-source compiled acceptance remains pending.
+  tree authority. Fresh same-source compiled acceptance passed in native CI.
   Portable six-case Source-owned fixtures are required on all three native jobs.
-- [ ] Accept genuine installed owned entries on macOS and Windows. Separate
+- [x] Accept genuine installed owned entries on macOS and Windows (native
+  owned-entry cases at `e181209`). Separate
   bundle/shortcut declarations and retained CF/COM adapters are source-reviewed;
   three required ordinary product cases let only the pinned SUT create/remove
   the real entry and second pinned executable. The Windows pre-SUT retirement
   barrier is implemented and independently reviewed; original parser handles
   retire before replacement, with durable quarantine on failure.
-  Native execution is still pending.
-- [ ] Qualify native SDK builds and platform test execution. The AppKit bridge
+  Native execution passed.
+- [x] Qualify native SDK builds and platform test execution. The AppKit bridge
   requires a native macOS build with the Apple SDK. Real supplied graphical
   sessions remain a separate external acceptance row.
 - [x] Implement desktop execution from standalone Clean to Upgrade, Reinstall and
@@ -578,7 +575,7 @@ Theseus observes it and performs only declared Start/Stop rehearsals.
   SDK/interactive execution remains a separate pending qualification gate.
 
 The checked backend work includes private D-Bus primitive and ownership-model
-checks. Actual systemd-manager acceptance remains pending. Local model checks now
+checks. Real systemd-manager acceptance passed in native CI. Local model checks
 exercise the full compiled product path; they do not qualify a real manager.
 
 
@@ -601,16 +598,18 @@ exercise the full compiled product path; they do not qualify a real manager.
   tests, default shipping compilation and macOS/Windows metadata checks pass.
 - [x] Run focused local checks during development; defer full repeated batches
   until the implementation is ready.
-- [ ] Run one combined same-source Linux/macOS/Windows native CI batch plus all
-  eight existing Docker suites; investigate failures before rerunning.
-- [ ] Verify release builds, required named tests, documentation links and retained
-  source/artifact/cleanup evidence.
-- [ ] Merge accepted work into `main`, update this tracker and document the exact
-  supported scope and remaining externally blocked acceptance.
+- [x] Run one combined same-source Linux/macOS/Windows native CI batch plus all
+  eight existing Docker suites; investigate failures before rerunning. Accepted:
+  [run 42402902817](https://github.com/AraneaDev/theseus/actions/runs/42402902817) at `e181209`.
+- [x] Verify release builds, required named tests, documentation links and retained
+  source/artifact/cleanup evidence. Release builds and required named cases pass
+  in that run; public documentation links resolve.
+- [x] Merge accepted work into `main` (`d22822f`), update this tracker and document
+  the exact supported scope and remaining externally blocked acceptance.
 
 **Explicitly pending external acceptance:** supplied-machine SSH lifecycle,
-VM reboot/reset, systemd/launchd/SCM and interactive Linux/macOS/Windows desktop
-sessions. Adapters can be implemented with these tests pending when no target is
+VM reboot/reset, systemd/launchd/SCM on supplied machines (disposable hosted
+managers are accepted) and interactive Linux/macOS/Windows desktop sessions. Adapters can be implemented with these tests pending when no target is
 available, as agreed. Pending tests must remain visible; they are not successful
 or skipped acceptance. Native hosted CI remains required by default.
 
