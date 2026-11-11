@@ -139,9 +139,13 @@ impl Docker {
             Instant::now() < deadline,
             "container transition deadline exceeded"
         );
+        // A transition gets the caller's whole remaining deadline, like ownership
+        // inspection: `docker kill`/`start`/`rm` can exceed a second on a loaded
+        // host, and a CLI timeout here would misreport a completed kill as an
+        // interrupted transition.
         let output = process::run(
             self.command().args(args),
-            operation_budget(deadline),
+            deadline.saturating_duration_since(Instant::now()),
             cancel,
             None,
             512,
@@ -162,10 +166,4 @@ impl Docker {
         );
         Ok(())
     }
-}
-
-pub(super) fn operation_budget(deadline: Instant) -> Duration {
-    deadline
-        .saturating_duration_since(Instant::now())
-        .min(Duration::from_secs(1))
 }
