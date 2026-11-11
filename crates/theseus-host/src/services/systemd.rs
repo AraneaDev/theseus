@@ -165,10 +165,6 @@ impl RegistrationOwner {
     pub fn is_revoked(&self) -> bool {
         self.revoked
     }
-    /// Diagnostic binding evidence, never authority to reconstruct an owner.
-    pub fn definition_fingerprint(&self) -> Vec<u8> {
-        self.fingerprint.canonical_bytes()
-    }
     pub fn definition_bytes(&self) -> &[u8] {
         &self.definition_bytes
     }

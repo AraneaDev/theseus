@@ -269,6 +269,7 @@ fn is_local_system(account: &[u16]) -> bool {
     account == "LocalSystem".encode_utf16().collect::<Vec<_>>()
 }
 impl ScmAuthority {
+    #[cfg(test)]
     pub fn service_access(&self) -> io::Result<u32> {
         self.validate()?;
         Ok(self.allowed_access)

@@ -207,9 +207,6 @@ impl CommandProvider {
     pub fn spawn_failure(&self) -> Option<&theseus_host::process::SpawnFailure> {
         self.spawn_failure.as_ref()
     }
-    pub fn failures(&self) -> &[std::io::Error] {
-        &self.failures
-    }
     pub fn settled(&self) -> bool {
         self.owner.is_none()
             && self

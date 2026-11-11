@@ -6,9 +6,8 @@ mod intent;
 mod qualification;
 mod store;
 pub use bootstrap::{
-    BootstrapReceipt, BootstrapRequest, BootstrapScope, bootstrap, bootstrap_declared_integration,
-    bootstrap_integration, bootstrap_native, bootstrap_provider_broker,
-    bootstrap_provider_declared_integration,
+    BootstrapReceipt, BootstrapRequest, bootstrap, bootstrap_declared_integration,
+    bootstrap_integration, bootstrap_native, bootstrap_provider_declared_integration,
 };
 pub use error::{IntentError, StoreError};
 pub use intent::{IntentRecord, IntentStore, PreparedAcquire, VerifiedOriginalIntent};

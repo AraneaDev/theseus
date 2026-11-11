@@ -3,11 +3,11 @@ use super::RunOptions;
 use crate::{
     model::{ProfileName, RunJournal, RunReport, ScenarioKind},
     native::{
-        model::{CatalogCommand, NativeCommandEvidence, NativeJournal, NativeReport},
+        model::{CatalogCommand, NativeJournal, NativeReport},
         recipe::{NativeRunLimits, ValidatedNativeRecipe},
     },
     recipe::ValidatedRecipe,
-    runner::{CommandRequest, ExecutedCommand},
+    runner::CommandRequest,
 };
 use anyhow::{Result, bail};
 use std::path::PathBuf;
@@ -57,10 +57,6 @@ pub struct SelectedRunResult {
 pub enum StageCommand {
     Docker(CommandRequest),
     Native(CatalogCommand),
-}
-pub enum CommandEvidence {
-    Docker(ExecutedCommand),
-    Native(NativeCommandEvidence),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleRole {

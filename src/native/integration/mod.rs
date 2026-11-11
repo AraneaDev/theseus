@@ -1,5 +1,4 @@
 //! Explicit schema2 native integration contracts.
-pub mod manifest;
 pub mod model;
 pub mod recipe;
 pub use model::*;

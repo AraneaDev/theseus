@@ -20,9 +20,6 @@ impl QualifiedLinuxGioAdmission {
     pub fn reference(&self) -> &theseus_native_protocol::v2::LinuxGioQualificationRef {
         &self.reference
     }
-    pub fn manifest_digest(&self) -> theseus_native_protocol::v2::Digest {
-        self.manifest_digest
-    }
 }
 fn validate_linux_admission_binding(
     proof: Option<&QualifiedLinuxGioAdmission>,
@@ -246,14 +243,8 @@ impl NativeSession {
             .poll_settle()
             .map_err(|_| ClientError::Native)
     }
-    pub fn preparation(&self) -> &LaunchPreparation {
-        &self.preparation
-    }
     pub fn is_settled(&self) -> bool {
         self.client.is_settled() && self.preparation.is_settled()
-    }
-    pub fn client(&self) -> &Client {
-        &self.client
     }
 }
 

@@ -20,13 +20,6 @@ pub enum ManagerKind {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DesktopKind {
-    Freedesktop,
-    MacosBundle,
-    WindowsShortcut,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum DefinitionRole {
     Base,
     Configured,

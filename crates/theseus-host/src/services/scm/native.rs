@@ -802,8 +802,6 @@ impl ScmManager {
         Ok(DeletionOwner {
             context: self.context.clone(),
             service_name: wide_name(&self.authority.service_name),
-            sut_delete_receipt,
-            stopped_original: status,
             progress: DeletionProgress::Pending,
             next_poll: Instant::now(),
         })
@@ -953,18 +951,10 @@ impl Drop for ScmManager {
 pub struct DeletionOwner {
     context: Rc<()>,
     service_name: Vec<u16>,
-    sut_delete_receipt: String,
-    stopped_original: ServiceStatus,
     progress: DeletionProgress,
     next_poll: Instant,
 }
 impl DeletionOwner {
-    pub fn sut_delete_receipt(&self) -> &str {
-        &self.sut_delete_receipt
-    }
-    pub fn stopped_original(&self) -> ServiceStatus {
-        self.stopped_original
-    }
     pub fn progress(&self) -> DeletionProgress {
         self.progress
     }

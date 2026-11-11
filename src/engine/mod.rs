@@ -25,6 +25,7 @@ mod plugin;
 pub mod projector;
 mod rollback;
 mod rollback_checks;
+mod scenario;
 mod stages;
 use crate::{
     model::*,
@@ -224,7 +225,7 @@ pub(crate) fn run_with_parent(
                                 recipe.recipe.profiles[profile].rollback.clone();
                         }
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            stages::scenario(stages::ScenarioContext {
+                            scenario::scenario(stages::ScenarioContext {
                                 recipe,
                                 options: &options,
                                 cancel: &cancel,
