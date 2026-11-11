@@ -1585,9 +1585,23 @@ mod tests {
             error.contains("duplex worker failed") && error.contains("owned abort diagnostic"),
             "{error}"
         );
-        let stopped = std::fs::metadata(&heartbeat).unwrap().len();
-        thread::sleep(Duration::from_millis(40));
-        assert_eq!(std::fs::metadata(&heartbeat).unwrap().len(), stopped);
+        // Group termination can land asynchronously (macOS): a heartbeat byte
+        // already in flight may follow the cleanup return, but the holder must
+        // then stop writing within a bounded window rather than keep running.
+        let mut stopped = std::fs::metadata(&heartbeat).unwrap().len();
+        let settle_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            thread::sleep(Duration::from_millis(40));
+            let now = std::fs::metadata(&heartbeat).unwrap().len();
+            if now == stopped {
+                break;
+            }
+            assert!(
+                Instant::now() < settle_deadline,
+                "owned descriptor holder kept writing after group cleanup"
+            );
+            stopped = now;
+        }
         #[cfg(target_os = "linux")]
         {
             assert_eq!(state(leader), None, "leader must be reaped after abort");
