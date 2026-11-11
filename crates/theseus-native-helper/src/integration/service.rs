@@ -28,8 +28,6 @@ impl std::error::Error for ClassifiedInspect {
         Some(&self.source)
     }
 }
-// launchd inspection is not yet tagged (its refusals report Unclassified).
-#[cfg(any(target_os = "linux", windows, test))]
 /// Tag a failed inspection step at its call site. The innermost (first)
 /// classification wins; the error kind is preserved.
 pub(crate) fn classify<T>(failure: v2::InspectFailure, result: io::Result<T>) -> io::Result<T> {

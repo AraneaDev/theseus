@@ -545,10 +545,6 @@ fn run_native(
     }
     Ok(outcome.exit_code())
 }
-/// Load only the strict shipping OpenSSH authority format.
-pub fn read_native_launch(path: &Path) -> Result<crate::native::launch::LaunchAuthority> {
-    crate::target_authority::load(path, &crate::target_authority::ShippingAuthorityLoader)
-}
 /// Read the shipping saved decoder/projections for separately built fixture assertions.
 /// This does not create an MCP admission or grant execution/recovery authority.
 #[cfg(feature = "native-integration-test-support")]

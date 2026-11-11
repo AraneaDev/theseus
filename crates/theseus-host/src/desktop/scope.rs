@@ -130,9 +130,6 @@ impl DedicatedBrokerScope {
     pub fn reaped_descendants(&self) -> u64 {
         self.reaped_descendants
     }
-    pub fn is_joined(&self) -> bool {
-        self.joined
-    }
     pub fn primary_exit_status(&self) -> Option<ExitStatus> {
         self.primary_status
     }

@@ -8,11 +8,6 @@ pub enum ManagerPlatform {
     Launchd,
     Scm,
 }
-impl ManagerPlatform {
-    pub fn is_systemd(&self) -> bool {
-        *self == Self::Systemd
-    }
-}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LaunchdDomain {

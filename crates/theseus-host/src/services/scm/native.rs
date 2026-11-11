@@ -267,7 +267,7 @@ struct OriginalRegistration {
     configuration_receipts: RefCell<Vec<String>>,
     revoked: Cell<bool>,
     binding_lost: Cell<bool>,
-    runtime_pid: Cell<Option<u32>>,
+    runtime_pid: Cell<RuntimePin>,
     last_status: Cell<Option<ServiceStatus>>,
 }
 impl Drop for OriginalRegistration {
@@ -293,9 +293,6 @@ impl RegistrationOwner {
     }
     pub fn original_handle_closed(&self) -> bool {
         self.original.handle.borrow().is_none()
-    }
-    pub fn next_start_definition(&self) -> ScmDefinition {
-        self.original.definition.borrow().clone()
     }
 }
 struct PendingAction {
@@ -462,7 +459,7 @@ impl ScmManager {
             configuration_receipts: RefCell::new(vec![]),
             revoked: Cell::new(false),
             binding_lost: Cell::new(false),
-            runtime_pid: Cell::new(observation.status.and_then(|s| s.observed_process_id())),
+            runtime_pid: initial_runtime_pin(observation.status),
             last_status: Cell::new(observation.status),
         });
         self.original = Some(original.clone());
@@ -494,8 +491,10 @@ impl ScmManager {
         // is released here, and the first PID observed afterwards is pinned
         // again, so any later unadmitted restart still revokes. The receipt is
         // only format-checked here; its authenticity rests on the helper
-        // passing exclusively the accepted SUT run's receipt.
-        owner.original.runtime_pid.set(None);
+        // passing exclusively the accepted SUT run's receipt. A transition
+        // that leaves the service stopped closes the interval instead: only
+        // the helper's own Start may open the next one.
+        owner.original.runtime_pid.set(RuntimePin::Open);
         let observation = self.observe_original(&owner.original, deadline, cancel, false)?;
         self.check_owner(owner)?;
         if observation.registration != RegistrationState::Present
@@ -505,6 +504,7 @@ impl ScmManager {
             self.revoke_context();
             return Err(invalid("unproved SUT SCM configuration transition"));
         }
+        close_stopped_interval(&owner.original.runtime_pid, observation.status);
         *owner.original.definition.borrow_mut() = definition.clone();
         owner
             .original
@@ -554,7 +554,7 @@ impl ScmManager {
         preflight(deadline, cancel)?;
         let raw = original_raw(&owner.original)?;
         if action == ServiceAction::Start {
-            owner.original.runtime_pid.set(None);
+            owner.original.runtime_pid.set(RuntimePin::Open);
         }
         self.pending = Some(PendingAction {
             original: owner.original.clone(),
@@ -972,15 +972,52 @@ impl DeletionOwner {
 fn runtime_changed(o: &OriginalRegistration, status: ServiceStatus) -> bool {
     pinned_pid_changed(&o.runtime_pid, status)
 }
-/// First observed live PID is pinned; any different live PID is a change.
-fn pinned_pid_changed(pin: &Cell<Option<u32>>, status: ServiceStatus) -> bool {
-    if let Some(pid) = status.observed_process_id() {
-        if let Some(previous) = pin.get() {
-            return previous != pid;
+/// Runtime interval of the original registration. Only the helper's own Start
+/// or an admitted SUT transition opens it; the first live PID observed while
+/// open is pinned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimePin {
+    Open,
+    Pinned(u32),
+    /// An admitted transition left the service stopped: any live PID before
+    /// the helper's next Start is a foreign start.
+    Closed,
+}
+/// First observed live PID is pinned; any different live PID, or any live PID
+/// while closed, is a change. Statuses without a live PID never change it.
+fn pinned_pid_changed(pin: &Cell<RuntimePin>, status: ServiceStatus) -> bool {
+    match (pin.get(), status.observed_process_id()) {
+        (_, None) => false,
+        (RuntimePin::Open, Some(pid)) => {
+            pin.set(RuntimePin::Pinned(pid));
+            false
         }
-        pin.set(Some(pid));
+        (RuntimePin::Pinned(previous), Some(pid)) => previous != pid,
+        (RuntimePin::Closed, Some(_)) => true,
     }
-    false
+}
+/// Qualification pins a running service's PID; a qualified service that is
+/// stopped starts closed, so only the helper's own Start (or an admitted SUT
+/// transition) opens its first runtime interval.
+fn initial_runtime_pin(status: Option<ServiceStatus>) -> Cell<RuntimePin> {
+    let pin = Cell::new(
+        status
+            .and_then(|s| s.observed_process_id())
+            .map_or(RuntimePin::Open, RuntimePin::Pinned),
+    );
+    close_stopped_interval(&pin, status);
+    pin
+}
+/// An interval still open after an admitted transition observed the service
+/// stopped (or stopping) is closed; a pending start keeps it open so the PID
+/// the transition itself starts is pinned.
+fn close_stopped_interval(pin: &Cell<RuntimePin>, status: Option<ServiceStatus>) {
+    if pin.get() == RuntimePin::Open
+        && status
+            .is_some_and(|s| matches!(s.state(), RuntimeState::Stopped | RuntimeState::StopPending))
+    {
+        pin.set(RuntimePin::Closed);
+    }
 }
 fn original_raw(o: &OriginalRegistration) -> io::Result<Handle> {
     o.handle
@@ -1261,18 +1298,87 @@ mod qualification_tests {
             process_id,
             service_flags: 0,
         };
-        let pin = Cell::new(None);
+        let pin = Cell::new(RuntimePin::Open);
         assert!(!pinned_pid_changed(&pin, status(4, 8656)));
         // A restart that is not released (no admitted transition) is a change.
         assert!(pinned_pid_changed(&pin, status(4, 9001)));
         // Stopped carries no live PID and never pins or changes.
         assert!(!pinned_pid_changed(&pin, status(1, 0)));
         // Admitted SUT transition releases the pin: the new PID is pinned once,
-        assert!(pin.replace(None).is_some());
+        assert_eq!(pin.replace(RuntimePin::Open), RuntimePin::Pinned(8656));
         assert!(!pinned_pid_changed(&pin, status(4, 9001)));
-        assert_eq!(pin.get(), Some(9001));
+        // a running admission keeps that pin,
+        close_stopped_interval(&pin, Some(status(4, 9001)));
+        assert_eq!(pin.get(), RuntimePin::Pinned(9001));
         // and any later unadmitted restart is still detected.
         assert!(pinned_pid_changed(&pin, status(4, 9100)));
+    }
+    #[test]
+    fn admitted_transition_left_stopped_flags_any_later_foreign_start() {
+        let status = |state, process_id| ServiceStatus {
+            service_type: 0x10,
+            state,
+            controls_accepted: 1,
+            win32_exit_code: 0,
+            service_specific_exit_code: 0,
+            checkpoint: 0,
+            wait_hint_ms: 0,
+            process_id,
+            service_flags: 0,
+        };
+        for stopped in [1, 3] {
+            let pin = Cell::new(RuntimePin::Open);
+            assert!(!pinned_pid_changed(&pin, status(stopped, 0)));
+            close_stopped_interval(&pin, Some(status(stopped, 0)));
+            assert_eq!(pin.get(), RuntimePin::Closed);
+            assert!(!pinned_pid_changed(&pin, status(1, 0)));
+            // A start the helper did not perform is a foreign runtime change.
+            assert!(pinned_pid_changed(&pin, status(4, 7000)));
+            // Only the helper's own Start reopens the interval.
+            pin.set(RuntimePin::Open);
+            assert!(!pinned_pid_changed(&pin, status(4, 7000)));
+            assert_eq!(pin.get(), RuntimePin::Pinned(7000));
+        }
+        // A transition still starting the service keeps the interval open.
+        let pin = Cell::new(RuntimePin::Open);
+        close_stopped_interval(&pin, Some(status(2, 0)));
+        assert_eq!(pin.get(), RuntimePin::Open);
+        assert!(!pinned_pid_changed(&pin, status(4, 7100)));
+        // An unavailable status never closes it either.
+        let pin = Cell::new(RuntimePin::Open);
+        close_stopped_interval(&pin, None);
+        assert_eq!(pin.get(), RuntimePin::Open);
+    }
+    #[test]
+    fn qualified_registration_starts_pinned_closed_or_open_by_runtime_state() {
+        let status = |state, process_id| ServiceStatus {
+            service_type: 0x10,
+            state,
+            controls_accepted: 1,
+            win32_exit_code: 0,
+            service_specific_exit_code: 0,
+            checkpoint: 0,
+            wait_hint_ms: 0,
+            process_id,
+            service_flags: 0,
+        };
+        assert_eq!(
+            initial_runtime_pin(Some(status(4, 5000))).get(),
+            RuntimePin::Pinned(5000)
+        );
+        // A stopped qualified service flags a start the helper did not perform.
+        let pin = initial_runtime_pin(Some(status(1, 0)));
+        assert_eq!(pin.get(), RuntimePin::Closed);
+        assert!(pinned_pid_changed(&pin, status(4, 5100)));
+        assert_eq!(
+            initial_runtime_pin(Some(status(3, 0))).get(),
+            RuntimePin::Closed
+        );
+        // A start already pending at qualification pins its own first PID.
+        let pin = initial_runtime_pin(Some(status(2, 0)));
+        assert_eq!(pin.get(), RuntimePin::Open);
+        assert!(!pinned_pid_changed(&pin, status(4, 5200)));
+        assert_eq!(initial_runtime_pin(None).get(), RuntimePin::Open);
     }
     #[test]
     fn platform_version_parser_is_canonical_and_never_selects_a_default() {

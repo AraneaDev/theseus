@@ -27,12 +27,6 @@ pub enum DesktopKind {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RegistrationAuthorityKind {
-    LiveManagerObject,
-    ExclusiveOwnedRegistration,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum DefinitionRole {
     Base,
     Configured,
@@ -49,11 +43,6 @@ pub enum ArtifactRole {
 pub enum ServiceAction {
     Start,
     Stop,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ManagerAction {
-    DaemonReload,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

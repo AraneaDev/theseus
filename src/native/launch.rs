@@ -1229,9 +1229,6 @@ impl LaunchPreparation {
     pub fn launch_fingerprint(&self) -> &str {
         &self.launch_fingerprint
     }
-    pub fn material(&self) -> Option<&theseus_host::fs::HostDir> {
-        self.material.as_ref()
-    }
     pub fn probe(&self) -> Option<&super::provider::CommandProvider> {
         self.probe.as_ref()
     }
