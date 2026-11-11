@@ -33,7 +33,6 @@ pub struct Prepared {
     finalize: OriginalFinalizer,
 }
 enum Preparation {
-    Original(Box<host::PreparedNativeActivation>),
     Qualified(Box<QualifiedPreparation>),
 }
 struct QualifiedPreparation {
@@ -45,7 +44,6 @@ struct QualifiedPreparation {
 impl Preparation {
     fn observe_session(&mut self, observed: Option<&SessionBinding>) -> io::Result<()> {
         match self {
-            Self::Original(original) => original.observe_session(observed),
             Self::Qualified(original) => original.broker.observe_session(observed),
         }
     }
@@ -58,7 +56,6 @@ impl Preparation {
             return (OriginalOwner::Deferred(Box::new(self)), Some(error));
         }
         let prepared = match self {
-            Self::Original(original) => Ok(*original),
             Self::Qualified(original) => original.broker.prepare(
                 original.entry,
                 original.manifest,
@@ -113,34 +110,6 @@ pub struct Retained {
     finalize: OriginalFinalizer,
 }
 impl Prepared {
-    /// Accepts an independently authenticated original Host preparation, never
-    /// qualification DTOs from config. Stock startup instead uses the opaque
-    /// verified-bootstrap factory and defers SDK setup until durable acceptance.
-    /// Caller retains responsibility for the exact original SDK/graph provenance.
-    pub fn from_original(
-        native: host::PreparedNativeActivation,
-        session: SessionBinding,
-        binding: ExecutableBinding,
-        definition: &v2::NativeDesktopDefinition,
-        ready: LocalChallenge,
-        close: LocalChallenge,
-        finalize: OriginalFinalizer,
-    ) -> io::Result<Self> {
-        if !matches!(definition, v2::NativeDesktopDefinition::LinuxGio { .. }) {
-            return Err(invalid("wrong original Linux platform"));
-        }
-        binding.validate()?;
-        Ok(Self {
-            native: Preparation::Original(Box::new(native)),
-            session,
-            binding,
-            ready,
-            close,
-            lifetime: initial_lifetime(definition)?,
-            finalize,
-        })
-    }
-
     // Each authority remains explicit; only the factory owns these original values.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn qualified(

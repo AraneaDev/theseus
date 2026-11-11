@@ -253,24 +253,6 @@ impl RetainedActivation {
             )),
         }
     }
-    pub(crate) fn try_stdout(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Self::Owned(v) => v.try_stdout(bytes),
-            _ => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "native stdout unavailable",
-            )),
-        }
-    }
-    pub(crate) fn try_stderr(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Self::Owned(v) => v.try_stderr(bytes),
-            _ => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "native stderr unavailable",
-            )),
-        }
-    }
     pub(crate) fn pump(&mut self) -> io::Result<()> {
         match self {
             #[cfg(target_os = "macos")]

@@ -75,46 +75,75 @@ impl ServiceRuntime {
         cancel: &AtomicBool,
     ) -> io::Result<v2::ServiceObservation> {
         use sha2::{Digest as _, Sha256};
+        use v2::InspectFailure as F;
         if slot != self.config.authority().slot() {
-            return Err(io::Error::other("undeclared service slot"));
+            return classify(
+                F::SlotUndeclared,
+                Err(io::Error::other("undeclared service slot")),
+            );
         }
         if self.inspection_evidence.len() >= 64 {
             return Err(io::Error::other(
                 "bounded original launchd inspection evidence capacity exhausted",
             ));
         }
-        self.ensure_readiness_channel()?;
-        let expected_transition = self
-            .sut_transition
-            .as_ref()
-            .filter(|(program, _)| program != "uninstall")
-            .map(|(program, _)| self.transition_definition(program))
-            .transpose()?;
-        self.manager(deadline, cancel)?;
+        let readiness_step = if self.readiness.is_none() {
+            F::ReadinessBind
+        } else {
+            F::ReadinessRenewal
+        };
+        classify(readiness_step, self.ensure_readiness_channel())?;
+        let expected_transition = classify(
+            F::TransitionDefinition,
+            self.sut_transition
+                .as_ref()
+                .filter(|(program, _)| program != "uninstall")
+                .map(|(program, _)| self.transition_definition(program))
+                .transpose(),
+        )?;
+        classify(
+            F::ManagerConnect,
+            self.manager(deadline, cancel).map(|_| ()),
+        )?;
         if self.owner.is_some()
             && let Some((program, receipt)) = self.sut_transition.clone()
             && program != "uninstall"
         {
-            let expected = self.transition_definition(&program)?;
-            let observed = self.manager.as_mut().unwrap().inspect(deadline, cancel)?;
-            let bytes = observed
-                .definition_bytes
-                .as_deref()
-                .ok_or_else(|| io::Error::other("SUT plist missing"))?;
+            let expected = classify(
+                F::TransitionDefinition,
+                self.transition_definition(&program),
+            )?;
+            let observed = classify(
+                F::TransitionAdmission,
+                self.manager.as_mut().unwrap().inspect(deadline, cancel),
+            )?;
+            let bytes = classify(
+                F::TransitionAdmission,
+                observed
+                    .definition_bytes
+                    .as_deref()
+                    .ok_or_else(|| io::Error::other("SUT plist missing")),
+            )?;
             if format!("{:x}", Sha256::digest(bytes)) != expected.definition_sha256 {
                 self.uncertain = true;
                 self.manager.as_mut().unwrap().revoke_context();
-                return Err(io::Error::other(
-                    "SUT replacement differs from admitted plist",
-                ));
+                return classify(
+                    F::TransitionAdmission,
+                    Err(io::Error::other(
+                        "SUT replacement differs from admitted plist",
+                    )),
+                );
             }
-            self.manager.as_mut().unwrap().admit_configuration(
-                self.owner.as_mut().unwrap(),
-                &raw_definition(&expected),
-                bytes,
-                receipt,
-                deadline,
-                cancel,
+            classify(
+                F::TransitionAdmission,
+                self.manager.as_mut().unwrap().admit_configuration(
+                    self.owner.as_mut().unwrap(),
+                    &raw_definition(&expected),
+                    bytes,
+                    receipt,
+                    deadline,
+                    cancel,
+                ),
             )?;
             self.sut_transition = None;
         }
@@ -125,19 +154,24 @@ impl ServiceRuntime {
                 .as_ref()
                 .filter(|(program, _)| program == "uninstall")
                 .map(|(_, receipt)| receipt.as_str());
+            let step = if uninstall_receipt.is_some() {
+                F::UninstallTransition
+            } else {
+                F::ManagerQuery
+            };
             match manager.inspect_registration(owner, uninstall_receipt, deadline, cancel) {
                 Ok(observed) => observed,
                 Err(error) => {
                     if owner.is_revoked() || manager.is_revoked() {
                         self.uncertain = true;
                     }
-                    return Err(error);
+                    return classify(step, Err(error));
                 }
             }
         } else if manager.pending_inspection().is_some() {
-            manager.poll_inspect(deadline, cancel)?
+            classify(F::ManagerQuery, manager.poll_inspect(deadline, cancel))?
         } else {
-            manager.inspect(deadline, cancel)?
+            classify(F::ManagerQuery, manager.inspect(deadline, cancel))?
         };
         let digest = observed
             .definition_bytes
@@ -180,11 +214,14 @@ impl ServiceRuntime {
         if self.owner.is_none()
             && let (Some(d), Some(receipt)) = (&definition, &self.install_receipt)
         {
-            self.owner = Some(self.manager.as_mut().unwrap().qualify_registration(
-                &raw_definition(d),
-                receipt.clone(),
-                deadline,
-                cancel,
+            self.owner = Some(classify(
+                F::RegistrationQualification,
+                self.manager.as_mut().unwrap().qualify_registration(
+                    &raw_definition(d),
+                    receipt.clone(),
+                    deadline,
+                    cancel,
+                ),
             )?);
             if format!(
                 "{:x}",
@@ -193,9 +230,12 @@ impl ServiceRuntime {
             {
                 self.uncertain = true;
                 self.manager.as_mut().unwrap().revoke_context();
-                return Err(io::Error::other(
-                    "original installed plist differs from manifest",
-                ));
+                return classify(
+                    F::RegistrationQualification,
+                    Err(io::Error::other(
+                        "original installed plist differs from manifest",
+                    )),
+                );
             }
             self.sut_transition = None;
         }
@@ -264,27 +304,30 @@ impl ServiceRuntime {
         self.inspection_evidence.push(observed.evidence.clone());
         let complete =
             matches!(observed.registration, host::Fact::Known(false)) || loaded.is_some(); // Only separately qualified absence can complete without loaded facts.
-        self.bind_observation(
-            lease,
-            v2::ServiceObservation {
-                platform,
-                instance: self.instance.clone(),
-                slot: slot.clone(),
-                registration_present: observed.definition_present || loaded.is_some(),
-                definition_digest: definition.as_ref().map(|d| d.definition_sha256.clone()),
-                configured: definition.is_some(),
-                running: loaded.is_some_and(|l| l.state == host::RuntimeState::Running),
-                origin: loaded.map(|l| l.origin.clone()),
-                manager_generation: self
-                    .config
-                    .context
-                    .manager_unique_name
-                    .clone()
-                    .expect("validated service context"),
-                complete,
-                binding_digest: String::new(),
-            },
-            definition,
+        classify(
+            F::ObservationBinding,
+            self.bind_observation(
+                lease,
+                v2::ServiceObservation {
+                    platform,
+                    instance: self.instance.clone(),
+                    slot: slot.clone(),
+                    registration_present: observed.definition_present || loaded.is_some(),
+                    definition_digest: definition.as_ref().map(|d| d.definition_sha256.clone()),
+                    configured: definition.is_some(),
+                    running: loaded.is_some_and(|l| l.state == host::RuntimeState::Running),
+                    origin: loaded.map(|l| l.origin.clone()),
+                    manager_generation: self
+                        .config
+                        .context
+                        .manager_unique_name
+                        .clone()
+                        .expect("validated service context"),
+                    complete,
+                    binding_digest: String::new(),
+                },
+                definition,
+            ),
         )
     }
     fn ensure_readiness_channel(&mut self) -> io::Result<()> {

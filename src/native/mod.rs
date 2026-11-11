@@ -4,7 +4,6 @@ pub mod launch;
 pub mod model;
 pub mod provider;
 pub mod recipe;
-pub mod recovery;
 pub mod storage;
 pub mod transport;
 pub mod view;

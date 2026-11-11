@@ -621,9 +621,6 @@ pub struct IntegrationManifest {
     pub desktop_capabilities: Vec<String>,
 }
 impl IntegrationManifest {
-    pub fn required_service(&self) -> Result<&ServiceAuthority, Error> {
-        self.service_authority.as_ref().ok_or(Error::InvalidValue)
-    }
     pub fn validate(&self) -> Result<(), Error> {
         if self.schema != 1
             || self.artifact_slots.len() > 8

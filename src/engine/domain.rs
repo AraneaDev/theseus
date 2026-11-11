@@ -1,17 +1,13 @@
 //! Closed backend selection and effect-free lifecycle compilation.
 use super::RunOptions;
 use crate::{
-    model::{OwnedResource, ProfileName, RunJournal, RunReport, ScenarioKind, StepName},
+    model::{ProfileName, RunJournal, RunReport, ScenarioKind},
     native::{
-        model::{
-            CatalogCommand, NativeCommandEvidence, NativeFileObservation, NativeJournal,
-            NativeReport, NativeResource,
-        },
+        model::{CatalogCommand, NativeCommandEvidence, NativeJournal, NativeReport},
         recipe::{NativeRunLimits, ValidatedNativeRecipe},
     },
     recipe::ValidatedRecipe,
     runner::{CommandRequest, ExecutedCommand},
-    snapshot::Snapshot,
 };
 use anyhow::{Result, bail};
 use std::path::PathBuf;
@@ -57,27 +53,6 @@ pub struct SelectedRunResult {
     pub report: StoredRun,
     pub report_path: PathBuf,
 }
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ResourceKey {
-    Docker {
-        scenario_id: String,
-        container_id: String,
-    },
-    Native {
-        scenario_id: String,
-        ownership_id: String,
-    },
-}
-#[derive(Debug, Clone)]
-pub enum Resource {
-    Docker(OwnedResource),
-    Native(Box<NativeResource>),
-}
-#[derive(Debug, Clone)]
-pub enum ObservationSet {
-    Docker(Vec<Snapshot>),
-    Native(Vec<NativeFileObservation>),
-}
 #[derive(Debug, Clone)]
 pub enum StageCommand {
     Docker(CommandRequest),
@@ -101,34 +76,6 @@ pub struct ScenarioPlan {
 pub struct LifecyclePlan {
     pub source_digest: String,
     pub scenarios: Vec<ScenarioPlan>,
-    recipe: SelectedRecipe,
-}
-impl LifecyclePlan {
-    pub fn compile_step(&self, scenario: &ScenarioPlan, step: StepName) -> Result<StageCommand> {
-        match (&self.recipe, scenario.role) {
-            (SelectedRecipe::NativeIntegration(recipe), LifecycleRole::NativeCurrentAccount) => {
-                recipe
-                    .core
-                    .recipe
-                    .steps
-                    .get(&step)
-                    .cloned()
-                    .map(StageCommand::Native)
-                    .ok_or_else(|| anyhow::anyhow!("missing integration step {step}"))
-            }
-            (SelectedRecipe::Native(recipe), LifecycleRole::NativeCurrentAccount) => recipe
-                .recipe
-                .steps
-                .get(&step)
-                .cloned()
-                .map(StageCommand::Native)
-                .ok_or_else(|| anyhow::anyhow!("missing native step {step}")),
-            (SelectedRecipe::Docker(_), LifecycleRole::Docker(_)) => bail!(
-                "Docker commands require runtime identity and sequence; compile through the legacy adapter"
-            ),
-            _ => bail!("lifecycle role/backend mismatch"),
-        }
-    }
 }
 /// Admission is pure: mismatched backends refuse before any store/provider/lease effect.
 pub fn compile(recipe: &SelectedRecipe, selection: &SelectedRunOptions) -> Result<LifecyclePlan> {
@@ -199,13 +146,5 @@ pub fn compile(recipe: &SelectedRecipe, selection: &SelectedRunOptions) -> Resul
             SelectedRecipe::NativeIntegration(r) => r.digest.clone(),
         },
         scenarios,
-        recipe: recipe.clone(),
     })
-}
-
-/// Original owned infrastructure errors are not replaced by serialized status text.
-pub struct CaptureResult<O> {
-    pub observations: O,
-    pub infrastructure: Option<anyhow::Error>,
-    pub prefix_authority_failure: Option<crate::native::model::PrefixAuthorityFailure>,
 }

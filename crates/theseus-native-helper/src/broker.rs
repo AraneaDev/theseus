@@ -448,9 +448,6 @@ impl BrokerRuntime {
             }
         }
     }
-    pub fn native_errors(&self) -> Option<&[io::Error]> {
-        self.owner.as_ref().map(|live| live.owner.retained_errors())
-    }
     pub(crate) fn commit(&mut self, event: BrokerEvent) -> io::Result<()> {
         if self.poisoned {
             return Err(invalid("broker commit uncertainty"));
@@ -1092,44 +1089,6 @@ impl BrokerRuntime {
         let result = live.owner.probe_ready(deadline, cancel);
         self.native_result(&identity.helper_operation, result)
     }
-    /// The caller has published this exact fresh probe nonce before dispatch.
-    /// Pending native channel state cannot be replaced; a new activation is never
-    /// constructed by a readiness transition.
-    pub fn probe_ready_with_nonce(
-        &mut self,
-        identity: &BrokerOperationIdentity,
-        nonce: v2::BindingId,
-        deadline: Instant,
-        cancel: &AtomicBool,
-    ) -> io::Result<theseus_host::services::readiness::ReadinessObservation> {
-        self.query(identity)?;
-        let live = self
-            .owner
-            .as_mut()
-            .filter(|o| o.operation == identity.helper_operation)
-            .ok_or_else(|| invalid("original native owner lost"))?;
-        if let Some(observed) = crate::broker_transport::native_policy::initial_native_sample(
-            live.owner.observation().native_lifetime.is_some(),
-            live.owner.current_ready_probe()?.challenge.nonce,
-            *nonce.as_bytes(),
-            &live.initial_readiness,
-        ) {
-            return Ok(observed);
-        }
-        if live.owner.current_ready_probe()?.challenge.nonce != *nonce.as_bytes() {
-            let mut next = live.owner.current_ready_probe()?.clone();
-            next.challenge.nonce = *nonce.as_bytes();
-            live.owner.begin_fresh_ready_probe(next)?;
-            live.initial_readiness = None;
-        }
-        let deadline = crate::broker_transport::native_policy::original_probe_deadline(
-            &mut live.ready_deadline,
-            *nonce.as_bytes(),
-            deadline,
-        );
-        let result = live.owner.probe_ready(deadline, cancel);
-        self.native_result(&identity.helper_operation, result)
-    }
     /// Bounded advance of the original nonce; None is scheduling pending.
     pub fn poll_ready_with_nonce(
         &mut self,
@@ -1164,34 +1123,6 @@ impl BrokerRuntime {
             deadline,
         );
         let result = live.owner.poll_ready(deadline, cancel);
-        self.native_result(&identity.helper_operation, result)
-    }
-    /// Existing worker output framing/budgets remain authoritative. The broker
-    /// reads only the original retained pipes, never opens a new process.
-    pub fn try_output(
-        &mut self,
-        identity: &BrokerOperationIdentity,
-        channel: v2::Channel,
-        bytes: &mut [u8],
-    ) -> io::Result<usize> {
-        self.query(identity)?;
-        let live = self
-            .owner
-            .as_mut()
-            .filter(|o| o.operation == identity.helper_operation)
-            .ok_or_else(|| invalid("original output owner lost"))?;
-        let result = match channel {
-            v2::Channel::Stdout => live.owner.try_stdout(bytes),
-            v2::Channel::Stderr => live.owner.try_stderr(bytes),
-        };
-        if result.as_ref().is_err_and(|e| {
-            matches!(
-                e.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::Unsupported
-            )
-        }) {
-            return result;
-        }
         self.native_result(&identity.helper_operation, result)
     }
     pub fn request_close(
