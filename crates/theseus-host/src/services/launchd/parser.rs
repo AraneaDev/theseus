@@ -274,7 +274,17 @@ fn parse(authority: &LaunchdAuthority, bytes: &[u8]) -> io::Result<LoadedService
         "running" => RuntimeState::Running,
         "not running" => RuntimeState::NotRunning,
         "waiting" => RuntimeState::Waiting,
-        _ => return Err(invalid("unknown runtime state")),
+        // Name the unrecognised launchd token (bounded printable ASCII only) so
+        // a transitional state seen in CI is diagnosable from retained evidence.
+        other => {
+            let token =
+                if other.len() <= 32 && other.bytes().all(|b| b == b' ' || b.is_ascii_graphic()) {
+                    other
+                } else {
+                    "<unrepresentable>"
+                };
+            return Err(invalid(&format!("unknown runtime state `{token}`")));
+        }
     };
     let pid = match fields.get("pid") {
         Some(value) => {
@@ -583,6 +593,20 @@ mod tests {
                 ),
                 "accepted {text}"
             );
+        }
+        for (state, named) in [
+            ("spawn scheduled", "`spawn scheduled`"),
+            (
+                "an overlong transitional launchd state",
+                "`<unrepresentable>`",
+            ),
+        ] {
+            let text = PRINT.replace("\tstate = running", &format!("\tstate = {state}"));
+            let Fact::Unknown(reason) = normalize_print(&authority(), evidence(&text)).loaded
+            else {
+                panic!("accepted state {state:?}");
+            };
+            assert!(reason.contains(named), "{reason}");
         }
         let mut e = evidence(PRINT);
         e.truncated = true;
