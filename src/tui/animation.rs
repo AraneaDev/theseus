@@ -207,7 +207,7 @@ fn scene(frame: usize, direction: Direction) -> Vec<Line<'static>> {
             (Direction::Exit, _) => "Following the thread home",
         },
     );
-    centered(&mut grid, 16, "Aranea Development");
+    centered(&mut grid, 16, "aranea.dev");
     centered(
         &mut grid,
         17,
@@ -369,7 +369,7 @@ mod tests {
                     "Following the thread home"
                 }
             );
-            assert_eq!(enter[16].trim(), "Aranea Development");
+            assert_eq!(enter[16].trim(), "aranea.dev");
             assert_eq!(enter[17].trim(), "[ Space ] skip");
             assert_eq!(exit[17].trim(), "[ Space / q ] skip");
         }
