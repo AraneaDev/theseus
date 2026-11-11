@@ -882,17 +882,62 @@ impl Drop for DesktopFixture {
     fn drop(&mut self) {
         let result = self.operator.as_mut().map(Operator::finish).transpose();
         self.operator.take();
+        let uncertain = result.is_err();
         if let Err(error) = result {
             eprintln!("original desktop broker cleanup uncertain: {error:#}");
         }
+        // Evidence is retained only for a fixture that did not finish cleanly
+        // (failed step, panic or uncertain broker cleanup); a finished fixture
+        // removes its trees, including the read-only pinned artifact copies.
+        let retain = !self.finished || uncertain || std::thread::panicking();
         if let Some(root) = self.directory.take() {
-            let _ = root.keep();
-            eprintln!("retained desktop fixture: {}", self.root.display());
+            if retain {
+                let _ = root.keep();
+                eprintln!("retained desktop fixture: {}", self.root.display());
+            } else if let Err(error) = remove_fixture_tree(root.keep()) {
+                eprintln!("desktop fixture removal incomplete: {error}");
+            }
         }
         if let Some(root) = self.sockets.take() {
-            eprintln!("retained desktop endpoints: {}", root.keep().display());
+            if retain {
+                eprintln!("retained desktop endpoints: {}", root.keep().display());
+            } else if let Err(error) = root.close() {
+                eprintln!("desktop endpoint removal incomplete: {error}");
+            }
         }
     }
+}
+/// Restore owner write permission (unix directories, Windows read-only files)
+/// throughout a fixture tree, then remove it. Links are never followed.
+fn remove_fixture_tree(root: PathBuf) -> std::io::Result<()> {
+    fn writable(path: &Path) -> std::io::Result<()> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        if metadata.is_dir() {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        }
+        #[cfg(windows)]
+        {
+            let mut permissions = metadata.permissions();
+            if permissions.readonly() {
+                #[allow(clippy::permissions_set_readonly_false)]
+                permissions.set_readonly(false);
+                std::fs::set_permissions(path, permissions)?;
+            }
+        }
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(path)? {
+                writable(&entry?.path())?;
+            }
+        }
+        Ok(())
+    }
+    writable(&root)?;
+    std::fs::remove_dir_all(&root)
 }
 
 pub fn assert_entry_fault(report: &NativeIntegrationReport, fault: Fault) -> Result<()> {

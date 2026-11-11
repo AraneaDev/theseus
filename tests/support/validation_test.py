@@ -138,6 +138,35 @@ class ValidationTests(unittest.TestCase):
             self.assertEqual((stdout.encoding, stdout.errors), ('cp1252', 'strict'))
             self.assertEqual((stderr.encoding, stderr.errors), ('cp1252', 'strict'))
 
+    def test_complete_run_removes_only_builder_named_read_only_artifact_tree(self):
+        with tempfile.TemporaryDirectory() as evidence_root, tempfile.TemporaryDirectory() as temporary:
+            evidence = pathlib.Path(evidence_root)
+            temporary = pathlib.Path(temporary).resolve()
+
+            def pinned(root):
+                binary = root / 'fixture' / 'theseus-host-fixture'
+                binary.parent.mkdir(parents=True)
+                binary.write_bytes(b'fixture')
+                (evidence / 'native-artifacts.json').write_text(json.dumps({'fixture': {'path': str(binary)}}))
+                return binary
+
+            with patch.object(validation.tempfile, 'gettempdir', return_value=str(temporary)):
+                self.assertEqual(validation.remove_pinned_artifacts(evidence), 'absent')
+                owned = temporary / 'theseus-native-artifacts-abc'
+                binary = pinned(owned)
+                if os.name != 'nt':
+                    os.chmod(binary.parent, 0o500)
+                self.assertEqual(validation.remove_pinned_artifacts(evidence), f'removed {owned}')
+                self.assertFalse(owned.exists())
+                other = temporary / 'unrelated'
+                pinned(other)
+                self.assertTrue(validation.remove_pinned_artifacts(evidence).startswith('refused'))
+                self.assertTrue(other.exists())
+                nested = temporary / 'nested' / 'theseus-native-artifacts-def'
+                pinned(nested)
+                self.assertTrue(validation.remove_pinned_artifacts(evidence).startswith('refused'))
+                self.assertTrue(nested.exists())
+
     def test_early_trace_is_scoped_before_later_runtime(self):
         key = 'THESEUS_TERMINAL_TRACE'
         for stage in ('early-controls', 'early-cli'):

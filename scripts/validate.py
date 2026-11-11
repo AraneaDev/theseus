@@ -11,6 +11,7 @@ import os
 import pathlib
 import platform
 import re
+import shutil
 import signal
 import stat
 import subprocess
@@ -490,6 +491,36 @@ def run_desktop(runner, name, command, cases):
         raise
 
 
+def remove_pinned_artifacts(evidence):
+    """After a complete local run, remove the ~2GB pinned-artifact tree that
+    build_host_fixture.py created in the temporary directory. CI stages share it
+    between steps and never call this. Only a builder-named directory directly
+    under the system temporary directory is removed; never raises."""
+    try:
+        metadata = json.loads((evidence / 'native-artifacts.json').read_text(encoding='utf-8'))
+        root = pathlib.Path(metadata['fixture']['path']).parent.parent
+    except (OSError, ValueError, KeyError, TypeError):
+        return 'absent'
+    temporary = pathlib.Path(tempfile.gettempdir()).resolve()
+    if not root.name.startswith('theseus-native-artifacts-') or root.is_symlink() or root.resolve().parent != temporary:
+        return f'refused {root}'
+
+    def writable(function, path, *_):
+        # Restore owner write permission on the containing directory and retry.
+        os.chmod(os.path.dirname(path), stat.S_IRWXU)
+        if os.path.lexists(path) and not os.path.islink(path):
+            os.chmod(path, stat.S_IRWXU)
+        function(path)
+    try:
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(root, onexc=writable)
+        else:
+            shutil.rmtree(root, onerror=writable)
+    except OSError as error:
+        return f'incomplete {root}: {error}'
+    return f'removed {root}'
+
+
 def load_pinned(runner):
     metadata = json.loads((runner.evidence / 'native-artifacts.json').read_text(encoding='utf-8'))
     verify_artifacts(metadata)
@@ -800,6 +831,8 @@ def main():
         receipt['error'] = str(error)
         console(f'THESEUS FAILED: {error}', file=sys.stderr)
     finally:
+        if args.mode == 'native' and not args.stage:
+            receipt['pinned_artifacts'] = remove_pinned_artifacts(evidence)
         write_json(evidence / f'{args.mode}-{args.stage or "all"}.result.json', receipt)
     return 0 if receipt['pass'] else 1
 
