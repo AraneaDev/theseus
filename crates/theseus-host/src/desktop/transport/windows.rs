@@ -387,7 +387,6 @@ impl Slot {
 }
 pub(super) struct Stream {
     pipe: Option<Handle>,
-    local: MeasuredIdentity,
     measured: Option<MeasuredIdentity>,
     expected: PeerCeiling,
     peer_owners: Option<PeerOwners>,
@@ -425,7 +424,6 @@ impl Stream {
         }
         Ok(Self {
             pipe: Some(Handle(raw)),
-            local: measured,
             measured: None,
             expected,
             peer_owners: None,
@@ -434,9 +432,6 @@ impl Stream {
             stopping: false,
             server: false,
         })
-    }
-    pub fn local_identity(&self) -> &MeasuredIdentity {
-        &self.local
     }
     pub fn identity(&self) -> Option<&MeasuredIdentity> {
         self.measured.as_ref()
@@ -558,7 +553,6 @@ impl Stream {
 }
 pub(super) struct Listener {
     name: Vec<u16>,
-    local: MeasuredIdentity,
     peer: PeerCeiling,
     descriptor: Option<Allocation>,
     pipe: Option<Handle>,
@@ -604,7 +598,6 @@ impl Listener {
         }
         Ok(Self {
             name: endpoint(endpoint_value)?,
-            local: measured,
             peer: expected,
             descriptor: Some(Allocation(descriptor)),
             pipe: None,
@@ -643,9 +636,6 @@ impl Listener {
         self.pipe = Some(Handle(raw));
         Ok(())
     }
-    pub fn local_identity(&self) -> &MeasuredIdentity {
-        &self.local
-    }
     pub fn try_accept(&mut self) -> io::Result<Option<Stream>> {
         if self.pipe.is_none() {
             self.start_bind()?;
@@ -676,7 +666,6 @@ impl Listener {
         }
         Ok(Some(Stream {
             pipe: self.pipe.take(),
-            local: self.local.clone(),
             measured: Some(identity),
             expected: self.peer.clone(),
             peer_owners: Some(owners),

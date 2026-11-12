@@ -203,10 +203,6 @@ impl CommandProvider {
         });
         Ok(baseline)
     }
-    /// Retained owners/errors are accessible after any partial failure.
-    pub fn spawn_failure(&self) -> Option<&theseus_host::process::SpawnFailure> {
-        self.spawn_failure.as_ref()
-    }
     pub fn settled(&self) -> bool {
         self.owner.is_none()
             && self

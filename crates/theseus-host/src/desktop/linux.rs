@@ -1041,14 +1041,6 @@ pub struct NativeActivation {
     local_retired: bool,
 }
 impl NativeActivation {
-    pub fn receipt(&self) -> NativeLaunchReceipt {
-        self.receipt
-    }
-    pub fn native_error(&self) -> Option<&sdk::NativeErrorOwner> {
-        self.prepared
-            .as_ref()
-            .and_then(|p| p.objects.error.as_ref())
-    }
     pub fn retirement_native_errors(&self) -> &[sdk::NativeErrorOwner] {
         self.prepared
             .as_ref()
@@ -1245,13 +1237,7 @@ impl NativeActivation {
             .take()
             .ok_or_else(|| invalid("original native token already handed back"))
     }
-    pub fn primary_reaped(&self) -> bool {
-        self.primary_reaped
-    }
 
-    pub fn cleanup_complete(&self) -> bool {
-        false
-    }
     pub fn observe_session(&mut self, observed: Option<&SessionBinding>) -> io::Result<()> {
         self.prepared
             .as_mut()
