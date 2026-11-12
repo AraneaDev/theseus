@@ -1249,15 +1249,6 @@ impl NativeActivation {
         self.primary_reaped
     }
 
-    pub fn owned_tree_available(&self) -> bool {
-        false
-    }
-    pub fn readiness_observed(&self) -> bool {
-        false
-    }
-    pub fn instance_termination_observed(&self) -> bool {
-        false
-    }
     pub fn cleanup_complete(&self) -> bool {
         false
     }

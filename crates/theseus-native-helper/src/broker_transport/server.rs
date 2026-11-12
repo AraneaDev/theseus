@@ -466,9 +466,6 @@ impl BrokerServer {
     pub fn header(&self) -> &IntegrationBrokerHeader {
         &self.config.header
     }
-    pub fn measured_identity(&self) -> &MeasuredIdentity {
-        &self.measurement
-    }
     pub fn retained_errors(&self) -> &[io::Error] {
         &self.errors
     }

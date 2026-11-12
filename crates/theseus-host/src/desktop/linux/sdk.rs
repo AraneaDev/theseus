@@ -69,9 +69,6 @@ impl DynamicLoaderFailure {
     pub fn operation(&self) -> &'static str {
         self.operation
     }
-    pub fn diagnostic_bytes(&self) -> &[u8] {
-        &self.diagnostic
-    }
 }
 impl std::fmt::Display for DynamicLoaderFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
