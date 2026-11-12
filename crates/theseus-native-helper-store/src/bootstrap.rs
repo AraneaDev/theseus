@@ -6,15 +6,9 @@ pub struct BootstrapRequest {
     pub manifest_digest: Digest,
     pub os: Os,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BootstrapScope {
-    FileAndDirectorySynced,
-    FileFlushedProcessCrash,
-}
 pub struct BootstrapReceipt {
     marker: WorkspaceMarker,
     header: Record,
-    scope: BootstrapScope,
 }
 impl BootstrapReceipt {
     pub fn workspace_marker(&self) -> WorkspaceMarker {
@@ -22,9 +16,6 @@ impl BootstrapReceipt {
     }
     pub fn header(&self) -> &Record {
         &self.header
-    }
-    pub fn scope(&self) -> BootstrapScope {
-        self.scope
     }
 }
 pub(crate) const LEDGER: &str = "ledger.bin";
@@ -285,19 +276,14 @@ fn bootstrap_profile_with(
     write_sync(&mut marker_file, marker.to_hex().as_bytes())?;
     let mut ledger_file = ledger_root.create_file(&ledger_path)?;
     write_sync(&mut ledger_file, &encoded)?;
+    // Unix also makes the new directory entries durable; Windows files are
+    // flushed (process-crash durability) by write_sync above.
     #[cfg(unix)]
-    let scope = {
+    {
         workspace_root.sync_directory()?;
         ledger_root.sync_directory()?;
-        BootstrapScope::FileAndDirectorySynced
-    };
-    #[cfg(windows)]
-    let scope = BootstrapScope::FileFlushedProcessCrash;
-    Ok(BootstrapReceipt {
-        marker,
-        header,
-        scope,
-    })
+    }
+    Ok(BootstrapReceipt { marker, header })
 }
 #[cfg(test)]
 mod tests {
@@ -544,35 +530,6 @@ pub fn bootstrap_provider_declared_integration(
     authority.revalidate()?;
     store.append_provider_qualification(Record::new(
         2,
-        Entry::LinuxGioQualificationDeclared {
-            attestation: Box::new(authority.attestation().clone()),
-        },
-    )?)?;
-    Ok(receipt)
-}
-/// Provider-only creation of the matching dedicated broker's qualified ledger.
-pub fn bootstrap_provider_broker(
-    ledger_root: &HostDir,
-    workspace_root: &HostDir,
-    header: &theseus_native_protocol::v2::broker::IntegrationBrokerHeader,
-    manifest: &theseus_native_protocol::v2::IntegrationManifest,
-    context: &theseus_native_protocol::v2::IntegrationRuntimeContext,
-    authority: &crate::ProviderLinuxGioQualification,
-) -> Result<BootstrapReceipt, StoreError> {
-    use theseus_native_protocol::v2::ledger::Entry;
-    authority.revalidate()?;
-    authority
-        .attestation()
-        .validate_context(manifest, context)
-        .map_err(|_| StoreError::BindingMismatch)?;
-    if context.desktop_broker_header.as_ref() != Some(header) {
-        return Err(StoreError::BindingMismatch);
-    }
-    let receipt = bootstrap_broker_profile(ledger_root, workspace_root, header)?;
-    let mut store = crate::LedgerStore::open_broker(ledger_root, workspace_root, header)?;
-    authority.revalidate()?;
-    store.append_provider_qualification(Record::new(
-        1,
         Entry::LinuxGioQualificationDeclared {
             attestation: Box::new(authority.attestation().clone()),
         },

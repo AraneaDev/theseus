@@ -280,12 +280,6 @@ impl RetainedEntry {
             revoked: std::cell::Cell::new(false),
         })
     }
-    pub fn definition(&self) -> &AdmittedDefinition {
-        &self.definition
-    }
-    pub fn entry_bytes(&self) -> &[u8] {
-        &self.bytes
-    }
     pub fn revalidate(&self) -> io::Result<()> {
         if self.revoked.get() {
             return Err(invalid("original desktop artifact authority revoked"));
@@ -843,18 +837,16 @@ impl DedicatedGioBroker {
                 &self.sdk,
             )
         })();
-        let executable_admission = match preflight {
-            Ok(admission) => admission,
-            Err(error) => {
-                return Err(NativePreparationFailure {
-                    error,
-                    native_error: None,
-                    retained_broker: Some(Box::new(self)),
-                    retained_entry: Some(Box::new(entry)),
-                    retained_objects: None,
-                });
-            }
-        };
+        // The admission is a validation gate only; nothing retains its facts.
+        if let Err(error) = preflight {
+            return Err(NativePreparationFailure {
+                error,
+                native_error: None,
+                retained_broker: Some(Box::new(self)),
+                retained_entry: Some(Box::new(entry)),
+                retained_objects: None,
+            });
+        }
         let objects = match sdk::Objects::prepare(
             &entry.bytes,
             &entry.definition.command,
@@ -874,7 +866,6 @@ impl DedicatedGioBroker {
             broker: Some(self),
             original_session,
             entry,
-            executable_admission,
             objects,
             requirement,
         })
@@ -922,14 +913,10 @@ pub struct PreparedNativeActivation {
     broker: Option<DedicatedGioBroker>,
     original_session: SessionBinding,
     entry: RetainedEntry,
-    executable_admission: NativeBinaryAdmission,
     objects: sdk::Objects,
     requirement: NativeLifetimeRequirement,
 }
 impl PreparedNativeActivation {
-    pub fn executable_admission(&self) -> &NativeBinaryAdmission {
-        &self.executable_admission
-    }
     pub fn observe_session(&mut self, observed: Option<&SessionBinding>) -> io::Result<()> {
         match &mut self.broker {
             Some(original) => original.observe_session(observed),
@@ -1054,13 +1041,6 @@ pub struct NativeActivation {
     local_retired: bool,
 }
 impl NativeActivation {
-    pub fn executable_admission(&self) -> &NativeBinaryAdmission {
-        &self
-            .prepared
-            .as_ref()
-            .expect("retained original native owner")
-            .executable_admission
-    }
     pub fn receipt(&self) -> NativeLaunchReceipt {
         self.receipt
     }

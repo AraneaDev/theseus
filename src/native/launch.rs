@@ -1248,6 +1248,8 @@ impl LaunchPreparation {
         })
     }
     /// First original terminal deletion failure, retained even after a proved retry.
+    /// Only the unit tests below observe it.
+    #[cfg(test)]
     pub fn settled_cleanup_error(&self) -> Option<&std::io::Error> {
         self.settled_cleanup_history.as_ref()
     }

@@ -188,6 +188,7 @@ impl ActivationProgress {
         self.effect = ActivationEffect::Unknown;
         self.ready = false;
     }
+    #[cfg(test)]
     pub fn callback_pending(&self) -> bool {
         self.callback_pending
     }
