@@ -327,9 +327,6 @@ impl NativeActivation {
     pub fn local_cleanup_complete(&self) -> bool {
         self.local_settled
     }
-    pub fn native_error_code(&self) -> Option<i64> {
-        (self.last_snapshot.error_code != 0).then_some(self.last_snapshot.error_code)
-    }
     pub fn binding(&self) -> &ExecutableBinding {
         &self.resources.binding
     }

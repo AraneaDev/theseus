@@ -583,6 +583,7 @@ impl OwnedExecutable {
     }
     /// Drains a bounded caller buffer through the existing interruptible pipes.
     /// The caller's existing worker/pump owns scheduling and output budgets.
+    #[cfg(test)]
     pub fn try_stdout(&mut self, out: &mut [u8]) -> io::Result<usize> {
         self.stdout
             .as_mut()

@@ -317,9 +317,6 @@ impl NativeStartFailure {
     pub fn preparation(&self) -> &LaunchPreparation {
         &self.preparation
     }
-    pub fn client_failure(&self) -> Option<&StartFailure> {
-        self.client.as_ref()
-    }
     pub fn request_stop(&mut self) {
         if let Some(c) = &mut self.client {
             c.request_stop()
