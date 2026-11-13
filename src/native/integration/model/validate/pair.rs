@@ -21,6 +21,18 @@ pub fn validate_pair(
             && report.selected_scenarios == journal.selected_scenarios,
         "integration report/journal pair mismatch"
     );
+    validate_recovery_report_progress(report, journal)?;
+    validate_catalog_operations(report, journal)?;
+    validate_desktop_observations(report, journal)?;
+    validate_rehearsal_starts(report, journal)?;
+    validate_sut_readiness(report, journal)?;
+    validate_public_readiness(report, journal)
+}
+
+fn validate_recovery_report_progress(
+    report: &NativeIntegrationReport,
+    journal: &NativeIntegrationJournal,
+) -> Result<()> {
     for recovery in &journal.integration_recoveries {
         for observation in &recovery.broker_observations {
             let action = journal
@@ -37,6 +49,13 @@ pub fn validate_pair(
             validate_original_broker_report_progress(report, action, &observation.state)?;
         }
     }
+    Ok(())
+}
+
+fn validate_catalog_operations(
+    report: &NativeIntegrationReport,
+    journal: &NativeIntegrationJournal,
+) -> Result<()> {
     for scenario in &report.catalog.scenarios {
         for command in scenario.stages.iter().flat_map(|s| &s.commands) {
             ensure!(
@@ -51,134 +70,182 @@ pub fn validate_pair(
             );
         }
     }
+    Ok(())
+}
+
+fn validate_desktop_observations(
+    report: &NativeIntegrationReport,
+    journal: &NativeIntegrationJournal,
+) -> Result<()> {
     for integration in &report.integrations {
         crate::native::integration::owned_lifetime::validate_pair_projection(integration, journal)?;
         for desktop in &integration.desktops {
             for observation in &desktop.observations {
-                validate_desktop_observation_generation(report, journal, observation)?;
-                let binding = &observation.binding;
-                ensure!(journal.ownership.iter().any(|owner|owner.ownership_id==binding.ownership_id && owner.scenario_id==binding.scenario_id && matches!(&owner.ownership,NativeOwnership::Acquired {lease,..} if lease==&binding.lease)),"desktop observation original helper lease missing");
-                if observation.broker_state.is_some() || observation.readiness.is_some() {
-                    let action = journal
-                        .integration_actions
-                        .iter()
-                        .find(|a| {
-                            a.ownership_id == binding.ownership_id
-                                && a.lease == binding.lease
-                                && a.slot == binding.slot
-                                && binding.action.as_ref() == Some(&a.operation)
-                        })
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "desktop observation lacks original published activation"
-                            )
-                        })?;
-                    let IntegrationRequest::Desktop { request, .. } = &action.request else {
-                        anyhow::bail!("desktop observation borrowed a service operation")
-                    };
-                    ensure!(
-                        matches!(
-                            request.action,
-                            theseus_native_protocol::v2::broker::DesktopAction::Activate { .. }
-                        ) && request.prior_binding_digest == binding.binding_digest,
-                        "desktop observation changed original activation context"
-                    );
-                    if let Some(state) = &observation.broker_state
-                        && (request.owned_lifetime_definition().is_some()
-                            || state.owned_lifetime.is_some())
-                    {
-                        let broker = journal
-                            .broker_bindings
-                            .iter()
-                            .find(|b| {
-                                b.ownership_id == binding.ownership_id
-                                    && b.helper_lease == binding.lease
-                                    && b.broker_lease.as_ref() == Some(&request.broker_lease)
-                            })
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("owned lifetime original broker mapping missing")
-                            })?;
-                        crate::native::integration::owned_lifetime::validate_original_observation(
-                            request,
-                            state,
-                            report.requirements.desktop.as_ref(),
-                            &broker.original.expected_header.os,
-                        )?;
-                        crate::native::integration::owned_lifetime::validate_report_effect(
-                            action, state,
-                        )?;
-                    }
-                    if let Some(native) = observation
-                        .broker_state
-                        .as_ref()
-                        .and_then(|s| s.native_lifetime.as_ref())
-                    {
-                        let broker = journal
-                            .broker_bindings
-                            .iter()
-                            .find(|b| {
-                                b.ownership_id == binding.ownership_id
-                                    && b.helper_lease == binding.lease
-                                    && b.broker_lease.as_ref() == Some(&request.broker_lease)
-                            })
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("native lifetime original broker mapping missing")
-                            })?;
-                        let required = report.requirements.desktop.as_ref().ok_or_else(|| {
-                            anyhow::anyhow!("native lifetime requirements missing")
-                        })?;
-                        ensure!(required.modes==[DesktopMode::NativeActivation] && native.required==required.lifetime.native() && matches!(request.action,theseus_native_protocol::v2::broker::DesktopAction::Activate {mode:theseus_native_protocol::v2::broker::DesktopMode::NativeActivation,..}),"native lifetime borrowed another mode/requirement");
-                        native.validate_platform(&broker.original.expected_header.os)?;
-                    }
-                    if let Some(ready) = &observation.readiness {
-                        let identity = request.identity()?;
-                        ready.validate_desktop(&identity)?;
-                        let broker = journal
-                            .broker_bindings
-                            .iter()
-                            .find(|b| {
-                                b.ownership_id == binding.ownership_id
-                                    && b.helper_lease == binding.lease
-                                    && b.broker_lease.as_ref() == Some(&identity.broker_lease)
-                            })
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("desktop readiness original broker mapping missing")
-                            })?;
-                        ready.validate_desktop_peer(
-                            &broker.original.expected_header.broker_principal,
-                        )?;
-                        let probe = journal
-                            .readiness_probes
-                            .iter()
-                            .find(|p| {
-                                p.challenge.ownership_id == binding.ownership_id
-                                    && p.challenge.slot == binding.slot
-                                    && p.challenge.resource_binding_digest == binding.binding_digest
-                                    && p.challenge.operation == identity.helper_operation
-                                    && p.challenge.lease == identity.broker_lease
-                                    && p.challenge
-                                        .digest()
-                                        .is_ok_and(|d| d == ready.challenge_digest)
-                                    && p.expectation_digest == ready.expectation_digest
-                                    && p.expectation.wire() == ready.expectation
-                                    && p.observation_ids.contains(&binding.id)
-                            })
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "desktop readiness lacks exact original published probe"
-                                )
-                            })?;
-                        if ready.state == theseus_native_protocol::v2::ReadinessState::Ready {
-                            ensure!(
-                                matches!(&probe.completion,Disposition::Complete {receipt} if Some(receipt)==ready.response_digest.as_ref()),
-                                "desktop Ready response lacks exact completed private receipt"
-                            );
-                        }
-                    }
-                }
+                validate_desktop_observation_origin(report, journal, observation)?;
             }
         }
     }
+    Ok(())
+}
+
+fn validate_desktop_observation_origin(
+    report: &NativeIntegrationReport,
+    journal: &NativeIntegrationJournal,
+    observation: &BoundDesktopObservation,
+) -> Result<()> {
+    validate_desktop_observation_generation(report, journal, observation)?;
+    let binding = &observation.binding;
+    ensure!(journal.ownership.iter().any(|owner|owner.ownership_id==binding.ownership_id && owner.scenario_id==binding.scenario_id && matches!(&owner.ownership,NativeOwnership::Acquired {lease,..} if lease==&binding.lease)),"desktop observation original helper lease missing");
+    if observation.broker_state.is_some() || observation.readiness.is_some() {
+        let action = journal
+            .integration_actions
+            .iter()
+            .find(|a| {
+                a.ownership_id == binding.ownership_id
+                    && a.lease == binding.lease
+                    && a.slot == binding.slot
+                    && binding.action.as_ref() == Some(&a.operation)
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("desktop observation lacks original published activation")
+            })?;
+        let IntegrationRequest::Desktop { request, .. } = &action.request else {
+            anyhow::bail!("desktop observation borrowed a service operation")
+        };
+        ensure!(
+            matches!(
+                request.action,
+                theseus_native_protocol::v2::broker::DesktopAction::Activate { .. }
+            ) && request.prior_binding_digest == binding.binding_digest,
+            "desktop observation changed original activation context"
+        );
+        validate_desktop_observation_lifetimes(
+            report,
+            journal,
+            observation,
+            binding,
+            action,
+            request,
+        )?;
+        if let Some(ready) = &observation.readiness {
+            validate_desktop_observation_readiness(journal, binding, request, ready)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_desktop_observation_lifetimes(
+    report: &NativeIntegrationReport,
+    journal: &NativeIntegrationJournal,
+    observation: &BoundDesktopObservation,
+    binding: &ObservationBinding,
+    action: &IntegrationActionRecord,
+    request: &theseus_native_protocol::v2::broker::DesktopRequest,
+) -> Result<()> {
+    if let Some(state) = &observation.broker_state
+        && (request.owned_lifetime_definition().is_some() || state.owned_lifetime.is_some())
+    {
+        let broker = journal
+            .broker_bindings
+            .iter()
+            .find(|b| {
+                b.ownership_id == binding.ownership_id
+                    && b.helper_lease == binding.lease
+                    && b.broker_lease.as_ref() == Some(&request.broker_lease)
+            })
+            .ok_or_else(|| anyhow::anyhow!("owned lifetime original broker mapping missing"))?;
+        crate::native::integration::owned_lifetime::validate_original_observation(
+            request,
+            state,
+            report.requirements.desktop.as_ref(),
+            &broker.original.expected_header.os,
+        )?;
+        crate::native::integration::owned_lifetime::validate_report_effect(action, state)?;
+    }
+    if let Some(native) = observation
+        .broker_state
+        .as_ref()
+        .and_then(|s| s.native_lifetime.as_ref())
+    {
+        let broker = journal
+            .broker_bindings
+            .iter()
+            .find(|b| {
+                b.ownership_id == binding.ownership_id
+                    && b.helper_lease == binding.lease
+                    && b.broker_lease.as_ref() == Some(&request.broker_lease)
+            })
+            .ok_or_else(|| anyhow::anyhow!("native lifetime original broker mapping missing"))?;
+        let required = report
+            .requirements
+            .desktop
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("native lifetime requirements missing"))?;
+        ensure!(
+            required.modes == [DesktopMode::NativeActivation]
+                && native.required == required.lifetime.native()
+                && matches!(
+                    request.action,
+                    theseus_native_protocol::v2::broker::DesktopAction::Activate {
+                        mode: theseus_native_protocol::v2::broker::DesktopMode::NativeActivation,
+                        ..
+                    }
+                ),
+            "native lifetime borrowed another mode/requirement"
+        );
+        native.validate_platform(&broker.original.expected_header.os)?;
+    }
+    Ok(())
+}
+
+fn validate_desktop_observation_readiness(
+    journal: &NativeIntegrationJournal,
+    binding: &ObservationBinding,
+    request: &theseus_native_protocol::v2::broker::DesktopRequest,
+    ready: &theseus_native_protocol::v2::ReadinessObservation,
+) -> Result<()> {
+    let identity = request.identity()?;
+    ready.validate_desktop(&identity)?;
+    let broker = journal
+        .broker_bindings
+        .iter()
+        .find(|b| {
+            b.ownership_id == binding.ownership_id
+                && b.helper_lease == binding.lease
+                && b.broker_lease.as_ref() == Some(&identity.broker_lease)
+        })
+        .ok_or_else(|| anyhow::anyhow!("desktop readiness original broker mapping missing"))?;
+    ready.validate_desktop_peer(&broker.original.expected_header.broker_principal)?;
+    let probe = journal
+        .readiness_probes
+        .iter()
+        .find(|p| {
+            p.challenge.ownership_id == binding.ownership_id
+                && p.challenge.slot == binding.slot
+                && p.challenge.resource_binding_digest == binding.binding_digest
+                && p.challenge.operation == identity.helper_operation
+                && p.challenge.lease == identity.broker_lease
+                && p.challenge
+                    .digest()
+                    .is_ok_and(|d| d == ready.challenge_digest)
+                && p.expectation_digest == ready.expectation_digest
+                && p.expectation.wire() == ready.expectation
+                && p.observation_ids.contains(&binding.id)
+        })
+        .ok_or_else(|| anyhow::anyhow!("desktop readiness lacks exact original published probe"))?;
+    if ready.state == theseus_native_protocol::v2::ReadinessState::Ready {
+        ensure!(
+            matches!(&probe.completion,Disposition::Complete {receipt} if Some(receipt)==ready.response_digest.as_ref()),
+            "desktop Ready response lacks exact completed private receipt"
+        );
+    }
+    Ok(())
+}
+
+fn validate_rehearsal_starts(
+    report: &NativeIntegrationReport,
+    journal: &NativeIntegrationJournal,
+) -> Result<()> {
     // Public runtime predicates may name a declared rehearsal Start, but a
     // report reference cannot turn a Stop, another lease, or an unfinished
     // action into that accepted original cause.
@@ -235,6 +302,13 @@ pub fn validate_pair(
             }
         }
     }
+    Ok(())
+}
+
+fn validate_sut_readiness(
+    report: &NativeIntegrationReport,
+    journal: &NativeIntegrationJournal,
+) -> Result<()> {
     for probe in &journal.readiness_probes {
         let challenge = &probe.challenge;
         let Some(operation) = journal.operations.iter().find(|operation| {
@@ -302,53 +376,71 @@ pub fn validate_pair(
                             && &command.stdout == expected)),
             "SUT readiness lacks exact successful original activation Run evidence"
         );
-        let integration = report
-            .integrations
-            .iter()
-            .find(|s| s.ownership_id == challenge.ownership_id)
-            .ok_or_else(|| anyhow::anyhow!("SUT readiness integration scenario missing"))?;
-        for id in &probe.observation_ids {
-            let Some(observation) = integration
-                .services
-                .iter()
-                .filter(|s| s.slot == challenge.slot)
-                .flat_map(|s| &s.observations)
-                .find(|o| &o.binding.id == id)
-            else {
-                // The private completion barrier precedes the public report.
-                // Missing historical bytes remain unavailable after a crash;
-                // no required public predicate can pass without its observation.
-                continue;
-            };
-            let phase = observation.binding.phase;
-            let phase_matches = match (operation.command.program, scenario.scenario) {
-                (CatalogProgram::Configure, ScenarioKind::Clean) => matches!(
-                    phase,
-                    IntegrationPhase::Configured | IntegrationPhase::ExerciseFinal
-                ),
-                (CatalogProgram::Configure, ScenarioKind::Upgrade) => {
-                    phase == IntegrationPhase::Configured
-                }
-                (CatalogProgram::Configure, ScenarioKind::Reinstall) => matches!(
-                    phase,
-                    IntegrationPhase::Configured | IntegrationPhase::ExerciseBeforeReinstall
-                ),
-                (CatalogProgram::InstallTarget, ScenarioKind::Upgrade) => matches!(
-                    phase,
-                    IntegrationPhase::TargetInstalledAfterUpgrade | IntegrationPhase::ExerciseFinal
-                ),
-                (CatalogProgram::InstallTarget, ScenarioKind::Reinstall) => matches!(
-                    phase,
-                    IntegrationPhase::Reinstalled | IntegrationPhase::ExerciseAfterReinstall
-                ),
-                _ => false,
-            };
-            ensure!(
-                phase_matches,
-                "SUT readiness observation phase differs from original activation interval"
-            );
-        }
+        validate_sut_readiness_observations(report, probe, operation, scenario)?;
     }
+    Ok(())
+}
+
+fn validate_sut_readiness_observations(
+    report: &NativeIntegrationReport,
+    probe: &ReadinessProbeRecord,
+    operation: &NativeOperation,
+    scenario: &NativeScenario,
+) -> Result<()> {
+    let challenge = &probe.challenge;
+    let integration = report
+        .integrations
+        .iter()
+        .find(|s| s.ownership_id == challenge.ownership_id)
+        .ok_or_else(|| anyhow::anyhow!("SUT readiness integration scenario missing"))?;
+    for id in &probe.observation_ids {
+        let Some(observation) = integration
+            .services
+            .iter()
+            .filter(|s| s.slot == challenge.slot)
+            .flat_map(|s| &s.observations)
+            .find(|o| &o.binding.id == id)
+        else {
+            // The private completion barrier precedes the public report.
+            // Missing historical bytes remain unavailable after a crash;
+            // no required public predicate can pass without its observation.
+            continue;
+        };
+        let phase = observation.binding.phase;
+        let phase_matches = match (operation.command.program, scenario.scenario) {
+            (CatalogProgram::Configure, ScenarioKind::Clean) => matches!(
+                phase,
+                IntegrationPhase::Configured | IntegrationPhase::ExerciseFinal
+            ),
+            (CatalogProgram::Configure, ScenarioKind::Upgrade) => {
+                phase == IntegrationPhase::Configured
+            }
+            (CatalogProgram::Configure, ScenarioKind::Reinstall) => matches!(
+                phase,
+                IntegrationPhase::Configured | IntegrationPhase::ExerciseBeforeReinstall
+            ),
+            (CatalogProgram::InstallTarget, ScenarioKind::Upgrade) => matches!(
+                phase,
+                IntegrationPhase::TargetInstalledAfterUpgrade | IntegrationPhase::ExerciseFinal
+            ),
+            (CatalogProgram::InstallTarget, ScenarioKind::Reinstall) => matches!(
+                phase,
+                IntegrationPhase::Reinstalled | IntegrationPhase::ExerciseAfterReinstall
+            ),
+            _ => false,
+        };
+        ensure!(
+            phase_matches,
+            "SUT readiness observation phase differs from original activation interval"
+        );
+    }
+    Ok(())
+}
+
+fn validate_public_readiness(
+    report: &NativeIntegrationReport,
+    journal: &NativeIntegrationJournal,
+) -> Result<()> {
     for scenario in &report.integrations {
         for service in &scenario.services {
             for observation in &service.observations {
