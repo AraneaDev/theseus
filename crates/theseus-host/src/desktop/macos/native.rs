@@ -321,9 +321,6 @@ impl NativeActivation {
     pub fn manager_instance_terminated(&self) -> bool {
         self.progress.manager_instance_terminated()
     }
-    pub fn descendants_owned(&self) -> bool {
-        false
-    }
     pub fn local_cleanup_complete(&self) -> bool {
         self.local_settled
     }

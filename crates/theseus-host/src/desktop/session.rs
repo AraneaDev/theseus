@@ -163,10 +163,13 @@ impl BoundSession {
     }
     pub fn is_source_owned_headless(&self) -> bool {
         #[cfg(any(test, feature = "test-support", feature = "desktop-test-support"))]
-        if matches!(self.binding().display, SuppliedDisplay::SourceOwnedHeadless) {
-            return true;
+        {
+            matches!(self.binding().display, SuppliedDisplay::SourceOwnedHeadless)
         }
-        false
+        #[cfg(not(any(test, feature = "test-support", feature = "desktop-test-support")))]
+        {
+            false
+        }
     }
 }
 fn identifier(v: &str) -> bool {

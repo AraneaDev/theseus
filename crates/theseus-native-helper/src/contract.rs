@@ -313,12 +313,14 @@ impl ControlPermit {
     }
 }
 impl OwnedWorkerFailure {
+    #[cfg(test)]
     pub fn spawn_failure(&self) -> Option<&theseus_host::process::SpawnFailure> {
         match &self.primary {
             WorkerPrimary::Spawn(f) => Some(f),
             _ => self.retained_spawn.as_deref(),
         }
     }
+    #[cfg(test)]
     pub fn classification(&self) -> &'static str {
         match &self.primary {
             WorkerPrimary::File(_) => "file",
@@ -336,9 +338,6 @@ impl OwnedWorkerFailure {
                     .as_ref()
                     .is_some_and(|o| o.cleanup_error.is_some()),
             )
-    }
-    pub fn service_errors(&self) -> &[io::Error] {
-        &self.retained_service_errors
     }
     pub fn panic_payload(&self) -> Option<&(dyn std::any::Any + Send + 'static)> {
         match &self.primary {

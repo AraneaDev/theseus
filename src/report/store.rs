@@ -760,9 +760,6 @@ fn validate_journal(journal: &RunJournal) -> Result<()> {
     );
     Ok(())
 }
-pub fn read_log(root: &Path, relative: &str, limit: usize) -> Result<LogRead> {
-    open_store(root)?.read_log(relative, limit)
-}
 /// Freshness from a safely reopened regular file, including native replacement identity.
 pub fn log_fingerprint(root: &Path, relative: &str) -> Result<LogFingerprint> {
     fingerprint(&open_store(root)?.open_log(relative)?).context("fingerprint contained command log")

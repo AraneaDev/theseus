@@ -132,7 +132,6 @@ fn socket() -> io::Result<File> {
 }
 pub(super) struct Stream {
     file: Option<File>,
-    local: MeasuredIdentity,
     peer: Option<MeasuredIdentity>,
     ceiling: PeerCeiling,
     connecting: bool,
@@ -169,15 +168,11 @@ impl Stream {
         }
         Ok(Self {
             file: Some(file),
-            local: observed,
             peer: None,
             ceiling: expected,
             connecting: result != 0,
             stopping: false,
         })
-    }
-    pub fn local_identity(&self) -> &MeasuredIdentity {
-        &self.local
     }
     pub fn identity(&self) -> Option<&MeasuredIdentity> {
         self.peer.as_ref()
@@ -311,7 +306,6 @@ pub(super) struct Listener {
     identity: Option<(u64, u64)>,
     bound: bool,
     revoked: bool,
-    local: MeasuredIdentity,
     peer: PeerCeiling,
     stopping: bool,
     removed: bool,
@@ -370,7 +364,6 @@ impl Listener {
             identity: None,
             bound: false,
             revoked: false,
-            local: observed,
             peer: peer_ceiling,
             stopping: false,
             removed: false,
@@ -436,9 +429,6 @@ impl Listener {
         }
         result
     }
-    pub fn local_identity(&self) -> &MeasuredIdentity {
-        &self.local
-    }
     pub fn try_accept(&mut self) -> io::Result<Option<Stream>> {
         self.revalidate()?;
         let fd = unsafe {
@@ -487,7 +477,6 @@ impl Listener {
         admit(&observed, &self.peer)?;
         Ok(Some(Stream {
             file: Some(file),
-            local: self.local.clone(),
             peer: Some(observed),
             ceiling: self.peer.clone(),
             connecting: false,

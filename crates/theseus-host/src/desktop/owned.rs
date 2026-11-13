@@ -420,9 +420,6 @@ impl OwnedExecutable {
         let probe = std::mem::replace(&mut self.ready_probe, next);
         Ok(TerminalReadinessProbe { probe, observation })
     }
-    pub fn session_binding(&self) -> &SessionBinding {
-        self.session.binding()
-    }
     pub fn observe_session(&mut self, observed: Option<&SessionBinding>) -> io::Result<()> {
         self.session.observe(observed).map_err(Into::into)
     }
@@ -588,12 +585,6 @@ impl OwnedExecutable {
         self.stdout
             .as_mut()
             .ok_or_else(|| invalid("stdout already settled"))?
-            .try_read(out)
-    }
-    pub fn try_stderr(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        self.stderr
-            .as_mut()
-            .ok_or_else(|| invalid("stderr already settled"))?
             .try_read(out)
     }
     pub fn observe_primary(&mut self) -> io::Result<bool> {

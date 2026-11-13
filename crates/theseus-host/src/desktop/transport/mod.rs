@@ -128,9 +128,6 @@ impl AuthenticatedStream {
     pub fn identity(&self) -> Option<&MeasuredIdentity> {
         self.native.as_ref().and_then(platform::Stream::identity)
     }
-    pub fn local_identity(&self) -> Option<&MeasuredIdentity> {
-        self.native.as_ref().map(platform::Stream::local_identity)
-    }
     pub fn retained_errors(&self) -> &[io::Error] {
         &self.errors
     }
@@ -296,9 +293,6 @@ impl LocalListener {
                 ))
             }
         }
-    }
-    pub fn local_identity(&self) -> Option<&MeasuredIdentity> {
-        self.native.as_ref().map(platform::Listener::local_identity)
     }
     pub fn try_accept(&mut self) -> io::Result<Option<AuthenticatedStream>> {
         if self.stopping {
