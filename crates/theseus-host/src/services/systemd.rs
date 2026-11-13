@@ -15,36 +15,6 @@ use std::{
 
 pub use super::endpoint::UnixPath;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn closed_endpoint_rejects_dbus_grammar_and_unsafe_components() {
-        for path in [
-            "",
-            "bus",
-            "/tmp/../bus",
-            "/tmp/./bus",
-            "/tmp//bus",
-            "/tmp/bus;unixexec:path=sh",
-            "unix:path=/tmp/bus",
-            "/tmp/bus,guid=00",
-            "/tmp/$BUS",
-            "/tmp/é",
-            "/tmp/a\0b",
-        ] {
-            assert!(UnixPath::new(path.into()).is_err(), "accepted {path:?}");
-        }
-        assert!(UnixPath::new(format!("/{}", "a".repeat(100))).is_err());
-        assert_eq!(
-            UnixPath::new("/tmp/private/bus.sock".into())
-                .unwrap()
-                .address(),
-            "unix:path=/tmp/private/bus.sock"
-        );
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SystemdScope {
     User,
@@ -286,66 +256,6 @@ impl SystemdDefinition {
             }
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod model_tests {
-    use super::*;
-    fn authority() -> SystemdAuthority {
-        SystemdAuthority {
-            endpoint: UnixPath::new("/tmp/theseus/bus".into()).unwrap(),
-            scope: SystemdScope::User,
-            bus_uid: 1000,
-            manager_uid: 1000,
-            manager_unique_name: ":1.17".into(),
-            manager_version: "262".into(),
-            unit: "theseus-fixture.service".into(),
-            definition_root: PathBuf::from("/tmp/theseus/units"),
-            unit_load_paths: vec!["/tmp/theseus/units".into()],
-            ownership_id: "reserved-context".into(),
-            context_receipt: "provider-receipt".into(),
-            allowed_start: true,
-            allowed_stop: true,
-        }
-    }
-    #[test]
-    fn model_rejects_incomplete_or_ambiguous_authority_before_library_loading() {
-        let a = authority();
-        assert!(a.validate().is_ok());
-        let mut a = authority();
-        a.unit = "other*.service".into();
-        assert!(a.validate().is_err());
-        let mut a = authority();
-        a.manager_unique_name = MANAGER.into();
-        assert!(a.validate().is_err());
-        let mut a = authority();
-        a.context_receipt.clear();
-        assert!(a.validate().is_err());
-        let mut a = authority();
-        a.unit_load_paths.push(a.unit_load_paths[0].clone());
-        assert!(a.validate().is_err());
-        let mut a = authority();
-        a.unit_load_paths.clear();
-        assert!(a.validate().is_err());
-    }
-    #[test]
-    fn model_rejects_unbounded_or_relative_exec_definition() {
-        let mut d = SystemdDefinition {
-            executable: "/fixture/service".into(),
-            arguments: vec!["/fixture/service".into()],
-            environment: vec!["A=value".into()],
-            working_directory: "/fixture".into(),
-        };
-        assert!(d.validate().is_ok());
-        d.executable = "service".into();
-        assert!(d.validate().is_err());
-        d.executable = "/fixture/service".into();
-        d.environment = vec!["A=1".into(), "A=2".into()];
-        assert!(d.validate().is_err());
-        d.environment.clear();
-        d.arguments.clear();
-        assert!(d.validate().is_err());
     }
 }
 
@@ -1213,148 +1123,15 @@ fn validate_definition_source(bytes: &[u8]) -> io::Result<()> {
     }
     Ok(())
 }
-#[cfg(test)]
-mod definition_model_tests {
-    use super::*;
-    #[test]
-    fn model_refuses_hidden_exec_and_dependency_configuration() {
-        let base = "[Unit]\nDescription=Fixture\nDefaultDependencies=no\n[Service]\nType=simple\nExecStart=/fixture/service\nWorkingDirectory=/fixture\nRestart=no\n";
-        assert!(validate_definition_source(base.as_bytes()).is_ok());
-        for extra in [
-            "ExecStartPre=/unadmitted",
-            "EnvironmentFile=/unadmitted",
-            "Restart=always",
-            "User=other",
-            "Sockets=other.socket",
-            "Type=forking",
-            "ExecStart=/second",
-            "[Install]\nWantedBy=default.target",
-            "[Unit]\nRequires=unadmitted.service",
-        ] {
-            assert!(
-                validate_definition_source(format!("{base}{extra}\n").as_bytes()).is_err(),
-                "accepted {extra}"
-            );
-        }
-    }
-    #[test]
-    fn fixture_renderer_quoted_absolute_command_is_supported_without_prefix_escape() {
-        let definition=b"[Unit]\nDescription=Theseus fixture\nDefaultDependencies=no\n[Service]\nType=simple\nRestart=no\nExecStart=\"/fixture/service\" \"service\" \"/fixture/ready.sock\"\nWorkingDirectory=/fixture\nEnvironment=\"VALUE=fixture value\"\n";
-        assert!(validate_definition_source(definition).is_ok());
-        for prefix in ["+", "!", "@", "-", ":"] {
-            let text = format!("[Service]\nExecStart={prefix}/fixture/service\n");
-            assert!(validate_definition_source(text.as_bytes()).is_err());
-        }
-    }
-    #[test]
-    fn working_directory_is_admitted_only_as_the_literal_a_real_manager_reads() {
-        // CI10 real systemd keeps quotes in path settings, so a quoted
-        // WorkingDirectory would name a different, relative directory.
-        let base = "[Unit]\nDescription=Theseus fixture\nDefaultDependencies=no\n[Service]\nType=simple\nRestart=no\nExecStart=\"/fixture/service\" \"service\"\n";
-        assert!(
-            validate_definition_source(
-                format!("{base}WorkingDirectory=/fixture/work dir\n").as_bytes()
-            )
-            .is_ok()
-        );
-        for value in [
-            "\"/fixture\"",
-            "'/fixture'",
-            "fixture",
-            "/fix\"ture",
-            "/fixture/%h",
-            "/fixture/$HOME",
-            "-/fixture",
-            "~/x",
-            "",
-        ] {
-            assert!(
-                validate_definition_source(format!("{base}WorkingDirectory={value}\n").as_bytes())
-                    .is_err(),
-                "{value}"
-            );
-        }
-    }
-    #[test]
-    fn cooperative_deadline_and_cancel_have_no_default_timeout_fallback() {
-        let cancelled = AtomicBool::new(true);
-        assert_eq!(
-            remaining(Instant::now() + Duration::from_secs(1), &cancelled)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::Interrupted
-        );
-        let cancel = AtomicBool::new(false);
-        assert_eq!(
-            remaining(Instant::now() - Duration::from_secs(1), &cancel)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::TimedOut
-        );
-        assert!(remaining(Instant::now() + Duration::from_secs(31), &cancel).is_err());
-        assert!(remaining(Instant::now() + Duration::from_secs(1), &cancel).unwrap() > 0);
-    }
-}
 
 #[cfg(test)]
-mod sut_transition_owner_tests {
-    use super::*;
-    #[test]
-    fn sut_transition_keeps_original_files_and_never_restores_revoked_owner() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("original");
-        std::fs::write(&path, b"base").unwrap();
-        let file = File::open(&path).unwrap();
-        let fp = crate::fs::fingerprint(&file).unwrap();
-        let definition = SystemdDefinition {
-            executable: "/fixture/base".into(),
-            arguments: vec![],
-            environment: vec![],
-            working_directory: "/fixture".into(),
-        };
-        let mut owner = RegistrationOwner {
-            _file: file,
-            prior_files: vec![],
-            transition_receipts: vec![],
-            fingerprint: fp.clone(),
-            definition_bytes: b"base".to_vec(),
-            definition: definition.clone(),
-            manager_instance: [1; 32],
-            install_receipt: "original-install".into(),
-            revoked: false,
-        };
-        let next = dir.path().join("target");
-        std::fs::write(&next, b"target").unwrap();
-        let replacement = File::open(&next).unwrap();
-        let replacement_fp = crate::fs::fingerprint(&replacement).unwrap();
-        owner
-            .record_transition(
-                replacement,
-                replacement_fp,
-                b"target".to_vec(),
-                &definition,
-                "accepted-upgrade".into(),
-            )
-            .unwrap();
-        assert_eq!(owner.install_receipt(), "original-install");
-        assert_eq!(owner.prior_files.len(), 1);
-        assert_eq!(crate::fs::fingerprint(&owner.prior_files[0]).unwrap(), fp);
-        assert_eq!(owner.definition_bytes(), b"target");
-        owner.revoked = true;
-        let original = File::open(&path).unwrap();
-        assert!(
-            owner
-                .record_transition(
-                    original,
-                    fp,
-                    b"base".to_vec(),
-                    &definition,
-                    "accepted-reinstall".into()
-                )
-                .is_err()
-        );
-        assert!(owner.is_revoked());
-        assert_eq!(owner.definition_bytes(), b"target");
-        assert_eq!(owner.prior_files.len(), 1);
-    }
-}
+mod tests;
+
+#[cfg(test)]
+mod model_tests;
+
+#[cfg(test)]
+mod definition_model_tests;
+
+#[cfg(test)]
+mod sut_transition_owner_tests;
