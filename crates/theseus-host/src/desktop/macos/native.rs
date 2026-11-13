@@ -327,9 +327,6 @@ impl NativeActivation {
     pub fn binding(&self) -> &ExecutableBinding {
         &self.resources.binding
     }
-    pub fn application_ready(&self) -> bool {
-        self.progress.application_ready()
-    }
     pub fn current_ready_probe(&self) -> &CommittedReadinessProbe {
         &self.ready_probe
     }
@@ -355,7 +352,6 @@ impl NativeActivation {
         self.used_ready_nonces.push(next.challenge.nonce);
         let probe = std::mem::replace(&mut self.ready_probe, next);
         self.ready_deadline = None;
-        self.progress.observe_application_ready(false);
         Ok(TerminalReadinessProbe { probe, observation })
     }
     pub fn observe_session(
@@ -535,8 +531,6 @@ impl NativeActivation {
         if !close && observation.state != ReadinessState::Incomplete {
             self.progress
                 .authenticate_instance(observation.authenticated_instance)?;
-            self.progress
-                .observe_application_ready(observation.state == ReadinessState::Ready);
         }
         Ok(Some(observation))
     }
