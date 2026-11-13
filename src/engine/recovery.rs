@@ -7,26 +7,22 @@ use super::{
 };
 use crate::{
     model::RunOutcome,
-    native::{
-        launch::LaunchAuthority,
-        model::*,
-        provider::{NativeProvider, validate_baseline},
-        transport::NativeSession,
-    },
+    native::{launch::LaunchAuthority, model::*, transport::NativeSession},
     report::ReportStore,
 };
 use anyhow::{Result, bail, ensure};
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 use theseus_native_client::{
     Action, ClientMode, Event, Poll, RecoveredOperation, RecoveryImage, RequestId,
 };
-use theseus_native_helper_store::{IntentRecord, VerifiedOriginalIntent};
+use theseus_native_helper_store::{IntentRecord, IntentStore, VerifiedOriginalIntent};
 use theseus_native_protocol::v2;
 
+mod attempt;
 mod outcome;
 
 pub struct NativeRecoveryResult {
@@ -272,6 +268,82 @@ fn validate_known_output(known: &NativeCommandEvidence, outcome: &v2::Outcome) -
     }
     Ok(())
 }
+/// Maps one queried original operation state to the completion it proves, if any.
+fn classify_completion(
+    projector: &mut RunProjector<'_>,
+    id: &str,
+    original: &NativeOperation,
+    state: v2::OperationView,
+    integration: bool,
+) -> Result<Option<Disposition>> {
+    Ok(match state {
+        v2::OperationView::Finished { outcome } => {
+            let known = scenarios_mut(projector)
+                .iter()
+                .filter(|scenario| scenario.ownership_id == id)
+                .flat_map(|scenario| scenario.stages.iter())
+                .flat_map(|stage| stage.commands.iter())
+                .find(|command| command.operation_id == original.operation_id)
+                .cloned();
+            if let Some(known) = known {
+                ensure!(
+                    known.command == original.command
+                        && known.request_digest == original.request_digest,
+                    "recovery command evidence differs from original request"
+                );
+                validate_known_output(&known, &outcome)?;
+                if let Some(status) = known.status {
+                    let v2::Outcome::RunCompleted {
+                        status: observed, ..
+                    } = &outcome
+                    else {
+                        bail!("original terminal status changed to non-run outcome")
+                    };
+                    ensure!(
+                        status == NativeStatus::from(observed.clone()),
+                        "original terminal operation status changed"
+                    );
+                }
+            }
+            Some(Disposition::Complete { receipt: "original terminal operation queried; missing historical output remains unavailable".into() })
+        }
+        v2::OperationView::Missing => {
+            ensure!(
+                !matches!(original.completion, Disposition::Complete { .. }),
+                "original terminal operation is missing"
+            );
+            Some(if integration {
+                Disposition::Unknown { reason: "original SUT operation missing; native owner cannot be reconstructed or replayed".into() }
+            } else {
+                Disposition::Failed {
+                    reason: "original operation not found; never replayed".into(),
+                }
+            })
+        }
+        v2::OperationView::Unknown { reason } => {
+            if !integration {
+                bail!("original operation disposition unknown; never replayed");
+            }
+            ensure!(
+                !matches!(original.completion, Disposition::Complete { .. }),
+                "original terminal SUT operation changed to Unknown"
+            );
+            ensure!(
+                !scenarios_mut(projector)
+                    .iter()
+                    .filter(|s| s.ownership_id == id)
+                    .flat_map(|s| &s.stages)
+                    .flat_map(|s| &s.commands)
+                    .any(|c| c.operation_id == original.operation_id && c.status.is_some()),
+                "known terminal SUT status changed to Unknown"
+            );
+            Some(Disposition::Unknown {
+                reason: format!("original SUT native owner unknown: {reason:?}; never replayed"),
+            })
+        }
+        v2::OperationView::Accepted { .. } | v2::OperationView::Running => None,
+    })
+}
 fn operations(
     projector: &mut RunProjector<'_>,
     session: &mut NativeSession,
@@ -317,75 +389,7 @@ fn operations(
                 }
                 _ => bail!("original operation query refused"),
             };
-            let completion = match state {
-                v2::OperationView::Finished { outcome } => {
-                    let known = scenarios_mut(projector)
-                        .iter()
-                        .filter(|scenario| scenario.ownership_id == id)
-                        .flat_map(|scenario| scenario.stages.iter())
-                        .flat_map(|stage| stage.commands.iter())
-                        .find(|command| command.operation_id == original.operation_id)
-                        .cloned();
-                    if let Some(known) = known {
-                        ensure!(
-                            known.command == original.command
-                                && known.request_digest == original.request_digest,
-                            "recovery command evidence differs from original request"
-                        );
-                        validate_known_output(&known, &outcome)?;
-                        if let Some(status) = known.status {
-                            let v2::Outcome::RunCompleted {
-                                status: observed, ..
-                            } = &outcome
-                            else {
-                                bail!("original terminal status changed to non-run outcome")
-                            };
-                            ensure!(
-                                status == NativeStatus::from(observed.clone()),
-                                "original terminal operation status changed"
-                            );
-                        }
-                    }
-                    Some(Disposition::Complete { receipt: "original terminal operation queried; missing historical output remains unavailable".into() })
-                }
-                v2::OperationView::Missing => {
-                    ensure!(
-                        !matches!(original.completion, Disposition::Complete { .. }),
-                        "original terminal operation is missing"
-                    );
-                    Some(if integration {
-                        Disposition::Unknown { reason: "original SUT operation missing; native owner cannot be reconstructed or replayed".into() }
-                    } else {
-                        Disposition::Failed {
-                            reason: "original operation not found; never replayed".into(),
-                        }
-                    })
-                }
-                v2::OperationView::Unknown { reason } => {
-                    if !integration {
-                        bail!("original operation disposition unknown; never replayed");
-                    }
-                    ensure!(
-                        !matches!(original.completion, Disposition::Complete { .. }),
-                        "original terminal SUT operation changed to Unknown"
-                    );
-                    ensure!(
-                        !scenarios_mut(projector)
-                            .iter()
-                            .filter(|s| s.ownership_id == id)
-                            .flat_map(|s| &s.stages)
-                            .flat_map(|s| &s.commands)
-                            .any(|c| c.operation_id == original.operation_id && c.status.is_some()),
-                        "known terminal SUT status changed to Unknown"
-                    );
-                    Some(Disposition::Unknown {
-                        reason: format!(
-                            "original SUT native owner unknown: {reason:?}; never replayed"
-                        ),
-                    })
-                }
-                v2::OperationView::Accepted { .. } | v2::OperationView::Running => None,
-            };
+            let completion = classify_completion(projector, id, &original, state, integration)?;
             if let Some(completion) = completion {
                 if matches!(original.completion, Disposition::Unknown { .. }) {
                     projector.record_operation_completion(
@@ -651,16 +655,14 @@ pub(crate) struct RecoveredNativeCore {
     pub local: Disposition,
     pub remote: Disposition,
 }
-pub(crate) fn recover_stored_native(
-    store: ReportStore,
+/// Validates the saved launch fingerprint and ownership and admits each original owner.
+fn admit(
+    store: &ReportStore,
     launch: &LaunchAuthority,
-    cancel: CancellationToken,
-    mut emit: impl FnMut(EngineEvent),
-    saved_report: StoredRun,
-    saved_journal: StoredJournal,
-) -> Result<RecoveredNativeCore> {
-    let integration = matches!(saved_report, StoredRun::NativeIntegration(_));
-    let saved_core = journal_view(&saved_journal);
+    saved_report: &StoredRun,
+    saved_journal: &StoredJournal,
+) -> Result<(Vec<Admission>, Option<IntentStore>)> {
+    let saved_core = journal_view(saved_journal);
     ensure!(
         saved_core.launch_fingerprint.as_deref() == Some(launch.view().fingerprint.as_str()),
         "recovery requires unchanged explicit launch fingerprint"
@@ -681,7 +683,7 @@ pub(crate) fn recover_stored_native(
     let mut admissions = vec![];
     for owner in saved_core.ownership {
         ensure!(
-            scenarios(&saved_report)
+            scenarios(saved_report)
                 .iter()
                 .any(|scenario| scenario.ownership_id == owner.ownership_id
                     && scenario.id == owner.scenario_id),
@@ -709,7 +711,7 @@ pub(crate) fn recover_stored_native(
             };
             admission.original = Some(intents.verify_original(&record)?);
             admission.mode = Some(original_mode(
-                &saved_journal,
+                saved_journal,
                 owner,
                 &active,
                 intents.verify_original(&record)?,
@@ -725,6 +727,34 @@ pub(crate) fn recover_stored_native(
         }
         admissions.push(admission);
     }
+    Ok((admissions, intents))
+}
+/// Hands retained owners and evidence to the retained failure envelope.
+fn retain_failure(
+    mut owners: Owners,
+    store: ReportStore,
+    stored_report: StoredRun,
+    stored_journal: StoredJournal,
+    intents: Option<IntentStore>,
+    path: &Path,
+) -> anyhow::Error {
+    owners.evidence = Some((store, stored_report, stored_journal));
+    owners.intents = intents;
+    retained_failure(
+        format!("native recovery incomplete; evidence at {}", path.display()),
+        owners,
+    )
+}
+pub(crate) fn recover_stored_native(
+    store: ReportStore,
+    launch: &LaunchAuthority,
+    cancel: CancellationToken,
+    mut emit: impl FnMut(EngineEvent),
+    saved_report: StoredRun,
+    saved_journal: StoredJournal,
+) -> Result<RecoveredNativeCore> {
+    let integration = matches!(saved_report, StoredRun::NativeIntegration(_));
+    let (admissions, intents) = admit(&store, launch, &saved_report, &saved_journal)?;
     let path = store.native_report_path();
     let mut projector = RunProjector::new(&store, saved_report, saved_journal)?;
     let mut owners = Owners::default();
@@ -751,134 +781,23 @@ pub(crate) fn recover_stored_native(
             break;
         }
         let id = admission.owner.ownership_id.clone();
-        let recovery_id = nonce()?;
-        let scenario = scenarios_mut(&mut projector)
-            .iter_mut()
-            .find(|scenario| scenario.ownership_id == id)
-            .unwrap();
-        let prior = if matches!(scenario.dispositions.local, Disposition::Complete { .. }) {
-            scenario.dispositions.local.clone()
-        } else {
-            Disposition::Unknown {
-                reason:
-                    "prior controller local process settlement cannot be reconstructed from journal"
-                        .into(),
-            }
+        let recovery_id =
+            attempt::begin_attempt(&mut projector, &mut prior_local, &id, integration)?;
+        let ctx = attempt::AttemptCtx {
+            launch,
+            id: &id,
+            cancel: &cancel,
+            integration,
         };
-        scenario.dispositions.local = prior.clone();
-        prior_local.push(prior.clone());
-        projector.save_report()?;
-        projector.record_recovery_attempt(NativeRecoveryAttempt {
-            recovery_id: recovery_id.clone(),
-            ownership_id: id.clone(),
-            prior_local: prior,
-            local: Disposition::Unknown {
-                reason: "recovery attempt published; new local settlement unproved".into(),
-            },
-            remote: Disposition::Unknown {
-                reason: "original remote settlement not queried".into(),
-            },
-        })?;
-        if integration {
-            super::integration_recovery::publish_attempt(&mut projector, &recovery_id, &id)?;
-        }
-        let mut remote_complete = false;
-        let mut provider_confirmed = false;
+        let mut flags = attempt::AttemptFlags::default();
         let work = catch_unwind(AssertUnwindSafe(|| -> Result<()> {
-            let calls = journal(&projector)
-                .provider_calls
-                .iter()
-                .filter(|call| call.invocation.ownership_id == id)
-                .cloned()
-                .collect::<Vec<_>>();
-            let disposition = calls.iter().rev().find(|call| {
-                matches!(
-                    call.invocation.action,
-                    ProviderAction::Reset | ProviderAction::Dispose
-                )
-            });
-            if let Some(call) = disposition {
-                if let Some(receipt) = &call.receipt {
-                    validate_disposition(
-                        launch,
-                        &current(&projector, &id),
-                        &call.invocation,
-                        receipt,
-                    )?;
-                    remote_complete = true;
-                    return Ok(());
-                }
-                owners.provider = Some(launch.provider_factory()?);
-                let receipt = owners
-                    .provider
-                    .as_mut()
-                    .unwrap()
-                    .query(&call.invocation)?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "original provider disposition remains unknown; never replayed"
-                        )
-                    })?;
-                validate_disposition(
-                    launch,
-                    &current(&projector, &id),
-                    &call.invocation,
-                    &receipt,
-                )?;
-                projector.record_provider_receipt(&call.invocation, receipt)?;
-                remote_complete = true;
-                return Ok(());
-            }
-            let prepare = calls
-                .iter()
-                .find(|call| call.invocation.action == ProviderAction::Prepare)
-                .ok_or_else(|| anyhow::anyhow!("original provider preparation missing"))?;
-            owners.provider = Some(launch.provider_factory()?);
-            let receipt = owners
-                .provider
-                .as_mut()
-                .unwrap()
-                .query(&prepare.invocation)?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("original provider preparation remains unknown; never replayed")
-                })?;
-            let baseline = validate_baseline(launch, &prepare.invocation, receipt.clone())?;
-            if let Some(saved) = &prepare.receipt {
-                ensure!(saved == &receipt, "provider query changed original receipt");
-            } else {
-                projector.record_provider_receipt(&prepare.invocation, receipt)?;
-            }
-            provider_confirmed = true;
-            if let Some(mut active) = admission.launch.take() {
-                if integration {
-                    let bound = launch.with_baseline(&baseline)?;
-                    ensure!(
-                        bound.binding().binding == active.binding().binding
-                            && bound.binding().manifest_digest == active.binding().manifest_digest
-                            && bound.binding().workspace_marker
-                                == active.binding().workspace_marker
-                            && bound.provider_epoch() == active.provider_epoch(),
-                        "queried original preparation differs from original intent"
-                    );
-                    active = bound;
-                }
-                match NativeSession::start_authorized(&active, admission.mode.take().unwrap()) {
-                    Ok(session) => owners.session = Some(session),
-                    Err(failure) => {
-                        owners.start = Some(failure);
-                        bail!("recovery startup failed; original owner retained")
-                    }
-                }
-                owners.session.as_mut().unwrap().wait_ready()?;
-                recover_session(
-                    &mut projector,
-                    owners.session.as_mut().unwrap(),
-                    &admission.owner,
-                    admission.original.as_ref().unwrap(),
-                    &cancel,
-                )?;
-            }
-            Ok(())
+            attempt::query_or_reconnect(
+                &mut projector,
+                &mut owners,
+                &mut admission,
+                &mut flags,
+                ctx,
+            )
         }));
         match work {
             Ok(Ok(())) => {}
@@ -895,97 +814,17 @@ pub(crate) fn recover_stored_native(
                 reason: "new recovery owners retained".into(),
             }
         };
-        if settled && !remote_complete && owners.provider.is_some() {
-            let no_pending_disposition = !journal(&projector).provider_calls.iter().any(|call| {
-                call.invocation.ownership_id == id
-                    && matches!(
-                        call.invocation.action,
-                        ProviderAction::Reset | ProviderAction::Dispose
-                    )
-            });
-            let known_prepare = journal(&projector).provider_calls.iter().any(|call| {
-                call.invocation.ownership_id == id
-                    && call.invocation.action == ProviderAction::Prepare
-                    && call.receipt.is_some()
-            });
-            if no_pending_disposition && known_prepare && provider_confirmed {
-                let dispose = catch_unwind(AssertUnwindSafe(|| -> Result<()> {
-                    let resource = current(&projector, &id);
-                    let invocation = ProviderInvocation {
-                        ownership_id: id.clone(),
-                        provider: launch.provider_name().into(),
-                        invocation_id: nonce()?,
-                        action: ProviderAction::Dispose,
-                        target_id: launch.view().target_id.clone(),
-                        baseline_label: launch.baseline_label().into(),
-                        launch_fingerprint: launch.view().fingerprint.clone(),
-                        prior_resource: resource.clone(),
-                    };
-                    let saved = projector.publish_provider(resource.clone(), invocation.clone())?;
-                    let receipt = owners.provider.as_mut().unwrap().invoke(saved)?;
-                    validate_disposition(launch, &resource, &invocation, &receipt)?;
-                    projector.record_provider_receipt(&invocation, receipt)?;
-                    remote_complete = true;
-                    Ok(())
-                }));
-                match dispose {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => owners.errors.push(error),
-                    Err(payload) => owners.panics.push(payload),
-                }
-            }
-        }
-        let joined = settle_owned(&mut owners);
-        if !joined {
-            local = Disposition::Unknown {
-                reason: "new recovery owners retained".into(),
-            };
-        }
-        let remote = if remote_complete {
-            Disposition::Complete {
-                receipt: "matching original provider disposition receipt validated".into(),
-            }
-        } else {
-            Disposition::Unknown {
-                reason: "original provider disposition remains unknown".into(),
-            }
-        };
+        attempt::dispose_original(&mut projector, &mut owners, &mut flags, ctx, settled);
+        let remote_complete = flags.remote_complete;
         all_remote &= remote_complete;
-        owners.remote_unknown = !remote_complete;
-        owners.pending_cleanup = !joined || owners.remote_unknown;
-        if let Err(error) =
-            projector.finish_recovery_attempt(&recovery_id, local.clone(), remote.clone())
-        {
-            owners.errors.push(error)
-        }
-        if integration
-            && let Err(error) = super::integration_recovery::finish_attempt(
-                &mut projector,
-                &recovery_id,
-                local.clone(),
-                remote.clone(),
-            )
-        {
-            owners.errors.push(error);
-        }
-        let scenario = scenarios_mut(&mut projector)
-            .iter_mut()
-            .find(|scenario| scenario.ownership_id == id)
-            .unwrap();
-        scenario.dispositions.remote = remote.clone();
-        if remote_complete {
-            scenario.dispositions.reset = remote;
-        }
-        if (!matches!(scenario.dispositions.local, Disposition::Complete { .. })
-            || !remote_complete
-            || !owners.errors.is_empty())
-            && (!integration || scenario.outcome != RunOutcome::Failed)
-        {
-            scenario.outcome = RunOutcome::Incomplete;
-        }
-        if let Err(error) = projector.save_report() {
-            owners.errors.push(error)
-        }
+        attempt::finish_attempt(
+            &mut projector,
+            &mut owners,
+            &mut local,
+            ctx,
+            &recovery_id,
+            remote_complete,
+        );
         if owners.pending_cleanup || !owners.errors.is_empty() || !owners.panics.is_empty() {
             break;
         }
@@ -1006,11 +845,13 @@ pub(crate) fn recover_stored_native(
     event(&mut owners, &mut emit, EventKind::Finished, &path, None);
     let (stored_report, stored_journal) = projector.into_parts();
     if !owners.errors.is_empty() || !owners.panics.is_empty() || owners.pending_cleanup {
-        owners.evidence = Some((store, stored_report, stored_journal));
-        owners.intents = intents;
-        return Err(retained_failure(
-            format!("native recovery incomplete; evidence at {}", path.display()),
+        return Err(retain_failure(
             owners,
+            store,
+            stored_report,
+            stored_journal,
+            intents,
+            &path,
         ));
     }
     Ok(RecoveredNativeCore {
