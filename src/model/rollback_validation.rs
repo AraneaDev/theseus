@@ -20,160 +20,103 @@ impl ScenarioReport {
             "before_attempt"
         };
         for stage in &self.stages {
-            if interrupted {
-                let step = match stage.name.as_str() {
-                    "install_base" => Some(StepName::InstallBase),
-                    "configure" => Some(StepName::Configure),
-                    "exercise_before_upgrade" => Some(StepName::Exercise),
-                    "backup" => Some(StepName::Backup),
-                    "interrupt_upgrade" => Some(StepName::InterruptUpgrade),
-                    "rollback" => Some(StepName::Rollback),
-                    "exercise_rolled_back" => Some(StepName::ExerciseRolledBack),
-                    "cleanup_backup" => Some(StepName::CleanupBackup),
-                    "uninstall" => Some(StepName::Uninstall),
-                    _ => None,
-                };
-                let checkpoint = [
-                    Checkpoint::BaseInstalled,
-                    Checkpoint::Configured,
-                    Checkpoint::KnownGood,
-                    Checkpoint::BackupCreated,
-                    Checkpoint::Interrupted,
-                    Checkpoint::RolledBack,
-                    Checkpoint::BackupRemoved,
-                    Checkpoint::Uninstalled,
-                ]
-                .into_iter()
-                .find(|cp| cp.to_string() == stage.name);
-                if stage.step != step
-                    || stage.checkpoint != checkpoint
-                    || (step.is_none() && checkpoint.is_none() && !stage.commands.is_empty())
-                {
-                    return false;
-                }
-                if checkpoint.is_some()
-                    && stage.commands.iter().any(|command| {
-                        stage
-                            .checks
-                            .iter()
-                            .flat_map(|c| &c.command_ids)
-                            .filter(|id| *id == &command.id)
-                            .count()
-                            != 1
-                    })
-                {
-                    return false;
-                }
+            if interrupted && !interrupted_stage_layout(stage) {
+                return false;
             }
-            if !matches!(
-                stage.name.as_str(),
-                "interrupt_upgrade" | "restart_after_interrupt"
-            ) && (stage.snapshots.is_empty()
-                || stage.snapshots.iter().any(|s| {
-                    matches!(
-                        s.completeness,
-                        crate::snapshot::ObservationStatus::Incomplete { .. }
-                    )
-                }))
+            if !rollback_stage_commands(stage, interrupted) {
+                return false;
+            }
+            if !self.rollback_stage_evidence(policy, change_checkpoint, interrupted, stage) {
+                return false;
+            }
+        }
+        if !self.rollback_stages_present(interrupted, restore, change_checkpoint) {
+            return false;
+        }
+        if !self.rollback_policy_checks(policy, change_checkpoint, interrupted, before_name) {
+            return false;
+        }
+        if !self.rollback_restored_data(policy, change_name) {
+            return false;
+        }
+        if !self.rollback_runtime_bound(policy) {
+            return false;
+        }
+        self.rollback_baseline_evidence(interrupted)
+    }
+    fn rollback_stage_evidence(
+        &self,
+        policy: &RollbackRecoveryContract,
+        change_checkpoint: Checkpoint,
+        interrupted: bool,
+        stage: &StageReport,
+    ) -> bool {
+        if interrupted && stage.step.is_some() {
+            let runtime = matches!(
+                stage.step,
+                Some(StepName::Configure | StepName::Exercise | StepName::ExerciseRolledBack)
+            );
+            let identity = if runtime || self.profile == ProfileName::User {
+                ExecutionIdentity::runtime()
+            } else {
+                ExecutionIdentity::root()
+            };
+            if stage.commands.iter().any(|c| {
+                c.identity.uid != identity.uid
+                    || c.identity.gid != identity.gid
+                    || c.identity.home != identity.home
+            }) {
+                return false;
+            }
+        }
+        for check in &stage.checks {
+            if interrupted
+                && check.command_expectation.is_some()
+                && !command_role_evidence(stage, check)
             {
                 return false;
             }
-            if stage.outcome != StageOutcome::Passed
-                || stage
-                    .checks
-                    .iter()
-                    .any(|c| c.outcome != CheckOutcome::Passed)
-            {
-                return false;
-            }
-            if let Some(step) = stage.step {
-                if interrupted && step == StepName::InterruptUpgrade {
-                    if !stage.verified_interruption()
-                        || !stage.commands.iter().all(|c| {
-                            valid_invocation(&c.argv, Invocation::ShellScript)
-                                && c.expected_failure.is_none()
-                                && c.rejection.is_none()
-                        })
-                    {
-                        return false;
-                    }
-                } else if step == StepName::AttemptUpgrade {
-                    if !stage.verified_failure() {
-                        return false;
-                    }
-                } else if stage.commands.len() != 1
-                    || stage.commands.iter().any(|c| {
-                        !valid_invocation(&c.argv, Invocation::ShellScript)
-                            || c.phase != stage.name
-                            || c.exit_status != Some(0)
-                            || c.outcome != CommandOutcome::Succeeded
-                            || c.expected_failure.is_some()
-                            || c.rejection.is_some()
-                            || c.interruption.is_some()
-                    })
-                {
-                    return false;
-                }
-            }
-            if interrupted && stage.step.is_some() {
-                let runtime = matches!(
-                    stage.step,
-                    Some(StepName::Configure | StepName::Exercise | StepName::ExerciseRolledBack)
-                );
-                let identity = if runtime || self.profile == ProfileName::User {
-                    ExecutionIdentity::runtime()
-                } else {
-                    ExecutionIdentity::root()
-                };
-                if stage.commands.iter().any(|c| {
-                    c.identity.uid != identity.uid
-                        || c.identity.gid != identity.gid
-                        || c.identity.home != identity.home
-                }) {
-                    return false;
-                }
-            }
-            for check in &stage.checks {
-                if interrupted
-                    && check.command_expectation.is_some()
-                    && !command_role_evidence(stage, check)
-                {
-                    return false;
-                }
-                if check.command_ids.iter().any(|id| {
-                    stage
-                        .commands
-                        .iter()
-                        .filter(|c| {
-                            &c.id == id
-                                && c.phase.ends_with(&format!(":{}", check.id))
-                                && c.outcome == CommandOutcome::Succeeded
-                                && c.exit_status.is_some()
-                                && c.identity.uid == 10001
-                                && c.identity.gid == 10001
-                        })
-                        .count()
-                        != 1
-                }) {
-                    return false;
-                }
-            }
-            for required in required_generated(policy, &stage.name) {
-                if stage
-                    .checks
+            if check.command_ids.iter().any(|id| {
+                stage
+                    .commands
                     .iter()
                     .filter(|c| {
-                        c.id == required
-                            && c.outcome == CheckOutcome::Passed
-                            && generated_context_at(policy, stage, c, change_checkpoint)
+                        &c.id == id
+                            && c.phase.ends_with(&format!(":{}", check.id))
+                            && c.outcome == CommandOutcome::Succeeded
+                            && c.exit_status.is_some()
+                            && c.identity.uid == 10001
+                            && c.identity.gid == 10001
                     })
                     .count()
                     != 1
-                {
-                    return false;
-                }
+            }) {
+                return false;
             }
         }
+        for required in required_generated(policy, &stage.name) {
+            if stage
+                .checks
+                .iter()
+                .filter(|c| {
+                    c.id == required
+                        && c.outcome == CheckOutcome::Passed
+                        && generated_context_at(policy, stage, c, change_checkpoint)
+                })
+                .count()
+                != 1
+            {
+                return false;
+            }
+        }
+        true
+    }
+    fn rollback_stages_present(
+        &self,
+        interrupted: bool,
+        restore: bool,
+        change_checkpoint: Checkpoint,
+    ) -> bool {
         for (name, step) in [
             ("install_base", StepName::InstallBase),
             ("configure", StepName::Configure),
@@ -237,6 +180,15 @@ impl ScenarioReport {
                 return false;
             }
         }
+        true
+    }
+    fn rollback_policy_checks(
+        &self,
+        policy: &RollbackRecoveryContract,
+        change_checkpoint: Checkpoint,
+        interrupted: bool,
+        before_name: &str,
+    ) -> bool {
         for (cp, ids) in [
             (change_checkpoint, &policy.change_checks),
             (Checkpoint::RolledBack, &policy.binary_checks),
@@ -323,6 +275,9 @@ impl ScenarioReport {
                 }
             }
         }
+        true
+    }
+    fn rollback_restored_data(&self, policy: &RollbackRecoveryContract, change_name: &str) -> bool {
         if let RestorationPolicy::RestoreData {
             backup_root,
             scopes,
@@ -387,9 +342,9 @@ impl ScenarioReport {
                 }
             }
         }
-        if !self.rollback_runtime_bound(policy) {
-            return false;
-        }
+        true
+    }
+    fn rollback_baseline_evidence(&self, interrupted: bool) -> bool {
         for cp in [Checkpoint::BaseInstalled, Checkpoint::KnownGood] {
             if !self
                 .stages
@@ -474,6 +429,105 @@ impl ScenarioReport {
             })
         })
     }
+}
+fn interrupted_stage_layout(stage: &StageReport) -> bool {
+    let step = match stage.name.as_str() {
+        "install_base" => Some(StepName::InstallBase),
+        "configure" => Some(StepName::Configure),
+        "exercise_before_upgrade" => Some(StepName::Exercise),
+        "backup" => Some(StepName::Backup),
+        "interrupt_upgrade" => Some(StepName::InterruptUpgrade),
+        "rollback" => Some(StepName::Rollback),
+        "exercise_rolled_back" => Some(StepName::ExerciseRolledBack),
+        "cleanup_backup" => Some(StepName::CleanupBackup),
+        "uninstall" => Some(StepName::Uninstall),
+        _ => None,
+    };
+    let checkpoint = [
+        Checkpoint::BaseInstalled,
+        Checkpoint::Configured,
+        Checkpoint::KnownGood,
+        Checkpoint::BackupCreated,
+        Checkpoint::Interrupted,
+        Checkpoint::RolledBack,
+        Checkpoint::BackupRemoved,
+        Checkpoint::Uninstalled,
+    ]
+    .into_iter()
+    .find(|cp| cp.to_string() == stage.name);
+    if stage.step != step
+        || stage.checkpoint != checkpoint
+        || (step.is_none() && checkpoint.is_none() && !stage.commands.is_empty())
+    {
+        return false;
+    }
+    if checkpoint.is_some()
+        && stage.commands.iter().any(|command| {
+            stage
+                .checks
+                .iter()
+                .flat_map(|c| &c.command_ids)
+                .filter(|id| *id == &command.id)
+                .count()
+                != 1
+        })
+    {
+        return false;
+    }
+    true
+}
+fn rollback_stage_commands(stage: &StageReport, interrupted: bool) -> bool {
+    if !matches!(
+        stage.name.as_str(),
+        "interrupt_upgrade" | "restart_after_interrupt"
+    ) && (stage.snapshots.is_empty()
+        || stage.snapshots.iter().any(|s| {
+            matches!(
+                s.completeness,
+                crate::snapshot::ObservationStatus::Incomplete { .. }
+            )
+        }))
+    {
+        return false;
+    }
+    if stage.outcome != StageOutcome::Passed
+        || stage
+            .checks
+            .iter()
+            .any(|c| c.outcome != CheckOutcome::Passed)
+    {
+        return false;
+    }
+    if let Some(step) = stage.step {
+        if interrupted && step == StepName::InterruptUpgrade {
+            if !stage.verified_interruption()
+                || !stage.commands.iter().all(|c| {
+                    valid_invocation(&c.argv, Invocation::ShellScript)
+                        && c.expected_failure.is_none()
+                        && c.rejection.is_none()
+                })
+            {
+                return false;
+            }
+        } else if step == StepName::AttemptUpgrade {
+            if !stage.verified_failure() {
+                return false;
+            }
+        } else if stage.commands.len() != 1
+            || stage.commands.iter().any(|c| {
+                !valid_invocation(&c.argv, Invocation::ShellScript)
+                    || c.phase != stage.name
+                    || c.exit_status != Some(0)
+                    || c.outcome != CommandOutcome::Succeeded
+                    || c.expected_failure.is_some()
+                    || c.rejection.is_some()
+                    || c.interruption.is_some()
+            })
+        {
+            return false;
+        }
+    }
+    true
 }
 /// The normal executor records one of these generated argv shapes. This checks
 /// structural executability, not equality to an unavailable original author script.

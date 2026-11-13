@@ -5,8 +5,25 @@ use crate::native::model::*;
 use anyhow::{Result, ensure};
 use std::collections::{BTreeMap, BTreeSet};
 
+type BrokerTerminals = BTreeMap<(OperationId, Digest), Option<IntegrationOutcome>>;
+
 impl NativeIntegrationJournal {
     pub fn validate(&self) -> Result<()> {
+        self.validate_header()?;
+        let owners = self.validate_owners()?;
+        self.validate_actions()?;
+        self.validate_integration_resources(&owners)?;
+        self.validate_action_terminals()?;
+        self.validate_resource_bindings()?;
+        self.validate_readiness_probes()?;
+        self.validate_broker_bindings()?;
+        self.validate_releases_and_provider_calls()?;
+        self.validate_recovery_attempts(&owners)?;
+        let mut broker_terminals = self.initial_broker_terminals()?;
+        self.validate_integration_recoveries(&mut broker_terminals)?;
+        self.validate_desktop_terminal_provenance(&broker_terminals)
+    }
+    fn validate_header(&self) -> Result<()> {
         common_validate(
             (&self.kind, self.schema),
             "theseus_native_journal",
@@ -46,6 +63,9 @@ impl NativeIntegrationJournal {
                 && self.integration_ownership.len() <= 6,
             "integration journal resource count exceeds bound"
         );
+        Ok(())
+    }
+    fn validate_owners(&self) -> Result<BTreeSet<&String>> {
         let mut owners = BTreeSet::new();
         for owner in &self.ownership {
             owner.validate()?;
@@ -68,22 +88,25 @@ impl NativeIntegrationJournal {
                 _ => (),
             }
         }
-        let lease_for = |ownership: &String, lease: &str| -> Result<()> {
-            let owner = self
-                .ownership
-                .iter()
-                .find(|r| &r.ownership_id == ownership)
-                .ok_or_else(|| anyhow::anyhow!("integration record has no original owner"))?;
-            ensure!(
-                matches!(&owner.ownership,NativeOwnership::Acquired{lease:original,..} if original==lease),
-                "integration record original lease mismatch"
-            );
-            Ok(())
-        };
+        Ok(owners)
+    }
+    fn lease_for(&self, ownership: &str, lease: &str) -> Result<()> {
+        let owner = self
+            .ownership
+            .iter()
+            .find(|r| r.ownership_id == ownership)
+            .ok_or_else(|| anyhow::anyhow!("integration record has no original owner"))?;
+        ensure!(
+            matches!(&owner.ownership,NativeOwnership::Acquired{lease:original,..} if original==lease),
+            "integration record original lease mismatch"
+        );
+        Ok(())
+    }
+    fn validate_actions(&self) -> Result<()> {
         let mut actions = BTreeSet::new();
         for op in &self.operations {
             op.validate()?;
-            lease_for(&op.ownership_id, &op.lease)?;
+            self.lease_for(&op.ownership_id, &op.lease)?;
             ensure!(
                 actions.insert((&op.lease, &op.operation_id)),
                 "duplicate core action"
@@ -91,7 +114,7 @@ impl NativeIntegrationJournal {
         }
         for action in &self.integration_actions {
             action.validate_identity()?;
-            lease_for(&action.ownership_id, &action.lease)?;
+            self.lease_for(&action.ownership_id, &action.lease)?;
             hex(&action.operation, 32)?;
             digest(&action.request_digest)?;
             digest(&action.prior_binding_digest)?;
@@ -135,6 +158,9 @@ impl NativeIntegrationJournal {
                 "duplicate integration action"
             );
         }
+        Ok(())
+    }
+    fn validate_integration_resources(&self, owners: &BTreeSet<&String>) -> Result<()> {
         for resource in &self.integration_ownership {
             ensure!(
                 owners.contains(&resource.key.ownership_id),
@@ -153,6 +179,9 @@ impl NativeIntegrationJournal {
                 <= 128 * self.ownership.len().max(1),
             "integration operation bound exceeded"
         );
+        Ok(())
+    }
+    fn validate_action_terminals(&self) -> Result<()> {
         for action in &self.integration_actions {
             ensure!(
                 theseus_native_protocol::v2::request_digest(&action.request.wire()?)?.to_hex()
@@ -181,6 +210,9 @@ impl NativeIntegrationJournal {
                 _ => anyhow::bail!("integration terminal disposition pairing differs"),
             }
         }
+        Ok(())
+    }
+    fn validate_resource_bindings(&self) -> Result<()> {
         let mut resource_keys = BTreeSet::new();
         for resource in &self.integration_ownership {
             ensure!(
@@ -224,6 +256,9 @@ impl NativeIntegrationJournal {
                 }
             }
         }
+        Ok(())
+    }
+    fn validate_readiness_probes(&self) -> Result<()> {
         ensure!(
             self.readiness_probes.len() <= 64 * self.ownership.len().max(1),
             "too many readiness probes"
@@ -236,7 +271,7 @@ impl NativeIntegrationJournal {
                     && b.broker_lease.as_ref() == Some(&challenge.lease)
                     && matches!(b.disposition, Disposition::Complete { .. })
             }) {
-                lease_for(&challenge.ownership_id, &challenge.lease)?;
+                self.lease_for(&challenge.ownership_id, &challenge.lease)?;
             }
             challenge.slot.validate()?;
             hex(&challenge.operation, 32)?;
@@ -261,64 +296,8 @@ impl NativeIntegrationJournal {
                         .any(|b| b.digest == challenge.resource_binding_digest)),
                 "readiness original resource binding missing"
             );
-            let rehearsal_start = self.integration_actions.iter().any(|a| {
-                a.ownership_id == challenge.ownership_id
-                    && a.lease == challenge.lease
-                    && a.slot == challenge.slot
-                    && a.operation == challenge.operation
-                    && a.request_digest == challenge.action_digest
-                    && matches!(
-                        a.request,
-                        IntegrationRequest::Service {
-                            control: ServiceAction::Start,
-                            ..
-                        }
-                    )
-                    && matches!(a.completion, Disposition::Complete { .. })
-            });
-            let sut_activation = self.operations.iter().any(|operation| {
-                operation.ownership_id == challenge.ownership_id
-                    && operation.lease == challenge.lease
-                    && operation.operation_id == challenge.operation
-                    && operation.request_digest == challenge.action_digest
-                    && matches!(operation.completion, Disposition::Complete { .. })
-                    && probe.expectation.role == DefinitionRole::Configured
-                    && match operation.command.program {
-                        CatalogProgram::Configure => {
-                            self.requirements.service.as_ref().is_some_and(|s| {
-                                s.resource == challenge.slot
-                                    && s.controls.configured_activation == ActivationCause::Sut
-                            })
-                        }
-                        CatalogProgram::InstallTarget => {
-                            probe.expectation.artifact == ArtifactRole::Target
-                                && self.selected_scenarios.iter().any(|s| {
-                                    matches!(s, ScenarioKind::Upgrade | ScenarioKind::Reinstall)
-                                })
-                        }
-                        _ => false,
-                    }
-                    && self.integration_ownership.iter().any(|resource| {
-                        resource.key.ownership_id == challenge.ownership_id
-                            && resource.key.slot == challenge.slot
-                            && resource.binding_history.iter().any(|binding| {
-                                binding.digest == challenge.resource_binding_digest
-                                    && binding.original_action.as_ref()
-                                        == Some(&challenge.operation)
-                                    && binding.definition.as_ref()
-                                        == Some(&DefinitionKey {
-                                            role: probe.expectation.role,
-                                            artifact: probe.expectation.artifact,
-                                        })
-                            })
-                    })
-            });
-            let desktop_activation=self.integration_actions.iter().any(|a|a.ownership_id==challenge.ownership_id && a.operation==challenge.operation
-                && a.broker_identity.as_ref().is_some_and(|i|i.broker_lease==challenge.lease && i.request_digest==challenge.action_digest)
-                && matches!(&a.request,IntegrationRequest::Desktop {request,..} if request.slot.as_str()==challenge.slot.as_str() && request.prior_binding_digest==challenge.resource_binding_digest && matches!(&request.action,theseus_native_protocol::v2::broker::DesktopAction::Activate {expectation_digest,..} if expectation_digest==&challenge.expectation_digest))
-                && matches!(a.completion,Disposition::Complete {..}));
             ensure!(
-                rehearsal_start || sut_activation || desktop_activation,
+                self.readiness_activation_proved(probe),
                 "readiness lacks exact original Start or declared SUT activation completion"
             );
             probe.completion.validate()?;
@@ -336,6 +315,68 @@ impl NativeIntegrationJournal {
                 text(id, 128)?;
             }
         }
+        Ok(())
+    }
+    fn readiness_activation_proved(&self, probe: &ReadinessProbeRecord) -> bool {
+        let challenge = &probe.challenge;
+        let rehearsal_start = self.integration_actions.iter().any(|a| {
+            a.ownership_id == challenge.ownership_id
+                && a.lease == challenge.lease
+                && a.slot == challenge.slot
+                && a.operation == challenge.operation
+                && a.request_digest == challenge.action_digest
+                && matches!(
+                    a.request,
+                    IntegrationRequest::Service {
+                        control: ServiceAction::Start,
+                        ..
+                    }
+                )
+                && matches!(a.completion, Disposition::Complete { .. })
+        });
+        let sut_activation = self.operations.iter().any(|operation| {
+            operation.ownership_id == challenge.ownership_id
+                && operation.lease == challenge.lease
+                && operation.operation_id == challenge.operation
+                && operation.request_digest == challenge.action_digest
+                && matches!(operation.completion, Disposition::Complete { .. })
+                && probe.expectation.role == DefinitionRole::Configured
+                && match operation.command.program {
+                    CatalogProgram::Configure => {
+                        self.requirements.service.as_ref().is_some_and(|s| {
+                            s.resource == challenge.slot
+                                && s.controls.configured_activation == ActivationCause::Sut
+                        })
+                    }
+                    CatalogProgram::InstallTarget => {
+                        probe.expectation.artifact == ArtifactRole::Target
+                            && self.selected_scenarios.iter().any(|s| {
+                                matches!(s, ScenarioKind::Upgrade | ScenarioKind::Reinstall)
+                            })
+                    }
+                    _ => false,
+                }
+                && self.integration_ownership.iter().any(|resource| {
+                    resource.key.ownership_id == challenge.ownership_id
+                        && resource.key.slot == challenge.slot
+                        && resource.binding_history.iter().any(|binding| {
+                            binding.digest == challenge.resource_binding_digest
+                                && binding.original_action.as_ref() == Some(&challenge.operation)
+                                && binding.definition.as_ref()
+                                    == Some(&DefinitionKey {
+                                        role: probe.expectation.role,
+                                        artifact: probe.expectation.artifact,
+                                    })
+                        })
+                })
+        });
+        let desktop_activation=self.integration_actions.iter().any(|a|a.ownership_id==challenge.ownership_id && a.operation==challenge.operation
+                && a.broker_identity.as_ref().is_some_and(|i|i.broker_lease==challenge.lease && i.request_digest==challenge.action_digest)
+                && matches!(&a.request,IntegrationRequest::Desktop {request,..} if request.slot.as_str()==challenge.slot.as_str() && request.prior_binding_digest==challenge.resource_binding_digest && matches!(&request.action,theseus_native_protocol::v2::broker::DesktopAction::Activate {expectation_digest,..} if expectation_digest==&challenge.expectation_digest))
+                && matches!(a.completion,Disposition::Complete {..}));
+        rehearsal_start || sut_activation || desktop_activation
+    }
+    fn validate_broker_bindings(&self) -> Result<()> {
         ensure!(
             self.broker_bindings.len() <= self.ownership.len(),
             "too many original broker bindings"
@@ -351,7 +392,7 @@ impl NativeIntegrationJournal {
             binding.disposition.validate()?;
             let original = &binding.original;
             let header = &original.expected_header;
-            lease_for(&binding.ownership_id, &binding.helper_lease)?;
+            self.lease_for(&binding.ownership_id, &binding.helper_lease)?;
             ensure!(
                 broker_owners.insert(&binding.ownership_id)
                     && binding.slot == desktop.resource
@@ -384,8 +425,11 @@ impl NativeIntegrationJournal {
                 );
             }
         }
+        Ok(())
+    }
+    fn validate_releases_and_provider_calls(&self) -> Result<()> {
         for release in &self.releases {
-            lease_for(&release.ownership_id, &release.lease)?;
+            self.lease_for(&release.ownership_id, &release.lease)?;
             release.completion.validate()?;
         }
         for call in &self.provider_calls {
@@ -399,6 +443,9 @@ impl NativeIntegrationJournal {
                 );
             }
         }
+        Ok(())
+    }
+    fn validate_recovery_attempts(&self, owners: &BTreeSet<&String>) -> Result<()> {
         // Recovery records import diagnostic knowledge about these exact
         // original actions. They never introduce native authority or a new ID.
         ensure!(
@@ -417,6 +464,9 @@ impl NativeIntegrationJournal {
             recovery.local.validate()?;
             recovery.remote.validate()?;
         }
+        Ok(())
+    }
+    fn initial_broker_terminals(&self) -> Result<BrokerTerminals> {
         // New records explicitly bind knowledge at publication. For legacy
         // omitted baselines, an original cached query supplies chronology; a
         // later receipt cannot retroactively invalidate earlier Unknown samples.
@@ -463,6 +513,12 @@ impl NativeIntegrationJournal {
                 initial,
             );
         }
+        Ok(broker_terminals)
+    }
+    fn validate_integration_recoveries(
+        &self,
+        broker_terminals: &mut BrokerTerminals,
+    ) -> Result<()> {
         let mut recovery_ids = BTreeSet::new();
         let mut cached_terminals = BTreeMap::new();
         for (index, recovery) in self.integration_recoveries.iter().enumerate() {
@@ -471,252 +527,291 @@ impl NativeIntegrationJournal {
                 recovery_ids.insert(&recovery.recovery_id),
                 "duplicate integration recovery"
             );
-            let core = self
-                .recovery_attempts
-                .iter()
-                .find(|r| {
-                    r.recovery_id == recovery.recovery_id && r.ownership_id == recovery.ownership_id
-                })
-                .ok_or_else(|| {
-                    anyhow::anyhow!("integration recovery lacks published original core attempt")
-                })?;
+            self.validate_recovery_core_settlement(index, recovery)?;
+            self.validate_recovery_original_actions(recovery, broker_terminals)?;
+            self.validate_recovery_broker_observations(index, recovery, broker_terminals)?;
+            self.validate_recovery_broker_release(recovery)?;
+            self.validate_recovery_queries(recovery, broker_terminals, &mut cached_terminals)?;
+        }
+        Ok(())
+    }
+    fn validate_recovery_core_settlement(
+        &self,
+        index: usize,
+        recovery: &IntegrationRecoveryRecord,
+    ) -> Result<()> {
+        let core = self
+            .recovery_attempts
+            .iter()
+            .find(|r| {
+                r.recovery_id == recovery.recovery_id && r.ownership_id == recovery.ownership_id
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("integration recovery lacks published original core attempt")
+            })?;
+        ensure!(
+            !recovery.prior_local.is_empty() && recovery.prior_local.len() <= 4096,
+            "integration recovery prior-local evidence missing or excessive"
+        );
+        for prior in &recovery.prior_local {
+            prior.validate()?;
+        }
+        ensure!(
+            recovery.prior_local.contains(&core.prior_local),
+            "integration recovery omitted original controller uncertainty"
+        );
+        recovery.local.validate()?;
+        recovery.broker.validate()?;
+        recovery.provider.validate()?;
+        ensure!(
+            !matches!(recovery.local, Disposition::Complete { .. }) || recovery.local == core.local,
+            "integration recovery local settlement differs from original attempt"
+        );
+        ensure!(
+            !matches!(recovery.provider, Disposition::Complete { .. })
+                || recovery.provider == core.remote,
+            "integration recovery provider settlement differs from original attempt"
+        );
+        for prior in self.integration_recoveries[..index]
+            .iter()
+            .filter(|r| r.ownership_id == recovery.ownership_id)
+        {
             ensure!(
-                !recovery.prior_local.is_empty() && recovery.prior_local.len() <= 4096,
-                "integration recovery prior-local evidence missing or excessive"
+                recovery.prior_local.contains(&prior.local)
+                    && prior
+                        .prior_local
+                        .iter()
+                        .all(|d| recovery.prior_local.contains(d)),
+                "integration recovery erased prior local uncertainty"
             );
-            for prior in &recovery.prior_local {
-                prior.validate()?;
-            }
-            ensure!(
-                recovery.prior_local.contains(&core.prior_local),
-                "integration recovery omitted original controller uncertainty"
-            );
-            recovery.local.validate()?;
-            recovery.broker.validate()?;
-            recovery.provider.validate()?;
-            ensure!(
-                !matches!(recovery.local, Disposition::Complete { .. })
-                    || recovery.local == core.local,
-                "integration recovery local settlement differs from original attempt"
-            );
-            ensure!(
-                !matches!(recovery.provider, Disposition::Complete { .. })
-                    || recovery.provider == core.remote,
-                "integration recovery provider settlement differs from original attempt"
-            );
-            for prior in self.integration_recoveries[..index]
-                .iter()
-                .filter(|r| r.ownership_id == recovery.ownership_id)
-            {
-                ensure!(
-                    recovery.prior_local.contains(&prior.local)
-                        && prior
-                            .prior_local
-                            .iter()
-                            .all(|d| recovery.prior_local.contains(d)),
-                    "integration recovery erased prior local uncertainty"
-                );
-            }
-            let originals = self
+        }
+        Ok(())
+    }
+    fn validate_recovery_original_actions(
+        &self,
+        recovery: &IntegrationRecoveryRecord,
+        broker_terminals: &BrokerTerminals,
+    ) -> Result<()> {
+        let originals = self
+            .integration_actions
+            .iter()
+            .filter(|a| a.ownership_id == recovery.ownership_id)
+            .map(|a| ActionReference {
+                operation: a.operation.clone(),
+                request_digest: a.request_digest.clone(),
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            recovery.original_actions == originals,
+            "integration recovery original action set differs"
+        );
+        if !recovery.broker_effect_baselines.is_empty() {
+            let desktops = self
                 .integration_actions
                 .iter()
-                .filter(|a| a.ownership_id == recovery.ownership_id)
-                .map(|a| ActionReference {
-                    operation: a.operation.clone(),
-                    request_digest: a.request_digest.clone(),
+                .filter(|a| {
+                    a.ownership_id == recovery.ownership_id
+                        && matches!(a.request, IntegrationRequest::Desktop { .. })
                 })
                 .collect::<Vec<_>>();
             ensure!(
-                recovery.original_actions == originals,
-                "integration recovery original action set differs"
+                recovery.broker_effect_baselines.len() == desktops.len(),
+                "desktop terminal baseline set differs from original actions"
             );
-            if !recovery.broker_effect_baselines.is_empty() {
-                let desktops = self
-                    .integration_actions
-                    .iter()
-                    .filter(|a| {
-                        a.ownership_id == recovery.ownership_id
-                            && matches!(a.request, IntegrationRequest::Desktop { .. })
-                    })
-                    .collect::<Vec<_>>();
+            for (baseline, action) in recovery.broker_effect_baselines.iter().zip(desktops) {
                 ensure!(
-                    recovery.broker_effect_baselines.len() == desktops.len(),
-                    "desktop terminal baseline set differs from original actions"
+                    baseline.original.operation == action.operation
+                        && baseline.original.request_digest == action.request_digest,
+                    "desktop terminal baseline identity changed"
                 );
-                for (baseline, action) in recovery.broker_effect_baselines.iter().zip(desktops) {
-                    ensure!(
-                        baseline.original.operation == action.operation
-                            && baseline.original.request_digest == action.request_digest,
-                        "desktop terminal baseline identity changed"
-                    );
-                    ensure!(
-                        broker_terminals
-                            .get(&(action.operation.clone(), action.request_digest.clone()))
-                            == Some(&baseline.terminal),
-                        "desktop terminal baseline changed without original cached query provenance"
-                    );
-                }
-            }
-            ensure!(
-                recovery.broker_observations.len() <= 64 * recovery.original_actions.len().max(1),
-                "broker recovery observations exceed bound"
-            );
-            let mut broker_states = BTreeMap::new();
-            for prior in self.integration_recoveries[..index]
-                .iter()
-                .filter(|r| r.ownership_id == recovery.ownership_id)
-            {
-                for observation in &prior.broker_observations {
-                    broker_states.insert(
-                        observation.original.operation.clone(),
-                        observation.state.clone(),
-                    );
-                }
-            }
-            for observation in &recovery.broker_observations {
-                observation.identity.validate()?;
-                observation.state.validate()?;
-                let action = self
-                    .integration_actions
-                    .iter()
-                    .find(|a| {
-                        a.ownership_id == recovery.ownership_id
-                            && a.operation == observation.original.operation
-                            && a.request_digest == observation.original.request_digest
-                    })
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("broker observation lacks original published action")
-                    })?;
-                let IntegrationRequest::Desktop { request, .. } = &action.request else {
-                    anyhow::bail!("broker observation borrowed service authority")
-                };
                 ensure!(
-                    request.identity()? == observation.identity,
-                    "broker observation original identity changed"
-                );
-                crate::native::integration::owned_lifetime::validate_recovered_observation(
-                    self,
-                    action,
-                    &observation.state,
-                )?;
-                validate_broker_effect_terminal(
                     broker_terminals
                         .get(&(action.operation.clone(), action.request_digest.clone()))
-                        .and_then(|t| t.as_ref()),
-                    &observation.state,
-                )?;
-                if observation.source == BrokerObservationSource::Cancel {
-                    ensure!(
-                        matches!(
-                            request.action,
-                            theseus_native_protocol::v2::broker::DesktopAction::Activate { .. }
-                        ),
-                        "broker Cancel must name the original activation owner"
-                    );
-                }
-                if let Some(previous) = broker_states.get(&observation.original.operation) {
-                    validate_broker_progress(previous, &observation.state)?;
-                }
+                        == Some(&baseline.terminal),
+                    "desktop terminal baseline changed without original cached query provenance"
+                );
+            }
+        }
+        ensure!(
+            recovery.broker_observations.len() <= 64 * recovery.original_actions.len().max(1),
+            "broker recovery observations exceed bound"
+        );
+        Ok(())
+    }
+    fn validate_recovery_broker_observations(
+        &self,
+        index: usize,
+        recovery: &IntegrationRecoveryRecord,
+        broker_terminals: &BrokerTerminals,
+    ) -> Result<()> {
+        let mut broker_states = BTreeMap::new();
+        for prior in self.integration_recoveries[..index]
+            .iter()
+            .filter(|r| r.ownership_id == recovery.ownership_id)
+        {
+            for observation in &prior.broker_observations {
                 broker_states.insert(
                     observation.original.operation.clone(),
                     observation.state.clone(),
                 );
             }
-            if let Some(release) = &recovery.broker_release {
-                let binding = self
-                    .broker_bindings
-                    .iter()
-                    .find(|b| {
-                        b.ownership_id == recovery.ownership_id
-                            && b.helper_lease == release.helper_lease
-                            && b.broker_lease.as_ref() == Some(&release.broker_lease)
-                    })
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("broker release lacks exact original mapping")
-                    })?;
-                let owner = self
-                    .ownership
-                    .iter()
-                    .find(|o| o.ownership_id == binding.ownership_id)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("broker release original helper owner missing")
-                    })?;
+        }
+        for observation in &recovery.broker_observations {
+            observation.identity.validate()?;
+            observation.state.validate()?;
+            let action = self
+                .integration_actions
+                .iter()
+                .find(|a| {
+                    a.ownership_id == recovery.ownership_id
+                        && a.operation == observation.original.operation
+                        && a.request_digest == observation.original.request_digest
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("broker observation lacks original published action")
+                })?;
+            let IntegrationRequest::Desktop { request, .. } = &action.request else {
+                anyhow::bail!("broker observation borrowed service authority")
+            };
+            ensure!(
+                request.identity()? == observation.identity,
+                "broker observation original identity changed"
+            );
+            crate::native::integration::owned_lifetime::validate_recovered_observation(
+                self,
+                action,
+                &observation.state,
+            )?;
+            validate_broker_effect_terminal(
+                broker_terminals
+                    .get(&(action.operation.clone(), action.request_digest.clone()))
+                    .and_then(|t| t.as_ref()),
+                &observation.state,
+            )?;
+            if observation.source == BrokerObservationSource::Cancel {
                 ensure!(
-                    matches!(&owner.ownership,NativeOwnership::Acquired {prepared,lease} if lease==&release.helper_lease && prepared.intent==release.helper_intent),
-                    "broker release original helper intent changed"
+                    matches!(
+                        request.action,
+                        theseus_native_protocol::v2::broker::DesktopAction::Activate { .. }
+                    ),
+                    "broker Cancel must name the original activation owner"
                 );
             }
-            let mut queried = BTreeSet::new();
-            for query in &recovery.queries {
-                hex(&query.original.operation, 32)?;
-                digest(&query.original.request_digest)?;
-                ensure!(
-                    queried.insert((&query.original.operation, &query.original.request_digest)),
-                    "duplicate original recovery query"
-                );
-                let action = self
-                    .integration_actions
-                    .iter()
-                    .find(|a| {
-                        a.ownership_id == recovery.ownership_id
-                            && a.operation == query.original.operation
-                            && a.request_digest == query.original.request_digest
-                    })
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("integration recovery query has no exact original action")
-                    })?;
-                match &query.outcome {
-                    IntegrationOutcome::Complete { receipt } => text(receipt, 4096)?,
-                    IntegrationOutcome::Unknown { reason }
-                    | IntegrationOutcome::Failed { reason } => text(reason, 4096)?,
+            if let Some(previous) = broker_states.get(&observation.original.operation) {
+                validate_broker_progress(previous, &observation.state)?;
+            }
+            broker_states.insert(
+                observation.original.operation.clone(),
+                observation.state.clone(),
+            );
+        }
+        Ok(())
+    }
+    fn validate_recovery_broker_release(&self, recovery: &IntegrationRecoveryRecord) -> Result<()> {
+        if let Some(release) = &recovery.broker_release {
+            let binding = self
+                .broker_bindings
+                .iter()
+                .find(|b| {
+                    b.ownership_id == recovery.ownership_id
+                        && b.helper_lease == release.helper_lease
+                        && b.broker_lease.as_ref() == Some(&release.broker_lease)
+                })
+                .ok_or_else(|| anyhow::anyhow!("broker release lacks exact original mapping"))?;
+            let owner = self
+                .ownership
+                .iter()
+                .find(|o| o.ownership_id == binding.ownership_id)
+                .ok_or_else(|| anyhow::anyhow!("broker release original helper owner missing"))?;
+            ensure!(
+                matches!(&owner.ownership,NativeOwnership::Acquired {prepared,lease} if lease==&release.helper_lease && prepared.intent==release.helper_intent),
+                "broker release original helper intent changed"
+            );
+        }
+        Ok(())
+    }
+    fn validate_recovery_queries<'a>(
+        &'a self,
+        recovery: &'a IntegrationRecoveryRecord,
+        broker_terminals: &mut BrokerTerminals,
+        cached_terminals: &mut BTreeMap<
+            (&'a String, &'a String, &'a String),
+            &'a IntegrationOutcome,
+        >,
+    ) -> Result<()> {
+        let mut queried = BTreeSet::new();
+        for query in &recovery.queries {
+            hex(&query.original.operation, 32)?;
+            digest(&query.original.request_digest)?;
+            ensure!(
+                queried.insert((&query.original.operation, &query.original.request_digest)),
+                "duplicate original recovery query"
+            );
+            let action = self
+                .integration_actions
+                .iter()
+                .find(|a| {
+                    a.ownership_id == recovery.ownership_id
+                        && a.operation == query.original.operation
+                        && a.request_digest == query.original.request_digest
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("integration recovery query has no exact original action")
+                })?;
+            match &query.outcome {
+                IntegrationOutcome::Complete { receipt } => text(receipt, 4096)?,
+                IntegrationOutcome::Unknown { reason } | IntegrationOutcome::Failed { reason } => {
+                    text(reason, 4096)?
                 }
-                match query.view {
-                    OriginalQueryView::NonterminalUnknown => ensure!(
-                        matches!(query.outcome, IntegrationOutcome::Unknown { .. }),
-                        "nonterminal recovery query cannot claim a terminal outcome"
-                    ),
-                    OriginalQueryView::CachedTerminal => {
-                        validate_original_query_broker_receipts(
-                            self,
-                            &recovery.ownership_id,
-                            query,
-                        )?;
-                        if matches!(action.request, IntegrationRequest::Desktop { .. }) {
-                            let known = broker_terminals
-                                .get_mut(&(action.operation.clone(), action.request_digest.clone()))
-                                .expect("original desktop terminal tracked");
-                            if let Some(terminal) = known.as_ref() {
-                                ensure!(
-                                    terminal == &query.outcome,
-                                    "original desktop query changed earlier terminal knowledge"
-                                );
-                            } else {
-                                *known = Some(query.outcome.clone());
-                            }
-                        }
-                        if let Some(prior) = cached_terminals.insert(
-                            (
-                                &recovery.ownership_id,
-                                &query.original.operation,
-                                &query.original.request_digest,
-                            ),
-                            &query.outcome,
-                        ) {
-                            ensure!(
-                                prior == &query.outcome,
-                                "original cached recovery terminal changed"
-                            );
-                        }
-                        if let Some(terminal) = &action.terminal {
+            }
+            match query.view {
+                OriginalQueryView::NonterminalUnknown => ensure!(
+                    matches!(query.outcome, IntegrationOutcome::Unknown { .. }),
+                    "nonterminal recovery query cannot claim a terminal outcome"
+                ),
+                OriginalQueryView::CachedTerminal => {
+                    validate_original_query_broker_receipts(self, &recovery.ownership_id, query)?;
+                    if matches!(action.request, IntegrationRequest::Desktop { .. }) {
+                        let known = broker_terminals
+                            .get_mut(&(action.operation.clone(), action.request_digest.clone()))
+                            .expect("original desktop terminal tracked");
+                        if let Some(terminal) = known.as_ref() {
                             ensure!(
                                 terminal == &query.outcome,
-                                "integration recovery query changed known cached terminal outcome"
+                                "original desktop query changed earlier terminal knowledge"
                             );
+                        } else {
+                            *known = Some(query.outcome.clone());
                         }
+                    }
+                    if let Some(prior) = cached_terminals.insert(
+                        (
+                            &recovery.ownership_id,
+                            &query.original.operation,
+                            &query.original.request_digest,
+                        ),
+                        &query.outcome,
+                    ) {
+                        ensure!(
+                            prior == &query.outcome,
+                            "original cached recovery terminal changed"
+                        );
+                    }
+                    if let Some(terminal) = &action.terminal {
+                        ensure!(
+                            terminal == &query.outcome,
+                            "integration recovery query changed known cached terminal outcome"
+                        );
                     }
                 }
             }
         }
+        Ok(())
+    }
+    fn validate_desktop_terminal_provenance(
+        &self,
+        broker_terminals: &BrokerTerminals,
+    ) -> Result<()> {
         for action in self
             .integration_actions
             .iter()
