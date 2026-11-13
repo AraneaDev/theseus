@@ -14,6 +14,10 @@ use std::time::{Duration, Instant};
 use theseus_native_client::{Action, Event, Poll};
 use theseus_native_protocol::v2;
 
+mod compose;
+use compose::{
+    OrdinaryIntegrationHooks, composed_before_reinstall, composed_checkpoint, composed_step,
+};
 pub struct IntegrationDriver<'a, 'b, 's> {
     core: &'a mut NativeDriver<'b, 's>,
     recipe: &'a ValidatedIntegrationRecipe,
@@ -801,58 +805,6 @@ impl IntegrationDriver<'_, '_, '_> {
         }
         Ok(())
     }
-}
-// One step/checkpoint compositor around the original core; no scenario or owner loop.
-trait OrdinaryIntegrationHooks {
-    fn forward_hooks(&self) -> bool;
-    fn service_before(&mut self, step: StepName) -> Result<()>;
-    fn desktop_before(&mut self, step: StepName) -> Result<()>;
-    fn core_step(&mut self, step: StepName, name: &str) -> Result<()>;
-    fn service_after(&mut self, step: StepName) -> Result<()>;
-    fn desktop_after(&mut self, step: StepName) -> Result<()>;
-    fn core_checkpoint(&mut self, checkpoint: Checkpoint, configured: bool) -> Result<()>;
-    fn service_checkpoint(&mut self, checkpoint: Checkpoint, configured: bool) -> Result<()>;
-    fn desktop_checkpoint(&mut self, checkpoint: Checkpoint, configured: bool) -> Result<()>;
-    fn core_before_reinstall(&mut self) -> Result<()>;
-}
-fn composed_step(h: &mut impl OrdinaryIntegrationHooks, step: StepName, name: &str) -> Result<()> {
-    if !h.forward_hooks() && step != StepName::Uninstall {
-        return Ok(());
-    }
-    // Desktop close can change a dependent service's runtime. Observe/control
-    // the service only after close, immediately before the single SUT step.
-    h.desktop_before(step)?;
-    if !h.forward_hooks() && step != StepName::Uninstall {
-        return Ok(());
-    }
-    h.service_before(step)?;
-    if !h.forward_hooks() && step != StepName::Uninstall {
-        return Ok(());
-    }
-    h.core_step(step, name)?;
-    h.service_after(step)?;
-    h.desktop_after(step)
-}
-fn composed_checkpoint(
-    h: &mut impl OrdinaryIntegrationHooks,
-    checkpoint: Checkpoint,
-    configured: bool,
-) -> Result<()> {
-    if !h.forward_hooks() && checkpoint != Checkpoint::Uninstalled {
-        return Ok(());
-    }
-    h.core_checkpoint(checkpoint, configured)?;
-    if !h.forward_hooks() && checkpoint != Checkpoint::Uninstalled {
-        return Ok(());
-    }
-    h.service_checkpoint(checkpoint, configured)?;
-    h.desktop_checkpoint(checkpoint, configured)
-}
-fn composed_before_reinstall(h: &mut impl OrdinaryIntegrationHooks) -> Result<()> {
-    if h.forward_hooks() {
-        h.core_before_reinstall()?;
-    }
-    Ok(())
 }
 impl OrdinaryIntegrationHooks for IntegrationDriver<'_, '_, '_> {
     fn forward_hooks(&self) -> bool {
