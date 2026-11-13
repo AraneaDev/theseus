@@ -227,32 +227,6 @@ impl RetainedActivation {
             Self::Windows(v) => v.begin_fresh_ready_probe(next),
         }
     }
-    pub(crate) fn probe_ready(
-        &mut self,
-        deadline: Instant,
-        cancel: &AtomicBool,
-    ) -> io::Result<theseus_host::services::readiness::ReadinessObservation> {
-        match self {
-            Self::Owned(v) => v.probe_ready(deadline, cancel),
-            _ => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "native readiness requires original server polling",
-            )),
-        }
-    }
-    pub(crate) fn request_close(
-        &mut self,
-        deadline: Instant,
-        cancel: &AtomicBool,
-    ) -> io::Result<theseus_host::services::readiness::ReadinessObservation> {
-        match self {
-            Self::Owned(v) => v.request_close(deadline, cancel),
-            _ => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "native close requires original server polling",
-            )),
-        }
-    }
     pub(crate) fn pump(&mut self) -> io::Result<()> {
         match self {
             #[cfg(target_os = "macos")]

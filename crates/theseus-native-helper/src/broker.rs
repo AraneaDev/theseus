@@ -1074,21 +1074,6 @@ impl BrokerRuntime {
         }
         Ok(state)
     }
-    pub fn probe_ready(
-        &mut self,
-        identity: &BrokerOperationIdentity,
-        deadline: Instant,
-        cancel: &AtomicBool,
-    ) -> io::Result<theseus_host::services::readiness::ReadinessObservation> {
-        self.query(identity)?;
-        let live = self
-            .owner
-            .as_mut()
-            .filter(|o| o.operation == identity.helper_operation)
-            .ok_or_else(|| invalid("original native owner lost"))?;
-        let result = live.owner.probe_ready(deadline, cancel);
-        self.native_result(&identity.helper_operation, result)
-    }
     /// Bounded advance of the original nonce; None is scheduling pending.
     pub fn poll_ready_with_nonce(
         &mut self,
@@ -1125,29 +1110,19 @@ impl BrokerRuntime {
         let result = live.owner.poll_ready(deadline, cancel);
         self.native_result(&identity.helper_operation, result)
     }
-    pub fn request_close(
-        &mut self,
-        request: DesktopRequest,
-        deadline: Instant,
-        cancel: &AtomicBool,
-    ) -> io::Result<BrokerState> {
-        self.close_inner(request, deadline, cancel, false)?
-            .ok_or_else(|| invalid("blocking close unexpectedly yielded"))
-    }
     pub fn poll_request_close(
         &mut self,
         request: DesktopRequest,
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> io::Result<Option<BrokerState>> {
-        self.close_inner(request, deadline, cancel, true)
+        self.close_inner(request, deadline, cancel)
     }
     fn close_inner(
         &mut self,
         request: DesktopRequest,
         deadline: Instant,
         cancel: &AtomicBool,
-        poll_only: bool,
     ) -> io::Result<Option<BrokerState>> {
         request.validate().map_err(io::Error::other)?;
         let view = projection(&self.store)?;
@@ -1196,11 +1171,7 @@ impl BrokerRuntime {
             .as_mut()
             .ok_or_else(|| invalid("original close owner lost"))?;
         let deadline = *live.close_deadline.get_or_insert(deadline);
-        let observed = if poll_only {
-            live.owner.poll_request_close(deadline, cancel)
-        } else {
-            live.owner.request_close(deadline, cancel).map(Some)
-        };
+        let observed = live.owner.poll_request_close(deadline, cancel);
         let evidence = live.owner.observation().evidence;
         let Some(observation) = self.native_result(&request.helper_operation, observed)? else {
             return Ok(None);

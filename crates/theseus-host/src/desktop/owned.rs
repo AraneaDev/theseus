@@ -461,6 +461,7 @@ impl OwnedExecutable {
     pub fn original_peer_pid(&self) -> Option<u32> {
         self.original_peer_pid
     }
+    #[cfg(test)]
     pub fn probe_ready(
         &mut self,
         deadline: Instant,
@@ -468,6 +469,7 @@ impl OwnedExecutable {
     ) -> io::Result<ReadinessObservation> {
         self.probe(false, deadline, cancel)
     }
+    #[cfg(test)]
     pub fn request_close(
         &mut self,
         deadline: Instant,
@@ -489,6 +491,7 @@ impl OwnedExecutable {
     ) -> io::Result<Option<ReadinessObservation>> {
         self.probe_mode(true, deadline, cancel, true)
     }
+    #[cfg(test)]
     fn probe(
         &mut self,
         close: bool,

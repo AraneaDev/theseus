@@ -443,18 +443,6 @@ impl NativeActivation {
         validate_session(&r.session)?;
         Ok(())
     }
-    pub fn probe_ready(
-        &mut self,
-        deadline: Instant,
-        cancel: &AtomicBool,
-    ) -> io::Result<ReadinessObservation> {
-        loop {
-            if let Some(observed) = self.poll_ready(deadline, cancel)? {
-                return Ok(observed);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-    }
     pub fn poll_ready(
         &mut self,
         deadline: Instant,
@@ -509,18 +497,6 @@ impl NativeActivation {
             probe: old,
             observation,
         })
-    }
-    pub fn request_close(
-        &mut self,
-        deadline: Instant,
-        cancel: &AtomicBool,
-    ) -> io::Result<ReadinessObservation> {
-        loop {
-            if let Some(observed) = self.poll_request_close(deadline, cancel)? {
-                return Ok(observed);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
     }
     pub fn poll_request_close(
         &mut self,
