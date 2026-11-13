@@ -51,172 +51,7 @@ impl ValidatedRecipe {
                 .with_context(|| format!("profile {name} is not defined"))?;
             for scenario in scenarios {
                 super::validate_mcp_contract(profile, *scenario)?;
-                let required = match scenario {
-                    ScenarioKind::PluginLifecycle => {
-                        ensure!(
-                            *name == ProfileName::User,
-                            "plugin_lifecycle requires user profile"
-                        );
-                        super::validate_plugin_contract(profile)?;
-                        &super::plugin::STEPS[..]
-                    }
-                    ScenarioKind::InterruptedRollback => {
-                        ensure!(
-                            self.base_artifact.is_some(),
-                            "interrupted_rollback requires artifacts.base"
-                        );
-                        super::interrupted_rollback::validate_profile(
-                            profile,
-                            &self.recipe.observe,
-                            &declared,
-                        )?;
-                        &[
-                            StepName::InstallBase,
-                            StepName::Configure,
-                            StepName::Exercise,
-                            StepName::InterruptUpgrade,
-                            StepName::Rollback,
-                            StepName::ExerciseRolledBack,
-                            StepName::Uninstall,
-                        ][..]
-                    }
-                    ScenarioKind::Rollback => {
-                        ensure!(
-                            self.base_artifact.is_some(),
-                            "rollback requires artifacts.base"
-                        );
-                        super::rollback::validate_profile(
-                            profile,
-                            &self.recipe.observe,
-                            &declared,
-                        )?;
-                        &[
-                            StepName::InstallBase,
-                            StepName::Configure,
-                            StepName::Exercise,
-                            StepName::AttemptUpgrade,
-                            StepName::Rollback,
-                            StepName::ExerciseRolledBack,
-                            StepName::Uninstall,
-                        ][..]
-                    }
-                    ScenarioKind::Downgrade => {
-                        ensure!(
-                            self.base_artifact.is_some(),
-                            "downgrade requires artifacts.base"
-                        );
-                        super::downgrade::validate_profile(profile)?;
-                        if matches!(
-                            profile.downgrade,
-                            Some(DowngradeContract::Compatible { .. })
-                        ) {
-                            ensure!(
-                                profile.steps.contains_key(&StepName::ExerciseDowngraded),
-                                "{name}/downgrade requires step exercise_downgraded"
-                            );
-                        }
-                        &[
-                            StepName::InstallTarget,
-                            StepName::Configure,
-                            StepName::Exercise,
-                            StepName::Downgrade,
-                            StepName::Uninstall,
-                        ][..]
-                    }
-                    ScenarioKind::Clean => &[
-                        StepName::InstallTarget,
-                        StepName::Configure,
-                        StepName::Exercise,
-                        StepName::Uninstall,
-                    ][..],
-                    ScenarioKind::Reinstall => {
-                        ensure!(
-                            profile
-                                .checks
-                                .iter()
-                                .any(|check| check.checkpoint == Checkpoint::Reinstalled
-                                    && matches!(check.expectation, Expectation::Unchanged { .. })),
-                            "{name}/reinstall requires at least one unchanged contract"
-                        );
-                        &[
-                            StepName::InstallTarget,
-                            StepName::Configure,
-                            StepName::Exercise,
-                            StepName::Reinstall,
-                            StepName::Uninstall,
-                        ][..]
-                    }
-                    ScenarioKind::InterruptedInstall | ScenarioKind::InterruptedUpgrade => {
-                        ensure!(
-                            profile
-                                .checks
-                                .iter()
-                                .any(|check| check.checkpoint == Checkpoint::Interrupted
-                                    && check.expectation.path().is_some()),
-                            "{name}/{scenario} requires an interrupted filesystem contract"
-                        );
-                        ensure!(profile.checks.iter().any(|check| check.checkpoint == Checkpoint::Recovered && matches!(&check.expectation, Expectation::Executable { stdout_contains: Some(value), .. } if !value.trim().is_empty())), "{name}/{scenario} requires a recovered Executable contract with nonempty stdout_contains");
-                        if *scenario == ScenarioKind::InterruptedUpgrade {
-                            ensure!(
-                                self.base_artifact.is_some(),
-                                "interrupted_upgrade requires artifacts.base"
-                            );
-                            ensure!(
-                                profile.checks.iter().any(|check| check.checkpoint
-                                    == Checkpoint::Recovered
-                                    && match &check.expectation {
-                                        Expectation::Unchanged { .. }
-                                        | Expectation::Preserved { .. } => true,
-                                        Expectation::Command {
-                                            stdout_contains: Some(value),
-                                            ..
-                                        } => !value.trim().is_empty(),
-                                        _ => false,
-                                    }),
-                                "{name}/{scenario} requires a recovered data contract"
-                            );
-                            &[
-                                StepName::InstallBase,
-                                StepName::InterruptUpgrade,
-                                StepName::RecoverUpgrade,
-                                StepName::Configure,
-                                StepName::Exercise,
-                                StepName::Uninstall,
-                            ][..]
-                        } else {
-                            ensure!(
-                                !profile.checks.iter().any(|check| matches!(
-                                    check.checkpoint,
-                                    Checkpoint::Interrupted | Checkpoint::Recovered
-                                ) && matches!(
-                                    check.expectation,
-                                    Expectation::Preserved { .. }
-                                )),
-                                "preserved at interrupted/recovered requires interrupted_upgrade configuration"
-                            );
-                            &[
-                                StepName::InterruptInstall,
-                                StepName::RecoverInstall,
-                                StepName::Configure,
-                                StepName::Exercise,
-                                StepName::Uninstall,
-                            ][..]
-                        }
-                    }
-                    ScenarioKind::Upgrade => {
-                        ensure!(
-                            self.base_artifact.is_some(),
-                            "upgrade requires artifacts.base"
-                        );
-                        &[
-                            StepName::InstallBase,
-                            StepName::Configure,
-                            StepName::Upgrade,
-                            StepName::Exercise,
-                            StepName::Uninstall,
-                        ][..]
-                    }
-                };
+                let required = self.required_steps(name, profile, scenario, &declared)?;
                 for step in required {
                     ensure!(
                         profile.steps.contains_key(step),
@@ -238,6 +73,188 @@ impl ValidatedRecipe {
             }
         }
         Ok(())
+    }
+
+    /// Validate one selected scenario's profile contract and return its required steps.
+    fn required_steps(
+        &self,
+        name: &ProfileName,
+        profile: &Profile,
+        scenario: &ScenarioKind,
+        declared: &[ScenarioKind],
+    ) -> Result<&'static [StepName]> {
+        Ok(match scenario {
+            ScenarioKind::PluginLifecycle => {
+                ensure!(
+                    *name == ProfileName::User,
+                    "plugin_lifecycle requires user profile"
+                );
+                super::validate_plugin_contract(profile)?;
+                &super::plugin::STEPS[..]
+            }
+            ScenarioKind::InterruptedRollback => {
+                ensure!(
+                    self.base_artifact.is_some(),
+                    "interrupted_rollback requires artifacts.base"
+                );
+                super::interrupted_rollback::validate_profile(
+                    profile,
+                    &self.recipe.observe,
+                    declared,
+                )?;
+                &[
+                    StepName::InstallBase,
+                    StepName::Configure,
+                    StepName::Exercise,
+                    StepName::InterruptUpgrade,
+                    StepName::Rollback,
+                    StepName::ExerciseRolledBack,
+                    StepName::Uninstall,
+                ][..]
+            }
+            ScenarioKind::Rollback => {
+                ensure!(
+                    self.base_artifact.is_some(),
+                    "rollback requires artifacts.base"
+                );
+                super::rollback::validate_profile(profile, &self.recipe.observe, declared)?;
+                &[
+                    StepName::InstallBase,
+                    StepName::Configure,
+                    StepName::Exercise,
+                    StepName::AttemptUpgrade,
+                    StepName::Rollback,
+                    StepName::ExerciseRolledBack,
+                    StepName::Uninstall,
+                ][..]
+            }
+            ScenarioKind::Downgrade => {
+                ensure!(
+                    self.base_artifact.is_some(),
+                    "downgrade requires artifacts.base"
+                );
+                super::downgrade::validate_profile(profile)?;
+                if matches!(
+                    profile.downgrade,
+                    Some(DowngradeContract::Compatible { .. })
+                ) {
+                    ensure!(
+                        profile.steps.contains_key(&StepName::ExerciseDowngraded),
+                        "{name}/downgrade requires step exercise_downgraded"
+                    );
+                }
+                &[
+                    StepName::InstallTarget,
+                    StepName::Configure,
+                    StepName::Exercise,
+                    StepName::Downgrade,
+                    StepName::Uninstall,
+                ][..]
+            }
+            ScenarioKind::Clean => &[
+                StepName::InstallTarget,
+                StepName::Configure,
+                StepName::Exercise,
+                StepName::Uninstall,
+            ][..],
+            ScenarioKind::Reinstall => {
+                ensure!(
+                    profile
+                        .checks
+                        .iter()
+                        .any(|check| check.checkpoint == Checkpoint::Reinstalled
+                            && matches!(check.expectation, Expectation::Unchanged { .. })),
+                    "{name}/reinstall requires at least one unchanged contract"
+                );
+                &[
+                    StepName::InstallTarget,
+                    StepName::Configure,
+                    StepName::Exercise,
+                    StepName::Reinstall,
+                    StepName::Uninstall,
+                ][..]
+            }
+            ScenarioKind::InterruptedInstall | ScenarioKind::InterruptedUpgrade => {
+                self.interrupted_required_steps(name, profile, scenario)?
+            }
+            ScenarioKind::Upgrade => {
+                ensure!(
+                    self.base_artifact.is_some(),
+                    "upgrade requires artifacts.base"
+                );
+                &[
+                    StepName::InstallBase,
+                    StepName::Configure,
+                    StepName::Upgrade,
+                    StepName::Exercise,
+                    StepName::Uninstall,
+                ][..]
+            }
+        })
+    }
+
+    fn interrupted_required_steps(
+        &self,
+        name: &ProfileName,
+        profile: &Profile,
+        scenario: &ScenarioKind,
+    ) -> Result<&'static [StepName]> {
+        ensure!(
+            profile
+                .checks
+                .iter()
+                .any(|check| check.checkpoint == Checkpoint::Interrupted
+                    && check.expectation.path().is_some()),
+            "{name}/{scenario} requires an interrupted filesystem contract"
+        );
+        ensure!(profile.checks.iter().any(|check| check.checkpoint == Checkpoint::Recovered && matches!(&check.expectation, Expectation::Executable { stdout_contains: Some(value), .. } if !value.trim().is_empty())), "{name}/{scenario} requires a recovered Executable contract with nonempty stdout_contains");
+        Ok(if *scenario == ScenarioKind::InterruptedUpgrade {
+            ensure!(
+                self.base_artifact.is_some(),
+                "interrupted_upgrade requires artifacts.base"
+            );
+            ensure!(
+                profile
+                    .checks
+                    .iter()
+                    .any(|check| check.checkpoint == Checkpoint::Recovered
+                        && match &check.expectation {
+                            Expectation::Unchanged { .. } | Expectation::Preserved { .. } => true,
+                            Expectation::Command {
+                                stdout_contains: Some(value),
+                                ..
+                            } => !value.trim().is_empty(),
+                            _ => false,
+                        }),
+                "{name}/{scenario} requires a recovered data contract"
+            );
+            &[
+                StepName::InstallBase,
+                StepName::InterruptUpgrade,
+                StepName::RecoverUpgrade,
+                StepName::Configure,
+                StepName::Exercise,
+                StepName::Uninstall,
+            ][..]
+        } else {
+            ensure!(
+                !profile.checks.iter().any(|check| matches!(
+                    check.checkpoint,
+                    Checkpoint::Interrupted | Checkpoint::Recovered
+                ) && matches!(
+                    check.expectation,
+                    Expectation::Preserved { .. }
+                )),
+                "preserved at interrupted/recovered requires interrupted_upgrade configuration"
+            );
+            &[
+                StepName::InterruptInstall,
+                StepName::RecoverInstall,
+                StepName::Configure,
+                StepName::Exercise,
+                StepName::Uninstall,
+            ][..]
+        })
     }
 }
 pub fn load(path: &Path) -> Result<ValidatedRecipe> {
@@ -263,6 +280,78 @@ pub fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<ValidatedRecipe> {
     );
     let mut recipe: Recipe =
         toml::from_str(std::str::from_utf8(bytes)?).context("parse theseus.toml")?;
+    let (plugin_declared, interrupted_rollback_declared, rollback_declared, downgrade_declared) =
+        validate_schema_scenarios(&recipe)?;
+    validate_recipe_basics(&mut recipe)?;
+    let rules = RecipeRules {
+        schema_version: recipe.schema_version,
+        network: recipe.network,
+        scenarios: recipe.scenarios.as_ref(),
+        observe: &recipe.observe,
+        plugin_declared,
+        interrupted_rollback_declared,
+        rollback_declared,
+        downgrade_declared,
+    };
+    for (name, profile) in &mut recipe.profiles {
+        validate_profile_features(&rules, name, profile)?;
+        validate_profile_steps(&rules, profile)?;
+        let mut ids = BTreeSet::new();
+        for check in &mut profile.checks {
+            validate_check_checkpoint(&rules, name, &mut ids, check)?;
+            validate_check_expectation(&rules, check)?;
+        }
+    }
+    for profile in recipe.profiles.values() {
+        if rollback_declared {
+            super::rollback::validate_profile(
+                profile,
+                &recipe.observe,
+                recipe.scenarios.as_deref().unwrap_or_default(),
+            )?;
+        }
+        if interrupted_rollback_declared {
+            super::interrupted_rollback::validate_profile(
+                profile,
+                &recipe.observe,
+                recipe.scenarios.as_deref().unwrap_or_default(),
+            )?;
+        }
+        if profile.downgrade.is_some() {
+            super::downgrade::validate_profile(profile)?;
+        }
+    }
+    let target_artifact = resolve_artifact(&project_root, &recipe.artifacts.target)?;
+    let base_artifact = recipe
+        .artifacts
+        .base
+        .as_ref()
+        .map(|p| resolve_artifact(&project_root, p))
+        .transpose()?;
+    Ok(ValidatedRecipe {
+        recipe,
+        path: path.to_path_buf(),
+        project_root,
+        base_artifact,
+        target_artifact,
+        digest: format!("{:x}", Sha256::digest(bytes)),
+    })
+}
+
+/// Recipe-wide facts the per-profile validation reads while the profiles are borrowed mutably.
+struct RecipeRules<'a> {
+    schema_version: u32,
+    network: Network,
+    scenarios: Option<&'a Vec<ScenarioKind>>,
+    observe: &'a [String],
+    plugin_declared: bool,
+    interrupted_rollback_declared: bool,
+    rollback_declared: bool,
+    downgrade_declared: bool,
+}
+
+/// Returns (plugin, interrupted_rollback, rollback, downgrade) declared flags.
+fn validate_schema_scenarios(recipe: &Recipe) -> Result<(bool, bool, bool, bool)> {
     match recipe.schema_version {
         1 => ensure!(
             recipe.scenarios.is_none(),
@@ -328,6 +417,15 @@ pub fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<ValidatedRecipe> {
             "interruption requires recipe schema version 3"
         );
     }
+    Ok((
+        plugin_declared,
+        interrupted_rollback_declared,
+        rollback_declared,
+        downgrade_declared,
+    ))
+}
+
+fn validate_recipe_basics(recipe: &mut Recipe) -> Result<()> {
     ensure!(
         !recipe.name.trim().is_empty() && !recipe.image.trim().is_empty(),
         "name and image cannot be empty"
@@ -360,297 +458,280 @@ pub fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<ValidatedRecipe> {
             );
         }
     }
-    for (name, profile) in &mut recipe.profiles {
-        if profile.mcp.is_some() {
-            ensure!(
-                recipe.schema_version == 8
-                    && recipe.network == Network::None
-                    && *name == ProfileName::User,
-                "MCP contract requires schema 8, network none and user profile"
-            );
-            let scenarios = recipe.scenarios.as_ref().unwrap();
-            ensure!(
-                scenarios.len() == 1,
-                "MCP contract requires exactly one scenario"
-            );
-            super::validate_mcp_contract(profile, scenarios[0])?;
-        }
-        let plugin_features = profile.plugin.is_some()
-            || profile
-                .steps
-                .keys()
-                .any(|s| matches!(s, StepName::DisablePlugin | StepName::EnablePlugin))
-            || profile.checks.iter().any(|c| {
-                matches!(
-                    c.checkpoint,
-                    Checkpoint::PluginDisabled | Checkpoint::PluginEnabled
-                )
-            });
+    Ok(())
+}
+
+fn validate_profile_features(
+    rules: &RecipeRules<'_>,
+    name: &ProfileName,
+    profile: &Profile,
+) -> Result<()> {
+    if profile.mcp.is_some() {
         ensure!(
-            !plugin_features || plugin_declared,
-            "plugin features require declared plugin_lifecycle scenario"
+            rules.schema_version == 8
+                && rules.network == Network::None
+                && *name == ProfileName::User,
+            "MCP contract requires schema 8, network none and user profile"
         );
-        if plugin_declared {
+        let scenarios = rules.scenarios.unwrap();
+        ensure!(
+            scenarios.len() == 1,
+            "MCP contract requires exactly one scenario"
+        );
+        super::validate_mcp_contract(profile, scenarios[0])?;
+    }
+    let plugin_features = profile.plugin.is_some()
+        || profile
+            .steps
+            .keys()
+            .any(|s| matches!(s, StepName::DisablePlugin | StepName::EnablePlugin))
+        || profile.checks.iter().any(|c| {
+            matches!(
+                c.checkpoint,
+                Checkpoint::PluginDisabled | Checkpoint::PluginEnabled
+            )
+        });
+    ensure!(
+        !plugin_features || rules.plugin_declared,
+        "plugin features require declared plugin_lifecycle scenario"
+    );
+    if rules.plugin_declared {
+        ensure!(
+            *name == ProfileName::User,
+            "plugin_lifecycle requires user profile"
+        );
+        super::validate_plugin_contract(profile)?;
+    }
+    super::rollback::validate_features(
+        profile,
+        rules.schema_version,
+        rules.rollback_declared,
+        rules.interrupted_rollback_declared,
+    )?;
+    ensure!(
+        profile.interrupted_rollback.is_none() || rules.schema_version >= 6,
+        "interrupted_rollback requires recipe schema version 6"
+    );
+    ensure!(
+        profile.interrupted_rollback.is_none() || rules.interrupted_rollback_declared,
+        "interrupted_rollback policy requires declared interrupted_rollback scenario"
+    );
+    let downgrade_features = profile.downgrade.is_some()
+        || profile
+            .steps
+            .keys()
+            .any(|step| matches!(step, StepName::Downgrade | StepName::ExerciseDowngraded))
+        || profile.checks.iter().any(|check| {
+            matches!(
+                check.checkpoint,
+                Checkpoint::Downgraded | Checkpoint::DowngradeRejected
+            )
+        });
+    ensure!(
+        !downgrade_features || rules.schema_version >= 4,
+        "downgrade requires recipe schema version 4"
+    );
+    ensure!(
+        !downgrade_features || rules.downgrade_declared,
+        "downgrade features require declared downgrade scenario"
+    );
+    Ok(())
+}
+
+fn validate_profile_steps(rules: &RecipeRules<'_>, profile: &Profile) -> Result<()> {
+    if rules.schema_version == 1 {
+        ensure!(
+            !profile.steps.contains_key(&StepName::Reinstall),
+            "reinstall requires recipe schema version 2"
+        );
+    }
+    for (step, command) in &profile.steps {
+        if matches!(
+            step,
+            StepName::InterruptInstall
+                | StepName::RecoverInstall
+                | StepName::InterruptUpgrade
+                | StepName::RecoverUpgrade
+        ) {
             ensure!(
-                *name == ProfileName::User,
-                "plugin_lifecycle requires user profile"
+                rules.schema_version >= 3,
+                "interruption steps require recipe schema version 3"
             );
-            super::validate_plugin_contract(profile)?;
         }
-        super::rollback::validate_features(
-            profile,
-            recipe.schema_version,
-            rollback_declared,
-            interrupted_rollback_declared,
+        if matches!(
+            step,
+            StepName::InterruptInstall | StepName::InterruptUpgrade
+        ) {
+            ensure!(
+                !command.env.contains_key("THESEUS_INTERRUPT_BARRIER")
+                    && !command
+                        .pass_env
+                        .iter()
+                        .any(|name| name == "THESEUS_INTERRUPT_BARRIER"),
+                "THESEUS_INTERRUPT_BARRIER is reserved for interruption"
+            );
+        }
+    }
+    for command in profile.steps.values() {
+        validate_command(
+            &command.script,
+            command.timeout_seconds,
+            &command.env,
+            &command.pass_env,
         )?;
+    }
+    Ok(())
+}
+
+fn validate_check_checkpoint(
+    rules: &RecipeRules<'_>,
+    name: &ProfileName,
+    ids: &mut BTreeSet<String>,
+    check: &Check,
+) -> Result<()> {
+    ensure!(
+        !check.id.trim().is_empty() && ids.insert(check.id.clone()),
+        "duplicate/empty check ID in {name}: {}",
+        check.id
+    );
+    if rules.schema_version == 1 {
         ensure!(
-            profile.interrupted_rollback.is_none() || recipe.schema_version >= 6,
-            "interrupted_rollback requires recipe schema version 6"
+            check.checkpoint != Checkpoint::Reinstalled
+                && !matches!(check.expectation, Expectation::Unchanged { .. }),
+            "reinstalled/unchanged requires recipe schema version 2"
+        );
+    }
+    if matches!(
+        check.checkpoint,
+        Checkpoint::Interrupted | Checkpoint::Recovered
+    ) {
+        ensure!(
+            rules.schema_version >= 3,
+            "interruption checkpoints require recipe schema version 3"
         );
         ensure!(
-            profile.interrupted_rollback.is_none() || interrupted_rollback_declared,
-            "interrupted_rollback policy requires declared interrupted_rollback scenario"
+            rules.scenarios.is_some_and(|scenarios| scenarios
+                .iter()
+                .any(|scenario| { crate::model::checkpoint_applies(*scenario, check.checkpoint) })),
+            "interruption checkpoint requires a declared interrupted scenario"
         );
-        let downgrade_features = profile.downgrade.is_some()
-            || profile
-                .steps
-                .keys()
-                .any(|step| matches!(step, StepName::Downgrade | StepName::ExerciseDowngraded))
-            || profile.checks.iter().any(|check| {
-                matches!(
-                    check.checkpoint,
-                    Checkpoint::Downgraded | Checkpoint::DowngradeRejected
-                )
-            });
+    }
+    if check.checkpoint == Checkpoint::Reinstalled {
         ensure!(
-            !downgrade_features || recipe.schema_version >= 4,
-            "downgrade requires recipe schema version 4"
+            rules
+                .scenarios
+                .is_some_and(|scenarios| scenarios.contains(&ScenarioKind::Reinstall)),
+            "reinstalled requires a recipe that must declare reinstall"
         );
+    }
+    if matches!(check.expectation, Expectation::Unchanged { .. }) {
         ensure!(
-            !downgrade_features || downgrade_declared,
-            "downgrade features require declared downgrade scenario"
+            matches!(
+                check.checkpoint,
+                Checkpoint::Reinstalled
+                    | Checkpoint::Interrupted
+                    | Checkpoint::Recovered
+                    | Checkpoint::Downgraded
+                    | Checkpoint::DowngradeRejected
+                    | Checkpoint::RolledBack
+            ),
+            "unchanged requires checkpoint reinstalled, interrupted, recovered, downgraded or downgrade_rejected"
         );
-        if recipe.schema_version == 1 {
+    }
+    Ok(())
+}
+
+fn validate_check_expectation(rules: &RecipeRules<'_>, check: &mut Check) -> Result<()> {
+    match &mut check.expectation {
+        Expectation::McpStdio { probe } => {
             ensure!(
-                !profile.steps.contains_key(&StepName::Reinstall),
-                "reinstall requires recipe schema version 2"
+                rules.schema_version >= 8,
+                "mcp_stdio requires recipe schema version 8"
             );
+            probe.validate()?;
         }
-        for (step, command) in &profile.steps {
-            if matches!(
-                step,
-                StepName::InterruptInstall
-                    | StepName::RecoverInstall
-                    | StepName::InterruptUpgrade
-                    | StepName::RecoverUpgrade
-            ) {
-                ensure!(
-                    recipe.schema_version >= 3,
-                    "interruption steps require recipe schema version 3"
-                );
-            }
-            if matches!(
-                step,
-                StepName::InterruptInstall | StepName::InterruptUpgrade
-            ) {
-                ensure!(
-                    !command.env.contains_key("THESEUS_INTERRUPT_BARRIER")
-                        && !command
-                            .pass_env
-                            .iter()
-                            .any(|name| name == "THESEUS_INTERRUPT_BARRIER"),
-                    "THESEUS_INTERRUPT_BARRIER is reserved for interruption"
-                );
-            }
-        }
-        let mut ids = BTreeSet::new();
-        for command in profile.steps.values() {
-            validate_command(
-                &command.script,
-                command.timeout_seconds,
-                &command.env,
-                &command.pass_env,
-            )?;
-        }
-        for check in &mut profile.checks {
+        Expectation::JsonCommand {
+            script,
+            timeout_seconds,
+            env,
+            pass_env,
+            expected_exit,
+            max_stdout_bytes,
+            assertions,
+        } => {
             ensure!(
-                !check.id.trim().is_empty() && ids.insert(check.id.clone()),
-                "duplicate/empty check ID in {name}: {}",
+                rules.schema_version >= 7,
+                "json_command requires recipe schema version 7"
+            );
+            validate_command(script, *timeout_seconds, env, pass_env)?;
+            validate_exit(*expected_exit)?;
+            super::validate_json_assertions(assertions, *max_stdout_bytes)?;
+        }
+        Expectation::Command {
+            script,
+            timeout_seconds,
+            env,
+            pass_env,
+            expected_exit,
+            ..
+        } => {
+            validate_command(script, *timeout_seconds, env, pass_env)?;
+            validate_exit(*expected_exit)?;
+        }
+        Expectation::Executable {
+            name,
+            resolved_path,
+            args,
+            timeout_seconds,
+            env,
+            pass_env,
+            expected_exit,
+            ..
+        } => {
+            ensure!(
+                !name.is_empty()
+                    && !name.contains('/')
+                    && !name.contains('\0')
+                    && !name.chars().any(char::is_whitespace),
+                "executable name must be a single command name"
+            );
+            *resolved_path = normalize_container_path(resolved_path)?;
+            ensure!(
+                !args.iter().any(|arg| arg.contains('\0')),
+                "executable argument contains NUL"
+            );
+            validate_command("executable", *timeout_seconds, env, pass_env)?;
+            validate_exit(*expected_exit)?;
+        }
+        Expectation::Absent { path }
+        | Expectation::Present { path, .. }
+        | Expectation::Preserved { path }
+        | Expectation::Unchanged { path }
+        | Expectation::Changed { path } => {
+            *path = normalize_container_path(path)?;
+            ensure!(
+                rules.observe.iter().any(|root| contained(path, root)),
+                "check {} is outside observed roots",
                 check.id
             );
-            if recipe.schema_version == 1 {
-                ensure!(
-                    check.checkpoint != Checkpoint::Reinstalled
-                        && !matches!(check.expectation, Expectation::Unchanged { .. }),
-                    "reinstalled/unchanged requires recipe schema version 2"
-                );
-            }
-            if matches!(
+        }
+    }
+    if matches!(check.expectation, Expectation::Preserved { .. }) {
+        ensure!(
+            matches!(
                 check.checkpoint,
-                Checkpoint::Interrupted | Checkpoint::Recovered
-            ) {
-                ensure!(
-                    recipe.schema_version >= 3,
-                    "interruption checkpoints require recipe schema version 3"
-                );
-                ensure!(
-                    recipe
-                        .scenarios
-                        .as_ref()
-                        .is_some_and(|scenarios| scenarios.iter().any(|scenario| {
-                            crate::model::checkpoint_applies(*scenario, check.checkpoint)
-                        })),
-                    "interruption checkpoint requires a declared interrupted scenario"
-                );
-            }
-            if check.checkpoint == Checkpoint::Reinstalled {
-                ensure!(
-                    recipe
-                        .scenarios
-                        .as_ref()
-                        .is_some_and(|scenarios| scenarios.contains(&ScenarioKind::Reinstall)),
-                    "reinstalled requires a recipe that must declare reinstall"
-                );
-            }
-            if matches!(check.expectation, Expectation::Unchanged { .. }) {
-                ensure!(
-                    matches!(
-                        check.checkpoint,
-                        Checkpoint::Reinstalled
-                            | Checkpoint::Interrupted
-                            | Checkpoint::Recovered
-                            | Checkpoint::Downgraded
-                            | Checkpoint::DowngradeRejected
-                            | Checkpoint::RolledBack
-                    ),
-                    "unchanged requires checkpoint reinstalled, interrupted, recovered, downgraded or downgrade_rejected"
-                );
-            }
-            match &mut check.expectation {
-                Expectation::McpStdio { probe } => {
-                    ensure!(
-                        recipe.schema_version >= 8,
-                        "mcp_stdio requires recipe schema version 8"
-                    );
-                    probe.validate()?;
-                }
-                Expectation::JsonCommand {
-                    script,
-                    timeout_seconds,
-                    env,
-                    pass_env,
-                    expected_exit,
-                    max_stdout_bytes,
-                    assertions,
-                } => {
-                    ensure!(
-                        recipe.schema_version >= 7,
-                        "json_command requires recipe schema version 7"
-                    );
-                    validate_command(script, *timeout_seconds, env, pass_env)?;
-                    validate_exit(*expected_exit)?;
-                    super::validate_json_assertions(assertions, *max_stdout_bytes)?;
-                }
-                Expectation::Command {
-                    script,
-                    timeout_seconds,
-                    env,
-                    pass_env,
-                    expected_exit,
-                    ..
-                } => {
-                    validate_command(script, *timeout_seconds, env, pass_env)?;
-                    validate_exit(*expected_exit)?;
-                }
-                Expectation::Executable {
-                    name,
-                    resolved_path,
-                    args,
-                    timeout_seconds,
-                    env,
-                    pass_env,
-                    expected_exit,
-                    ..
-                } => {
-                    ensure!(
-                        !name.is_empty()
-                            && !name.contains('/')
-                            && !name.contains('\0')
-                            && !name.chars().any(char::is_whitespace),
-                        "executable name must be a single command name"
-                    );
-                    *resolved_path = normalize_container_path(resolved_path)?;
-                    ensure!(
-                        !args.iter().any(|arg| arg.contains('\0')),
-                        "executable argument contains NUL"
-                    );
-                    validate_command("executable", *timeout_seconds, env, pass_env)?;
-                    validate_exit(*expected_exit)?;
-                }
-                Expectation::Absent { path }
-                | Expectation::Present { path, .. }
-                | Expectation::Preserved { path }
-                | Expectation::Unchanged { path }
-                | Expectation::Changed { path } => {
-                    *path = normalize_container_path(path)?;
-                    ensure!(
-                        recipe.observe.iter().any(|root| contained(path, root)),
-                        "check {} is outside observed roots",
-                        check.id
-                    );
-                }
-            }
-            if matches!(check.expectation, Expectation::Preserved { .. }) {
-                ensure!(
-                    matches!(
-                        check.checkpoint,
-                        Checkpoint::TargetInstalled
-                            | Checkpoint::Uninstalled
-                            | Checkpoint::Reinstalled
-                            | Checkpoint::Interrupted
-                            | Checkpoint::Recovered
-                            | Checkpoint::Downgraded
-                            | Checkpoint::DowngradeRejected
-                    ),
-                    "preserved requires a checkpoint after configuration"
-                );
-            }
-        }
+                Checkpoint::TargetInstalled
+                    | Checkpoint::Uninstalled
+                    | Checkpoint::Reinstalled
+                    | Checkpoint::Interrupted
+                    | Checkpoint::Recovered
+                    | Checkpoint::Downgraded
+                    | Checkpoint::DowngradeRejected
+            ),
+            "preserved requires a checkpoint after configuration"
+        );
     }
-    for profile in recipe.profiles.values() {
-        if rollback_declared {
-            super::rollback::validate_profile(
-                profile,
-                &recipe.observe,
-                recipe.scenarios.as_deref().unwrap_or_default(),
-            )?;
-        }
-        if interrupted_rollback_declared {
-            super::interrupted_rollback::validate_profile(
-                profile,
-                &recipe.observe,
-                recipe.scenarios.as_deref().unwrap_or_default(),
-            )?;
-        }
-        if profile.downgrade.is_some() {
-            super::downgrade::validate_profile(profile)?;
-        }
-    }
-    let target_artifact = resolve_artifact(&project_root, &recipe.artifacts.target)?;
-    let base_artifact = recipe
-        .artifacts
-        .base
-        .as_ref()
-        .map(|p| resolve_artifact(&project_root, p))
-        .transpose()?;
-    Ok(ValidatedRecipe {
-        recipe,
-        path: path.to_path_buf(),
-        project_root,
-        base_artifact,
-        target_artifact,
-        digest: format!("{:x}", Sha256::digest(bytes)),
-    })
+    Ok(())
 }
 fn validate_exit(status: i32) -> Result<()> {
     ensure!(
