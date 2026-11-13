@@ -251,13 +251,6 @@ fn operation() -> Result<v2::OperationId> {
     Ok(v2::OperationId::from_bytes(*nonce()?.as_bytes()))
 }
 impl<'a, 'b, 's> DesktopDriver<'a, 'b, 's> {
-    pub fn new(
-        core: &'a mut NativeDriver<'b, 's>,
-        recipe: &ValidatedIntegrationRecipe,
-        header: broker::IntegrationBrokerHeader,
-    ) -> Result<Self> {
-        Self::new_for_scenario(core, recipe, header, ScenarioKind::Clean)
-    }
     pub(crate) fn new_for_scenario(
         core: &'a mut NativeDriver<'b, 's>,
         recipe: &ValidatedIntegrationRecipe,

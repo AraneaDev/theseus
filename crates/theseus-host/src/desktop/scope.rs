@@ -127,6 +127,7 @@ impl DedicatedBrokerScope {
         self.joined = false;
         Ok(())
     }
+    #[cfg(test)]
     pub fn reaped_descendants(&self) -> u64 {
         self.reaped_descendants
     }
