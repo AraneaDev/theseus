@@ -19,7 +19,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::Instant,
 };
 /// Validate the supplied native broker session before acquiring a broker lease.
 /// This is the same read-only native session check used before activation.
@@ -429,18 +429,6 @@ impl NativeActivation {
         self.last_snapshot = snapshot;
         Ok(self.effect())
     }
-    pub fn probe_ready(
-        &mut self,
-        deadline: Instant,
-        cancel: &AtomicBool,
-    ) -> io::Result<ReadinessObservation> {
-        loop {
-            if let Some(observed) = self.poll_ready(deadline, cancel)? {
-                return Ok(observed);
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-    }
     pub fn poll_ready(
         &mut self,
         deadline: Instant,
@@ -448,19 +436,6 @@ impl NativeActivation {
     ) -> io::Result<Option<ReadinessObservation>> {
         let result = self.probe(false, deadline, cancel);
         self.retain_result(result)
-    }
-    /// Cooperative original-object IPC only; no native terminate or PID control.
-    pub fn request_close(
-        &mut self,
-        deadline: Instant,
-        cancel: &AtomicBool,
-    ) -> io::Result<ReadinessObservation> {
-        loop {
-            if let Some(observed) = self.poll_request_close(deadline, cancel)? {
-                return Ok(observed);
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
     }
     pub fn poll_request_close(
         &mut self,
