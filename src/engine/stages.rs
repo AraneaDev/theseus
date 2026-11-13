@@ -577,74 +577,7 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
         let command_start = stage.commands.len();
         let mut command_expectation = None;
         let mut result = match &check.expectation {
-            Expectation::McpStdio { probe } => {
-                let spec = CommandSpec {
-                    script: String::new(),
-                    timeout_seconds: probe.timeout_seconds,
-                    env: probe.env.clone(),
-                    pass_env: vec![],
-                };
-                let request = self.request(
-                    state,
-                    format!("check:{}", check.id),
-                    &spec,
-                    ExecutionIdentity::runtime(),
-                    probe.argv.clone(),
-                    0,
-                );
-                let observed = match self.environment.probe_mcp(
-                    &state.resource,
-                    request.clone(),
-                    probe.clone(),
-                    self.store,
-                    self.cancel,
-                ) {
-                    Ok(observed) => observed,
-                    Err(error) => {
-                        self.cleanup.retain(&error);
-                        state.availability = Availability::Unavailable;
-                        let mut record = CommandRecord::new(request.id, request.phase);
-                        record.identity = request.identity;
-                        record.argv = request.argv;
-                        record.environment = record.identity.public_environment();
-                        record.environment.extend(request.env);
-                        record.error = Some(format!("{error:#}"));
-                        record.cancelled = self.cancel.is_cancelled();
-                        record.outcome = if record.cancelled {
-                            CommandOutcome::Cancelled
-                        } else {
-                            CommandOutcome::Error
-                        };
-                        if let Err(error) = self.environment.stop(&state.resource) {
-                            self.cleanup.retain(&error);
-                            stage
-                                .errors
-                                .push(format!("stop after MCP infrastructure error: {error:#}"));
-                        }
-                        crate::runner::ExecutedMcp {
-                            command: ExecutedCommand {
-                                record,
-                                stdout: String::new(),
-                                stdout_complete: false,
-                                stdout_utf8: false,
-                            },
-                            evidence: crate::mcp::McpSession::new(probe.clone())
-                                .expect("validated probe")
-                                .finish(crate::mcp::McpShutdown::Unverified),
-                            container_available: false,
-                        }
-                    }
-                };
-                if !observed.container_available {
-                    state.availability = Availability::Unavailable;
-                }
-                if observed.command.record.cancelled {
-                    self.cancel.cancel();
-                    self.report.cancelled = true;
-                }
-                stage.commands.push(observed.command.record.clone());
-                checks::evaluate_mcp(check, &observed)
-            }
+            Expectation::McpStdio { probe } => self.check_mcp(state, check, probe, stage),
             Expectation::JsonCommand {
                 script,
                 timeout_seconds,
@@ -709,154 +642,11 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
                 command_expectation = self.command_expectation(check, &executed);
                 checks::evaluate_command(check, &observed(&executed))
             }
-            Expectation::Executable {
-                name,
-                args,
-                timeout_seconds,
-                env,
-                pass_env,
-                expected_exit,
-                ..
-            } => {
-                let spec = CommandSpec {
-                    script: String::new(),
-                    timeout_seconds: *timeout_seconds,
-                    env: env.clone(),
-                    pass_env: pass_env.clone(),
-                };
-                let request = self.request(
-                    state,
-                    format!("resolve:{}", check.id),
-                    &spec,
-                    ExecutionIdentity::runtime(),
-                    vec![
-                        "/bin/sh".into(),
-                        "-c".into(),
-                        "command -v \"$1\"".into(),
-                        "theseus-resolve".into(),
-                        name.clone(),
-                    ],
-                    0,
-                );
-                let resolution = self.execute(state, request, stage);
-                let resolved = resolution.stdout.trim().to_string();
-                if state.availability != Availability::Running
-                    || resolution.record.error.is_some()
-                    || !resolution.stdout_complete
-                    || !resolved.starts_with('/')
-                    || resolved.contains('\n')
-                    || resolution.record.exit_status != Some(0)
-                {
-                    checks::evaluate_executable(check, None, &observed(&resolution))
-                } else {
-                    let mut argv = vec![resolved.clone()];
-                    argv.extend(args.iter().cloned());
-                    let request = self.request(
-                        state,
-                        format!("check:{}", check.id),
-                        &spec,
-                        ExecutionIdentity::runtime(),
-                        argv,
-                        *expected_exit,
-                    );
-                    let executed = self.execute(state, request, stage);
-                    command_expectation = self.command_expectation(check, &executed);
-                    checks::evaluate_executable(check, Some(&resolved), &observed(&executed))
-                }
+            Expectation::Executable { .. } => {
+                self.check_executable(state, check, stage, &mut command_expectation)
             }
-            Expectation::Unchanged { path } => {
-                let mut stability = checks::compare_unchanged(
-                    path,
-                    match check.checkpoint {
-                        Checkpoint::Reinstalled => state.before_reinstall.as_deref(),
-                        Checkpoint::RolledBack => state.before_upgrade.as_deref(),
-                        Checkpoint::Interrupted | Checkpoint::Recovered => {
-                            state.before_interrupt.as_deref()
-                        }
-                        Checkpoint::Downgraded | Checkpoint::DowngradeRejected => {
-                            state.before_downgrade.as_deref()
-                        }
-                        _ => None,
-                    }
-                    .unwrap_or_default(),
-                    &stage.snapshots,
-                );
-                if check.checkpoint == Checkpoint::DowngradeRejected
-                    && stability.outcome == CheckOutcome::Passed
-                    && matches!(&self.report.scenarios[self.index].downgrade,
-                        Some(crate::recipe::DowngradeContract::SafeRejection { binary_checks, .. }) if binary_checks.contains(&check.id))
-                    && state.before_downgrade.as_ref().is_some_and(|snapshots| {
-                        snapshots.iter().any(|snapshot| {
-                            snapshot
-                                .entries
-                                .get(path)
-                                .is_some_and(|entry| entry.kind == FileKind::Directory)
-                        })
-                    })
-                {
-                    stability.outcome = CheckOutcome::Failed;
-                    stability.message =
-                        "binary scope must be a file or symlink before downgrade".into();
-                }
-                if check.checkpoint == Checkpoint::RolledBack
-                    && self.report.scenarios[self.index]
-                        .rollback_recovery()
-                        .is_some_and(|p| p.binary_checks.contains(&check.id))
-                    && state.before_upgrade.as_ref().is_some_and(|snapshots| {
-                        snapshots.iter().any(|s| {
-                            s.entries.get(path).is_some_and(|e| {
-                                !matches!(e.kind, FileKind::File | FileKind::Symlink)
-                            })
-                        })
-                    })
-                {
-                    stability.outcome = CheckOutcome::Failed;
-                    stability.message =
-                        "binary scope must be a file or symlink before upgrade".into();
-                }
-                CheckResult {
-                    mcp_required: matches!(check.expectation, Expectation::McpStdio { .. }),
-                    mcp: None,
-                    json_expectation: None,
-                    json_required: matches!(check.expectation, Expectation::JsonCommand { .. }),
-                    command_expectation: None,
-                    id: check.id.clone(),
-                    checkpoint: check.checkpoint,
-                    outcome: stability.outcome,
-                    message: stability.message,
-                    path: Some(path.clone()),
-                    command_ids: vec![],
-                    backup: None,
-                    comparison: None,
-                }
-            }
-            Expectation::Changed { path } => {
-                let r = checks::compare_changed(
-                    path,
-                    if check.checkpoint == Checkpoint::Interrupted {
-                        state.before_interrupt.as_deref()
-                    } else {
-                        state.before_attempt.as_deref()
-                    }
-                    .unwrap_or_default(),
-                    &stage.snapshots,
-                );
-                CheckResult {
-                    mcp_required: matches!(check.expectation, Expectation::McpStdio { .. }),
-                    mcp: None,
-                    json_expectation: None,
-                    json_required: matches!(check.expectation, Expectation::JsonCommand { .. }),
-                    command_expectation: None,
-                    id: check.id.clone(),
-                    checkpoint: check.checkpoint,
-                    outcome: r.outcome,
-                    message: r.message,
-                    path: Some(path.clone()),
-                    command_ids: vec![],
-                    backup: None,
-                    comparison: None,
-                }
-            }
+            Expectation::Unchanged { path } => self.check_unchanged(state, check, path, stage),
+            Expectation::Changed { path } => check_changed(state, check, path, stage),
             _ => checks::evaluate_filesystem(check, &stage.snapshots, state.configured.as_deref()),
         };
         result.command_expectation = command_expectation;
@@ -865,6 +655,242 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
             .map(|c| c.id.clone())
             .collect();
         result
+    }
+    fn check_mcp(
+        &mut self,
+        state: &mut State,
+        check: &Check,
+        probe: &crate::mcp::McpProbe,
+        stage: &mut StageReport,
+    ) -> CheckResult {
+        let spec = CommandSpec {
+            script: String::new(),
+            timeout_seconds: probe.timeout_seconds,
+            env: probe.env.clone(),
+            pass_env: vec![],
+        };
+        let request = self.request(
+            state,
+            format!("check:{}", check.id),
+            &spec,
+            ExecutionIdentity::runtime(),
+            probe.argv.clone(),
+            0,
+        );
+        let observed = match self.environment.probe_mcp(
+            &state.resource,
+            request.clone(),
+            probe.clone(),
+            self.store,
+            self.cancel,
+        ) {
+            Ok(observed) => observed,
+            Err(error) => {
+                self.cleanup.retain(&error);
+                state.availability = Availability::Unavailable;
+                let mut record = CommandRecord::new(request.id, request.phase);
+                record.identity = request.identity;
+                record.argv = request.argv;
+                record.environment = record.identity.public_environment();
+                record.environment.extend(request.env);
+                record.error = Some(format!("{error:#}"));
+                record.cancelled = self.cancel.is_cancelled();
+                record.outcome = if record.cancelled {
+                    CommandOutcome::Cancelled
+                } else {
+                    CommandOutcome::Error
+                };
+                if let Err(error) = self.environment.stop(&state.resource) {
+                    self.cleanup.retain(&error);
+                    stage
+                        .errors
+                        .push(format!("stop after MCP infrastructure error: {error:#}"));
+                }
+                crate::runner::ExecutedMcp {
+                    command: ExecutedCommand {
+                        record,
+                        stdout: String::new(),
+                        stdout_complete: false,
+                        stdout_utf8: false,
+                    },
+                    evidence: crate::mcp::McpSession::new(probe.clone())
+                        .expect("validated probe")
+                        .finish(crate::mcp::McpShutdown::Unverified),
+                    container_available: false,
+                }
+            }
+        };
+        if !observed.container_available {
+            state.availability = Availability::Unavailable;
+        }
+        if observed.command.record.cancelled {
+            self.cancel.cancel();
+            self.report.cancelled = true;
+        }
+        stage.commands.push(observed.command.record.clone());
+        checks::evaluate_mcp(check, &observed)
+    }
+    fn check_executable(
+        &mut self,
+        state: &mut State,
+        check: &Check,
+        stage: &mut StageReport,
+        command_expectation: &mut Option<CommandExpectationEvidence>,
+    ) -> CheckResult {
+        let Expectation::Executable {
+            name,
+            args,
+            timeout_seconds,
+            env,
+            pass_env,
+            expected_exit,
+            ..
+        } = &check.expectation
+        else {
+            unreachable!("check_executable requires an executable expectation")
+        };
+        let spec = CommandSpec {
+            script: String::new(),
+            timeout_seconds: *timeout_seconds,
+            env: env.clone(),
+            pass_env: pass_env.clone(),
+        };
+        let request = self.request(
+            state,
+            format!("resolve:{}", check.id),
+            &spec,
+            ExecutionIdentity::runtime(),
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "command -v \"$1\"".into(),
+                "theseus-resolve".into(),
+                name.clone(),
+            ],
+            0,
+        );
+        let resolution = self.execute(state, request, stage);
+        let resolved = resolution.stdout.trim().to_string();
+        if state.availability != Availability::Running
+            || resolution.record.error.is_some()
+            || !resolution.stdout_complete
+            || !resolved.starts_with('/')
+            || resolved.contains('\n')
+            || resolution.record.exit_status != Some(0)
+        {
+            checks::evaluate_executable(check, None, &observed(&resolution))
+        } else {
+            let mut argv = vec![resolved.clone()];
+            argv.extend(args.iter().cloned());
+            let request = self.request(
+                state,
+                format!("check:{}", check.id),
+                &spec,
+                ExecutionIdentity::runtime(),
+                argv,
+                *expected_exit,
+            );
+            let executed = self.execute(state, request, stage);
+            *command_expectation = self.command_expectation(check, &executed);
+            checks::evaluate_executable(check, Some(&resolved), &observed(&executed))
+        }
+    }
+    fn check_unchanged(
+        &self,
+        state: &State,
+        check: &Check,
+        path: &str,
+        stage: &StageReport,
+    ) -> CheckResult {
+        let mut stability = checks::compare_unchanged(
+            path,
+            match check.checkpoint {
+                Checkpoint::Reinstalled => state.before_reinstall.as_deref(),
+                Checkpoint::RolledBack => state.before_upgrade.as_deref(),
+                Checkpoint::Interrupted | Checkpoint::Recovered => {
+                    state.before_interrupt.as_deref()
+                }
+                Checkpoint::Downgraded | Checkpoint::DowngradeRejected => {
+                    state.before_downgrade.as_deref()
+                }
+                _ => None,
+            }
+            .unwrap_or_default(),
+            &stage.snapshots,
+        );
+        if check.checkpoint == Checkpoint::DowngradeRejected
+            && stability.outcome == CheckOutcome::Passed
+            && matches!(&self.report.scenarios[self.index].downgrade,
+                Some(crate::recipe::DowngradeContract::SafeRejection { binary_checks, .. }) if binary_checks.contains(&check.id))
+            && state.before_downgrade.as_ref().is_some_and(|snapshots| {
+                snapshots.iter().any(|snapshot| {
+                    snapshot
+                        .entries
+                        .get(path)
+                        .is_some_and(|entry| entry.kind == FileKind::Directory)
+                })
+            })
+        {
+            stability.outcome = CheckOutcome::Failed;
+            stability.message = "binary scope must be a file or symlink before downgrade".into();
+        }
+        if check.checkpoint == Checkpoint::RolledBack
+            && self.report.scenarios[self.index]
+                .rollback_recovery()
+                .is_some_and(|p| p.binary_checks.contains(&check.id))
+            && state.before_upgrade.as_ref().is_some_and(|snapshots| {
+                snapshots.iter().any(|s| {
+                    s.entries
+                        .get(path)
+                        .is_some_and(|e| !matches!(e.kind, FileKind::File | FileKind::Symlink))
+                })
+            })
+        {
+            stability.outcome = CheckOutcome::Failed;
+            stability.message = "binary scope must be a file or symlink before upgrade".into();
+        }
+        CheckResult {
+            mcp_required: matches!(check.expectation, Expectation::McpStdio { .. }),
+            mcp: None,
+            json_expectation: None,
+            json_required: matches!(check.expectation, Expectation::JsonCommand { .. }),
+            command_expectation: None,
+            id: check.id.clone(),
+            checkpoint: check.checkpoint,
+            outcome: stability.outcome,
+            message: stability.message,
+            path: Some(path.to_owned()),
+            command_ids: vec![],
+            backup: None,
+            comparison: None,
+        }
+    }
+}
+fn check_changed(state: &State, check: &Check, path: &str, stage: &StageReport) -> CheckResult {
+    let r = checks::compare_changed(
+        path,
+        if check.checkpoint == Checkpoint::Interrupted {
+            state.before_interrupt.as_deref()
+        } else {
+            state.before_attempt.as_deref()
+        }
+        .unwrap_or_default(),
+        &stage.snapshots,
+    );
+    CheckResult {
+        mcp_required: matches!(check.expectation, Expectation::McpStdio { .. }),
+        mcp: None,
+        json_expectation: None,
+        json_required: matches!(check.expectation, Expectation::JsonCommand { .. }),
+        command_expectation: None,
+        id: check.id.clone(),
+        checkpoint: check.checkpoint,
+        outcome: r.outcome,
+        message: r.message,
+        path: Some(path.to_owned()),
+        command_ids: vec![],
+        backup: None,
+        comparison: None,
     }
 }
 pub(super) fn observed(executed: &ExecutedCommand) -> CommandObservation {
