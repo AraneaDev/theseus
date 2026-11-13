@@ -121,8 +121,6 @@ pub struct ActivationProgress {
     effect: ActivationEffect,
     callback_pending: bool,
     original_instance: bool,
-    authenticated: bool,
-    ready: bool,
     terminated: bool,
 }
 impl ActivationProgress {
@@ -131,8 +129,6 @@ impl ActivationProgress {
             effect: ActivationEffect::Pending,
             callback_pending: true,
             original_instance: false,
-            authenticated: false,
-            ready: false,
             terminated: false,
         }
     }
@@ -164,20 +160,11 @@ impl ActivationProgress {
             ));
         }
         if matches_original {
-            self.authenticated = true;
-            self.ready = true;
             self.effect = ActivationEffect::Acknowledged;
         } else {
-            self.authenticated = false;
             self.effect = ActivationEffect::Unknown;
         }
         Ok(())
-    }
-    pub fn application_ready(&self) -> bool {
-        self.authenticated && self.ready && !self.terminated
-    }
-    pub fn observe_application_ready(&mut self, ready: bool) {
-        self.ready = ready && self.authenticated;
     }
     pub fn descendants_owned(&self) -> bool {
         false
@@ -186,7 +173,6 @@ impl ActivationProgress {
     pub fn mark_deadline_or_cancel(&mut self) {}
     pub fn mark_native_uncertain(&mut self) {
         self.effect = ActivationEffect::Unknown;
-        self.ready = false;
     }
     #[cfg(test)]
     pub fn callback_pending(&self) -> bool {

@@ -101,11 +101,9 @@ fn native_manager_receipt_needs_original_channel_and_never_owns_descendants() {
         .callback(CallbackResult::OriginalManagerInstance)
         .unwrap();
     assert_eq!(state.effect(), ActivationEffect::Unavailable);
-    assert!(!state.application_ready());
     assert!(!state.descendants_owned());
     state.authenticate_instance(false).unwrap();
     assert_eq!(state.effect(), ActivationEffect::Unknown);
-    assert!(!state.application_ready());
 
     let mut state = ActivationProgress::pending();
     state.mark_deadline_or_cancel();
@@ -115,7 +113,6 @@ fn native_manager_receipt_needs_original_channel_and_never_owns_descendants() {
         .unwrap();
     state.authenticate_instance(true).unwrap();
     assert_eq!(state.effect(), ActivationEffect::Acknowledged);
-    assert!(state.application_ready());
     state.manager_terminated();
     assert!(state.manager_instance_terminated());
     assert!(!state.descendants_owned());
@@ -209,7 +206,6 @@ fn failed_or_ambiguous_native_callback_never_becomes_fresh_instance() {
         assert!(state.authenticate_instance(true).is_err());
         state.callback(result).unwrap();
         assert!(!state.callback_pending());
-        assert!(!state.application_ready());
         assert!(state.authenticate_instance(true).is_err());
         assert!(!state.descendants_owned());
     }
@@ -222,9 +218,7 @@ fn failed_application_facts_preserve_authenticated_original_activation() {
         .callback(CallbackResult::OriginalManagerInstance)
         .unwrap();
     state.authenticate_instance(true).unwrap();
-    state.observe_application_ready(false);
     assert_eq!(state.effect(), ActivationEffect::Acknowledged);
-    assert!(!state.application_ready());
     assert!(!state.descendants_owned());
 }
 
