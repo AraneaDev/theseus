@@ -29,6 +29,68 @@ fn capacity(l: usize, n: usize, unfinished: bool, closed: bool) -> Result<usize,
         .ok_or(LedgerError::Capacity)?;
     Ok(next)
 }
+fn header_identity(entry: &Entry) -> Result<(BindingId, Digest, Os), LedgerError> {
+    Ok(match entry {
+        Entry::IntegrationBrokerHeader { header } => {
+            header.validate().map_err(|_| LedgerError::InvalidRecord)?;
+            (
+                BindingId::parse(&header.binding).map_err(|_| LedgerError::InvalidRecord)?,
+                Digest::parse(&header.manifest_digest).map_err(|_| LedgerError::InvalidRecord)?,
+                match header.os.as_str() {
+                    "linux" => Os::Linux,
+                    "macos" => Os::Macos,
+                    "windows" => Os::Windows,
+                    _ => return Err(LedgerError::InvalidRecord),
+                },
+            )
+        }
+        Entry::Header {
+            binding,
+            manifest_digest,
+            os,
+            ..
+        }
+        | Entry::IntegrationHeader {
+            binding,
+            manifest_digest,
+            os,
+            ..
+        }
+        | Entry::NativeHeader {
+            binding,
+            manifest_digest,
+            os,
+            ..
+        } => (*binding, *manifest_digest, *os),
+        _ => return Err(LedgerError::InvalidTransition),
+    })
+}
+/// The record index a `LeaseReserved` must occupy, and whether the ledger
+/// declares a Linux GIO qualification that must be present.
+fn expected_lease_position(records: &[Record]) -> (usize, bool) {
+    match records[0].entry() {
+        Entry::IntegrationBrokerHeader { header } => (
+            if header.linux_gio_qualification.is_some() {
+                2
+            } else {
+                1
+            },
+            header.linux_gio_qualification.is_some(),
+        ),
+        Entry::IntegrationHeader { .. } => match records.get(1).map(Record::entry) {
+            Some(Entry::DesktopAuthorityDeclared { context, .. }) => (
+                if context.linux_gio_qualification.is_some() {
+                    3
+                } else {
+                    2
+                },
+                context.linux_gio_qualification.is_some(),
+            ),
+            _ => (1, false),
+        },
+        _ => (1, false),
+    }
+}
 impl LedgerView {
     pub fn replay(records: &[Record]) -> Result<Self, LedgerError> {
         if records.is_empty() {
@@ -37,41 +99,7 @@ impl LedgerView {
         if records.len() > MAX_RECORDS {
             return Err(LedgerError::Capacity);
         }
-        let (binding, manifest_digest, os) = match records[0].entry() {
-            Entry::IntegrationBrokerHeader { header } => {
-                header.validate().map_err(|_| LedgerError::InvalidRecord)?;
-                (
-                    BindingId::parse(&header.binding).map_err(|_| LedgerError::InvalidRecord)?,
-                    Digest::parse(&header.manifest_digest)
-                        .map_err(|_| LedgerError::InvalidRecord)?,
-                    match header.os.as_str() {
-                        "linux" => Os::Linux,
-                        "macos" => Os::Macos,
-                        "windows" => Os::Windows,
-                        _ => return Err(LedgerError::InvalidRecord),
-                    },
-                )
-            }
-            Entry::Header {
-                binding,
-                manifest_digest,
-                os,
-                ..
-            }
-            | Entry::IntegrationHeader {
-                binding,
-                manifest_digest,
-                os,
-                ..
-            }
-            | Entry::NativeHeader {
-                binding,
-                manifest_digest,
-                os,
-                ..
-            } => (*binding, *manifest_digest, *os),
-            _ => return Err(LedgerError::InvalidTransition),
-        };
+        let (binding, manifest_digest, os) = header_identity(records[0].entry())?;
         let mut v = Self {
             binding,
             manifest: manifest_digest,
@@ -129,30 +157,7 @@ impl LedgerView {
                     v.authority_failure = Some(*reason);
                 }
                 Entry::LeaseReserved { intent, lease } => {
-                    let (expected, qualified) = match records[0].entry() {
-                        Entry::IntegrationBrokerHeader { header } => (
-                            if header.linux_gio_qualification.is_some() {
-                                2
-                            } else {
-                                1
-                            },
-                            header.linux_gio_qualification.is_some(),
-                        ),
-                        Entry::IntegrationHeader { .. } => {
-                            match records.get(1).map(Record::entry) {
-                                Some(Entry::DesktopAuthorityDeclared { context, .. }) => (
-                                    if context.linux_gio_qualification.is_some() {
-                                        3
-                                    } else {
-                                        2
-                                    },
-                                    context.linux_gio_qualification.is_some(),
-                                ),
-                                _ => (1, false),
-                            }
-                        }
-                        _ => (1, false),
-                    };
+                    let (expected, qualified) = expected_lease_position(records);
                     if i != expected
                         || v.lease.is_some()
                         || (qualified
@@ -229,51 +234,7 @@ impl LedgerView {
                     active = None;
                 }
                 Entry::LeaseClosed { lease, disposition } => {
-                    v.check_lease(*lease)
-                        .map_err(|_| LedgerError::InvalidTransition)?;
-                    if matches!(records[0].entry(), Entry::IntegrationBrokerHeader { .. })
-                        && matches!(disposition, Disposition::AwaitingExternalReset)
-                    {
-                        let broker = crate::v2::broker::BrokerLedgerView::replay(&records[..i])?;
-                        if broker.requests().any(|request| {
-                            broker
-                                .query(request)
-                                .map_or(true, |state| !state.original_retired())
-                        }) {
-                            return Err(LedgerError::InvalidTransition);
-                        }
-                    }
-                    if matches!(records[0].entry(), Entry::IntegrationHeader { .. })
-                        && matches!(disposition, Disposition::AwaitingExternalReset)
-                    {
-                        let broker = crate::v2::broker::BrokerLedgerView::replay(&records[..i])?;
-                        if broker.binding_original().is_some() && !broker.helper_released() {
-                            return Err(LedgerError::InvalidTransition);
-                        }
-                    }
-                    if n > CLOSE_RESERVE {
-                        return Err(LedgerError::Capacity);
-                    }
-                    let (intent, _, state) =
-                        v.lease.as_mut().ok_or(LedgerError::InvalidTransition)?;
-                    *state = match disposition {
-                        Disposition::AwaitingExternalReset => {
-                            if active.is_some() {
-                                return Err(LedgerError::InvalidTransition);
-                            }
-                            LeaseView::AwaitingExternalReset { intent: *intent }
-                        }
-                        Disposition::Quarantined { reason } => {
-                            if let Some(a) = active {
-                                v.operations[a].view = OperationView::Unknown { reason: *reason }
-                            }
-                            LeaseView::Quarantined {
-                                intent: *intent,
-                                reason: *reason,
-                            }
-                        }
-                    };
-                    active = None;
+                    v.replay_lease_closed(records, i, n, lease, disposition, &mut active)?;
                     closed = true;
                 }
             }
@@ -302,6 +263,61 @@ impl LedgerView {
             };
         }
         Ok(v)
+    }
+    fn replay_lease_closed(
+        &mut self,
+        records: &[Record],
+        i: usize,
+        n: usize,
+        lease: &LeaseId,
+        disposition: &Disposition,
+        active: &mut Option<usize>,
+    ) -> Result<(), LedgerError> {
+        self.check_lease(*lease)
+            .map_err(|_| LedgerError::InvalidTransition)?;
+        if matches!(records[0].entry(), Entry::IntegrationBrokerHeader { .. })
+            && matches!(disposition, Disposition::AwaitingExternalReset)
+        {
+            let broker = crate::v2::broker::BrokerLedgerView::replay(&records[..i])?;
+            if broker.requests().any(|request| {
+                broker
+                    .query(request)
+                    .map_or(true, |state| !state.original_retired())
+            }) {
+                return Err(LedgerError::InvalidTransition);
+            }
+        }
+        if matches!(records[0].entry(), Entry::IntegrationHeader { .. })
+            && matches!(disposition, Disposition::AwaitingExternalReset)
+        {
+            let broker = crate::v2::broker::BrokerLedgerView::replay(&records[..i])?;
+            if broker.binding_original().is_some() && !broker.helper_released() {
+                return Err(LedgerError::InvalidTransition);
+            }
+        }
+        if n > CLOSE_RESERVE {
+            return Err(LedgerError::Capacity);
+        }
+        let (intent, _, state) = self.lease.as_mut().ok_or(LedgerError::InvalidTransition)?;
+        *state = match disposition {
+            Disposition::AwaitingExternalReset => {
+                if active.is_some() {
+                    return Err(LedgerError::InvalidTransition);
+                }
+                LeaseView::AwaitingExternalReset { intent: *intent }
+            }
+            Disposition::Quarantined { reason } => {
+                if let Some(a) = *active {
+                    self.operations[a].view = OperationView::Unknown { reason: *reason }
+                }
+                LeaseView::Quarantined {
+                    intent: *intent,
+                    reason: *reason,
+                }
+            }
+        };
+        *active = None;
+        Ok(())
     }
     pub fn native_authority_failure(&self) -> Option<PrefixAuthorityFailure> {
         self.authority_failure
