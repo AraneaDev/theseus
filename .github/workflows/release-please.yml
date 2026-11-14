@@ -40,5 +40,12 @@ jobs:
         if: ${{ steps.release.outputs.release_created }}
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
         if: ${{ steps.release.outputs.release_created }}
+      # The library tests need the trusted native fixture; this stage builds it
+      # and exports THESEUS_HOST_TEST_FIXTURE through GITHUB_ENV.
+      - name: Build trusted native application fixture
+        if: ${{ steps.release.outputs.release_created }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/theseus-release-evidence"
+          python3 scripts/validate.py native --stage fixture --evidence "$RUNNER_TEMP/theseus-release-evidence"
       - run: cargo test --locked -p theseus --lib
         if: ${{ steps.release.outputs.release_created }}
