@@ -1,7 +1,7 @@
 //! Suite state and workbench rendering; lifecycle execution stays in the shared worker.
 use super::{
     App, safe_text,
-    theme::{self, Hint, REQUIRED, hint},
+    theme::{self, HELP_ONLY, Hint, REQUIRED, hint},
 };
 use crate::comparison::{
     ComparisonReport, LoadedComparison, SuiteManifest, SuiteRunOptions, ValidatedSuite,
@@ -207,7 +207,7 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
         spans.push(if app.active {
             Span::styled(
                 format!(" | {} running {clock}", super::render::spinner(elapsed)),
-                Style::default().fg(ratatui::style::Color::Cyan),
+                theme::tone(ratatui::style::Color::Cyan),
             )
         } else {
             Span::styled(format!(" | ran {clock}"), theme::dim())
@@ -468,40 +468,44 @@ fn suite_preview(app: &App, view: &ComparisonView) -> super::preview_doc::Doc {
     doc
 }
 /// Only keys that act in the current comparison mode and focus.
-fn hints(app: &App, view: &ComparisonView) -> Vec<Hint> {
+pub(super) fn hints(app: &App, view: &ComparisonView) -> Vec<Hint> {
+    use theme::Group::*;
     if super::preview_edit::dirty(app) {
-        return vec![
-            hint("e", "edit", REQUIRED),
-            hint("d", "discard", REQUIRED),
-            hint("q", "discard/quit", REQUIRED),
-            hint("r/p/s", "disabled until Save Copy or discard", 1),
-        ];
+        return super::render::draft_hints();
     }
     if app.editing_filter {
         return vec![];
     }
     let mut hints = Vec::new();
     if view.report.is_some() {
-        hints.push(hint("Tab", "cells/evidence", REQUIRED));
-        hints.push(hint("↑↓", "select", 2));
-        hints.push(hint("Home/End", "first/last", 5));
-        if view.evidence_focus && app.viewport.borrow().has_chunks() {
-            hints.push(hint("[ ]", "chunks", 2));
-        }
-        hints.push(hint("PgUp/Dn", "scroll", 4));
-        hints.push(hint("/", "filter", 3));
+        hints.push(hint(Navigate, "Tab", "cells/evidence", REQUIRED));
+        hints.push(hint(Navigate, "↑↓", "select", 2));
+        hints.push(hint(Navigate, "j/k", "select", HELP_ONLY));
+        hints.push(hint(Navigate, "Home/End", "first/last", 5));
+        let chunks = view.evidence_focus && app.viewport.borrow().has_chunks();
+        hints.push(hint(
+            Evidence,
+            "[ ]",
+            if chunks {
+                "chunks"
+            } else {
+                "previous/next chunk"
+            },
+            if chunks { 2 } else { HELP_ONLY },
+        ));
+        hints.push(hint(Evidence, "PgUp/Dn", "scroll", 4));
+        hints.push(hint(Evidence, "/", "filter", 3));
     } else if !app.has_started() {
         if view.suite.is_some() && !app.work_consumed {
-            hints.push(hint("r", "run", REQUIRED));
+            hints.push(hint(Run, "r", "run", REQUIRED));
         }
-        hints.push(hint("↑↓", "scroll", 3));
+        hints.push(hint(Navigate, "↑↓", "scroll", 3));
+        hints.push(hint(Navigate, "j/k", "scroll a line", HELP_ONLY));
+        hints.push(hint(Navigate, "PgUp/Dn", "scroll a page", HELP_ONLY));
         if super::preview_edit::eligible(app) {
-            hints.push(hint("e", "edit", 2));
+            super::render::editor_hints(&mut hints);
         }
     }
-    if app.active {
-        hints.push(hint("c", "cancel", REQUIRED));
-    }
-    hints.push(hint("q", "quit", REQUIRED));
+    super::render::common_hints(&mut hints, app);
     hints
 }

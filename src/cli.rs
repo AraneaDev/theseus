@@ -241,7 +241,7 @@ fn handle_report(
         engine::domain::StoredRun::Docker(report) => {
             if !json {
                 return crate::tui::run_with_options(
-                    crate::tui::App::offline(report, run_directory),
+                    crate::tui::App::open_saved(report, run_directory),
                     animation,
                 );
             }

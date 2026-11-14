@@ -1,7 +1,7 @@
 //! Native evidence has its own display domain; no Docker identity projection.
 use super::{
     App,
-    theme::{self, REQUIRED, hint},
+    theme::{self, Hint, REQUIRED, hint},
 };
 use crate::{
     model::RunOutcome,
@@ -15,7 +15,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout},
-    style::{Color, Modifier, Style},
+    style::{Color, Modifier},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Tabs, Wrap},
 };
@@ -259,6 +259,23 @@ impl NativeView {
         }
     }
 }
+/// Only keys that act now: selectors and records need a report, r is the
+/// single explicit start, c applies while running.
+pub(super) fn hints(app: &App, view: &NativeView) -> Vec<Hint> {
+    use theme::Group::*;
+    let mut hints = Vec::new();
+    if view.report.is_some() {
+        hints.push(hint(Navigate, "←→", "selector", REQUIRED));
+        hints.push(hint(Navigate, "↑↓", "record", 1));
+    }
+    hints.push(hint(Evidence, "n/p", "text page", 2));
+    hints.push(hint(Evidence, "PgUp/Dn", "scroll", 3));
+    if !app.active && !app.work_consumed && view.report.is_none() {
+        hints.push(hint(Run, "r", "run", REQUIRED));
+    }
+    super::render::common_hints(&mut hints, app);
+    hints
+}
 pub fn render(frame: &mut Frame, app: &App) -> bool {
     let Some(view) = &app.native else {
         return false;
@@ -267,7 +284,17 @@ pub fn render(frame: &mut Frame, app: &App) -> bool {
     let area = frame.area();
     // Header: outcome glyph once (or the preview notice), as in the run view.
     let mut header = match &outcome {
-        Some(outcome) => vec![Span::raw("Outcome: "), theme::status_word(outcome, true)],
+        // Glyph first, so the exact `Outcome: <word>` text stays intact for
+        // readers and for the real-manager acceptance checks that match it.
+        Some(outcome) => {
+            let (glyph, color) = theme::status(outcome);
+            let style = theme::tone(color).add_modifier(Modifier::BOLD);
+            vec![
+                Span::styled(format!("{glyph} "), style),
+                Span::raw("Outcome: "),
+                Span::styled(super::safe_text(outcome), style),
+            ]
+        }
         None => vec![Span::raw("Preview — no commands executed")],
     };
     if let Some(elapsed) = app.run_clock() {
@@ -275,28 +302,13 @@ pub fn render(frame: &mut Frame, app: &App) -> bool {
         header.push(if app.active {
             Span::styled(
                 format!("  │ {} running {clock}", super::render::spinner(elapsed)),
-                Style::default().fg(Color::Cyan),
+                theme::tone(Color::Cyan),
             )
         } else {
             Span::styled(format!("  │ ran {clock}"), theme::dim())
         });
     }
-    // Only keys that act now: selectors and records need a report, r is the
-    // single explicit start, c applies while running.
-    let mut hints = Vec::new();
-    if view.report.is_some() {
-        hints.push(hint("←→", "selector", REQUIRED));
-        hints.push(hint("↑↓", "record", 1));
-    }
-    hints.push(hint("n/p", "text page", 2));
-    hints.push(hint("PgUp/Dn", "scroll", 3));
-    if !app.active && !app.work_consumed && view.report.is_none() {
-        hints.push(hint("r", "run", REQUIRED));
-    }
-    if app.active {
-        hints.push(hint("c", "cancel", REQUIRED));
-    }
-    hints.push(hint("q", "quit", REQUIRED));
+    let hints = hints(app, view);
     let status = super::render::projection(&app.status, 512);
     let footer = theme::footer(&status, &hints, area.width);
     let tabs_height = u16::from(view.report.is_some());
@@ -321,9 +333,7 @@ pub fn render(frame: &mut Frame, app: &App) -> bool {
             Tabs::new(view.selector_names().iter().copied())
                 .select(view.selector)
                 .highlight_style(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                    theme::tone(Color::Cyan).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
                 ),
             regions[1],
         );
@@ -466,7 +476,7 @@ mod tests {
         let report = crate::native::integration::view::tests::report();
         let mut app = App::integration_offline(report, "/saved-evidence".into());
         let text = draw(&app);
-        assert!(text.contains("Outcome: … incomplete"));
+        assert!(text.contains("… Outcome: incomplete"));
         assert!(text.contains("Overview │ Services │ Readiness"));
         assert!(text.contains("←→ selector") && !text.contains("r run"));
         input(&mut app, KeyCode::Right.into());
