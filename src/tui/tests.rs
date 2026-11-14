@@ -242,6 +242,14 @@ fn live_header_names_the_running_stage_and_elapsed_time_then_freezes() {
         "{screen}"
     );
     assert!(screen.contains("▸   user/upgrade incomplete"), "{screen}");
+    // Narrow terminals give the activity its own header line, kept whole.
+    let narrow = rows(&app, 80, 30);
+    assert!(
+        narrow[2].contains("user/upgrade · configure  1:15"),
+        "{}",
+        narrow.join("\n")
+    );
+    assert!(narrow[0].ends_with('┐') && narrow[3].starts_with('└'));
     app.active = false;
     app.run_elapsed = Some(Duration::from_secs(80));
     let screen = rows(&app, 140, 30).join("\n");

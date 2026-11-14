@@ -138,19 +138,29 @@ fn header(app: &App, width: u16) -> Paragraph<'static> {
             };
             spans.push(Span::styled(format!("{word} {count}"), style));
         }
-        spans.extend(run_activity(app));
-        Line::from(spans)
+        // Activity stays on the counts line when it fits; otherwise it gets its
+        // own line so the spinner, stage and clock are never split apart.
+        let mut activity = run_activity(app);
+        let fits = Line::from(spans.clone()).width() + Line::from(activity.clone()).width()
+            <= width.saturating_sub(2) as usize;
+        if fits || activity.is_empty() {
+            spans.extend(activity);
+            vec![Line::from(spans)]
+        } else {
+            activity.remove(0);
+            vec![Line::from(spans), Line::from(activity)]
+        }
     } else if app.has_started() {
-        Line::raw("Theseus | Live evidence pending or unavailable")
+        vec![Line::raw("Theseus | Live evidence pending or unavailable")]
     } else if super::preview_edit::dirty(app) {
-        Line::styled(
+        vec![Line::styled(
             "Theseus | UNSAVED draft — accepted preview below; no commands executed",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
-        )
+        )]
     } else {
-        Line::raw("Theseus | Preview — no commands executed")
+        vec![Line::raw("Theseus | Preview — no commands executed")]
     };
     Paragraph::new(line).block(block).wrap(Wrap { trim: false })
 }
@@ -187,9 +197,15 @@ fn running_stage(app: &App) -> Option<(String, Option<String>)> {
             })
         })
         .or_else(|| {
-            app.live_stage
-                .as_ref()
-                .map(|(id, stage)| (one_line(id), stage.as_deref().map(one_line)))
+            app.live_stage.as_ref().map(|(id, stage)| {
+                // Name a known scenario the same way the selector does.
+                let scenario = app
+                    .report
+                    .as_ref()
+                    .and_then(|r| r.scenarios.iter().find(|s| s.id == *id))
+                    .map_or_else(|| one_line(id), |s| format!("{}/{}", s.profile, s.scenario));
+                (scenario, stage.as_deref().map(one_line))
+            })
         })
 }
 /// Header suffix: what is running now and for how long, or the final duration.
