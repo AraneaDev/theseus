@@ -199,7 +199,7 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
     // "passed" in a preview would read as a result.
     if view.report.is_some() {
         spans.push(Span::raw(" | "));
-        spans.push(theme::status_word(&app.outcome().to_string(), true));
+        spans.push(theme::status_word(&super::live_outcome_word(app), true));
     }
     spans.push(Span::raw(suffix));
     if let Some(elapsed) = app.run_clock() {

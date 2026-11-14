@@ -156,7 +156,9 @@ fn header(app: &App, width: u16) -> Paragraph<'static> {
             );
         }
         let mut spans = vec![
-            theme::status_word(&app.outcome().to_string(), true),
+            // While a run is active the report is partial; say so instead of
+            // showing its provisional "incomplete" outcome.
+            theme::status_word(&super::live_outcome_word(app), true),
             // The label only fits on wide terminals; narrow ones keep every count.
             Span::styled(
                 if width >= 85 {

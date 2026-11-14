@@ -17,6 +17,7 @@ mod view;
 use crate::engine::{self, CancellationToken, RunResult};
 use animation::{KeyAction, Presentation};
 use anyhow::{Result, anyhow};
+use app::live_outcome_word;
 pub use app::{App, Focus, Tab, safe_text};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 pub use input::input;
