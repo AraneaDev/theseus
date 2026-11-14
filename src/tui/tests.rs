@@ -206,3 +206,111 @@ fn terminal_worker_error_overrides_cached_passed_and_failed_results() {
         }
     }
 }
+
+fn rows(app: &App, width: u16, height: u16) -> Vec<String> {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal.draw(|frame| render(frame, app)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    (0..height)
+        .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+        .collect()
+}
+
+fn live_report() -> RunReport {
+    let mut report = RunReport::new("live");
+    let mut done = ScenarioReport::new("user-clean", ProfileName::User, ScenarioKind::Clean);
+    let mut stage = StageReport::new("base_installed:after_checks");
+    stage.outcome = StageOutcome::Passed;
+    done.stages.push(stage);
+    let mut running = ScenarioReport::new("user-upgrade", ProfileName::User, ScenarioKind::Upgrade);
+    let mut stage = StageReport::new("configure");
+    stage.outcome = StageOutcome::Running;
+    running.stages.push(stage);
+    report.scenarios.extend([done, running]);
+    report
+}
+
+#[test]
+fn live_header_names_the_running_stage_and_elapsed_time_then_freezes() {
+    let mut app = App::offline(live_report(), PathBuf::from("/live"));
+    app.active = true;
+    app.run_started = Some(std::time::Instant::now() - Duration::from_secs(75));
+    let screen = rows(&app, 140, 30).join("\n");
+    // The running stage is in an unselected scenario; the header still says so.
+    assert!(
+        screen.contains("user/upgrade · configure  1:15"),
+        "{screen}"
+    );
+    assert!(screen.contains("▸   user/upgrade incomplete"), "{screen}");
+    app.active = false;
+    app.run_elapsed = Some(Duration::from_secs(80));
+    let screen = rows(&app, 140, 30).join("\n");
+    assert!(screen.contains("ran 1:20"), "{screen}");
+    assert!(!screen.contains("· configure"), "{screen}");
+}
+
+#[test]
+fn live_header_falls_back_to_the_latest_engine_event_while_the_report_lags() {
+    let mut report = RunReport::new("lagging");
+    report.scenarios.push(ScenarioReport::new(
+        "system-clean",
+        ProfileName::System,
+        ScenarioKind::Clean,
+    ));
+    let mut app = App::offline(report, PathBuf::from("/live"));
+    app.active = true;
+    app.run_started = Some(std::time::Instant::now());
+    let event = |kind, stage: Option<&str>| {
+        WorkEvent::Run(engine::EngineEvent {
+            kind,
+            report_path: PathBuf::from("/live/report.json"),
+            scenario_id: Some("system-clean".into()),
+            stage: stage.map(Into::into),
+        })
+    };
+    apply_event(
+        &mut app,
+        event(engine::EventKind::StageStarted, Some("configure\u{1b}")),
+        &mut None,
+    );
+    app.report = Some(RunReport::new("lagging"));
+    let screen = rows(&app, 140, 30).join("\n");
+    assert!(screen.contains("system-clean · configure�"), "{screen}");
+    apply_event(
+        &mut app,
+        event(engine::EventKind::StageFinished, Some("configure")),
+        &mut None,
+    );
+    app.report = Some(RunReport::new("lagging"));
+    assert!(
+        rows(&app, 140, 30)
+            .join("\n")
+            .contains("system-clean · between stages")
+    );
+}
+
+#[test]
+fn selector_column_fits_the_longest_row_within_bounds_and_narrow_stays_stacked() {
+    let app = App::offline(live_report(), PathBuf::from("/saved"));
+    // Stage rows keep the trailing status word harnesses match.
+    let wide = rows(&app, 120, 30);
+    let stage = wide
+        .iter()
+        .find(|row| row.contains("base_installed:after_checks passed"))
+        .expect("full stage row is visible");
+    assert!(
+        stage.starts_with("│✓ > base_installed:after_checks passed"),
+        "{stage}"
+    );
+    // At most 45% of the width, so the detail keeps the rest.
+    let border = wide[3].chars().position(|c| c == '┓').expect("border");
+    assert!(border < 54, "{}", wide[3]);
+    let narrow = rows(&app, 80, 30);
+    assert!(
+        narrow
+            .iter()
+            .any(|row| row.contains("Scenarios") && row.contains("Stages")),
+        "{}",
+        narrow.join("\n")
+    );
+}

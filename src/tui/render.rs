@@ -54,6 +54,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             main[1],
         );
     } else {
+        let rows = selector_rows(app);
         let parts = Layout::default()
             .direction(if narrow {
                 Direction::Vertical
@@ -63,10 +64,13 @@ pub fn render(frame: &mut Frame, app: &App) {
             .constraints(if narrow {
                 vec![Constraint::Length(4), Constraint::Min(1)]
             } else {
-                vec![Constraint::Length(30), Constraint::Min(1)]
+                vec![
+                    Constraint::Length(selector_width(&rows, area.width)),
+                    Constraint::Min(1),
+                ]
             })
             .split(main[1]);
-        selectors(frame, app, parts[0], narrow);
+        selectors(frame, app, parts[0], narrow, rows);
         evidence(frame, app, parts[1]);
     }
     frame.render_widget(footer, main[2]);
@@ -134,6 +138,7 @@ fn header(app: &App, width: u16) -> Paragraph<'static> {
             };
             spans.push(Span::styled(format!("{word} {count}"), style));
         }
+        spans.extend(run_activity(app));
         Line::from(spans)
     } else if app.has_started() {
         Line::raw("Theseus | Live evidence pending or unavailable")
@@ -148,6 +153,76 @@ fn header(app: &App, width: u16) -> Paragraph<'static> {
         Line::raw("Theseus | Preview — no commands executed")
     };
     Paragraph::new(line).block(block).wrap(Wrap { trim: false })
+}
+pub(super) fn clock(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs >= 3600 {
+        format!("{}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
+    } else {
+        format!("{}:{:02}", secs / 60, secs % 60)
+    }
+}
+/// A spinner frame that advances with the run clock (the loop redraws ~20/s).
+pub(super) fn spinner(elapsed: std::time::Duration) -> &'static str {
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    FRAMES[(elapsed.as_millis() / 100 % FRAMES.len() as u128) as usize]
+}
+/// The stage the persisted report shows as running, wherever the selection is;
+/// otherwise what the latest engine event named (the report can lag behind).
+fn running_stage(app: &App) -> Option<(String, Option<String>)> {
+    let one_line = |text: &str| projection(text, 64).replace(['\n', '\t'], " ");
+    app.report
+        .as_ref()
+        .and_then(|report| {
+            report.scenarios.iter().find_map(|s| {
+                s.stages
+                    .iter()
+                    .find(|stage| stage.outcome == crate::model::StageOutcome::Running)
+                    .map(|stage| {
+                        (
+                            format!("{}/{}", s.profile, s.scenario),
+                            Some(one_line(&stage.name)),
+                        )
+                    })
+            })
+        })
+        .or_else(|| {
+            app.live_stage
+                .as_ref()
+                .map(|(id, stage)| (one_line(id), stage.as_deref().map(one_line)))
+        })
+}
+/// Header suffix: what is running now and for how long, or the final duration.
+fn run_activity(app: &App) -> Vec<Span<'static>> {
+    let Some(elapsed) = app.run_clock() else {
+        return vec![];
+    };
+    let mut spans = vec![Span::styled("  │ ", theme::dim())];
+    if app.active {
+        let accent = Style::default().fg(Color::Cyan);
+        spans.push(Span::styled(format!("{} ", spinner(elapsed)), accent));
+        match running_stage(app) {
+            Some((scenario, Some(stage))) => {
+                spans.push(Span::styled(format!("{} · ", safe_text(&scenario)), accent));
+                spans.push(Span::styled(
+                    safe_text(&stage),
+                    accent.add_modifier(Modifier::BOLD),
+                ));
+            }
+            Some((scenario, None)) => {
+                spans.push(Span::styled(format!("{} · ", safe_text(&scenario)), accent));
+                spans.push(Span::styled("between stages", accent));
+            }
+            None => spans.push(Span::styled("running", accent)),
+        }
+        spans.push(Span::styled(format!("  {}", clock(elapsed)), theme::dim()));
+    } else {
+        spans.push(Span::styled(
+            format!("ran {}", clock(elapsed)),
+            theme::dim(),
+        ));
+    }
+    spans
 }
 fn footer_status(app: &App) -> String {
     if super::preview_edit::dirty(app) {
@@ -219,15 +294,33 @@ fn hints(app: &App) -> Vec<Hint> {
     hints.push(hint("q", "quit", REQUIRED));
     hints
 }
-fn selectors(frame: &mut Frame, app: &App, area: Rect, narrow: bool) {
-    let parts = Layout::default()
-        .direction(if narrow {
-            Direction::Horizontal
-        } else {
-            Direction::Vertical
-        })
-        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-        .split(area);
+/// Bounded (<= 64 each) scenario and stage rows with their status words, plus
+/// the window starts. Row text keeps the trailing status word that terminal
+/// harnesses match (`> rolled_back passed`).
+pub(super) struct SelectorRows {
+    scenario_start: usize,
+    stage_start: usize,
+    scenarios: Vec<(String, String)>,
+    stages: Vec<(String, String)>,
+}
+/// Left column wide enough for the longest visible row (border, glyph and
+/// selection marker included), kept between 22% and 45% of the width.
+fn selector_width(rows: &SelectorRows, width: u16) -> u16 {
+    let longest = rows
+        .scenarios
+        .iter()
+        .chain(&rows.stages)
+        .map(|(text, _)| Span::raw(safe_text(text)).width())
+        .max()
+        .unwrap_or(0);
+    let needed = u16::try_from(longest + 6).unwrap_or(u16::MAX);
+    // Widen past the former fixed 30 columns only while the evidence side keeps
+    // at least 70, so one-line evidence records never wrap sooner than before.
+    let high = (width * 45 / 100).min(width.saturating_sub(70)).max(30);
+    let low = (width * 22 / 100).min(high);
+    needed.clamp(low, high)
+}
+fn selector_rows(app: &App) -> SelectorRows {
     let scenario_start = app.scenario_index.saturating_sub(32).min(
         app.report
             .as_ref()
@@ -248,24 +341,24 @@ fn selectors(frame: &mut Frame, app: &App, area: Rect, narrow: bool) {
                 .skip(scenario_start)
                 .take(64)
                 .map(|s| {
+                    // While live, the scenario holding the running stage shows
+                    // the running glyph; its text keeps the recorded outcome.
+                    let running = app.active
+                        && s.stages
+                            .iter()
+                            .any(|st| st.outcome == crate::model::StageOutcome::Running);
                     (
                         format!("{}/{} {}", s.profile, s.scenario, s.outcome),
-                        s.outcome.to_string(),
+                        if running {
+                            "running".to_string()
+                        } else {
+                            s.outcome.to_string()
+                        },
                     )
                 })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    theme::status_list(
-        frame,
-        parts[0],
-        theme::panel("Scenarios", app.focus == Focus::Scenario),
-        scenarios
-            .iter()
-            .map(|(t, w)| (t.clone(), w.as_str()))
-            .collect(),
-        app.scenario_index.saturating_sub(scenario_start),
-    );
     let stages = app
         .scenario()
         .map(|s| {
@@ -282,15 +375,56 @@ fn selectors(frame: &mut Frame, app: &App, area: Rect, narrow: bool) {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    SelectorRows {
+        scenario_start,
+        stage_start,
+        scenarios,
+        stages,
+    }
+}
+fn selectors(frame: &mut Frame, app: &App, area: Rect, narrow: bool, rows: SelectorRows) {
+    let parts = Layout::default()
+        .direction(if narrow {
+            Direction::Horizontal
+        } else {
+            Direction::Vertical
+        })
+        .constraints(if narrow {
+            // Side by side in the stacked strip: scenarios get what their
+            // longest row needs, within 25%..35%, and stages (never less than
+            // the former 65%) the rest.
+            let longest = rows
+                .scenarios
+                .iter()
+                .map(|(text, _)| Span::raw(safe_text(text)).width())
+                .max()
+                .unwrap_or(0);
+            let needed = u16::try_from(longest + 6).unwrap_or(u16::MAX);
+            let (low, high) = (area.width / 4, area.width * 35 / 100);
+            [
+                Constraint::Length(needed.clamp(low, high.max(low))),
+                Constraint::Min(1),
+            ]
+        } else {
+            [Constraint::Percentage(35), Constraint::Percentage(65)]
+        })
+        .split(area);
+    fn list(rows: &[(String, String)]) -> Vec<(String, &str)> {
+        rows.iter().map(|(t, w)| (t.clone(), w.as_str())).collect()
+    }
+    theme::status_list(
+        frame,
+        parts[0],
+        theme::panel("Scenarios", app.focus == Focus::Scenario),
+        list(&rows.scenarios),
+        app.scenario_index.saturating_sub(rows.scenario_start),
+    );
     theme::status_list(
         frame,
         parts[1],
         theme::panel("Stages", app.focus == Focus::Stage),
-        stages
-            .iter()
-            .map(|(t, w)| (t.clone(), w.as_str()))
-            .collect(),
-        app.stage_index.saturating_sub(stage_start),
+        list(&rows.stages),
+        app.stage_index.saturating_sub(rows.stage_start),
     );
 }
 fn evidence(frame: &mut Frame, app: &App, area: Rect) {

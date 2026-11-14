@@ -534,3 +534,31 @@ fn suite_startup_paste_cannot_start_and_live_event_retains_validated_recovery_co
     input(&mut app, KeyCode::Char('r').into());
     assert!(take_work(&mut app).unwrap().is_none());
 }
+#[test]
+fn preview_states_planned_cells_from_the_manifest_alone() {
+    let manifest: crate::comparison::SuiteManifest =
+        toml::from_str(include_str!("../../examples/comparisons/methods.toml")).unwrap();
+    // One candidate × (2 user + 2 system scopes) × 1 scenario × 3 stages.
+    assert_eq!(super::comparison::planned_cells(&manifest), 12);
+    let t = tempfile::tempdir().unwrap();
+    let path = fixtures::recipe_suite(t.path());
+    let app = App::comparison_preview(
+        suites::load(&path).unwrap(),
+        SuiteRunOptions {
+            output_root: t.path().join("out"),
+            pull: false,
+        },
+    );
+    let text = screen(&app);
+    for expected in [
+        "Will run:",
+        "Selection",
+        "Stages",
+        "Scopes",
+        "Variants",
+        " baseline ",
+    ] {
+        assert!(text.contains(expected), "missing {expected}: {text}");
+    }
+    assert!(!t.path().join("out").exists());
+}

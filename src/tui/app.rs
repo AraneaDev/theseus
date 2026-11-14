@@ -53,6 +53,12 @@ pub struct App {
     /// Authoritative worker failure, separate from the last persisted evidence.
     pub terminal_error: Option<String>,
     pub active: bool,
+    /// Wall-clock start of the explicit run and its frozen duration once the
+    /// worker returns; presentation only, never persisted as evidence.
+    pub(super) run_started: Option<std::time::Instant>,
+    pub(super) run_elapsed: Option<std::time::Duration>,
+    /// Scenario id and stage named by the latest engine event, if any.
+    pub(super) live_stage: Option<(String, Option<String>)>,
     pub start_requested: bool,
     pub cancel_requested: bool,
     pub quit_requested: bool,
@@ -83,6 +89,9 @@ impl App {
             status: "Offline report".into(),
             terminal_error: None,
             active: false,
+            run_started: None,
+            run_elapsed: None,
+            live_stage: None,
             start_requested: false,
             cancel_requested: false,
             quit_requested: false,
@@ -141,6 +150,11 @@ impl App {
         app.options = Some(options);
         app.status = "Preview — press r to start".into();
         app
+    }
+    /// Time since the explicit start, frozen when the worker returned.
+    pub(super) fn run_clock(&self) -> Option<std::time::Duration> {
+        self.run_elapsed
+            .or_else(|| self.run_started.map(|start| start.elapsed()))
     }
     pub(super) fn has_started(&self) -> bool {
         self.work_consumed || self.active || self.terminal_error.is_some()
