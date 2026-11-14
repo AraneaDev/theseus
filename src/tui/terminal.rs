@@ -1,7 +1,7 @@
 use anyhow::{Result, ensure};
 use crossterm::{
     cursor::Show,
-    event::{DisableBracketedPaste, EnableBracketedPaste},
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -22,25 +22,32 @@ pub fn require_tty() -> Result<()> {
 enum RestoreStep {
     Raw,
     Paste,
+    Mouse,
     Alternate,
     Cursor,
 }
+const ORDER: [RestoreStep; 5] = [
+    RestoreStep::Raw,
+    RestoreStep::Paste,
+    RestoreStep::Mouse,
+    RestoreStep::Alternate,
+    RestoreStep::Cursor,
+];
+const STEPS: usize = ORDER.len();
+/// Restoration progress before any step ran. Mouse capture is only enabled
+/// (and so only disabled) under `--mouse`; otherwise its step starts complete
+/// and no mouse escape is ever written.
+fn pending(mouse: bool) -> [bool; STEPS] {
+    ORDER.map(|step| step == RestoreStep::Mouse && !mouse)
+}
 fn restore_steps(
-    completed: &mut [bool; 4],
+    completed: &mut [bool; STEPS],
     mut prepare: impl FnMut() -> Result<()>,
     mut attempt: impl FnMut(RestoreStep) -> io::Result<()>,
 ) -> Result<()> {
     let mut errors = Vec::new();
     let mut prepared = false;
-    for (index, step) in [
-        RestoreStep::Raw,
-        RestoreStep::Paste,
-        RestoreStep::Alternate,
-        RestoreStep::Cursor,
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    for (index, step) in ORDER.into_iter().enumerate() {
         if completed[index] {
             continue;
         }
@@ -65,6 +72,7 @@ fn restore_step(step: RestoreStep) -> io::Result<()> {
     match step {
         RestoreStep::Raw => disable_raw_mode(),
         RestoreStep::Paste => execute!(io::stdout(), DisableBracketedPaste),
+        RestoreStep::Mouse => execute!(io::stdout(), DisableMouseCapture),
         RestoreStep::Alternate => execute!(io::stdout(), LeaveAlternateScreen),
         RestoreStep::Cursor => execute!(io::stdout(), Show),
     }
@@ -76,7 +84,7 @@ struct Restoration {
     step: Box<dyn Fn(RestoreStep) -> io::Result<()> + Send + Sync>,
     prepare: Box<dyn Fn() -> Result<()> + Send + Sync>,
     exact: Box<dyn Fn() -> Result<()> + Send + Sync>,
-    completed: Mutex<[bool; 4]>,
+    completed: Mutex<[bool; STEPS]>,
 }
 struct ExactOnExit<'a> {
     callback: &'a (dyn Fn() -> Result<()> + Send + Sync),
@@ -144,7 +152,9 @@ impl Guard {
             Err(error) => original.context(format!("terminal restoration: {error:#}")),
         })
     }
-    pub fn enter() -> Result<(Self, Terminal)> {
+    /// Raw mode, alternate screen, bracketed paste and, when `mouse` is set,
+    /// mouse capture; each is undone by the same guaranteed restoration.
+    pub fn enter(mouse: bool) -> Result<(Self, Terminal)> {
         require_tty()?;
         #[cfg(windows)]
         let snapshot = Arc::new(theseus_host::console::ConsoleModeSnapshot::capture()?);
@@ -165,7 +175,7 @@ impl Guard {
                     snapshot.restore()?;
                     Ok(())
                 }),
-                completed: Mutex::new([false; 4]),
+                completed: Mutex::new(pending(mouse)),
             }),
         };
         let weak = Arc::downgrade(&guard.state);
@@ -181,6 +191,9 @@ impl Guard {
             #[cfg(windows)]
             input_mode.enable_vt_input()?;
             execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+            if mouse {
+                execute!(io::stdout(), EnableMouseCapture)?;
+            }
             Ok(ratatui::Terminal::new(
                 ratatui::backend::CrosstermBackend::new(io::stdout()),
             )?)
@@ -215,7 +228,7 @@ mod tests {
                     exact.fetch_add(1, Ordering::SeqCst);
                     Ok(())
                 }),
-                completed: Mutex::new([false; 4]),
+                completed: Mutex::new(pending(false)),
             }),
         }
     }
@@ -228,7 +241,7 @@ mod tests {
                 step: Box::new(attempt),
                 prepare: Box::new(|| Ok(())),
                 exact: Box::new(exact),
-                completed: Mutex::new([false; 4]),
+                completed: Mutex::new(pending(false)),
             }),
         }
     }
@@ -331,6 +344,7 @@ mod tests {
                     events.lock().unwrap().push(match step {
                         RestoreStep::Raw => "raw",
                         RestoreStep::Paste => "paste",
+                        RestoreStep::Mouse => "mouse",
                         RestoreStep::Alternate => "alternate",
                         RestoreStep::Cursor => "cursor",
                     });
@@ -358,7 +372,7 @@ mod tests {
                     Ok(())
                 }
             }),
-            completed: Mutex::new([false; 4]),
+            completed: Mutex::new(pending(false)),
         };
         assert!(state.run(true).is_err());
         assert!(!vt.load(Ordering::SeqCst));
@@ -407,7 +421,7 @@ mod tests {
                     Ok(())
                 }
             }),
-            completed: Mutex::new([false; 4]),
+            completed: Mutex::new(pending(false)),
         };
         let error = format!("{:#}", state.run(true).unwrap_err());
         assert!(error.contains("preparation failed once") && error.contains("exact failed once"));
@@ -449,10 +463,55 @@ mod tests {
         );
     }
     #[test]
+    fn mouse_capture_is_released_only_when_enabled_and_retried_until_it_succeeds() {
+        let mut observed = Vec::new();
+        restore_steps(
+            &mut pending(false),
+            || Ok(()),
+            |step| {
+                observed.push(step);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!observed.contains(&RestoreStep::Mouse), "{observed:?}");
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let failed = Arc::new(AtomicUsize::new(0));
+        let state = Restoration {
+            step: Box::new({
+                let attempts = attempts.clone();
+                move |step| {
+                    attempts.lock().unwrap().push(step);
+                    if step == RestoreStep::Mouse && failed.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return Err(io::Error::other("mouse release failed once"));
+                    }
+                    Ok(())
+                }
+            }),
+            prepare: Box::new(|| Ok(())),
+            exact: Box::new(|| Ok(())),
+            completed: Mutex::new(pending(true)),
+        };
+        assert!(state.run(true).is_err());
+        state.run(true).unwrap();
+        state.run(true).unwrap();
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            [
+                RestoreStep::Raw,
+                RestoreStep::Paste,
+                RestoreStep::Mouse,
+                RestoreStep::Alternate,
+                RestoreStep::Cursor,
+                RestoreStep::Mouse
+            ]
+        );
+    }
+    #[test]
     fn cleanup_attempts_alternate_and_cursor_after_raw_and_paste_fail() {
         let mut observed = Vec::new();
         let error = restore_steps(
-            &mut [false; 4],
+            &mut pending(false),
             || Ok(()),
             |step| {
                 observed.push(step);

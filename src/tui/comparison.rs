@@ -242,27 +242,32 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
             .skip(row_start)
             .take(64)
             .map(|c| {
+                let word = if running_cell(app, c) {
+                    "running".to_string()
+                } else {
+                    format!("{:?}", c.comparison.status)
+                };
                 (
                     format!(
-                        "{} {}/{}/{} {} {:?}",
+                        "{} {}/{}/{} {} {word}",
                         bounded(&c.variant_id),
                         c.profile,
                         c.scenario,
                         bounded(&c.stage),
                         bounded(&c.scope_id),
-                        c.comparison.status
                     ),
-                    format!("{:?}", c.comparison.status),
+                    word,
                 )
             })
             .collect::<Vec<_>>();
-        theme::status_list(
+        let drawn = theme::status_list(
             frame,
             parts[0],
             theme::panel("Comparison rows — Tab evidence", !view.evidence_focus),
             rows.iter().map(|(t, w)| (t.clone(), w.as_str())).collect(),
             view.row.saturating_sub(row_start),
         );
+        app.hits.borrow_mut().cells = Some(super::mouse::ListHit::drawn(row_start, drawn));
         let heading_width = parts[1].width.saturating_sub(2) as usize;
         let compact = parts[1].height < 16;
         let heading = report
@@ -340,7 +345,9 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
                 .scroll((app.scroll, 0)),
             layout[1],
         );
+        app.hits.borrow_mut().scroll = Some(layout[1]);
     } else {
+        app.hits.borrow_mut().scroll = Some(layout[1]);
         let doc = suite_preview(app, view);
         frame.render_widget(
             Paragraph::new(doc.lines())
@@ -355,6 +362,17 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
         );
     }
     frame.render_widget(footer, layout[2]);
+}
+/// While a suite runs, a not-yet-compared cell whose variant, scenario and
+/// stage the latest source event names is executing now.
+fn running_cell(app: &App, cell: &crate::comparison::ComparisonCell) -> bool {
+    app.active
+        && cell.comparison.status == crate::comparison::ComparisonStatus::Unknown
+        && app.live_variant.as_deref() == Some(cell.variant_id.as_str())
+        && app.live_stage.as_ref().is_some_and(|(id, stage)| {
+            *id == format!("{}-{}", cell.profile, cell.scenario)
+                && stage.as_deref() == Some(cell.stage.as_str())
+        })
 }
 fn plural(count: usize, word: &str) -> String {
     format!("{count} {word}{}", if count == 1 { "" } else { "s" })
@@ -495,6 +513,7 @@ pub(super) fn hints(app: &App, view: &ComparisonView) -> Vec<Hint> {
         ));
         hints.push(hint(Evidence, "PgUp/Dn", "scroll", 4));
         hints.push(hint(Evidence, "/", "filter", 3));
+        hints.push(hint(Evidence, "y", "copy record (OSC 52)", HELP_ONLY));
     } else if !app.has_started() {
         if view.suite.is_some() && !app.work_consumed {
             hints.push(hint(Run, "r", "run", REQUIRED));

@@ -22,12 +22,17 @@ evidence = pathlib.Path(os.environ.get('THESEUS_HOST_EVIDENCE') or tempfile.mkdt
 evidence.mkdir(parents=True, exist_ok=True)
 profiles = ('default', 'echo-off-vt-off', 'processed-off-vt-on') if os.name == 'nt' else ('default',)
 for profile in profiles:
-    for action in ('quit', 'raw-control', 'native-control', 'resize-quit'):
-        case = action if profile == 'default' else profile + '-' + action
+    # Opt-in --mouse must be released by the same restoration, on quit and signal.
+    mouse_actions = ('mouse-quit', 'mouse-native-control') if profile == 'default' else ()
+    for case_action in ('quit', 'raw-control', 'native-control', 'resize-quit') + mouse_actions:
+        mouse = case_action.startswith('mouse-')
+        action = case_action.removeprefix('mouse-')
+        case = case_action if profile == 'default' else profile + '-' + case_action
         if os.environ.get('THESEUS_TERMINAL_TRACE') == '1':
             print('native terminal case=' + case + ' phase=start', file=sys.stderr, flush=True)
         diagnostics = SessionDiagnostics(case, profile, evidence)
-        terminal = NativeSession(binary, ['--no-animation'], 'examples/standalone', os.environ,
+        terminal = NativeSession(binary, ['--no-animation'] + (['--mouse'] if mouse else []),
+                                 'examples/standalone', os.environ,
                                  console_profile=profile, diagnostics=diagnostics)
         outcome = 'failed'
         try:
@@ -49,6 +54,15 @@ for profile in profiles:
                 terminal.key(b'\x03' if action == 'raw-control' else b'q')
             assert terminal.wait() == 0
             terminal.assert_restored()
+            if os.name != 'nt':
+                # Windows mouse input is a console mode covered by exact restoration.
+                data = terminal.output.data
+                if mouse:
+                    assert b'\x1b[?1000h' in data, 'mouse capture not enabled'
+                    assert data.rfind(b'\x1b[?1000l') > data.rfind(b'\x1b[?1000h'), 'mouse capture not released'
+                    assert data.rfind(b'\x1b[?1006l') > data.rfind(b'\x1b[?1006h'), 'SGR mouse mode not released'
+                else:
+                    assert b'\x1b[?1000h' not in data, 'mouse captured without --mouse'
             if os.name == 'nt':
                 assert terminal.modes['profile'] == profile
                 if profile == 'default':

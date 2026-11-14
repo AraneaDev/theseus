@@ -242,7 +242,8 @@ fn live_header_names_the_running_stage_and_elapsed_time_then_freezes() {
         screen.contains("user/upgrade · configure  1:15"),
         "{screen}"
     );
-    assert!(screen.contains("▸   user/upgrade incomplete"), "{screen}");
+    // The executing scenario reads "running", not its provisional outcome.
+    assert!(screen.contains("▸   user/upgrade running"), "{screen}");
     // Narrow terminals give the activity its own header line, kept whole.
     let narrow = rows(&app, 80, 30);
     assert!(
@@ -523,3 +524,6 @@ fn active_run_header_says_running_not_a_provisional_outcome() {
     assert_eq!(live_outcome_word(&app), app.outcome().to_string());
     assert!(!draw(&app).contains("▸ running"));
 }
+
+#[path = "ux_tests.rs"]
+mod ux;

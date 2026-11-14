@@ -587,3 +587,61 @@ fn preview_states_planned_cells_from_the_manifest_alone() {
     }
     assert!(!t.path().join("out").exists());
 }
+#[test]
+fn live_suite_marks_the_executing_uncompared_cell_running() {
+    let t = tempfile::tempdir().unwrap();
+    let root = fixtures::saved(t.path());
+    let mut document = suites::load_document(&root).unwrap();
+    for cell in &mut document.report.cells {
+        cell.comparison.status = suites::ComparisonStatus::Unknown;
+    }
+    let cell = document.report.cells[0].clone();
+    let mut app = App::comparison_offline(document, root.clone());
+    let needle = format!("/{} {} running", cell.stage, cell.scope_id);
+    let wide = |app: &App| {
+        let mut terminal = Terminal::new(TestBackend::new(260, 30)).unwrap();
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..30)
+            .map(|y| {
+                (0..260)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let rows = |app: &App| wide(app).matches(&needle).count();
+    app.active = true;
+    apply_event(
+        &mut app,
+        WorkEvent::Suite(suites::ComparisonEvent {
+            report_path: root.join("comparison.json"),
+            variant_id: Some(cell.variant_id.clone()),
+            source: Some(engine::EngineEvent {
+                kind: engine::EventKind::StageStarted,
+                report_path: root.join("sources/report.json"),
+                scenario_id: Some(format!("{}-{}", cell.profile, cell.scenario)),
+                stage: Some(cell.stage.clone()),
+            }),
+        }),
+        &mut None,
+    );
+    // Restore the loaded report: the event only names the live position.
+    app.set_comparison_report(suites::load_document(&root).unwrap().report, root.clone());
+    for cell in &mut app
+        .comparison
+        .as_mut()
+        .unwrap()
+        .report
+        .as_mut()
+        .unwrap()
+        .cells
+    {
+        cell.comparison.status = suites::ComparisonStatus::Unknown;
+    }
+    assert_eq!(rows(&app), 1, "{}", wide(&app));
+    app.active = false;
+    assert_eq!(rows(&app), 0, "{}", wide(&app));
+    assert!(wide(&app).contains(&format!("/{} {} Unknown", cell.stage, cell.scope_id)));
+}
