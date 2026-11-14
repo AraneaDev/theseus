@@ -12,8 +12,8 @@ Rust launcher alone does not establish platform acceptance. Consult the
 [source-specific CI
 results](https://github.com/AraneaDev/theseus/actions/workflows/ci.yml).
 
-Run the shared CI checks locally before pushing, without registering a runner or
-installing a Git hook. Python 3, a native stable Rust toolchain with rustfmt and
+Run the shared CI checks locally before pushing, without registering a runner.
+The optional [commit hooks](#commit-style-and-local-hooks) do not run them. Python 3, a native stable Rust toolchain with rustfmt and
 clippy, and Node.js for the existing observer controls must be available. Use
 Python 3.12 or newer on Windows and the checked Git-for-Windows Bash for the two
 POSIX guest-script byte oracles.
@@ -181,6 +181,45 @@ would contain your home directory or user name. The report scenes use the
 git-ignored saved run `examples/interrupted-rollback/.theseus-runs/1793309242520942542-1672854`
 (or `--report-run DIR`); without it they are skipped. Converter tests run
 without tmux: `python3 tests/support/screenshots_test.py`.
+
+## Commit style and local hooks
+
+Commit subjects and pull request titles use Conventional Commits:
+`type(scope): summary`, where the type is one of `feat`, `fix`, `perf`,
+`refactor`, `docs`, `test`, `ci`, `chore` or `style`. The scope is optional and
+`!` marks a breaking change. Check a subject by hand:
+
+```sh
+scripts/check-commit-style.sh "fix(tui): keep the selector in view"
+```
+
+The `Commit style` workflow runs the same script on every pull request title and
+every commit subject in the pull request. Its job is named `title`.
+
+The repository ships two optional hooks. Enable them once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+`commit-msg` rejects a subject that does not match the style. `pre-commit` runs
+`cargo fmt --all -- --check`, so it is fast and changes nothing. The full
+validation above stays a manual step, and CI runs it on every pull request.
+
+## Releases
+
+Releases are managed by release-please (`release-please-config.json` and
+`.release-please-manifest.json`). All six workspace crates share one version
+through the `linked-versions` plugin. Only the root `theseus` package creates a
+GitHub release and a `vX.Y.Z` tag; the five crates under `crates/` are bumped in
+the same release pull request but skip their own GitHub release. `feat`, `fix`,
+`perf` and `refactor` commits appear in the changelog. The other types are
+hidden.
+
+Every package currently sets `"release-as": "0.0.1"` so the first release is
+`v0.0.1`. After `v0.0.1` ships, remove `release-as` from every package in
+`release-please-config.json` in a `chore(release)` commit. If it stays,
+release-please keeps proposing 0.0.1.
 
 ## Related documentation
 
