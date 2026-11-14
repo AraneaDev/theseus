@@ -1,6 +1,6 @@
 # Theseus roadmap
 
-Last updated: **2026-11-06**. This is the maintained progress tracker for the
+Last updated: **2026-11-14**. This is the maintained progress tracker for the
 remaining roadmap. Update the relevant checklist, current work and acceptance
 status whenever a milestone is implemented, reviewed, tested or merged.
 
@@ -345,7 +345,25 @@ persistence, native guest behavior or a hostile-code sandbox. Current Docker
 reports write schema 8/read 1–8; recovery journals and ownership remain version 1,
 and comparison artifacts remain version 1.
 
-## In progress: native adapter foundations
+## Maintenance since acceptance
+
+Each PR below passed the full native Linux, macOS and Windows jobs and all eight
+Docker suites before merge. None changes the supported scope.
+
+- [x] Native follow-ups ([#2](https://github.com/AraneaDev/theseus/pull/2)):
+  SCM runtime-pin ownership and launchd inspect-failure classification.
+- [x] CI and validation hygiene ([#3](https://github.com/AraneaDev/theseus/pull/3)):
+  Docker transition deadline, `/tmp` fixture leaks, launchd parse diagnostics
+  and a duplex heartbeat race.
+- [x] Dead-code removal ([#5](https://github.com/AraneaDev/theseus/pull/5)–[#8](https://github.com/AraneaDev/theseus/pull/8)),
+  including the unused v1 `HandshakeGuard` and the blocking ready/close path,
+  and the unread macOS readiness cache ([#9](https://github.com/AraneaDev/theseus/pull/9)).
+- [x] Structural decomposition ([#10](https://github.com/AraneaDev/theseus/pull/10)–[#13](https://github.com/AraneaDev/theseus/pull/13)):
+  code moved into child modules with no logic changes. No product module is
+  over 1,000 lines except `v2/json.rs`, which is one typed codec. No function is
+  over 300 lines except the MCP schema table and `BrokerLedgerView::replay`.
+
+## Merged: native adapter foundations
 
 These are private helper/client foundations, not a second scenario engine or an
 installation interface for the controller machine.
@@ -372,7 +390,7 @@ installation interface for the controller machine.
   accepted combined CI [run 42402902817](https://github.com/AraneaDev/theseus/actions/runs/42402902817) at `e181209`.
 - [x] **Integrate to main:** merged as `d22822f` after the combined gates.
 
-## Local complete: bounded native helper file operations
+## Merged: bounded native helper file operations
 
 Implementation checkmarks in this section describe reviewed, locally qualified
 source. All 14 helper and 9 client pipe cases passed on Linux; the final fixture
@@ -394,7 +412,7 @@ combined CI batch at `e181209`.
 - [x] Add focused failure/order/ownership tests and required native cases on all
   three OS jobs; complete review and local qualification before the final batch.
 
-## Local complete: supplied native machine/VM adapters
+## Merged: supplied native machine/VM adapters (external acceptance pending)
 
 Checked tasks below are implemented, independently reviewed and locally qualified.
 Native OS CI and real supplied-target acceptance remain separate gates.
@@ -453,7 +471,7 @@ contracts and evidence before being enabled; Docker support does not enable them
 on native targets automatically. Theseus will not become a VM provisioner or use
 the controller as an implicit installation target.
 
-## In progress: services and desktop applications
+## Merged: services and desktop applications (external acceptance pending)
 
 The shared contract is reviewed. The first delivery is an installer-managed
 systemd Clean scenario: the installer creates/configures/removes the service;
