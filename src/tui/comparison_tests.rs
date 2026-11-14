@@ -157,6 +157,31 @@ fn recipe_save_copy_adopts_bytes_and_requires_fresh_run() {
     assert_eq!(adopted.path, saved);
 }
 #[test]
+fn question_mark_opens_help_in_preview_but_is_text_in_the_editor() {
+    let t = tempfile::tempdir().unwrap();
+    fixtures::recipe_suite(t.path());
+    let recipe = crate::recipe::load(&t.path().join("copy.toml")).unwrap();
+    let mut app = App::preview(recipe.clone(), engine::RunOptions::all(&recipe));
+    input(&mut app, KeyCode::Char('?').into());
+    assert!(app.help);
+    // Open help swallows run/edit keys.
+    input(&mut app, KeyCode::Char('r').into());
+    input(&mut app, KeyCode::Char('e').into());
+    assert!(!app.start_requested && app.edit_session.is_none());
+    input(&mut app, KeyCode::Esc.into());
+    assert!(!app.help);
+    input(&mut app, KeyCode::Char('e').into());
+    input(&mut app, KeyCode::Char('?').into());
+    assert!(!app.help, "editor keeps ? as text");
+    assert!(preview_edit::dirty(&app), "? was inserted into the draft");
+    input(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+    );
+    input(&mut app, KeyCode::Char('?').into());
+    assert!(!app.help, "Save Copy name keeps ? as text");
+}
+#[test]
 fn save_copy_falls_back_to_newly_declared_recipe_selection() {
     let t = tempfile::tempdir().unwrap();
     fixtures::recipe_suite(t.path());
