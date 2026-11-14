@@ -6,7 +6,7 @@
 <circle cx="18" cy="15" r="5" fill="#ff5f57"/><circle cx="34" cy="15" r="5" fill="#febc2e"/><circle cx="50" cy="15" r="5" fill="#28c840"/>
 <text x="520" y="20" text-anchor="middle" style="font-size:12px;fill:#8a94a6">theseus run — recipe editor (e)</text>
 <text y="59.5"><tspan x="16" textLength="226.8" class="c0">EDIT unchanged | Ln 1 Col 1</tspan></text>
-<text y="77.5"><tspan x="16" textLength="604.8" class="c0">Source: /var/tmp/tui-shots/theseus-demo/examples/standalone/theseus.toml</tspan></text>
+<text y="77.5"><tspan x="16" textLength="487.2" class="c0">Source: /tmp/theseus-demo/examples/standalone/theseus.toml</tspan></text>
 <text y="113.5"><tspan x="32.8" textLength="8.4" class="c1">1</tspan><tspan x="49.6" textLength="596.4" class="c2"># Run: theseus run --headless --recipe examples/standalone/theseus.toml</tspan></text>
 <text y="131.5"><tspan x="32.8" textLength="8.4" class="c2">2</tspan><tspan x="49.6" textLength="117.6" class="c1">schema_version</tspan><tspan x="175.6" textLength="8.4" class="c2">=</tspan><tspan x="192.4" textLength="8.4" class="c0">1</tspan></text>
 <text y="149.5"><tspan x="32.8" textLength="8.4" class="c2">3</tspan><tspan x="49.6" textLength="33.6" class="c1">name</tspan><tspan x="91.6" textLength="8.4" class="c2">=</tspan><tspan x="108.4" textLength="184.8" class="c3">&quot;sample-cli lifecycle&quot;</tspan></text>

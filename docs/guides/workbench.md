@@ -27,7 +27,11 @@ too narrow. Press `?` for a centred key reference listing every binding of the
 current mode and focus, grouped as Navigate, Evidence, Logs, Run control and
 Editing; `?` or Esc closes it, and no other key acts while it is open. In the
 editor, the Save Copy name, confirmations and the `/` filter draft, `?` is
-ordinary text. Setting `NO_COLOR` to any non-empty value (see
+ordinary text.
+
+![Key help overlay over a saved report, grouping bindings as Navigate, Evidence, Logs and Run control](../images/tui-help.svg)
+
+Setting `NO_COLOR` to any non-empty value (see
 [no-color.org](https://no-color.org)) renders without colour; glyphs, bold,
 reverse video and layout are unchanged. It is read once at startup. Scenario, stage and comparison rows start with a status glyph (✓
 passed, ✗ failed, ! review, … incomplete or pending, – skipped), and the focused
