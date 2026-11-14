@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="674" viewBox="0 0 1040 674" role="img" aria-label="theseus run — recipe editor (e)">
+<title>theseus run — recipe editor (e)</title>
+<style>text{font-family:ui-monospace, 'SFMono-Regular', 'DejaVu Sans Mono', Menlo, Consolas, 'Liberation Mono', monospace;font-size:14px;white-space:pre}.c0{fill:#d5d9e0}.c1{fill:#e5c07b}.c2{fill:#5c6370}.c3{fill:#98c379}.c4{fill:#56b6c2;font-weight:bold}</style>
+<rect width="1040" height="674" rx="10" fill="#11151c" stroke="#2b3240"/>
+<path d="M0 10a10 10 0 0 1 10-10h1020a10 10 0 0 1 10 10v20H0z" fill="#1b212c"/>
+<circle cx="18" cy="15" r="5" fill="#ff5f57"/><circle cx="34" cy="15" r="5" fill="#febc2e"/><circle cx="50" cy="15" r="5" fill="#28c840"/>
+<text x="520" y="20" text-anchor="middle" style="font-size:12px;fill:#8a94a6">theseus run — recipe editor (e)</text>
+<text y="59.5"><tspan x="16" textLength="226.8" class="c0">EDIT unchanged | Ln 1 Col 1</tspan></text>
+<text y="77.5"><tspan x="16" textLength="604.8" class="c0">Source: /var/tmp/tui-shots/theseus-demo/examples/standalone/theseus.toml</tspan></text>
+<text y="113.5"><tspan x="32.8" textLength="8.4" class="c1">1</tspan><tspan x="49.6" textLength="596.4" class="c2"># Run: theseus run --headless --recipe examples/standalone/theseus.toml</tspan></text>
+<text y="131.5"><tspan x="32.8" textLength="8.4" class="c2">2</tspan><tspan x="49.6" textLength="117.6" class="c1">schema_version</tspan><tspan x="175.6" textLength="8.4" class="c2">=</tspan><tspan x="192.4" textLength="8.4" class="c0">1</tspan></text>
+<text y="149.5"><tspan x="32.8" textLength="8.4" class="c2">3</tspan><tspan x="49.6" textLength="33.6" class="c1">name</tspan><tspan x="91.6" textLength="8.4" class="c2">=</tspan><tspan x="108.4" textLength="184.8" class="c3">&quot;sample-cli lifecycle&quot;</tspan></text>
+<text y="167.5"><tspan x="32.8" textLength="8.4" class="c2">4</tspan><tspan x="49.6" textLength="42" class="c1">image</tspan><tspan x="100" textLength="8.4" class="c2">=</tspan><tspan x="116.8" textLength="117.6" class="c3">&quot;ubuntu:24.04&quot;</tspan></text>
+<text y="185.5"><tspan x="32.8" textLength="8.4" class="c2">5</tspan><tspan x="49.6" textLength="58.8" class="c1">network</tspan><tspan x="116.8" textLength="8.4" class="c2">=</tspan><tspan x="133.6" textLength="50.4" class="c3">&quot;none&quot;</tspan></text>
+<text y="203.5"><tspan x="32.8" textLength="8.4" class="c2">6</tspan><tspan x="49.6" textLength="58.8" class="c1">observe</tspan><tspan x="116.8" textLength="25.2" class="c2">= [</tspan><tspan x="142" textLength="126" class="c3">&quot;/home/theseus&quot;</tspan><tspan x="268" textLength="8.4" class="c2">,</tspan><tspan x="284.8" textLength="134.4" class="c3">&quot;/usr/local/bin&quot;</tspan><tspan x="419.2" textLength="8.4" class="c2">]</tspan></text>
+<text y="221.5"><tspan x="32.8" textLength="8.4" class="c2">7</tspan><tspan x="49.6" textLength="92.4" class="c4">[artifacts]</tspan></text>
+<text y="239.5"><tspan x="32.8" textLength="8.4" class="c2">8</tspan><tspan x="49.6" textLength="33.6" class="c1">base</tspan><tspan x="91.6" textLength="8.4" class="c2">=</tspan><tspan x="108.4" textLength="50.4" class="c3">&quot;base&quot;</tspan></text>
+<text y="257.5"><tspan x="32.8" textLength="8.4" class="c2">9</tspan><tspan x="49.6" textLength="50.4" class="c1">target</tspan><tspan x="108.4" textLength="8.4" class="c2">=</tspan><tspan x="125.2" textLength="67.2" class="c3">&quot;target&quot;</tspan></text>
+<text y="275.5"><tspan x="24.4" textLength="16.8" class="c2">10</tspan></text>
+<text y="293.5"><tspan x="24.4" textLength="16.8" class="c2">11</tspan><tspan x="49.6" textLength="285.6" class="c4">[profiles.user.steps.install_base]</tspan></text>
+<text y="311.5"><tspan x="24.4" textLength="16.8" class="c2">12</tspan><tspan x="49.6" textLength="50.4" class="c1">script</tspan><tspan x="108.4" textLength="8.4" class="c2">=</tspan><tspan x="125.2" textLength="277.2" class="c3">&quot;sh /inputs/base/install.sh user&quot;</tspan></text>
+<text y="329.5"><tspan x="24.4" textLength="16.8" class="c2">13</tspan><tspan x="49.6" textLength="319.2" class="c4">[profiles.user.steps.install_base.env]</tspan></text>
+<text y="347.5"><tspan x="24.4" textLength="16.8" class="c2">14</tspan><tspan x="49.6" textLength="176.4" class="c1">THESEUS_FIXTURE_FAULT</tspan><tspan x="234.4" textLength="8.4" class="c2">=</tspan><tspan x="251.2" textLength="16.8" class="c3">&quot;&quot;</tspan></text>
+<text y="365.5"><tspan x="24.4" textLength="16.8" class="c2">15</tspan></text>
+<text y="383.5"><tspan x="24.4" textLength="16.8" class="c2">16</tspan><tspan x="49.6" textLength="302.4" class="c4">[profiles.user.steps.install_target]</tspan></text>
+<text y="401.5"><tspan x="24.4" textLength="16.8" class="c2">17</tspan><tspan x="49.6" textLength="50.4" class="c1">script</tspan><tspan x="108.4" textLength="8.4" class="c2">=</tspan><tspan x="125.2" textLength="294" class="c3">&quot;sh /inputs/target/install.sh user&quot;</tspan></text>
+<text y="419.5"><tspan x="24.4" textLength="16.8" class="c2">18</tspan><tspan x="49.6" textLength="336" class="c4">[profiles.user.steps.install_target.env]</tspan></text>
+<text y="437.5"><tspan x="24.4" textLength="16.8" class="c2">19</tspan><tspan x="49.6" textLength="176.4" class="c1">THESEUS_FIXTURE_FAULT</tspan><tspan x="234.4" textLength="8.4" class="c2">=</tspan><tspan x="251.2" textLength="16.8" class="c3">&quot;&quot;</tspan></text>
+<text y="455.5"><tspan x="24.4" textLength="16.8" class="c2">20</tspan></text>
+<text y="473.5"><tspan x="24.4" textLength="16.8" class="c2">21</tspan><tspan x="49.6" textLength="260.4" class="c4">[profiles.user.steps.configure]</tspan></text>
+<text y="491.5"><tspan x="24.4" textLength="16.8" class="c2">22</tspan><tspan x="49.6" textLength="50.4" class="c1">script</tspan><tspan x="108.4" textLength="8.4" class="c2">=</tspan><tspan x="125.2" textLength="184.8" class="c3">&quot;sample-cli configure&quot;</tspan></text>
+<text y="509.5"><tspan x="24.4" textLength="16.8" class="c2">23</tspan><tspan x="49.6" textLength="294" class="c4">[profiles.user.steps.configure.env]</tspan></text>
+<text y="527.5"><tspan x="24.4" textLength="16.8" class="c2">24</tspan><tspan x="49.6" textLength="176.4" class="c1">THESEUS_FIXTURE_FAULT</tspan><tspan x="234.4" textLength="8.4" class="c2">=</tspan><tspan x="251.2" textLength="16.8" class="c3">&quot;&quot;</tspan></text>
+<text y="545.5"><tspan x="24.4" textLength="16.8" class="c2">25</tspan></text>
+<text y="563.5"><tspan x="24.4" textLength="16.8" class="c2">26</tspan><tspan x="49.6" textLength="243.6" class="c4">[profiles.user.steps.upgrade]</tspan></text>
+<text y="581.5"><tspan x="24.4" textLength="16.8" class="c2">27</tspan><tspan x="49.6" textLength="50.4" class="c1">script</tspan><tspan x="108.4" textLength="8.4" class="c2">=</tspan><tspan x="125.2" textLength="294" class="c3">&quot;sh /inputs/target/install.sh user&quot;</tspan></text>
+<text y="599.5"><tspan x="24.4" textLength="16.8" class="c2">28</tspan><tspan x="49.6" textLength="277.2" class="c4">[profiles.user.steps.upgrade.env]</tspan></text>
+<text y="617.5"><tspan x="24.4" textLength="16.8" class="c2">29</tspan><tspan x="49.6" textLength="176.4" class="c1">THESEUS_FIXTURE_FAULT</tspan><tspan x="234.4" textLength="8.4" class="c2">=</tspan><tspan x="251.2" textLength="16.8" class="c3">&quot;&quot;</tspan></text>
+<text y="635.5"><tspan x="24.4" textLength="16.8" class="c2">30</tspan></text>
+<text y="653.5"><tspan x="16" textLength="294" class="c0">CtrlT test | CtrlS save | Esc close</tspan></text>
+</svg>

@@ -17,6 +17,10 @@ preview (`theseus compare --suite PATH`) lists its Selection, Stages, Scopes and
 Variants (the baseline is marked) and states how many lifecycle runs and
 comparison cells the declared suite implies, computed from the manifest alone.
 
+![Recipe preview: bracketed profile and scenario selection, a Will run line, the Environment group and the declared steps](../images/tui-preview.svg)
+
+![Comparison suite preview: Will run line with lifecycle runs and compared cells, then Selection, Stages, Scopes and Variants with the baseline marked](../images/tui-comparison.svg)
+
 The footer shows the current status followed by the keys that apply in the
 current mode and focus; lower-priority hints are omitted when the terminal is
 too narrow. Scenario, stage and comparison rows start with a status glyph (✓
@@ -29,6 +33,8 @@ event while the saved report catches up) and the elapsed time; the scenario
 holding the running stage shows `▸`. After the run the header shows the total
 duration. Native evidence views use the same header, selector tabs and footer.
 
+![A live run: the header shows a spinner, the running scenario and stage, and the elapsed time while completed stages fill the selector](../images/tui-live.svg)
+
 ## Edit a preview
 
 In a pristine recipe or comparison suite preview, `e` opens a raw TOML editor
@@ -36,6 +42,9 @@ before the first run. It opens at the top (`Ln 1 Col 1`) and preserves
 comments, Unicode and exact source bytes. At 60 columns or wider it shows a
 dim line-number gutter and colours TOML table headers, keys, strings and
 comments; colouring is display only.
+
+![Raw TOML editor at Ln 1 Col 1 with a line-number gutter and coloured table headers, keys, strings and comments](../images/tui-editor.svg)
+
 Ordinary `q`, `r`, `p`, `s` and `d` typed in the editor are text. Use arrows,
 Home/End, Ctrl-Home/End, Enter, Tab and Backspace/Delete to edit; bracketed
 paste inserts once. Ctrl-T validates the draft without saving or running it.
@@ -76,6 +85,8 @@ outcome and terminal restoration.
 ## Browse live and saved evidence
 
 During live or saved report viewing:
+
+![Saved report with the stage selector focused on an after-checks stage and the Files evidence tab listing fingerprinted records and the selected record's detail](../images/tui-evidence.svg)
 
 - `Tab` / `Enter` cycles scenario, stage, and evidence focus; `Esc` goes back.
 - Arrows or `j/k` select a scenario, stage, or evidence record; Home/End selects

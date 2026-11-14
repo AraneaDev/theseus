@@ -25,6 +25,8 @@ The same engine is available to an MCP client through `theseus serve`.
 It runs locally over ordinary stdin/stdout pipes, without a model dependency
 or a listening network service.
 
+![The Theseus workbench browsing a saved interrupted-rollback report: scenario and stage selectors with status glyphs, evidence tabs with record counts, and the selected record's detail](docs/images/tui-report.svg)
+
 ## What you can do
 
 - **Rehearse a lifecycle:** select declared user/system profiles and scenarios,
@@ -95,6 +97,8 @@ The workbench lets you select a profile and scenario before execution, then
 browse stages, findings, commands and logs. Saved evidence can be reopened
 without Docker. From the example's recipe project, replace `RUN_ID` with the
 location printed by the run:
+
+![Recipe preview of the standalone example: selected profiles and scenarios, the fixed guest environment and each step's command, before anything runs](docs/images/tui-preview.svg)
 
 ```sh
 theseus report .theseus-runs/RUN_ID
