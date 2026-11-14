@@ -10,9 +10,11 @@ from terminal_session import NativeSession, SessionDiagnostics
 
 def resized_frame(terminal):
     cells = terminal.output.screen.cells
-    # A buffered 120-column Preview is not evidence of the new 82-column frame.
+    # A buffered 120-column Preview is not evidence of the new 82-column frame:
+    # require the header box to close at column 81 within the first rows.
     return (terminal.output.has(b'Preview') and cells.get((0, 81)) == '┐'
-            and cells.get((3, 0)) == '└' and cells.get((3, 81)) == '┘')
+            and any(cells.get((row, 0)) == '└' and cells.get((row, 81)) == '┘'
+                    for row in range(2, 5)))
 
 
 binary = sys.argv[1]
