@@ -110,7 +110,7 @@ def session(root, policy=None, saved=None, legacy=False, unverified=False, negat
             index = next(i for i, stage in enumerate(scenario['stages']) if stage['name'] == 'rolled_back')
             proof = next(c for c in scenario['stages'][index]['checks'] if c['id'] == '__theseus_rollback_restored_data')
             assert proof['outcome'] in ['failed', 'skipped']
-            os.write(master, b'\t' + b'j' * index)
+            os.write(master, b'\t\x1b[H' + b'j' * index)  # Home: reports open on the first failure
             resize(60, 130)
             until(lambda: b'> rolled_back ' in rendered()
                   and ('__theseus_rollback_restored_data ' + proof['outcome']).encode() in rendered())
@@ -126,7 +126,7 @@ def session(root, policy=None, saved=None, legacy=False, unverified=False, negat
             until(lambda: b'incomplete' in rendered())
             value = json.loads(saved.read_text())
             index = next(i for i, stage in enumerate(value['scenarios'][0]['stages']) if stage['name'] == 'attempt_upgrade')
-            os.write(master, b'\t' + b'j' * index)
+            os.write(master, b'\t\x1b[H' + b'j' * index)  # Home: reports open on the first incomplete stage
             resize(50, 125)
             until(lambda: b'> attempt_upgrade passed' in rendered())
             assert b'Rollback verified:' not in rendered()
