@@ -41,6 +41,8 @@ pub(super) struct Hits {
     /// Comparison cell rows.
     pub cells: Option<ListHit>,
     pub tabs: Vec<(Rect, Tab)>,
+    /// Native evidence selector tabs, by selector index.
+    pub native_tabs: Vec<(Rect, usize)>,
     /// Scrollable text: the selected detail, a preview or pending body.
     pub scroll: Option<Rect>,
 }
@@ -142,6 +144,13 @@ fn click_at(app: &mut App, hits: &Hits, at: Position) {
         select_cell(app, i, true);
     } else if let Some(i) = hits.records.and_then(|h| h.row(at)) {
         select_record(app, i, true);
+    } else if let Some(&(_, index)) = hits.native_tabs.iter().find(|(r, _)| r.contains(at)) {
+        // Native evidence shows one record at a time (no rows to click).
+        if let Some(view) = app.native.as_mut()
+            && view.select(index)
+        {
+            app.scroll = 0;
+        }
     } else if let Some((_, tab)) = hits.tabs.iter().find(|(r, _)| r.contains(at)) {
         app.navigated |= app.report.is_some();
         app.focus = Focus::Evidence;

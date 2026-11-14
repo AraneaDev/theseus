@@ -146,7 +146,8 @@ Mouse input is off by default, because capturing the mouse disables the
 terminal's own text selection. The global `--mouse` flag enables it, for
 example `theseus --mouse report PATH`. Then a left click on a scenario, stage,
 comparison cell or evidence record row selects it and focuses that panel, a
-click on an evidence tab switches to it, and the wheel moves the selection of
+click on an evidence tab or a native evidence selector tab switches to it, and
+the wheel moves the selection of
 the list under the pointer or scrolls the detail, preview or native evidence
 under it. While the help overlay is open a click closes it; the editor,
 confirmations and the filter draft ignore the mouse. Mouse capture is released
