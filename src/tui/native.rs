@@ -1,5 +1,5 @@
 //! Native evidence has its own display domain; no Docker identity projection.
-use super::App;
+use super::{App, theme};
 use crate::{
     model::RunOutcome,
     native::{
@@ -11,6 +11,8 @@ use crate::{
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     Frame,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
@@ -186,7 +188,8 @@ impl NativeView {
             .as_ref()
             .map_or(RunOutcome::Passed, |r| r.consumer_outcome())
     }
-    fn text(&self) -> String {
+    /// Outcome line and bounded, sanitized evidence body.
+    fn text(&self) -> (Option<String>, String) {
         let (value, start) = if let Some(page) = self.integration_detail() {
             match page {
                 Ok(page) => (
@@ -216,11 +219,9 @@ impl NativeView {
         let outcome = self
             .report
             .as_ref()
-            .map(|r| format!("Outcome: {}", r.consumer_outcome()))
-            .unwrap_or_else(|| "Preview".into());
-        format!(
-            "{}\nSelector: {} | record {} | byte {}\n{}\n\nleft/right: selector | up/down: record | n/p: text page | r: run | c: cancel | q: quit",
-            outcome,
+            .map(|r| r.consumer_outcome().to_string());
+        let body = format!(
+            "Selector: {} | record {} | byte {}\n{}",
             if matches!(self.report, Some(NativeReportVersion::IntegrationV2(_))) {
                 [
                     "Overview",
@@ -247,26 +248,74 @@ impl NativeView {
             self.record,
             start,
             super::safe_text(&value)
-        )
+        );
+        (outcome, body)
     }
 }
 pub fn render(frame: &mut Frame, app: &App) -> bool {
     let Some(view) = &app.native else {
         return false;
     };
-    frame.render_widget(
-        Paragraph::new(format!(
-            "{}\n{}",
+    let (outcome, body) = view.text();
+    let mut lines = vec![
+        Line::styled(
             super::safe_text(&app.status),
-            view.text()
-        ))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Native evidence"),
-        )
-        .wrap(Wrap { trim: false })
-        .scroll((app.scroll, 0)),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        match &outcome {
+            // Glyph first, so the exact `Outcome: <word>` text stays intact for
+            // readers and for the real-manager acceptance checks that match it.
+            Some(outcome) => {
+                let (glyph, color) = theme::status(outcome);
+                let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+                Line::from(vec![
+                    Span::styled(format!("{glyph} "), style),
+                    Span::raw("Outcome: "),
+                    Span::styled(super::safe_text(outcome), style),
+                ])
+            }
+            None => Line::raw("Preview"),
+        },
+    ];
+    lines.extend(body.split('\n').map(|l| Line::raw(l.to_owned())));
+    lines.push(Line::raw(""));
+    // Only keys that act now: r before the single start, c while running.
+    let mut keys = vec![
+        ("←→", "selector"),
+        ("↑↓", "record"),
+        ("n/p", "text page"),
+        ("PgUp/Dn", "scroll"),
+    ];
+    if !app.active && !app.work_consumed && view.report.is_none() {
+        keys.push(("r", "run"));
+    }
+    if app.active {
+        keys.push(("c", "cancel"));
+    }
+    keys.push(("q", "quit"));
+    let mut spans = Vec::new();
+    for (i, (key, label)) in keys.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            key,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(format!(" {label}")));
+    }
+    lines.push(Line::from(spans));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Native evidence"),
+            )
+            .wrap(Wrap { trim: false })
+            .scroll((app.scroll, 0)),
         frame.area(),
     );
     true

@@ -9,8 +9,15 @@ server](../agents/mcp-server.md).
 Launch with `theseus` or `theseus run --recipe PATH` to inspect commands and
 public environment before execution. In preview, `p` cycles available profiles
 and `s` cycles the recipe’s declared scenarios and all; `r` starts the displayed
-selection. Arrows or `j/k` and Page Up/Down scroll the preview. Preview never
-executes automatically.
+selection. The preview marks the current selection in brackets and states it
+on a `Will run:` line. Arrows or `j/k` and Page Up/Down scroll the preview.
+Preview never executes automatically.
+
+The footer shows the current status followed by the keys that apply in the
+current mode and focus; lower-priority hints are omitted when the terminal is
+too narrow. Scenario, stage and comparison rows start with a status glyph (✓
+passed, ✗ failed, ! review, … incomplete or pending, – skipped), and the focused
+selector is marked `▶` with a heavy border. Evidence tabs show record counts.
 
 ## Edit a preview
 

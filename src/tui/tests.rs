@@ -194,7 +194,9 @@ fn terminal_worker_error_overrides_cached_passed_and_failed_results() {
                 .map(|cell| cell.symbol())
                 .collect();
             for expected in [
-                "cached-before-final-save | incomplete |".to_string(),
+                // Outcome once, coloured by glyph; run id dimmed in the title.
+                "… incomplete  │ ".to_string(),
+                " run cached-before-final-save ".to_string(),
                 "final persistence failed".to_string(),
                 root.join("report.json").display().to_string(),
                 format!("theseus cleanup {}", crate::shell::path_argument(&root)),
