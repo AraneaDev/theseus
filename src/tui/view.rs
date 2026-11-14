@@ -81,7 +81,11 @@ pub(super) struct View {
     log_metadata: bool,
     pub scroll: u16,
     last_scroll: u16,
+    /// Whether the selected record is a log, so `m` and log jumps apply.
+    pub selected_log: bool,
+    counts: Option<(CountKey, [usize; 5])>,
 }
+type CountKey = (u64, PathBuf, usize, usize, Option<(usize, usize)>);
 impl View {
     pub fn raw_log(&self) -> bool {
         !self.log_metadata
@@ -106,6 +110,32 @@ impl View {
     }
     pub fn restart_detail(&mut self) {
         self.selected = None;
+    }
+    /// Whether `[`/`]` can move to another stored chunk of the selected detail.
+    pub fn has_chunks(&self) -> bool {
+        self.next.is_some() || !matches!(self.position, Position::Text(0) | Position::Raw(0, _))
+    }
+    /// Unfiltered record counts per evidence tab, recomputed only when the
+    /// report revision or stage selection changes. Records are borrowed
+    /// in-memory references; no log or detail bytes are read.
+    pub fn tab_counts(&mut self, app: &App) -> [usize; 5] {
+        let key = (
+            app.view_revision,
+            app.root.clone(),
+            app.scenario_index,
+            app.stage_index,
+            app.terminal_error
+                .as_ref()
+                .map(|s| (s.as_ptr() as usize, s.len())),
+        );
+        if let Some((cached, counts)) = &self.counts
+            && *cached == key
+        {
+            return *counts;
+        }
+        let counts = Tab::ALL.map(|tab| Catalog::for_tab(app, tab).count());
+        self.counts = Some((key, counts));
+        counts
     }
     pub fn force_refresh(&mut self) {
         self.dirty = true;
@@ -182,7 +212,11 @@ impl View {
                 .min(index.len().saturating_sub(SUMMARY_ROWS));
             self.rows = index.summaries(&catalog, self.start, SUMMARY_ROWS, 512);
         }
-        let Some(selected) = index.get(&catalog, position) else {
+        let selected = index.get(&catalog, position);
+        self.selected_log = selected
+            .as_ref()
+            .is_some_and(|s| s.record.log_reference().is_some());
+        let Some(selected) = selected else {
             self.body = "No evidence for this stage/filter.".into();
             self.label = "0 records".into();
             self.dirty = false;

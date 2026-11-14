@@ -583,8 +583,7 @@ fn mixed_schema_three_preview_keeps_stability_scopes_with_their_checkpoint_refer
             .find(|line| line.starts_with("Declared stable scopes"))
             .expect("selected reinstall has a stability summary");
         assert_eq!(
-            reinstall_scopes,
-            "Declared stable scopes (path and descendants): [\"/home/theseus/config\"]",
+            reinstall_scopes, "Declared stable scopes (path and descendants): /home/theseus/config",
             "reinstall summary must exclude interrupted/recovered scopes: {preview}"
         );
         assert!(preview.contains("Compare before_reinstall (after first exercise) to reinstalled (before checks and second exercise)."));
@@ -604,9 +603,7 @@ fn mixed_schema_three_preview_keeps_stability_scopes_with_their_checkpoint_refer
             ("data", "recovered", "/home/theseus/data"),
         ] {
             assert!(
-                preview.contains(&format!(
-                    "check {id} @ {checkpoint}: Unchanged {{ path: \"{scope}\" }}"
-                )),
+                preview.contains(&format!("check {id} @ {checkpoint}: unchanged {scope}")),
                 "declared contract must retain its checkpoint and scope: {preview}"
             );
         }

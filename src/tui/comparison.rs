@@ -1,5 +1,8 @@
 //! Suite state and workbench rendering; lifecycle execution stays in the shared worker.
-use super::{App, safe_text};
+use super::{
+    App, safe_text,
+    theme::{self, Hint, REQUIRED, hint},
+};
 use crate::comparison::{
     ComparisonReport, LoadedComparison, SuiteManifest, SuiteRunOptions, ValidatedSuite,
 };
@@ -7,7 +10,9 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
 use std::path::PathBuf;
 
@@ -154,31 +159,49 @@ fn heading_field(label: &str, value: &str, width: usize, limit: usize) -> String
 pub(super) fn render(frame: &mut Frame, app: &App) {
     let view = app.comparison.as_ref().unwrap();
     let m = &view.manifest;
+    let status = if super::preview_edit::dirty(app) {
+        "UNSAVED draft".to_string()
+    } else if app.editing_filter {
+        format!("Filter (Enter/Esc apply): {}_", bounded(&app.filter_draft))
+    } else {
+        bounded(&app.status)
+    };
+    if view.report.is_some() {
+        app.viewport.borrow_mut().update(app, None);
+    }
+    let width = frame.area().width;
+    let footer = theme::footer(&status, &hints(app, view), width);
     let layout = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(1),
-        Constraint::Length(3),
+        Constraint::Length(theme::footer_height(&footer, width)),
     ])
     .split(frame.area());
-    let title = format!(
-        "{} | Baseline: {} | {}{}",
-        bounded(&m.name),
-        bounded(&m.baseline),
-        app.outcome(),
-        if view.report.is_none() && app.has_started() {
-            " | Live evidence pending or unavailable"
-        } else if view.report.is_none() {
-            if super::preview_edit::dirty(app) {
-                " | UNSAVED draft — accepted preview; no commands executed"
-            } else {
-                " | Preview — no commands executed"
-            }
+    let suffix = if view.report.is_none() && app.has_started() {
+        " | Live evidence pending or unavailable"
+    } else if view.report.is_none() {
+        if super::preview_edit::dirty(app) {
+            " | UNSAVED draft — accepted preview; no commands executed"
         } else {
-            ""
+            " | Preview — no commands executed"
         }
-    );
+    } else {
+        ""
+    };
+    let title = Line::from(vec![
+        Span::styled(
+            safe_text(&bounded(&m.name)),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(safe_text(&format!(
+            " | Baseline: {} | ",
+            bounded(&m.baseline)
+        ))),
+        theme::status_word(&app.outcome().to_string(), true),
+        Span::raw(suffix),
+    ]);
     frame.render_widget(
-        Paragraph::new(safe_text(&title))
+        Paragraph::new(title)
             .block(panel("Theseus comparison"))
             .wrap(Wrap { trim: false }),
         layout[0],
@@ -205,25 +228,26 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
             .skip(row_start)
             .take(64)
             .map(|c| {
-                ListItem::new(format!(
-                    "{} {}/{}/{} {} {:?}",
-                    bounded(&c.variant_id),
-                    c.profile,
-                    c.scenario,
-                    bounded(&c.stage),
-                    bounded(&c.scope_id),
-                    c.comparison.status
-                ))
+                (
+                    format!(
+                        "{} {}/{}/{} {} {:?}",
+                        bounded(&c.variant_id),
+                        c.profile,
+                        c.scenario,
+                        bounded(&c.stage),
+                        bounded(&c.scope_id),
+                        c.comparison.status
+                    ),
+                    format!("{:?}", c.comparison.status),
+                )
             })
             .collect::<Vec<_>>();
-        let mut state =
-            ListState::default().with_selected(Some(view.row.saturating_sub(row_start)));
-        frame.render_stateful_widget(
-            List::new(rows)
-                .block(panel("Comparison rows — Tab evidence"))
-                .highlight_symbol("> "),
+        theme::status_list(
+            frame,
             parts[0],
-            &mut state,
+            theme::panel("Comparison rows — Tab evidence", !view.evidence_focus),
+            rows.iter().map(|(t, w)| (t.clone(), w.as_str())).collect(),
+            view.row.saturating_sub(row_start),
         );
         let heading_width = parts[1].width.saturating_sub(2) as usize;
         let compact = parts[1].height < 16;
@@ -303,9 +327,12 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
             layout[1],
         );
     } else {
+        let join = |items: Vec<String>| items.join(", ");
         let mut context = format!(
-            "Profiles: {:?} | Scenarios: {:?}\nStages: {:?}\n",
-            m.profiles, m.scenarios, m.stages
+            "Profiles: {} | Scenarios: {}\nStages: {}\n",
+            join(m.profiles.iter().map(|p| p.to_string()).collect()),
+            join(m.scenarios.iter().map(|p| p.to_string()).collect()),
+            join(m.stages.iter().map(|s| bounded(s)).collect())
         );
         for scope in &m.scopes {
             context += &format!(
@@ -341,20 +368,43 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
             layout[1],
         );
     }
-    let hint = if super::preview_edit::dirty(app) {
-        "UNSAVED draft | e edit d discard q discard/quit | r/p/s disabled until Save Copy or discard".to_string()
-    } else {
-        format!(
-            "{} | Tab cells/evidence | ↑↓/j/k Home/End select | [ ] chunks PgUp/Dn scroll / filter | e edit d discard r run c cancel q quit",
-            if app.editing_filter {
-                format!("Filter (Enter/Esc apply): {}_", bounded(&app.filter_draft))
-            } else {
-                bounded(&app.status)
-            }
-        )
-    };
-    frame.render_widget(
-        Paragraph::new(safe_text(&hint)).wrap(Wrap { trim: false }),
-        layout[2],
-    );
+    frame.render_widget(footer, layout[2]);
+}
+/// Only keys that act in the current comparison mode and focus.
+fn hints(app: &App, view: &ComparisonView) -> Vec<Hint> {
+    if super::preview_edit::dirty(app) {
+        return vec![
+            hint("e", "edit", REQUIRED),
+            hint("d", "discard", REQUIRED),
+            hint("q", "discard/quit", REQUIRED),
+            hint("r/p/s", "disabled until Save Copy or discard", 1),
+        ];
+    }
+    if app.editing_filter {
+        return vec![];
+    }
+    let mut hints = Vec::new();
+    if view.report.is_some() {
+        hints.push(hint("Tab", "cells/evidence", REQUIRED));
+        hints.push(hint("↑↓", "select", 2));
+        hints.push(hint("Home/End", "first/last", 5));
+        if view.evidence_focus && app.viewport.borrow().has_chunks() {
+            hints.push(hint("[ ]", "chunks", 2));
+        }
+        hints.push(hint("PgUp/Dn", "scroll", 4));
+        hints.push(hint("/", "filter", 3));
+    } else if !app.has_started() {
+        if view.suite.is_some() && !app.work_consumed {
+            hints.push(hint("r", "run", REQUIRED));
+        }
+        hints.push(hint("↑↓", "scroll", 3));
+        if super::preview_edit::eligible(app) {
+            hints.push(hint("e", "edit", 2));
+        }
+    }
+    if app.active {
+        hints.push(hint("c", "cancel", REQUIRED));
+    }
+    hints.push(hint("q", "quit", REQUIRED));
+    hints
 }

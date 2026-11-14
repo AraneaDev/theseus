@@ -5,13 +5,18 @@ type Records<'a> = Box<dyn Iterator<Item = Record<'a>> + 'a>;
 /// The caller owns App/report storage. Rebuild after its revision/selection changes.
 pub struct Catalog<'a> {
     app: &'a App,
+    tab: Tab,
 }
 impl<'a> Catalog<'a> {
     pub fn for_app(app: &'a App) -> Self {
-        Self { app }
+        Self { app, tab: app.tab }
+    }
+    /// The same unfiltered records another evidence tab would show.
+    pub fn for_tab(app: &'a App, tab: Tab) -> Self {
+        Self { app, tab }
     }
     pub fn records(&self) -> impl Iterator<Item = SelectedRecord<'a>> + 'a {
-        records(self.app)
+        records(self.app, self.tab)
             .enumerate()
             .map(|(key, record)| SelectedRecord { key, record })
     }
@@ -22,7 +27,7 @@ impl<'a> Catalog<'a> {
         self.records().nth(key)
     }
 }
-fn records(app: &App) -> Records<'_> {
+fn records(app: &App, tab: Tab) -> Records<'_> {
     let terminal = app
         .terminal_error
         .as_deref()
@@ -31,14 +36,14 @@ fn records(app: &App) -> Records<'_> {
     let rest = if let Some(view) = &app.comparison {
         comparison(app, view)
     } else {
-        lifecycle(app)
+        lifecycle(app, tab)
     };
     Box::new(terminal.chain(rest))
 }
 fn errors(errors: &[String]) -> impl Iterator<Item = Record<'_>> {
     errors.iter().map(|s| Record::Text(s))
 }
-fn lifecycle(app: &App) -> Records<'_> {
+fn lifecycle(app: &App, tab: Tab) -> Records<'_> {
     let Some(stage) = app.stage() else {
         return Box::new(
             app.report.iter().flat_map(|r| errors(&r.errors)).chain(
@@ -49,7 +54,7 @@ fn lifecycle(app: &App) -> Records<'_> {
         );
     };
     let proofs: Records<'_> =
-        if matches!(app.tab, Tab::Stages | Tab::Commands) {
+        if matches!(tab, Tab::Stages | Tab::Commands) {
             Box::new(stage.restart.iter().map(Record::Restart).chain(
                 stage.commands.iter().flat_map(|c| {
                     [
@@ -72,7 +77,7 @@ fn lifecycle(app: &App) -> Records<'_> {
         } else {
             Box::new(empty())
         };
-    let rest: Records<'_> = match app.tab {
+    let rest: Records<'_> = match tab {
         Tab::Stages => Box::new(
             app.scenario()
                 .and_then(verified_label)
@@ -139,11 +144,11 @@ fn lifecycle(app: &App) -> Records<'_> {
     Box::new(
         plugin
             .into_iter()
-            .filter(|_| matches!(app.tab, Tab::Stages | Tab::Findings))
+            .filter(move |_| matches!(tab, Tab::Stages | Tab::Findings))
             .map(Record::Plugin)
             .chain(
                 mcp.into_iter()
-                    .filter(|_| matches!(app.tab, Tab::Stages | Tab::Findings))
+                    .filter(move |_| matches!(tab, Tab::Stages | Tab::Findings))
                     .map(Record::Mcp),
             )
             .chain(
@@ -151,7 +156,7 @@ fn lifecycle(app: &App) -> Records<'_> {
                     .iter()
                     .filter(move |_| {
                         (plugin.is_some() || mcp.is_some())
-                            && matches!(app.tab, Tab::Stages | Tab::Findings)
+                            && matches!(tab, Tab::Stages | Tab::Findings)
                     })
                     .flat_map(|r| r.artifacts.iter().map(Record::Artifact)),
             )

@@ -36,7 +36,7 @@ pub(super) fn blocks_work(app: &App) -> bool {
         .is_some_and(|s| s.dirty || s.mode != Mode::Preview)
 }
 
-fn eligible(app: &App) -> bool {
+pub(super) fn eligible(app: &App) -> bool {
     !app.active
         && !app.work_consumed
         && !app.quit_requested
