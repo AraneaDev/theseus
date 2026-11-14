@@ -233,6 +233,17 @@ impl NativeView {
         );
         (outcome, body)
     }
+    /// Switch to selector `index` (as ←/→ reaching it does), restarting at
+    /// its first record and byte. An out-of-range index does nothing.
+    pub(super) fn select(&mut self, index: usize) -> bool {
+        if index >= self.selector_names().len() {
+            return false;
+        }
+        self.selector = index;
+        self.record = 0;
+        self.byte = 0;
+        true
+    }
     fn selector_names(&self) -> &'static [&'static str] {
         if matches!(self.report, Some(NativeReportVersion::IntegrationV2(_))) {
             &[
@@ -329,8 +340,14 @@ pub fn render(frame: &mut Frame, app: &App) -> bool {
         regions[0],
     );
     if view.report.is_some() {
+        let names = view.selector_names();
+        app.hits.borrow_mut().native_tabs =
+            super::mouse::tab_areas(regions[1], names.iter().map(|n| n.chars().count()))
+                .into_iter()
+                .zip(0..names.len())
+                .collect();
         frame.render_widget(
-            Tabs::new(view.selector_names().iter().copied())
+            Tabs::new(names.iter().copied())
                 .select(view.selector)
                 .highlight_style(
                     theme::tone(Color::Cyan).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
@@ -371,20 +388,13 @@ pub fn input(app: &mut App, key: KeyEvent) -> bool {
             app.start_requested = true
         }
         KeyCode::Left | KeyCode::Right => {
-            let count = if matches!(view.report, Some(NativeReportVersion::IntegrationV2(_))) {
-                10
+            let count = view.selector_names().len();
+            let step = if key.code == KeyCode::Right {
+                1
             } else {
-                6
+                count - 1
             };
-            view.selector = (view.selector
-                + if key.code == KeyCode::Right {
-                    1
-                } else {
-                    count - 1
-                })
-                % count;
-            view.record = 0;
-            view.byte = 0;
+            view.select((view.selector + step) % count);
             app.scroll = 0;
         }
         KeyCode::Down => {
@@ -482,6 +492,99 @@ mod tests {
         assert!(text.contains("←→ selector") && !text.contains("r run"));
         input(&mut app, KeyCode::Right.into());
         assert!(draw(&app).contains("Selector: Services | record 0 | byte 0"));
+    }
+    fn rows(app: &App) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| super::super::render(f, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect()
+    }
+    fn pointer(app: &mut App, kind: crossterm::event::MouseEventKind, column: u16, row: u16) {
+        super::super::mouse::input(
+            app,
+            crossterm::event::MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+        );
+    }
+    /// Column and row of `needle` on the selector tab row.
+    fn tab_at(screen: &[String], needle: &str) -> (u16, u16) {
+        screen
+            .iter()
+            .enumerate()
+            .find_map(|(y, row)| {
+                (row.contains("Overview │"))
+                    .then(|| row.find(needle))
+                    .flatten()
+                    .map(|x| (row[..x].chars().count() as u16, y as u16))
+            })
+            .unwrap_or_else(|| panic!("{needle} not on the tab row\n{}", screen.join("\n")))
+    }
+    #[test]
+    fn native_selector_tabs_switch_on_click_and_wheel_still_scrolls() {
+        use crossterm::event::{MouseButton, MouseEventKind::*};
+        let click = Down(MouseButton::Left);
+        let report = crate::native::integration::view::tests::report();
+        let mut app = App::integration_offline(report, "/saved-evidence".into());
+        // Every recorded rectangle covers its own drawn selector title.
+        let screen = rows(&app);
+        let tabs = app.hits.borrow().native_tabs.clone();
+        assert_eq!(tabs.len(), 10);
+        let names = app.native.as_ref().unwrap().selector_names();
+        for (rect, index) in tabs {
+            let text: String = screen[rect.y as usize]
+                .chars()
+                .skip(rect.x as usize)
+                .take(rect.width as usize)
+                .collect();
+            assert_eq!(text.trim(), names[index], "{rect:?}");
+        }
+        // A click on a selector tab switches to it, like ←/→ reaching it.
+        app.native.as_mut().unwrap().record = 1;
+        app.scroll = 4;
+        let (x, y) = tab_at(&screen, "Readiness");
+        pointer(&mut app, click, x + 2, y);
+        let view = app.native.as_ref().unwrap();
+        assert_eq!((view.selector, view.record, view.byte), (2, 0, 0));
+        assert_eq!(app.scroll, 0);
+        let screen = rows(&app);
+        assert!(
+            screen
+                .iter()
+                .any(|r| r.contains("Selector: Readiness | record 0"))
+        );
+        assert!(screen.iter().any(|r| r.contains("… Outcome: incomplete")));
+        // Clicking the evidence body (one record, not rows) changes nothing.
+        let (x, y) = tab_at(&screen, "Overview");
+        pointer(&mut app, click, x, y + 3);
+        assert_eq!(app.native.as_ref().unwrap().selector, 2);
+        // Wheel over the evidence still scrolls it; over the tabs it does not.
+        pointer(&mut app, ScrollDown, x, y + 3);
+        assert_eq!(app.scroll, 3);
+        pointer(&mut app, ScrollDown, x, y);
+        assert_eq!((app.scroll, app.native.as_ref().unwrap().selector), (3, 2));
+        // Help open: a click on a tab only closes help.
+        let screen = rows(&app);
+        app.help = true;
+        let (x, y) = tab_at(&screen, "Failures");
+        pointer(&mut app, click, x, y);
+        assert!(!app.help);
+        assert_eq!(app.native.as_ref().unwrap().selector, 2);
+        pointer(&mut app, click, x, y);
+        assert_eq!(app.native.as_ref().unwrap().selector, 9);
+        // A preview has no selector tabs to click.
+        let preview = App::native_preview("no report".into());
+        rows(&preview);
+        assert!(preview.hits.borrow().native_tabs.is_empty());
     }
     #[test]
     fn large_readiness_details_and_following_record_remain_navigable() {
