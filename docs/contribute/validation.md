@@ -163,6 +163,25 @@ stable binaries/configuration, runtime behavior, retention, and owned cleanup,
 under that same binary-copy contract. Synthetic fixtures remain reproducible in
 this repository; real binary artifacts/reports are local evidence.
 
+## Regenerating screenshots
+
+The workbench images in `docs/images/` are generated, not hand-edited. With
+`tmux` on `PATH` (Linux or macOS), run from the repository root:
+
+```sh
+python3 scripts/screenshots.py            # build, then capture all quick scenes
+python3 scripts/screenshots.py --live     # also a live run and its cancellation (needs Docker)
+python3 scripts/screenshots.py --binary target/release/theseus --scenes preview,editor
+```
+
+Each scene runs the real binary with `--no-animation` in a detached 120×34 tmux
+session, from a copy of the example inputs in `<tmp>/theseus-demo`, and converts
+the captured ANSI screen to a self-contained SVG. The script fails if any image
+would contain your home directory or user name. The report scenes use the
+git-ignored saved run `examples/interrupted-rollback/.theseus-runs/1793309242520942542-1672854`
+(or `--report-run DIR`); without it they are skipped. Converter tests run
+without tmux: `python3 tests/support/screenshots_test.py`.
+
 ## Related documentation
 
 - [Installation](../get-started/installation.md): native architectures and host/guest distinctions.
