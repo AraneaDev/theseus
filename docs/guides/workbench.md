@@ -10,19 +10,38 @@ Launch with `theseus` or `theseus run --recipe PATH` to inspect commands and
 public environment before execution. In preview, `p` cycles available profiles
 and `s` cycles the recipe’s declared scenarios and all; `r` starts the displayed
 selection. The preview marks the current selection in brackets and states it
-on a `Will run:` line. Arrows or `j/k` and Page Up/Down scroll the preview.
-Preview never executes automatically.
+on a `Will run:` line, and groups the fixed runtime identity, home, XDG and
+`PATH` values under an `Environment` heading. Arrows or `j/k` and Page Up/Down
+scroll the preview. Preview never executes automatically. A comparison suite
+preview (`theseus compare --suite PATH`) lists its Selection, Stages, Scopes and
+Variants (the baseline is marked) and states how many lifecycle runs and
+comparison cells the declared suite implies, computed from the manifest alone.
 
 The footer shows the current status followed by the keys that apply in the
 current mode and focus; lower-priority hints are omitted when the terminal is
-too narrow. Scenario, stage and comparison rows start with a status glyph (✓
+too narrow. Press `?` for a centred key reference listing every binding of the
+current mode and focus, grouped as Navigate, Evidence, Logs, Run control and
+Editing; `?` or Esc closes it, and no other key acts while it is open. In the
+editor, the Save Copy name, confirmations and the `/` filter draft, `?` is
+ordinary text. Setting `NO_COLOR` to any non-empty value (see
+[no-color.org](https://no-color.org)) renders without colour; glyphs, bold,
+reverse video and layout are unchanged. It is read once at startup. Scenario, stage and comparison rows start with a status glyph (✓
 passed, ✗ failed, ! review, … incomplete or pending, – skipped), and the focused
 selector is marked `▶` with a heavy border. Evidence tabs show record counts.
+The scenario/stage column widens to fit the longest visible row when the
+terminal has room, keeping at least 70 columns for evidence. During a run the
+header shows a spinner, the running scenario and stage (from the latest engine
+event while the saved report catches up) and the elapsed time; the scenario
+holding the running stage shows `▸`. After the run the header shows the total
+duration. Native evidence views use the same header, selector tabs and footer.
 
 ## Edit a preview
 
 In a pristine recipe or comparison suite preview, `e` opens a raw TOML editor
-before the first run. It preserves comments, Unicode and exact source bytes.
+before the first run. It opens at the top (`Ln 1 Col 1`) and preserves
+comments, Unicode and exact source bytes. At 60 columns or wider it shows a
+dim line-number gutter and colours TOML table headers, keys, strings and
+comments; colouring is display only.
 Ordinary `q`, `r`, `p`, `s` and `d` typed in the editor are text. Use arrows,
 Home/End, Ctrl-Home/End, Enter, Tab and Backspace/Delete to edit; bracketed
 paste inserts once. Ctrl-T validates the draft without saving or running it.
@@ -64,12 +83,19 @@ outcome and terminal restoration.
 
 During live or saved report viewing:
 
+- A saved report opens on the first scenario and stage needing attention:
+  the first failed one (by stage or check outcome), else the first incomplete
+  one, else the first scenario with review findings; a report with none opens
+  on the first row. A live run moves the selection the same way when it
+  finishes, but only if you have not navigated during the run.
 - `Tab` / `Enter` cycles scenario, stage, and evidence focus; `Esc` goes back.
 - Arrows or `j/k` select a scenario, stage, or evidence record; Home/End selects
   the first/last record in the focused list.
 - Left/right in evidence focus switches Stages, Findings, Files, Commands, Logs.
 - `/` edits a case-insensitive evidence filter; Enter or Esc applies the draft.
   Press `/` and Enter to clear it. Matches include full stored record details.
+  While a filter is active, matched text is highlighted (reverse video) in the
+  visible record summaries and the current detail chunk only.
 - `[` / `]` loads the previous/next detail or log chunk. Page Up/Down scrolls
   inside the current chunk; it does not change the selected record.
 - Ctrl-Home/Ctrl-End jumps to the first/last stored log chunk. `m` toggles a

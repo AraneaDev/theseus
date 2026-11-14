@@ -53,9 +53,19 @@ pub struct App {
     /// Authoritative worker failure, separate from the last persisted evidence.
     pub terminal_error: Option<String>,
     pub active: bool,
+    /// Wall-clock start of the explicit run and its frozen duration once the
+    /// worker returns; presentation only, never persisted as evidence.
+    pub(super) run_started: Option<std::time::Instant>,
+    pub(super) run_elapsed: Option<std::time::Duration>,
+    /// Scenario id and stage named by the latest engine event, if any.
+    pub(super) live_stage: Option<(String, Option<String>)>,
     pub start_requested: bool,
     pub cancel_requested: bool,
     pub quit_requested: bool,
+    /// The `?` key reference is open; it swallows every other key.
+    pub help: bool,
+    /// The user moved a selection or focus; completion then keeps their place.
+    pub(super) navigated: bool,
 }
 impl App {
     pub fn offline(report: RunReport, root: PathBuf) -> Self {
@@ -83,10 +93,33 @@ impl App {
             status: "Offline report".into(),
             terminal_error: None,
             active: false,
+            run_started: None,
+            run_elapsed: None,
+            live_stage: None,
             start_requested: false,
             cancel_requested: false,
             quit_requested: false,
+            help: false,
+            navigated: false,
         }
+    }
+    /// A saved report as opened from the CLI: the first scenario and stage
+    /// needing attention is pre-selected.
+    pub fn open_saved(report: RunReport, root: PathBuf) -> Self {
+        let mut app = Self::offline(report, root);
+        app.select_attention();
+        app
+    }
+    /// Select the first failed, else incomplete, else review-finding scenario
+    /// and its first such stage. Leaves the selection alone when all passed.
+    pub(super) fn select_attention(&mut self) {
+        let Some((scenario, stage)) = self.report.as_ref().and_then(first_attention) else {
+            return;
+        };
+        self.scenario_index = scenario;
+        self.stage_index = stage;
+        self.evidence_index = 0;
+        self.scroll = 0;
     }
     pub fn native_offline(report: crate::native::model::NativeReport, root: PathBuf) -> Self {
         let mut app = Self::offline(RunReport::new("unused"), root);
@@ -141,6 +174,11 @@ impl App {
         app.options = Some(options);
         app.status = "Preview — press r to start".into();
         app
+    }
+    /// Time since the explicit start, frozen when the worker returned.
+    pub(super) fn run_clock(&self) -> Option<std::time::Duration> {
+        self.run_elapsed
+            .or_else(|| self.run_started.map(|start| start.elapsed()))
     }
     pub(super) fn has_started(&self) -> bool {
         self.work_consumed || self.active || self.terminal_error.is_some()
@@ -252,6 +290,48 @@ impl App {
     pub(super) fn evidence_len(&self) -> usize {
         self.viewport.borrow_mut().len(self)
     }
+}
+/// The first scenario/stage needing attention, by precedence failed >
+/// incomplete > review. A stage qualifies by its outcome or any of its checks;
+/// a scenario whose own outcome qualifies without such a stage selects its
+/// first stage. Review findings are per scenario, so they select its first stage.
+pub(super) fn first_attention(report: &RunReport) -> Option<(usize, usize)> {
+    let ranked = |stage_outcome, check_outcome, run_outcome| {
+        report
+            .scenarios
+            .iter()
+            .enumerate()
+            .find_map(|(i, scenario)| {
+                scenario
+                    .stages
+                    .iter()
+                    .position(|stage| {
+                        stage.outcome == stage_outcome
+                            || stage.checks.iter().any(|c| c.outcome == check_outcome)
+                    })
+                    .or((scenario.outcome == run_outcome).then_some(0))
+                    .map(|stage| (i, stage))
+            })
+    };
+    ranked(
+        StageOutcome::Failed,
+        CheckOutcome::Failed,
+        RunOutcome::Failed,
+    )
+    .or_else(|| {
+        ranked(
+            StageOutcome::Incomplete,
+            CheckOutcome::Incomplete,
+            RunOutcome::Incomplete,
+        )
+    })
+    .or_else(|| {
+        report
+            .scenarios
+            .iter()
+            .position(|s| !s.findings.is_empty())
+            .map(|i| (i, 0))
+    })
 }
 /// Prevent saved command output and recipe text from injecting terminal controls.
 pub fn safe_text(text: &str) -> String {

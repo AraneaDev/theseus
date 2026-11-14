@@ -96,7 +96,9 @@ fn preview_shows_explicit_manifest_and_quit_does_not_run_or_edit_it() {
         "/app",
         "configured",
         "missing_stage",
-        "pull: true",
+        "Pull:      true",
+        "baseline",
+        "Will run:",
         "no commands executed",
     ] {
         assert!(text.contains(s), "missing {s}: {text}");

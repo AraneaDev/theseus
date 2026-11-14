@@ -1,7 +1,7 @@
 //! Suite state and workbench rendering; lifecycle execution stays in the shared worker.
 use super::{
     App, safe_text,
-    theme::{self, Hint, REQUIRED, hint},
+    theme::{self, HELP_ONLY, Hint, REQUIRED, hint},
 };
 use crate::comparison::{
     ComparisonReport, LoadedComparison, SuiteManifest, SuiteRunOptions, ValidatedSuite,
@@ -202,6 +202,17 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
         spans.push(theme::status_word(&app.outcome().to_string(), true));
     }
     spans.push(Span::raw(suffix));
+    if let Some(elapsed) = app.run_clock() {
+        let clock = super::render::clock(elapsed);
+        spans.push(if app.active {
+            Span::styled(
+                format!(" | {} running {clock}", super::render::spinner(elapsed)),
+                theme::tone(ratatui::style::Color::Cyan),
+            )
+        } else {
+            Span::styled(format!(" | ran {clock}"), theme::dim())
+        });
+    }
     let title = Line::from(spans);
     frame.render_widget(
         Paragraph::new(title)
@@ -330,37 +341,9 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
             layout[1],
         );
     } else {
-        let join = |items: Vec<String>| items.join(", ");
-        let mut context = format!(
-            "Profiles: {} | Scenarios: {}\nStages: {}\n",
-            join(m.profiles.iter().map(|p| p.to_string()).collect()),
-            join(m.scenarios.iter().map(|p| p.to_string()).collect()),
-            join(m.stages.iter().map(|s| bounded(s)).collect())
-        );
-        for scope in &m.scopes {
-            context += &format!(
-                "Scope {}: {} {}\n",
-                scope.id,
-                scope.profile,
-                bounded(&scope.path)
-            );
-        }
-        context += &format!(
-            "pull: {}\n\nVariants:\n",
-            view.options.as_ref().is_some_and(|o| o.pull)
-        );
-        for variant in &m.variants {
-            context += &format!(
-                "{}: {}\n",
-                variant.id,
-                bounded(&variant.recipe.display().to_string())
-            );
-        }
-        if let Some(error) = &app.terminal_error {
-            context = format!("{}\n\n{context}", bounded(error));
-        }
+        let doc = suite_preview(app, view);
         frame.render_widget(
-            Paragraph::new(safe_text(&context))
+            Paragraph::new(doc.lines())
                 .block(panel(if super::preview_edit::dirty(app) {
                     "ACCEPTED suite preview (draft UNSAVED)"
                 } else {
@@ -373,41 +356,156 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
     }
     frame.render_widget(footer, layout[2]);
 }
+fn plural(count: usize, word: &str) -> String {
+    format!("{count} {word}{}", if count == 1 { "" } else { "s" })
+}
+/// Comparison cells the declared suite derives: every non-baseline variant ×
+/// profile × scenario × stage × scope declared for that profile. Arithmetic on
+/// the manifest only; nothing is loaded or run.
+pub(super) fn planned_cells(m: &SuiteManifest) -> usize {
+    let candidates = m.variants.iter().filter(|v| v.id != m.baseline).count();
+    let scoped_profiles = m
+        .profiles
+        .iter()
+        .map(|p| m.scopes.iter().filter(|s| s.profile == *p).count())
+        .sum::<usize>();
+    candidates * scoped_profiles * m.scenarios.len() * m.stages.len()
+}
+/// Labelled suite sections in the recipe preview's style; never executes.
+fn suite_preview(app: &App, view: &ComparisonView) -> super::preview_doc::Doc {
+    use super::preview_doc::{Doc, Tone};
+    let m = &view.manifest;
+    let mut doc = Doc::new();
+    if let Some(error) = &app.terminal_error {
+        doc.plain(&bounded(error)).plain("\n\n");
+    }
+    let join = |items: Vec<String>| {
+        if items.is_empty() {
+            "none".to_string()
+        } else {
+            items.join(", ")
+        }
+    };
+    let runs = m.variants.len() * m.profiles.len() * m.scenarios.len();
+    doc.push(Tone::Label, "Will run:  ")
+        .push(
+            Tone::Name,
+            &format!(
+                "{} × {} × {} = {}",
+                plural(m.variants.len(), "variant"),
+                plural(m.profiles.len(), "profile"),
+                plural(m.scenarios.len(), "scenario"),
+                plural(runs, "lifecycle run"),
+            ),
+        )
+        .dim(&format!(
+            " · {} compared against {}\n",
+            plural(planned_cells(m), "cell"),
+            bounded(&m.baseline)
+        ))
+        .plain("\n")
+        .heading("Selection")
+        .label(
+            "  Profiles:  ",
+            &join(m.profiles.iter().map(|p| p.to_string()).collect()),
+        )
+        .plain("\n")
+        .label(
+            "  Scenarios: ",
+            &join(m.scenarios.iter().map(|p| p.to_string()).collect()),
+        )
+        .plain("\n")
+        .label(
+            "  Pull:      ",
+            &view.options.as_ref().is_some_and(|o| o.pull).to_string(),
+        )
+        .plain("\n\n")
+        .heading("Stages");
+    for stage in &m.stages {
+        doc.plain(&format!(
+            "  {}\n",
+            bounded(stage).replace(['\n', '\t'], " ")
+        ));
+    }
+    // Pad names to the longest (bounded) id so paths line up.
+    let pad = |ids: &mut dyn Iterator<Item = &String>| {
+        ids.map(|id| bounded(id).chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(32)
+    };
+    let scope_pad = pad(&mut m.scopes.iter().map(|s| &s.id));
+    doc.plain("\n").heading("Scopes");
+    for scope in &m.scopes {
+        doc.push(
+            Tone::Name,
+            &format!(
+                "  {:<scope_pad$}",
+                bounded(&scope.id).replace(['\n', '\t'], " ")
+            ),
+        )
+        .dim(&format!("  {:<6} ", scope.profile.to_string()))
+        .plain(&bounded(&scope.path))
+        .plain("\n");
+    }
+    let variant_pad = pad(&mut m.variants.iter().map(|v| &v.id));
+    doc.plain("\n").heading("Variants");
+    for variant in &m.variants {
+        doc.push(
+            Tone::Name,
+            &format!(
+                "  {:<variant_pad$}",
+                bounded(&variant.id).replace(['\n', '\t'], " ")
+            ),
+        )
+        .dim("  ")
+        .plain(&bounded(&variant.recipe.display().to_string()));
+        if variant.id == m.baseline {
+            doc.plain("  ").push(Tone::Selected, " baseline ");
+        }
+        doc.plain("\n");
+    }
+    doc
+}
 /// Only keys that act in the current comparison mode and focus.
-fn hints(app: &App, view: &ComparisonView) -> Vec<Hint> {
+pub(super) fn hints(app: &App, view: &ComparisonView) -> Vec<Hint> {
+    use theme::Group::*;
     if super::preview_edit::dirty(app) {
-        return vec![
-            hint("e", "edit", REQUIRED),
-            hint("d", "discard", REQUIRED),
-            hint("q", "discard/quit", REQUIRED),
-            hint("r/p/s", "disabled until Save Copy or discard", 1),
-        ];
+        return super::render::draft_hints();
     }
     if app.editing_filter {
         return vec![];
     }
     let mut hints = Vec::new();
     if view.report.is_some() {
-        hints.push(hint("Tab", "cells/evidence", REQUIRED));
-        hints.push(hint("↑↓", "select", 2));
-        hints.push(hint("Home/End", "first/last", 5));
-        if view.evidence_focus && app.viewport.borrow().has_chunks() {
-            hints.push(hint("[ ]", "chunks", 2));
-        }
-        hints.push(hint("PgUp/Dn", "scroll", 4));
-        hints.push(hint("/", "filter", 3));
+        hints.push(hint(Navigate, "Tab", "cells/evidence", REQUIRED));
+        hints.push(hint(Navigate, "↑↓", "select", 2));
+        hints.push(hint(Navigate, "j/k", "select", HELP_ONLY));
+        hints.push(hint(Navigate, "Home/End", "first/last", 5));
+        let chunks = view.evidence_focus && app.viewport.borrow().has_chunks();
+        hints.push(hint(
+            Evidence,
+            "[ ]",
+            if chunks {
+                "chunks"
+            } else {
+                "previous/next chunk"
+            },
+            if chunks { 2 } else { HELP_ONLY },
+        ));
+        hints.push(hint(Evidence, "PgUp/Dn", "scroll", 4));
+        hints.push(hint(Evidence, "/", "filter", 3));
     } else if !app.has_started() {
         if view.suite.is_some() && !app.work_consumed {
-            hints.push(hint("r", "run", REQUIRED));
+            hints.push(hint(Run, "r", "run", REQUIRED));
         }
-        hints.push(hint("↑↓", "scroll", 3));
+        hints.push(hint(Navigate, "↑↓", "scroll", 3));
+        hints.push(hint(Navigate, "j/k", "scroll a line", HELP_ONLY));
+        hints.push(hint(Navigate, "PgUp/Dn", "scroll a page", HELP_ONLY));
         if super::preview_edit::eligible(app) {
-            hints.push(hint("e", "edit", 2));
+            super::render::editor_hints(&mut hints);
         }
     }
-    if app.active {
-        hints.push(hint("c", "cancel", REQUIRED));
-    }
-    hints.push(hint("q", "quit", REQUIRED));
+    super::render::common_hints(&mut hints, app);
     hints
 }

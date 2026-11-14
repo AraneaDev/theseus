@@ -12,7 +12,7 @@ use ratatui::{
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Tone {
+pub(super) enum Tone {
     Plain,
     Heading,
     Label,
@@ -47,12 +47,12 @@ pub(super) struct Doc {
     lines: Vec<Vec<(Tone, String)>>,
 }
 impl Doc {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             lines: vec![Vec::new()],
         }
     }
-    fn push(&mut self, tone: Tone, text: &str) -> &mut Self {
+    pub(super) fn push(&mut self, tone: Tone, text: &str) -> &mut Self {
         let mut parts = text.split('\n');
         if let Some(first) = parts.next()
             && !first.is_empty()
@@ -70,16 +70,16 @@ impl Doc {
         }
         self
     }
-    fn plain(&mut self, text: &str) -> &mut Self {
+    pub(super) fn plain(&mut self, text: &str) -> &mut Self {
         self.push(Tone::Plain, text)
     }
-    fn dim(&mut self, text: &str) -> &mut Self {
+    pub(super) fn dim(&mut self, text: &str) -> &mut Self {
         self.push(Tone::Dim, text)
     }
-    fn label(&mut self, label: &str, value: &str) -> &mut Self {
+    pub(super) fn label(&mut self, label: &str, value: &str) -> &mut Self {
         self.push(Tone::Label, label).push(Tone::Plain, value)
     }
-    fn heading(&mut self, text: &str) -> &mut Self {
+    pub(super) fn heading(&mut self, text: &str) -> &mut Self {
         self.push(Tone::Heading, text).plain("\n")
     }
     pub(super) fn text(&self) -> String {
@@ -329,9 +329,9 @@ pub(super) fn build(app: &App) -> Doc {
             Tone::Name,
             &format!("{} / {}", list(&options.profiles), list(&options.scenarios)),
         )
-        .dim("   (p profiles · s scenarios · r run explicitly)\n")
-        .dim("Runtime UID/GID 10001:10001 | system installation 0:0\nHOME=/home/theseus XDG_CONFIG_HOME=/home/theseus/.config\nXDG_DATA_HOME=/home/theseus/.local/share XDG_CACHE_HOME=/home/theseus/.cache\nPATH=/home/theseus/.local/bin:/usr/local/bin:/usr/bin:/bin\nWorking directory: /workspace | root installation HOME=/root\n")
-        .label("Observe: ", &list(&r.observe))
+        .dim("   (p profiles · s scenarios · r run explicitly)\n");
+    runtime_environment(&mut doc);
+    doc.label("Observe: ", &list(&r.observe))
         .plain("\n")
         .label(
             "Inputs: ",
@@ -366,6 +366,45 @@ pub(super) fn build(app: &App) -> Doc {
     doc
 }
 
+/// The fixed public runtime environment, one aligned name/value pair per line.
+fn runtime_environment(doc: &mut Doc) {
+    doc.push(Tone::Dim, "Environment\n");
+    for (name, value, note) in [
+        ("Runtime UID/GID", "10001:10001", "system installation 0:0"),
+        ("HOME", "/home/theseus", "root installation HOME=/root"),
+        ("XDG_CONFIG_HOME", "/home/theseus/.config", ""),
+        ("XDG_DATA_HOME", "/home/theseus/.local/share", ""),
+        ("XDG_CACHE_HOME", "/home/theseus/.cache", ""),
+        (
+            "PATH",
+            "/home/theseus/.local/bin:/usr/local/bin:/usr/bin:/bin",
+            "",
+        ),
+        ("Working directory", "/workspace", ""),
+    ] {
+        doc.push(Tone::Label, &format!("  {name:<19}")).plain(value);
+        if !note.is_empty() {
+            doc.dim(&format!("   ({note})"));
+        }
+        doc.plain("\n");
+    }
+}
+/// Plugin contract fields beyond the summary line, labelled like the rest.
+fn plugin_contract(doc: &mut Doc, plugin: &crate::recipe::PluginContract) {
+    doc.push(Tone::Label, "Plugin contract\n")
+        .label("  client check: ", &plugin.client_check)
+        .plain("\n");
+    for (checkpoint, contract) in &plugin.checkpoints {
+        doc.push(Tone::Name, &format!("  {checkpoint}"))
+            .plain("\n")
+            .label("    inventory: ", &contract.inventory)
+            .plain("\n")
+            .label("    preserved: ", &list(&contract.preservation))
+            .plain("\n")
+            .label("    components: ", &list(&contract.components))
+            .plain("\n");
+    }
+}
 fn scenario_notes(
     doc: &mut Doc,
     options: &crate::engine::RunOptions,
@@ -382,8 +421,8 @@ fn scenario_notes(
             plugin.target_version,
             plugin.client_version,
             plugin.client_artifact
-        ))
-        .dim(&format!("Plugin contract: {plugin:#?}\n"));
+        ));
+        plugin_contract(doc, plugin);
     }
     if options.scenarios.iter().any(|kind| {
         matches!(

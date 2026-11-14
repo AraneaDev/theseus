@@ -80,13 +80,13 @@ try:
         expect('record 70002 / 70002')
         expect('file-69999')
         snapshot('metadata-last-past-u16')
-        key(b']]]')
+        key(b']]]' + PGDN)  # the tail can sit below the fold of a narrower detail pane
         expect('DETAIL_TAIL')
         assert '�' not in text(), 'valid Unicode detail gained a replacement'
         snapshot('unicode-detail-tail')
         key(b'[')
         until(lambda: not has('DETAIL_TAIL'), 'previous detail chunk')
-        key(b']')
+        key(b']' + PGDN)
         expect('DETAIL_TAIL')
         filtered('file-')  # 70k matches exceed the 65536 cached-match bound
         key(END)

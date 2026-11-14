@@ -30,6 +30,13 @@ pub(super) fn dirty(app: &App) -> bool {
     app.edit_session.as_ref().is_some_and(|s| s.dirty)
 }
 
+/// Whether keys are text or modal answers (editor, Save Copy name, confirm).
+pub(super) fn modal(app: &App) -> bool {
+    app.edit_session
+        .as_ref()
+        .is_some_and(|s| s.mode != Mode::Preview)
+}
+
 pub(super) fn blocks_work(app: &App) -> bool {
     app.edit_session
         .as_ref()

@@ -44,6 +44,7 @@ impl Default for AnimationOptions {
 
 pub fn run_with_options(mut app: App, options: AnimationOptions) -> Result<i32> {
     terminal::require_tty()?;
+    theme::init_color();
     let runtime = tokio::runtime::Runtime::new()?;
     let cancel = CancellationToken::default();
     let terminate = CancellationToken::default();
@@ -107,6 +108,7 @@ pub fn run_with_options(mut app: App, options: AnimationOptions) -> Result<i32> 
                         let events = events_tx.clone();
                         let token = cancel.clone();
                         app.active = true;
+                        app.run_started = Some(Instant::now());
                         app.status = "Starting engine".into();
                         runtime.spawn_blocking(move || {
                             let result =
@@ -177,6 +179,9 @@ pub fn run_with_options(mut app: App, options: AnimationOptions) -> Result<i32> 
                     animation::draw(f, index, direction);
                 } else {
                     render(f, &app);
+                }
+                if theme::no_color() {
+                    theme::strip_colour(f.buffer_mut());
                 }
             })?;
         }
@@ -504,6 +509,20 @@ fn apply_event(
     event: WorkEvent,
     last_path: &mut Option<PathBuf>,
 ) -> (refresh::Kind, PathBuf) {
+    if let WorkEvent::Run(event) = &event {
+        // The latest engine event names the active stage before the persisted
+        // report catches up; it is presentation only.
+        app.live_stage = match event.kind {
+            engine::EventKind::StageStarted => event
+                .scenario_id
+                .clone()
+                .map(|id| (id, event.stage.clone())),
+            engine::EventKind::ScenarioStarted | engine::EventKind::StageFinished => {
+                event.scenario_id.clone().map(|id| (id, None))
+            }
+            _ => None,
+        };
+    }
     let (kind, path, status) = match event {
         WorkEvent::Run(event) => (
             if event
@@ -549,6 +568,7 @@ fn apply_event(
 // Shared completion boundary, also exercised without a terminal in regressions.
 fn complete_work(app: &mut App, result: Result<WorkResult>) -> Result<()> {
     app.active = false;
+    app.run_elapsed = app.run_started.map(|start| start.elapsed());
     match result {
         Ok(WorkResult::Native(result)) => {
             let root = result.report_path.parent().unwrap().to_path_buf();
@@ -564,6 +584,12 @@ fn complete_work(app: &mut App, result: Result<WorkResult>) -> Result<()> {
         Ok(WorkResult::Run(result)) => {
             let root = result.report_path.parent().unwrap().to_path_buf();
             app.set_report(result.report, root);
+            // Browsing during the run keeps the user's place; otherwise open
+            // on the first failure as an offline report would.
+            if !app.navigated {
+                app.select_attention();
+                app.refresh_logs();
+            }
             app.status = format!("Finished | {}", result.report_path.display());
         }
         Ok(WorkResult::Suite(result)) => {

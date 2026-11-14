@@ -133,6 +133,8 @@ fn recipe_save_copy_adopts_bytes_and_requires_fresh_run() {
     let mut app = App::preview(recipe.clone(), engine::RunOptions::all(&recipe));
     input(&mut app, KeyCode::Char('r').into());
     input(&mut app, KeyCode::Char('e').into());
+    // The editor opens at the top; append at the document end.
+    input(&mut app, KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL));
     preview_edit::paste(&mut app, "\n# café\n");
     input(
         &mut app,
@@ -153,6 +155,31 @@ fn recipe_save_copy_adopts_bytes_and_requires_fresh_run() {
         panic!("saved recipe must launch")
     };
     assert_eq!(adopted.path, saved);
+}
+#[test]
+fn question_mark_opens_help_in_preview_but_is_text_in_the_editor() {
+    let t = tempfile::tempdir().unwrap();
+    fixtures::recipe_suite(t.path());
+    let recipe = crate::recipe::load(&t.path().join("copy.toml")).unwrap();
+    let mut app = App::preview(recipe.clone(), engine::RunOptions::all(&recipe));
+    input(&mut app, KeyCode::Char('?').into());
+    assert!(app.help);
+    // Open help swallows run/edit keys.
+    input(&mut app, KeyCode::Char('r').into());
+    input(&mut app, KeyCode::Char('e').into());
+    assert!(!app.start_requested && app.edit_session.is_none());
+    input(&mut app, KeyCode::Esc.into());
+    assert!(!app.help);
+    input(&mut app, KeyCode::Char('e').into());
+    input(&mut app, KeyCode::Char('?').into());
+    assert!(!app.help, "editor keeps ? as text");
+    assert!(preview_edit::dirty(&app), "? was inserted into the draft");
+    input(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+    );
+    input(&mut app, KeyCode::Char('?').into());
+    assert!(!app.help, "Save Copy name keeps ? as text");
 }
 #[test]
 fn save_copy_falls_back_to_newly_declared_recipe_selection() {
@@ -531,4 +558,32 @@ fn suite_startup_paste_cannot_start_and_live_event_retains_validated_recovery_co
     assert_eq!(app.comparison.as_ref().unwrap().manifest.baseline, "copy");
     input(&mut app, KeyCode::Char('r').into());
     assert!(take_work(&mut app).unwrap().is_none());
+}
+#[test]
+fn preview_states_planned_cells_from_the_manifest_alone() {
+    let manifest: crate::comparison::SuiteManifest =
+        toml::from_str(include_str!("../../examples/comparisons/methods.toml")).unwrap();
+    // One candidate × (2 user + 2 system scopes) × 1 scenario × 3 stages.
+    assert_eq!(super::comparison::planned_cells(&manifest), 12);
+    let t = tempfile::tempdir().unwrap();
+    let path = fixtures::recipe_suite(t.path());
+    let app = App::comparison_preview(
+        suites::load(&path).unwrap(),
+        SuiteRunOptions {
+            output_root: t.path().join("out"),
+            pull: false,
+        },
+    );
+    let text = screen(&app);
+    for expected in [
+        "Will run:",
+        "Selection",
+        "Stages",
+        "Scopes",
+        "Variants",
+        " baseline ",
+    ] {
+        assert!(text.contains(expected), "missing {expected}: {text}");
+    }
+    assert!(!t.path().join("out").exists());
 }

@@ -3,6 +3,7 @@ use crate::model::{
     ProfileName, RunOutcome, RunReport, ScenarioKind, ScenarioReport, StageOutcome, StageReport,
     TeardownStatus,
 };
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{Terminal, backend::TestBackend};
 
 #[test]
@@ -205,4 +206,297 @@ fn terminal_worker_error_overrides_cached_passed_and_failed_results() {
             }
         }
     }
+}
+
+fn rows(app: &App, width: u16, height: u16) -> Vec<String> {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal.draw(|frame| render(frame, app)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    (0..height)
+        .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+        .collect()
+}
+
+fn live_report() -> RunReport {
+    let mut report = RunReport::new("live");
+    let mut done = ScenarioReport::new("user-clean", ProfileName::User, ScenarioKind::Clean);
+    let mut stage = StageReport::new("base_installed:after_checks");
+    stage.outcome = StageOutcome::Passed;
+    done.stages.push(stage);
+    let mut running = ScenarioReport::new("user-upgrade", ProfileName::User, ScenarioKind::Upgrade);
+    let mut stage = StageReport::new("configure");
+    stage.outcome = StageOutcome::Running;
+    running.stages.push(stage);
+    report.scenarios.extend([done, running]);
+    report
+}
+
+#[test]
+fn live_header_names_the_running_stage_and_elapsed_time_then_freezes() {
+    let mut app = App::offline(live_report(), PathBuf::from("/live"));
+    app.active = true;
+    app.run_started = Some(std::time::Instant::now() - Duration::from_secs(75));
+    let screen = rows(&app, 140, 30).join("\n");
+    // The running stage is in an unselected scenario; the header still says so.
+    assert!(
+        screen.contains("user/upgrade · configure  1:15"),
+        "{screen}"
+    );
+    assert!(screen.contains("▸   user/upgrade incomplete"), "{screen}");
+    // Narrow terminals give the activity its own header line, kept whole.
+    let narrow = rows(&app, 80, 30);
+    assert!(
+        narrow[2].contains("user/upgrade · configure  1:15"),
+        "{}",
+        narrow.join("\n")
+    );
+    assert!(narrow[0].ends_with('┐') && narrow[3].starts_with('└'));
+    app.active = false;
+    app.run_elapsed = Some(Duration::from_secs(80));
+    let screen = rows(&app, 140, 30).join("\n");
+    assert!(screen.contains("ran 1:20"), "{screen}");
+    assert!(!screen.contains("· configure"), "{screen}");
+}
+
+#[test]
+fn live_header_falls_back_to_the_latest_engine_event_while_the_report_lags() {
+    let mut report = RunReport::new("lagging");
+    report.scenarios.push(ScenarioReport::new(
+        "system-clean",
+        ProfileName::System,
+        ScenarioKind::Clean,
+    ));
+    let mut app = App::offline(report, PathBuf::from("/live"));
+    app.active = true;
+    app.run_started = Some(std::time::Instant::now());
+    let event = |kind, stage: Option<&str>| {
+        WorkEvent::Run(engine::EngineEvent {
+            kind,
+            report_path: PathBuf::from("/live/report.json"),
+            scenario_id: Some("system-clean".into()),
+            stage: stage.map(Into::into),
+        })
+    };
+    apply_event(
+        &mut app,
+        event(engine::EventKind::StageStarted, Some("configure\u{1b}")),
+        &mut None,
+    );
+    app.report = Some(RunReport::new("lagging"));
+    let screen = rows(&app, 140, 30).join("\n");
+    assert!(screen.contains("system-clean · configure�"), "{screen}");
+    apply_event(
+        &mut app,
+        event(engine::EventKind::StageFinished, Some("configure")),
+        &mut None,
+    );
+    app.report = Some(RunReport::new("lagging"));
+    assert!(
+        rows(&app, 140, 30)
+            .join("\n")
+            .contains("system-clean · between stages")
+    );
+}
+
+#[test]
+fn selector_column_fits_the_longest_row_within_bounds_and_narrow_stays_stacked() {
+    let app = App::offline(live_report(), PathBuf::from("/saved"));
+    // Stage rows keep the trailing status word harnesses match.
+    let wide = rows(&app, 120, 30);
+    let stage = wide
+        .iter()
+        .find(|row| row.contains("base_installed:after_checks passed"))
+        .expect("full stage row is visible");
+    assert!(
+        stage.starts_with("│✓ > base_installed:after_checks passed"),
+        "{stage}"
+    );
+    // At most 45% of the width, so the detail keeps the rest.
+    let border = wide[3].chars().position(|c| c == '┓').expect("border");
+    assert!(border < 54, "{}", wide[3]);
+    let narrow = rows(&app, 80, 30);
+    assert!(
+        narrow
+            .iter()
+            .any(|row| row.contains("Scenarios") && row.contains("Stages")),
+        "{}",
+        narrow.join("\n")
+    );
+}
+
+fn attention_report() -> RunReport {
+    let stage = |name: &str, outcome| {
+        let mut stage = StageReport::new(name);
+        stage.outcome = outcome;
+        stage
+    };
+    let mut report = RunReport::new("attention");
+    let mut review = ScenarioReport::new("user-clean", ProfileName::User, ScenarioKind::Clean);
+    review.stages.push(stage("install", StageOutcome::Passed));
+    review.findings.push(crate::model::Finding {
+        kind: crate::model::FindingKind::Leftover,
+        path: Some("/leftover".into()),
+        message: "left behind".into(),
+    });
+    let mut incomplete =
+        ScenarioReport::new("user-upgrade", ProfileName::User, ScenarioKind::Upgrade);
+    incomplete
+        .stages
+        .push(stage("install", StageOutcome::Passed));
+    incomplete
+        .stages
+        .push(stage("upgrade", StageOutcome::Incomplete));
+    let mut failed = ScenarioReport::new("system-clean", ProfileName::System, ScenarioKind::Clean);
+    failed.stages.push(stage("install", StageOutcome::Passed));
+    failed.stages.push(stage("configure", StageOutcome::Passed));
+    failed.stages.push(stage("exercise", StageOutcome::Failed));
+    review.outcome = RunOutcome::Passed;
+    incomplete.outcome = RunOutcome::Incomplete;
+    failed.outcome = RunOutcome::Failed;
+    report.scenarios.extend([review, incomplete, failed]);
+    report
+}
+
+#[test]
+fn saved_report_opens_on_first_failure_then_incomplete_then_review() {
+    let mut report = attention_report();
+    let app = App::open_saved(report.clone(), PathBuf::from("/saved"));
+    assert_eq!((app.scenario_index, app.stage_index), (2, 2));
+    assert!(rows(&app, 120, 30).join("\n").contains("> exercise failed"));
+    // A failed scenario without a failed stage selects its first stage.
+    report.scenarios[2].stages[2].outcome = StageOutcome::Passed;
+    let app = App::open_saved(report.clone(), PathBuf::from("/saved"));
+    assert_eq!((app.scenario_index, app.stage_index), (2, 0));
+    report.scenarios[2].outcome = RunOutcome::Passed;
+    let app = App::open_saved(report.clone(), PathBuf::from("/saved"));
+    assert_eq!((app.scenario_index, app.stage_index), (1, 1));
+    report.scenarios[1].stages[1].outcome = StageOutcome::Passed;
+    report.scenarios[1].outcome = RunOutcome::Passed;
+    let app = App::open_saved(report.clone(), PathBuf::from("/saved"));
+    assert_eq!((app.scenario_index, app.stage_index), (0, 0));
+    report.scenarios[0].findings.clear();
+    let app = App::open_saved(report, PathBuf::from("/saved"));
+    assert_eq!((app.scenario_index, app.stage_index), (0, 0));
+    // The plain constructor (used by embedders and tests) keeps the first row.
+    let app = App::offline(attention_report(), PathBuf::from("/saved"));
+    assert_eq!((app.scenario_index, app.stage_index), (0, 0));
+}
+
+#[test]
+fn live_completion_selects_first_failure_unless_the_user_navigated() {
+    let finish = |navigate: bool| {
+        let mut app = App::offline(live_report(), PathBuf::from("/live"));
+        app.active = true;
+        if navigate {
+            press(&mut app, KeyCode::Down);
+        }
+        let before = (app.scenario_index, app.stage_index);
+        complete_run(
+            &mut app,
+            Ok(RunResult {
+                report: attention_report(),
+                report_path: PathBuf::from("/live/report.json"),
+            }),
+        )
+        .unwrap();
+        (before, (app.scenario_index, app.stage_index))
+    };
+    assert_eq!(finish(false), ((0, 0), (2, 2)));
+    assert_eq!(finish(true), ((1, 0), (1, 0)), "browsing keeps its place");
+}
+
+fn press(app: &mut App, code: KeyCode) {
+    input(app, KeyEvent::from(code));
+}
+
+#[test]
+fn help_overlay_lists_grouped_bindings_and_swallows_other_keys() {
+    let mut app = App::offline(live_report(), PathBuf::from("/saved"));
+    app.active = true;
+    let footer = rows(&app, 160, 30).join("\n");
+    assert!(footer.contains("? help"), "{footer}");
+    press(&mut app, KeyCode::Char('?'));
+    assert!(app.help);
+    let screen = rows(&app, 120, 36).join("\n");
+    for expected in [
+        "Help — ? or Esc closes",
+        "Navigate",
+        "Evidence",
+        "Logs",
+        "Run control",
+        "Tab/Enter",
+        "Home/End",
+        "first/last log chunk",
+        "Ctrl-C",
+    ] {
+        assert!(screen.contains(expected), "missing {expected}\n{screen}");
+    }
+    // Nothing acts while it is open: no quit, cancel, focus or selection.
+    for code in [
+        KeyCode::Char('q'),
+        KeyCode::Char('c'),
+        KeyCode::Char('r'),
+        KeyCode::Tab,
+        KeyCode::Down,
+        KeyCode::Char('/'),
+    ] {
+        press(&mut app, code);
+    }
+    assert!(!app.quit_requested && !app.cancel_requested && !app.start_requested);
+    assert_eq!((app.focus, app.scenario_index), (Focus::Scenario, 0));
+    assert!(!app.editing_filter && app.help);
+    press(&mut app, KeyCode::Esc);
+    assert!(!app.help);
+    assert_eq!(app.focus, Focus::Scenario, "closing Esc is not back");
+    press(&mut app, KeyCode::Char('?'));
+    press(&mut app, KeyCode::Char('?'));
+    assert!(!app.help);
+    // In the `/` draft `?` is text.
+    press(&mut app, KeyCode::Char('/'));
+    press(&mut app, KeyCode::Char('?'));
+    assert!(!app.help && app.filter_draft == "?");
+    // Small terminals still draw a bounded overlay.
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('?'));
+    let small = rows(&app, 40, 12);
+    assert!(small.iter().any(|row| row.contains("Help")), "{small:?}");
+}
+
+#[test]
+fn filter_highlights_matches_in_visible_rows_and_detail() {
+    let mut report = RunReport::new("highlight");
+    let mut scenario = ScenarioReport::new("user-clean", ProfileName::User, ScenarioKind::Clean);
+    let mut stage = StageReport::new("Café-alpha");
+    stage.outcome = StageOutcome::Passed;
+    stage.errors.push("ALPHA\u{1b}beta CAFÉ".into());
+    scenario.stages.push(stage);
+    report.scenarios.push(scenario);
+    let mut app = App::offline(report, PathBuf::from("/saved"));
+    app.filter = "café".into();
+    app.sync_view();
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    terminal.draw(|frame| render(frame, &app)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let mut highlighted = String::from("|");
+    for y in 0..30 {
+        for x in 0..120 {
+            let cell = &buffer[(x, y)];
+            if cell.modifier.contains(ratatui::style::Modifier::REVERSED) {
+                highlighted.push_str(cell.symbol());
+            } else if !highlighted.ends_with('|') {
+                highlighted.push('|');
+            }
+        }
+    }
+    let parts: Vec<_> = highlighted.split('|').filter(|s| !s.is_empty()).collect();
+    assert!(
+        parts.iter().all(|p| p.to_lowercase() == "café"),
+        "{parts:?}"
+    );
+    assert!(parts.len() >= 3, "row and detail matches: {parts:?}");
+    let screen = rows(&app, 120, 30).join("\n");
+    assert!(
+        screen.contains("ALPHA�beta CAFÉ"),
+        "escaping unchanged: {screen}"
+    );
 }
