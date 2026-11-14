@@ -263,10 +263,17 @@ pub fn render(frame: &mut Frame, app: &App) -> bool {
             Style::default().add_modifier(Modifier::BOLD),
         ),
         match &outcome {
-            Some(outcome) => Line::from(vec![
-                Span::raw("Outcome: "),
-                theme::status_word(outcome, true),
-            ]),
+            // Glyph first, so the exact `Outcome: <word>` text stays intact for
+            // readers and for the real-manager acceptance checks that match it.
+            Some(outcome) => {
+                let (glyph, color) = theme::status(outcome);
+                let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+                Line::from(vec![
+                    Span::styled(format!("{glyph} "), style),
+                    Span::raw("Outcome: "),
+                    Span::styled(super::safe_text(outcome), style),
+                ])
+            }
             None => Line::raw("Preview"),
         },
     ];
