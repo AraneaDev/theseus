@@ -228,9 +228,7 @@ impl Fixture {
     pub fn hook_release_path(&self) -> PathBuf {
         self.root.path().join("runtime-release")
     }
-    pub fn witness(&self) -> serde_json::Value {
-        let data: serde_json::Value =
-            serde_json::from_slice(&bounded_file(&self.witness_path(), 4096)).unwrap();
+    fn checked_witness(&self, data: serde_json::Value) -> serde_json::Value {
         assert_eq!(data["nonce"], self.nonce);
         assert_eq!(
             data["config_sha256"],
@@ -246,10 +244,17 @@ impl Fixture {
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {
             if self.witness_path().is_file() {
-                let data: serde_json::Value =
-                    serde_json::from_slice(&bounded_file(&self.witness_path(), 4096)).unwrap();
-                if fields.iter().all(|field| data[*field] == true) {
-                    return self.witness();
+                match try_bounded_file(&self.witness_path(), 4096) {
+                    Ok(bytes) => {
+                        let data: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        if fields.iter().all(|field| data[*field] == true) {
+                            // Check the bytes already read; a second read could
+                            // meet the same transient Windows lock.
+                            return self.checked_witness(data);
+                        }
+                    }
+                    Err(error) if transiently_locked(&error) => {}
+                    Err(error) => panic!("read runtime witness: {error}"),
                 }
             }
             assert!(
@@ -262,14 +267,21 @@ impl Fixture {
 }
 
 pub fn bounded_file(path: &Path, limit: u64) -> Vec<u8> {
+    try_bounded_file(path, limit).unwrap()
+}
+fn try_bounded_file(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     let mut data = vec![];
-    std::fs::File::open(path)
-        .unwrap()
+    std::fs::File::open(path)?
         .take(limit + 1)
-        .read_to_end(&mut data)
-        .unwrap();
+        .read_to_end(&mut data)?;
     assert!(data.len() <= limit as usize, "bounded artifact exceeded");
-    data
+    Ok(data)
+}
+/// Windows reports a writer's byte-range lock or sharing mode on the file
+/// being rewritten as ERROR_LOCK_VIOLATION (33) or ERROR_SHARING_VIOLATION
+/// (32). While polling, that means "not published yet", not a failure.
+fn transiently_locked(error: &std::io::Error) -> bool {
+    cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33))
 }
 
 pub fn pinned_hash(name: &str) -> String {
