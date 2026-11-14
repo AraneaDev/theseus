@@ -64,7 +64,7 @@ Validation and saved report viewing work offline. Docker access is configured by
 you; Theseus does not change daemon settings or user groups. Recipes are intended
 for maintainer-controlled inputs. A container is not a hostile-code sandbox.
 
-Theseus 0.12 targets native Linux, macOS and Windows controllers, with Linux
+Theseus targets native Linux, macOS and Windows controllers, with Linux
 containers as guests. See [installation and controller scope](docs/get-started/installation.md)
 for architectures, filesystem qualification and prerequisites.
 
