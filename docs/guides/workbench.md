@@ -10,19 +10,32 @@ Launch with `theseus` or `theseus run --recipe PATH` to inspect commands and
 public environment before execution. In preview, `p` cycles available profiles
 and `s` cycles the recipe’s declared scenarios and all; `r` starts the displayed
 selection. The preview marks the current selection in brackets and states it
-on a `Will run:` line. Arrows or `j/k` and Page Up/Down scroll the preview.
-Preview never executes automatically.
+on a `Will run:` line, and groups the fixed runtime identity, home, XDG and
+`PATH` values under an `Environment` heading. Arrows or `j/k` and Page Up/Down
+scroll the preview. Preview never executes automatically. A comparison suite
+preview (`theseus compare --suite PATH`) lists its Selection, Stages, Scopes and
+Variants (the baseline is marked) and states how many lifecycle runs and
+comparison cells the declared suite implies, computed from the manifest alone.
 
 The footer shows the current status followed by the keys that apply in the
 current mode and focus; lower-priority hints are omitted when the terminal is
 too narrow. Scenario, stage and comparison rows start with a status glyph (✓
 passed, ✗ failed, ! review, … incomplete or pending, – skipped), and the focused
 selector is marked `▶` with a heavy border. Evidence tabs show record counts.
+The scenario/stage column widens to fit the longest visible row when the
+terminal has room, keeping at least 70 columns for evidence. During a run the
+header shows a spinner, the running scenario and stage (from the latest engine
+event while the saved report catches up) and the elapsed time; the scenario
+holding the running stage shows `▸`. After the run the header shows the total
+duration. Native evidence views use the same header, selector tabs and footer.
 
 ## Edit a preview
 
 In a pristine recipe or comparison suite preview, `e` opens a raw TOML editor
-before the first run. It preserves comments, Unicode and exact source bytes.
+before the first run. It opens at the top (`Ln 1 Col 1`) and preserves
+comments, Unicode and exact source bytes. At 60 columns or wider it shows a
+dim line-number gutter and colours TOML table headers, keys, strings and
+comments; colouring is display only.
 Ordinary `q`, `r`, `p`, `s` and `d` typed in the editor are text. Use arrows,
 Home/End, Ctrl-Home/End, Enter, Tab and Backspace/Delete to edit; bracketed
 paste inserts once. Ctrl-T validates the draft without saving or running it.
