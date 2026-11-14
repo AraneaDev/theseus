@@ -221,6 +221,13 @@ Every package currently sets `"release-as": "0.0.1"` so the first release is
 `release-please-config.json` in a `chore(release)` commit. If it stays,
 release-please keeps proposing 0.0.1.
 
+The workflow opens release pull requests with the `RELEASE_PLEASE_TOKEN`
+repository secret, which is a fine-grained personal access token with
+contents and pull-request write access. Pull requests opened with the default
+`GITHUB_TOKEN` start no workflows. The required CI and `title` checks would then
+never run on the release pull request, and it could not be merged under branch
+protection. Without the secret the workflow falls back to `GITHUB_TOKEN`.
+
 ## Related documentation
 
 - [Installation](../get-started/installation.md): native architectures and host/guest distinctions.
