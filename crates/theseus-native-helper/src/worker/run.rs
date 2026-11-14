@@ -1,4 +1,14 @@
 use super::*;
+/// A Run request that passed admission; carries the values `begin` threads through.
+struct RunAdmission<'r> {
+    ticket: ResponseTicket,
+    cancel: CancelToken,
+    start: StartWatch,
+    lease: v2::LeaseId,
+    operation: v2::OperationId,
+    key: RunKey,
+    program: &'r v2::ProgramId,
+}
 impl Worker {
     pub(super) fn begin(
         &mut self,
@@ -7,28 +17,45 @@ impl Worker {
         cancel: CancelToken,
         start: StartWatch,
     ) -> Result<(), WorkerPrimary> {
+        let Some(admission) = self.check_admission(&request, ticket, cancel, start)? else {
+            return Ok(());
+        };
+        let Some(admission) = self.match_catalog(&request, admission)? else {
+            return Ok(());
+        };
+        self.commit_accepted(&request, admission)
+    }
+    /// Admission checks for a Run request, in their original order. `None` means a
+    /// refusal or reply has already been issued and `begin` returns `Ok(())`.
+    fn check_admission<'r>(
+        &mut self,
+        request: &'r v2::Request,
+        ticket: ResponseTicket,
+        cancel: CancelToken,
+        start: StartWatch,
+    ) -> Result<Option<RunAdmission<'r>>, WorkerPrimary> {
         if self.active.is_some() || self.file.is_some() || self.service_action.is_some() {
             self.refuse(ticket, v2::RefusalCode::Busy);
-            return Ok(());
+            return Ok(None);
         }
         if self.service.as_ref().is_some_and(|s| s.uncertain) {
             self.refuse(ticket, v2::RefusalCode::OwnershipPending);
-            return Ok(());
+            return Ok(None);
         }
         let v2::Request::Run {
             lease,
             operation,
             program,
-        } = &request
+        } = request
         else {
             self.refuse(ticket, v2::RefusalCode::InvalidRequest);
-            return Ok(());
+            return Ok(None);
         };
         let lease = *lease;
         let operation = *operation;
         if !self.lease.as_ref().is_some_and(|(_, l, _)| *l == lease) {
             self.refuse(ticket, v2::RefusalCode::WrongLease);
-            return Ok(());
+            return Ok(None);
         }
         if let Some(reason) = self.check_native_mapping(lease)? {
             self.respond(
@@ -36,19 +63,45 @@ impl Worker {
                 v2::Reply::PrefixAuthorityRevoked { lease, reason },
                 None,
             );
-            return Ok(());
+            return Ok(None);
         }
         let key = cancel.key;
         if key.lease != lease || key.operation != operation || start.key() != key {
             self.refuse(ticket, v2::RefusalCode::InvalidRequest);
-            return Ok(());
+            return Ok(None);
         }
+        Ok(Some(RunAdmission {
+            ticket,
+            cancel,
+            start,
+            lease,
+            operation,
+            key,
+            program,
+        }))
+    }
+    /// Ledger replay and catalog selection. `None` means a recorded view, refusal or
+    /// unsupported program has already been issued and `begin` returns `Ok(())`.
+    fn match_catalog<'r>(
+        &mut self,
+        request: &v2::Request,
+        admission: RunAdmission<'r>,
+    ) -> Result<Option<RunAdmission<'r>>, WorkerPrimary> {
+        let RunAdmission {
+            ticket,
+            cancel,
+            start,
+            lease,
+            operation,
+            key,
+            program,
+        } = admission;
         match self
             .store
             .as_ref()
             .unwrap()
             .restart_view()
-            .replay_operation(&request)
+            .replay_operation(request)
         {
             Ok(v2::ledger::ReplayDecision::NotRecorded) => {}
             Ok(v2::ledger::ReplayDecision::Recorded(view)) => {
@@ -57,7 +110,7 @@ impl Worker {
                 let boundary = out.boundary();
                 self.active = Some(Active {
                     key,
-                    request_digest: v2::request_digest(&request)
+                    request_digest: v2::request_digest(request)
                         .map_err(|e| WorkerPrimary::Io(io::Error::other(e)))?,
                     cancel,
                     start,
@@ -95,11 +148,11 @@ impl Worker {
                     view,
                     boundary,
                 }));
-                return Ok(());
+                return Ok(None);
             }
             Err(code) => {
                 self.refuse(ticket, code);
-                return Ok(());
+                return Ok(None);
             }
         }
         if !self
@@ -108,10 +161,35 @@ impl Worker {
             .is_some_and(|i| i.catalog.iter().any(|c| &c.id == program))
         {
             self.refuse(ticket, v2::RefusalCode::Unsupported);
-            return Ok(());
+            return Ok(None);
         }
+        Ok(Some(RunAdmission {
+            ticket,
+            cancel,
+            start,
+            lease,
+            operation,
+            key,
+            program,
+        }))
+    }
+    /// Commits `OperationAccepted`, installs the active Run, and publishes acceptance.
+    fn commit_accepted(
+        &mut self,
+        request: &v2::Request,
+        admission: RunAdmission<'_>,
+    ) -> Result<(), WorkerPrimary> {
+        let RunAdmission {
+            ticket,
+            cancel,
+            start,
+            lease,
+            operation,
+            key,
+            program,
+        } = admission;
         self.last_spawn = None;
-        let digest = v2::ledger::request_digest(&request)
+        let digest = v2::ledger::request_digest(request)
             .map_err(|_| WorkerPrimary::Io(io::Error::other("invalid request digest")))?;
         let committed = self.append(Entry::OperationAccepted {
             lease,
