@@ -1,5 +1,8 @@
 //! Native evidence has its own display domain; no Docker identity projection.
-use super::{App, theme};
+use super::{
+    App,
+    theme::{self, REQUIRED, hint},
+};
 use crate::{
     model::RunOutcome,
     native::{
@@ -11,9 +14,10 @@ use crate::{
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     Frame,
+    layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph, Tabs, Wrap},
 };
 
 pub struct NativeView {
@@ -222,34 +226,37 @@ impl NativeView {
             .map(|r| r.consumer_outcome().to_string());
         let body = format!(
             "Selector: {} | record {} | byte {}\n{}",
-            if matches!(self.report, Some(NativeReportVersion::IntegrationV2(_))) {
-                [
-                    "Overview",
-                    "Services",
-                    "Readiness",
-                    "Checks",
-                    "Dispositions",
-                    "Desktop",
-                    "NativeFiles",
-                    "Commands",
-                    "Identities",
-                    "Failures",
-                ][self.selector]
-            } else {
-                [
-                    "Overview",
-                    "NativeFiles",
-                    "Commands",
-                    "Dispositions",
-                    "Identities",
-                    "Failures",
-                ][self.selector]
-            },
+            self.selector_names()[self.selector],
             self.record,
             start,
             super::safe_text(&value)
         );
         (outcome, body)
+    }
+    fn selector_names(&self) -> &'static [&'static str] {
+        if matches!(self.report, Some(NativeReportVersion::IntegrationV2(_))) {
+            &[
+                "Overview",
+                "Services",
+                "Readiness",
+                "Checks",
+                "Dispositions",
+                "Desktop",
+                "NativeFiles",
+                "Commands",
+                "Identities",
+                "Failures",
+            ]
+        } else {
+            &[
+                "Overview",
+                "NativeFiles",
+                "Commands",
+                "Dispositions",
+                "Identities",
+                "Failures",
+            ]
+        }
     }
 }
 pub fn render(frame: &mut Frame, app: &App) -> bool {
@@ -257,60 +264,84 @@ pub fn render(frame: &mut Frame, app: &App) -> bool {
         return false;
     };
     let (outcome, body) = view.text();
-    let mut lines = vec![
-        Line::styled(
-            super::safe_text(&app.status),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        match &outcome {
-            Some(outcome) => Line::from(vec![
-                Span::raw("Outcome: "),
-                theme::status_word(outcome, true),
-            ]),
-            None => Line::raw("Preview"),
-        },
-    ];
-    lines.extend(body.split('\n').map(|l| Line::raw(l.to_owned())));
-    lines.push(Line::raw(""));
-    // Only keys that act now: r before the single start, c while running.
-    let mut keys = vec![
-        ("←→", "selector"),
-        ("↑↓", "record"),
-        ("n/p", "text page"),
-        ("PgUp/Dn", "scroll"),
-    ];
+    let area = frame.area();
+    // Header: outcome glyph once (or the preview notice), as in the run view.
+    let mut header = match &outcome {
+        Some(outcome) => vec![Span::raw("Outcome: "), theme::status_word(outcome, true)],
+        None => vec![Span::raw("Preview — no commands executed")],
+    };
+    if let Some(elapsed) = app.run_clock() {
+        let clock = super::render::clock(elapsed);
+        header.push(if app.active {
+            Span::styled(
+                format!("  │ {} running {clock}", super::render::spinner(elapsed)),
+                Style::default().fg(Color::Cyan),
+            )
+        } else {
+            Span::styled(format!("  │ ran {clock}"), theme::dim())
+        });
+    }
+    // Only keys that act now: selectors and records need a report, r is the
+    // single explicit start, c applies while running.
+    let mut hints = Vec::new();
+    if view.report.is_some() {
+        hints.push(hint("←→", "selector", REQUIRED));
+        hints.push(hint("↑↓", "record", 1));
+    }
+    hints.push(hint("n/p", "text page", 2));
+    hints.push(hint("PgUp/Dn", "scroll", 3));
     if !app.active && !app.work_consumed && view.report.is_none() {
-        keys.push(("r", "run"));
+        hints.push(hint("r", "run", REQUIRED));
     }
     if app.active {
-        keys.push(("c", "cancel"));
+        hints.push(hint("c", "cancel", REQUIRED));
     }
-    keys.push(("q", "quit"));
-    let mut spans = Vec::new();
-    for (i, (key, label)) in keys.into_iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw("  "));
-        }
-        spans.push(Span::styled(
-            key,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw(format!(" {label}")));
-    }
-    lines.push(Line::from(spans));
+    hints.push(hint("q", "quit", REQUIRED));
+    let status = super::render::projection(&app.status, 512);
+    let footer = theme::footer(&status, &hints, area.width);
+    let tabs_height = u16::from(view.report.is_some());
+    let regions = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(tabs_height),
+        Constraint::Min(1),
+        Constraint::Length(theme::footer_height(&footer, area.width)),
+    ])
+    .split(area);
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Native evidence"),
-            )
+        Paragraph::new(Line::from(header)).block(
+            Block::default()
+                .title("Theseus native")
+                .borders(Borders::ALL)
+                .border_style(theme::dim()),
+        ),
+        regions[0],
+    );
+    if view.report.is_some() {
+        frame.render_widget(
+            Tabs::new(view.selector_names().iter().copied())
+                .select(view.selector)
+                .highlight_style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                ),
+            regions[1],
+        );
+    }
+    let mut lines = body.split('\n');
+    let mut text = vec![Line::styled(
+        lines.next().unwrap_or_default().to_owned(),
+        theme::dim(),
+    )];
+    text.extend(lines.map(|l| Line::raw(l.to_owned())));
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(theme::plain_panel("Native evidence", true))
             .wrap(Wrap { trim: false })
             .scroll((app.scroll, 0)),
-        frame.area(),
+        regions[2],
     );
+    frame.render_widget(footer, regions[3]);
     true
 }
 pub fn input(app: &mut App, key: KeyEvent) -> bool {
@@ -422,6 +453,24 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+    #[test]
+    fn native_chrome_matches_the_workbench_and_offers_only_live_keys() {
+        let preview = App::native_preview("Native catalog preview\n\u{1b}[31mred".into());
+        let text = draw(&preview);
+        assert!(text.contains("Preview — no commands executed"));
+        assert!(text.contains("Native preview | n/p text page"));
+        assert!(text.contains("r run"));
+        assert!(!text.contains("selector"), "no selectors before a report");
+        assert!(!text.contains('\u{1b}'));
+        let report = crate::native::integration::view::tests::report();
+        let mut app = App::integration_offline(report, "/saved-evidence".into());
+        let text = draw(&app);
+        assert!(text.contains("Outcome: … incomplete"));
+        assert!(text.contains("Overview │ Services │ Readiness"));
+        assert!(text.contains("←→ selector") && !text.contains("r run"));
+        input(&mut app, KeyCode::Right.into());
+        assert!(draw(&app).contains("Selector: Services | record 0 | byte 0"));
     }
     #[test]
     fn large_readiness_details_and_following_record_remain_navigable() {
