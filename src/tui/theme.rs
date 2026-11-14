@@ -121,14 +121,16 @@ pub(super) fn plain_panel(title: &str, focused: bool) -> Block<'static> {
 }
 
 /// A one-line-per-row selector with a status glyph column left of the selection
-/// marker. Row text is flattened so the glyph column stays aligned.
+/// marker. Row text is flattened so the glyph column stays aligned. Returns
+/// the drawn rows: their area, the first visible row and the row count.
 pub(super) fn status_list(
     frame: &mut Frame,
     area: Rect,
     block: Block<'static>,
     rows: Vec<(String, &str)>,
     selected: usize,
-) {
+) -> (Rect, usize, usize) {
+    let count = rows.len();
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let columns = Layout::horizontal([Constraint::Length(2), Constraint::Min(1)]).split(inner);
@@ -157,6 +159,7 @@ pub(super) fn status_list(
         .map(|(glyph, color)| Line::styled(glyph, tone(color)))
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), columns[0]);
+    (inner, state.offset(), count)
 }
 
 /// Help overlay sections, in display order.

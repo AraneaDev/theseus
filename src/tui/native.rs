@@ -351,6 +351,7 @@ pub fn render(frame: &mut Frame, app: &App) -> bool {
             .scroll((app.scroll, 0)),
         regions[2],
     );
+    app.hits.borrow_mut().scroll = Some(regions[2]);
     frame.render_widget(footer, regions[3]);
     true
 }

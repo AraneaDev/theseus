@@ -1,10 +1,12 @@
 //! Responsive live and offline evidence UI; one blocking engine runs on a worker.
 mod animation;
 mod app;
+mod clipboard;
 mod comparison;
 mod editor;
 pub mod evidence;
 mod input;
+mod mouse;
 mod native;
 pub mod paging;
 mod preview_doc;
@@ -36,10 +38,16 @@ pub fn run(app: App) -> Result<i32> {
 #[derive(Clone, Copy, Debug)]
 pub struct AnimationOptions {
     pub enabled: bool,
+    /// Opt-in mouse capture (`--mouse`). Off by default: capture disables the
+    /// terminal's own text selection.
+    pub mouse: bool,
 }
 impl Default for AnimationOptions {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            mouse: false,
+        }
     }
 }
 
@@ -50,7 +58,7 @@ pub fn run_with_options(mut app: App, options: AnimationOptions) -> Result<i32> 
     let cancel = CancellationToken::default();
     let terminate = CancellationToken::default();
     let signals = Signals::register(&terminate)?;
-    let (guard, mut terminal) = terminal::Guard::enter()?;
+    let (guard, mut terminal) = terminal::Guard::enter(options.mouse)?;
     let (events_tx, mut events_rx) = mpsc::channel(32);
     let mut result_rx: Option<oneshot::Receiver<Result<WorkResult>>> = None;
     let mut refresh = refresh::Coordinator::live(runtime.handle().clone());
@@ -143,7 +151,20 @@ pub fn run_with_options(mut app: App, options: AnimationOptions) -> Result<i32> 
                         {
                             preview_edit::paste(&mut app, &text)
                         }
+                        // Only reported when --mouse enabled capture.
+                        Event::Mouse(mouse)
+                            if presentation.key(KeyCode::Null) == KeyAction::Browse =>
+                        {
+                            mouse::input(&mut app, mouse)
+                        }
                         _ => {}
+                    }
+                    if let Some(sequence) = app.clipboard.take() {
+                        // Base64 OSC 52 only: no stored byte reaches the terminal raw.
+                        use std::io::Write;
+                        let out = terminal.backend_mut();
+                        out.write_all(sequence.as_bytes())?;
+                        out.flush()?;
                     }
                     // Drain keys already received during the scene before advancing it.
                     // Bound each batch so a pasted input stream cannot starve cancellation.
@@ -510,19 +531,25 @@ fn apply_event(
     event: WorkEvent,
     last_path: &mut Option<PathBuf>,
 ) -> (refresh::Kind, PathBuf) {
-    if let WorkEvent::Run(event) = &event {
-        // The latest engine event names the active stage before the persisted
-        // report catches up; it is presentation only.
-        app.live_stage = match event.kind {
-            engine::EventKind::StageStarted => event
-                .scenario_id
-                .clone()
-                .map(|id| (id, event.stage.clone())),
-            engine::EventKind::ScenarioStarted | engine::EventKind::StageFinished => {
-                event.scenario_id.clone().map(|id| (id, None))
-            }
-            _ => None,
-        };
+    // The latest engine event names the active stage before the persisted
+    // report catches up; it is presentation only. Suite events carry their
+    // source run's event and the variant running it.
+    let live = |event: &engine::EngineEvent| match event.kind {
+        engine::EventKind::StageStarted => event
+            .scenario_id
+            .clone()
+            .map(|id| (id, event.stage.clone())),
+        engine::EventKind::ScenarioStarted | engine::EventKind::StageFinished => {
+            event.scenario_id.clone().map(|id| (id, None))
+        }
+        _ => None,
+    };
+    match &event {
+        WorkEvent::Run(event) => app.live_stage = live(event),
+        WorkEvent::Suite(event) => {
+            app.live_stage = event.source.as_ref().and_then(live);
+            app.live_variant = event.variant_id.clone();
+        }
     }
     let (kind, path, status) = match event {
         WorkEvent::Run(event) => (

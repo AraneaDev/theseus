@@ -19,6 +19,11 @@ pub struct Cli {
     /// Skip decorative startup and exit scenes.
     #[arg(long, global = true)]
     pub no_animation: bool,
+    /// Enable mouse in the interactive workbench: click selects rows and tabs,
+    /// the wheel scrolls the panel under the pointer. Off by default because
+    /// mouse capture disables the terminal's own text selection.
+    #[arg(long, global = true)]
+    pub mouse: bool,
     #[command(subcommand)]
     pub command: Option<Action>,
 }
@@ -121,6 +126,7 @@ fn execute_inner(
 ) -> Result<i32> {
     let animation = crate::tui::AnimationOptions {
         enabled: !cli.no_animation,
+        mouse: cli.mouse,
     };
     match cli.command {
         Some(Action::Serve {

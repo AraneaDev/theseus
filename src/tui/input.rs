@@ -21,6 +21,15 @@ pub fn input(app: &mut App, key: KeyEvent) {
     if page_input(app, key) {
         return;
     }
+    let plain = !key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    let browsing =
+        app.report.is_some() || app.comparison.as_ref().is_some_and(|v| v.report.is_some());
+    if plain && browsing && key.code == KeyCode::Char('y') {
+        super::clipboard::copy(app);
+        return;
+    }
     if app.comparison.is_some() {
         super::comparison::input(app, key);
         return;
@@ -73,6 +82,7 @@ pub fn input(app: &mut App, key: KeyEvent) {
                 options.scenarios = choices[(i + 1) % choices.len()].clone();
             }
         }
+        KeyCode::Char(c @ ('f' | 'F')) if plain && app.report.is_some() => jump(app, c == 'f'),
         KeyCode::Tab | KeyCode::Enter => {
             app.navigated |= app.report.is_some();
             app.focus = match app.focus {
@@ -145,6 +155,41 @@ pub fn input(app: &mut App, key: KeyEvent) {
         _ => {}
     }
     app.sync_view();
+}
+
+/// `f`/`F`: select the next/previous problem stage in first-failure
+/// precedence (failed, else incomplete, else review findings), wrapping.
+fn jump(app: &mut App, forward: bool) {
+    let Some(report) = app.report.as_ref() else {
+        return;
+    };
+    let current = (app.scenario_index, app.stage_index);
+    let Some((kind, (scenario, stage), position, total)) =
+        super::app::jump_target(report, current, forward)
+    else {
+        app.status = "No failed, incomplete or review stages".into();
+        return;
+    };
+    let name = report.scenarios.get(scenario).map(|s| {
+        let stage = s
+            .stages
+            .get(stage)
+            .map_or(String::new(), |st| format!(" · {}", st.name));
+        format!("{}/{}{stage}", s.profile, s.scenario)
+    });
+    app.navigated = true;
+    app.scenario_index = scenario;
+    app.stage_index = stage;
+    app.evidence_index = 0;
+    app.scroll = 0;
+    if app.focus == Focus::Evidence {
+        app.focus = Focus::Stage;
+    }
+    app.status = format!(
+        "Problem {position}/{total} ({}): {}",
+        kind.word(),
+        super::render::projection(&name.unwrap_or_default(), 256)
+    );
 }
 
 /// `?` toggles the key reference. While it is open no other key acts (no

@@ -108,6 +108,16 @@ impl View {
         self.update(app, None);
         true
     }
+    /// The selected record under the current filter, borrowed from the report.
+    pub fn selected_record<'a>(
+        &mut self,
+        app: &'a App,
+    ) -> Option<super::evidence::SelectedRecord<'a>> {
+        self.ensure_index(app);
+        let index = self.index.as_ref().unwrap();
+        let position = app.evidence_index.min(index.len().saturating_sub(1));
+        index.get(&Catalog::for_app(app), position)
+    }
     pub fn restart_detail(&mut self) {
         self.selected = None;
     }

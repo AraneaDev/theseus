@@ -59,6 +59,12 @@ pub struct App {
     pub(super) run_elapsed: Option<std::time::Duration>,
     /// Scenario id and stage named by the latest engine event, if any.
     pub(super) live_stage: Option<(String, Option<String>)>,
+    /// Comparison variant named by the latest suite event, if any.
+    pub(super) live_variant: Option<String>,
+    /// Panel rectangles of the last drawn frame, for mouse hit-testing.
+    pub(super) hits: std::cell::RefCell<super::mouse::Hits>,
+    /// An OSC 52 clipboard sequence waiting to be written to the terminal.
+    pub(super) clipboard: Option<String>,
     pub start_requested: bool,
     pub cancel_requested: bool,
     pub quit_requested: bool,
@@ -96,6 +102,9 @@ impl App {
             run_started: None,
             run_elapsed: None,
             live_stage: None,
+            live_variant: None,
+            hits: Default::default(),
+            clipboard: None,
             start_requested: false,
             cancel_requested: false,
             quit_requested: false,
@@ -291,47 +300,142 @@ impl App {
         self.viewport.borrow_mut().len(self)
     }
 }
-/// The first scenario/stage needing attention, by precedence failed >
-/// incomplete > review. A stage qualifies by its outcome or any of its checks;
-/// a scenario whose own outcome qualifies without such a stage selects its
-/// first stage. Review findings are per scenario, so they select its first stage.
-pub(super) fn first_attention(report: &RunReport) -> Option<(usize, usize)> {
+/// Which kind of problem an attention target is, in first-failure precedence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Attention {
+    Failed,
+    Incomplete,
+    Review,
+}
+impl Attention {
+    pub(super) fn word(self) -> &'static str {
+        match self {
+            Self::Failed => "failed",
+            Self::Incomplete => "incomplete",
+            Self::Review => "review",
+        }
+    }
+}
+/// Every scenario/stage needing attention, in report order, for the highest
+/// precedence present: failed > incomplete > review. A stage qualifies by its
+/// outcome or any of its checks; a scenario whose own outcome qualifies
+/// without such a stage contributes its first stage. Review findings are per
+/// scenario, so they contribute its first stage.
+pub(super) fn attention(report: &RunReport) -> Option<(Attention, Vec<(usize, usize)>)> {
     let ranked = |stage_outcome, check_outcome, run_outcome| {
         report
             .scenarios
             .iter()
             .enumerate()
-            .find_map(|(i, scenario)| {
-                scenario
+            .flat_map(|(i, scenario)| {
+                let stages = scenario
                     .stages
                     .iter()
-                    .position(|stage| {
+                    .enumerate()
+                    .filter(|(_, stage)| {
                         stage.outcome == stage_outcome
                             || stage.checks.iter().any(|c| c.outcome == check_outcome)
                     })
-                    .or((scenario.outcome == run_outcome).then_some(0))
-                    .map(|stage| (i, stage))
+                    .map(|(stage, _)| (i, stage))
+                    .collect::<Vec<_>>();
+                if stages.is_empty() && scenario.outcome == run_outcome {
+                    vec![(i, 0)]
+                } else {
+                    stages
+                }
             })
+            .collect::<Vec<_>>()
     };
-    ranked(
-        StageOutcome::Failed,
-        CheckOutcome::Failed,
-        RunOutcome::Failed,
-    )
-    .or_else(|| {
-        ranked(
-            StageOutcome::Incomplete,
-            CheckOutcome::Incomplete,
-            RunOutcome::Incomplete,
-        )
-    })
-    .or_else(|| {
-        report
-            .scenarios
+    [
+        (
+            Attention::Failed,
+            ranked(
+                StageOutcome::Failed,
+                CheckOutcome::Failed,
+                RunOutcome::Failed,
+            ),
+        ),
+        (
+            Attention::Incomplete,
+            ranked(
+                StageOutcome::Incomplete,
+                CheckOutcome::Incomplete,
+                RunOutcome::Incomplete,
+            ),
+        ),
+        (
+            Attention::Review,
+            report
+                .scenarios
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| !s.findings.is_empty())
+                .map(|(i, _)| (i, 0))
+                .collect(),
+        ),
+    ]
+    .into_iter()
+    .find(|(_, targets)| !targets.is_empty())
+}
+/// The first scenario/stage needing attention (see [`attention`]).
+pub(super) fn first_attention(report: &RunReport) -> Option<(usize, usize)> {
+    attention(report).and_then(|(_, targets)| targets.first().copied())
+}
+/// The next (or previous) attention target after the current selection,
+/// wrapping around, with its 1-based position and the total.
+pub(super) fn jump_target(
+    report: &RunReport,
+    current: (usize, usize),
+    forward: bool,
+) -> Option<(Attention, (usize, usize), usize, usize)> {
+    let (kind, targets) = attention(report)?;
+    let index = if forward {
+        targets.iter().position(|t| *t > current).unwrap_or(0)
+    } else {
+        targets
             .iter()
-            .position(|s| !s.findings.is_empty())
-            .map(|i| (i, 0))
-    })
+            .rposition(|t| *t < current)
+            .unwrap_or(targets.len() - 1)
+    };
+    Some((kind, targets[index], index + 1, targets.len()))
+}
+/// While a run is active: the scenario and stage executing now. The persisted
+/// report's running stage wins; otherwise the latest engine event names it
+/// (the saved report can lag behind). Only provisional rows qualify, so a
+/// stale event can never relabel a finished stage or scenario.
+pub(super) fn live_position(app: &App) -> Option<(usize, Option<usize>)> {
+    if !app.active {
+        return None;
+    }
+    let report = app.report.as_ref()?;
+    if let Some(found) = report.scenarios.iter().enumerate().find_map(|(i, s)| {
+        s.stages
+            .iter()
+            .position(|st| st.outcome == StageOutcome::Running)
+            .map(|stage| (i, Some(stage)))
+    }) {
+        return Some(found);
+    }
+    let (id, stage) = app.live_stage.as_ref()?;
+    let index = report.scenarios.iter().position(|s| s.id == *id)?;
+    let scenario = &report.scenarios[index];
+    if scenario.outcome != RunOutcome::Incomplete {
+        return None;
+    }
+    let stage = stage.as_ref().and_then(|name| {
+        scenario
+            .stages
+            .iter()
+            .position(|st| st.name == *name && provisional_stage(st.outcome))
+    });
+    Some((index, stage))
+}
+/// Stage outcomes a live run may still change.
+pub(super) fn provisional_stage(outcome: StageOutcome) -> bool {
+    matches!(
+        outcome,
+        StageOutcome::Pending | StageOutcome::Running | StageOutcome::Incomplete
+    )
 }
 /// Header outcome word: "running" while a run is active (its report is still
 /// partial and would otherwise read as "incomplete"), else the observed outcome.

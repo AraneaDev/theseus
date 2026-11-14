@@ -34,13 +34,17 @@ ordinary text.
 Setting `NO_COLOR` to any non-empty value (see
 [no-color.org](https://no-color.org)) renders without colour; glyphs, bold,
 reverse video and layout are unchanged. It is read once at startup. Scenario, stage and comparison rows start with a status glyph (✓
-passed, ✗ failed, ! review, … incomplete or pending, – skipped), and the focused
+passed, ✗ failed, ! review, … incomplete or pending, ▸ running, – skipped), and the focused
 selector is marked `▶` with a heavy border. Evidence tabs show record counts.
 The scenario/stage column widens to fit the longest visible row when the
 terminal has room, keeping at least 70 columns for evidence. During a run the
 header shows a spinner, the running scenario and stage (from the latest engine
-event while the saved report catches up) and the elapsed time; the scenario
-holding the running stage shows `▸`. After the run the header shows the total
+event while the saved report catches up) and the elapsed time. The scenario and
+stage executing now read `▸ running` in the selectors instead of their
+provisional `incomplete` or `pending` (from the same source as the header), and
+in a comparison run so does the not-yet-compared cell whose variant, scenario
+and stage is executing. Finished rows and saved reports keep their recorded
+words. After the run the header shows the total
 duration. Native evidence views use the same header, selector tabs and footer.
 
 ![A live run: the header shows a spinner, the running scenario and stage, and the elapsed time while completed stages fill the selector](../images/tui-live.svg)
@@ -111,6 +115,19 @@ During live or saved report viewing:
   Press `/` and Enter to clear it. Matches include full stored record details.
   While a filter is active, matched text is highlighted (reverse video) in the
   visible record summaries and the current detail chunk only.
+- `f` / `F` selects the next/previous problem stage, wrapping around: every
+  failed stage (by stage or check outcome), or if none failed every incomplete
+  one, or if none every scenario with review findings — the same precedence a
+  saved report opens with. The status line names the target (`Problem 2/3
+  (failed): …`) or says there are none.
+- `y` copies the selected evidence record to the clipboard: a file entry or
+  change copies its path, a command its shell-quoted command line, a log its
+  stored file path, and any other record (stage, check, finding, …) its full
+  record text. The status line confirms what was copied. Text over 64 KiB is
+  refused rather than truncated. The copy uses an OSC 52 escape whose payload
+  is base64, so stored bytes never reach the terminal raw; it needs a terminal
+  (and multiplexer, e.g. tmux `set-clipboard on`) that accepts OSC 52 clipboard
+  writes. `y` is ordinary text in the editor and filter draft.
 - `[` / `]` loads the previous/next detail or log chunk. Page Up/Down scrolls
   inside the current chunk; it does not change the selected record.
 - Ctrl-Home/Ctrl-End jumps to the first/last stored log chunk. `m` toggles a
@@ -123,11 +140,24 @@ During live or saved report viewing:
   SIGINT/SIGTERM follows the same exit path in preview, live, completed, and
   offline views.
 
+### Mouse
+
+Mouse input is off by default, because capturing the mouse disables the
+terminal's own text selection. The global `--mouse` flag enables it, for
+example `theseus --mouse report PATH`. Then a left click on a scenario, stage,
+comparison cell or evidence record row selects it and focuses that panel, a
+click on an evidence tab switches to it, and the wheel moves the selection of
+the list under the pointer or scrolls the detail, preview or native evidence
+under it. While the help overlay is open a click closes it; the editor,
+confirmations and the filter draft ignore the mouse. Mouse capture is released
+on every exit path, together with raw mode and the alternate screen.
+
 Resize preserves selections and uses stacked panels on narrow terminals. Logs
 show one selected stream in bounded pageable chunks; stored and capture limits
 are visible, and terminal control bytes are replaced. A finished session remains
-available for browsing; launch a new session for another run. Raw mode and
-alternate screen are restored on exit, errors, and panic. Interactive mode
+available for browsing; launch a new session for another run. Raw mode,
+alternate screen and (with `--mouse`) mouse capture are restored on exit,
+errors, signals and panic. Interactive mode
 requires stdin and stdout terminals; without them, use headless or JSON output.
 
 ## Paging and display bounds

@@ -1,5 +1,7 @@
 use super::{
-    App, Focus, Tab, safe_text,
+    App, Focus, Tab,
+    mouse::ListHit,
+    safe_text,
     theme::{self, Group, HELP, HELP_ONLY, Hint, REQUIRED, hint},
 };
 use ratatui::{
@@ -10,6 +12,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
 pub fn render(frame: &mut Frame, app: &App) {
+    *app.hits.borrow_mut() = Default::default();
     mode(frame, app);
     if app.help {
         theme::help(frame, &help_hints(app));
@@ -104,6 +107,7 @@ fn mode(frame: &mut Frame, app: &App) {
                 .scroll((app.scroll, 0)),
             main[1],
         );
+        app.hits.borrow_mut().scroll = Some(main[1]);
     } else {
         let rows = selector_rows(app);
         let parts = Layout::default()
@@ -347,6 +351,8 @@ pub(super) fn hints(app: &App) -> Vec<Hint> {
         hints.push(hint(Navigate, "j/k", "select", HELP_ONLY));
         hints.push(hint(Navigate, "Home/End", "first/last row", HELP_ONLY));
         hints.push(hint(Evidence, "/", "filter", 3));
+        hints.push(hint(Navigate, "f/F", "next/prev problem", 7));
+        hints.push(hint(Evidence, "y", "copy record (OSC 52)", HELP_ONLY));
         let view = app.viewport.borrow();
         let chunks = view.has_chunks();
         hints.push(hint(
@@ -419,29 +425,25 @@ fn selector_rows(app: &App) -> SelectorRows {
             .map_or(0, |s| s.stages.len())
             .saturating_sub(64),
     );
+    // While live, the executing scenario and stage read "running" instead of
+    // their provisional "incomplete"/"pending"; finished rows never change.
+    let live = super::app::live_position(app);
     let scenarios = app
         .report
         .as_ref()
         .map(|r| {
             r.scenarios
                 .iter()
+                .enumerate()
                 .skip(scenario_start)
                 .take(64)
-                .map(|s| {
-                    // While live, the scenario holding the running stage shows
-                    // the running glyph; its text keeps the recorded outcome.
-                    let running = app.active
-                        && s.stages
-                            .iter()
-                            .any(|st| st.outcome == crate::model::StageOutcome::Running);
-                    (
-                        format!("{}/{} {}", s.profile, s.scenario, s.outcome),
-                        if running {
-                            "running".to_string()
-                        } else {
-                            s.outcome.to_string()
-                        },
-                    )
+                .map(|(i, s)| {
+                    let word = if live.is_some_and(|(at, _)| at == i) {
+                        "running".to_string()
+                    } else {
+                        s.outcome.to_string()
+                    };
+                    (format!("{}/{} {word}", s.profile, s.scenario), word)
                 })
                 .collect::<Vec<_>>()
         })
@@ -451,13 +453,16 @@ fn selector_rows(app: &App) -> SelectorRows {
         .map(|s| {
             s.stages
                 .iter()
+                .enumerate()
                 .skip(stage_start)
                 .take(64)
-                .map(|s| {
-                    (
-                        format!("{} {}", projection(&s.name, 256), s.outcome),
-                        s.outcome.to_string(),
-                    )
+                .map(|(i, s)| {
+                    let word = if live == Some((app.scenario_index, Some(i))) {
+                        "running".to_string()
+                    } else {
+                        s.outcome.to_string()
+                    };
+                    (format!("{} {word}", projection(&s.name, 256)), word)
                 })
                 .collect::<Vec<_>>()
         })
@@ -499,20 +504,23 @@ fn selectors(frame: &mut Frame, app: &App, area: Rect, narrow: bool, rows: Selec
     fn list(rows: &[(String, String)]) -> Vec<(String, &str)> {
         rows.iter().map(|(t, w)| (t.clone(), w.as_str())).collect()
     }
-    theme::status_list(
+    let scenarios = theme::status_list(
         frame,
         parts[0],
         theme::panel("Scenarios", app.focus == Focus::Scenario),
         list(&rows.scenarios),
         app.scenario_index.saturating_sub(rows.scenario_start),
     );
-    theme::status_list(
+    let stages = theme::status_list(
         frame,
         parts[1],
         theme::panel("Stages", app.focus == Focus::Stage),
         list(&rows.stages),
         app.stage_index.saturating_sub(rows.stage_start),
     );
+    let mut hits = app.hits.borrow_mut();
+    hits.scenarios = Some(ListHit::drawn(rows.scenario_start, scenarios));
+    hits.stages = Some(ListHit::drawn(rows.stage_start, stages));
 }
 fn evidence(frame: &mut Frame, app: &App, area: Rect) {
     let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
@@ -541,6 +549,11 @@ fn evidence(frame: &mut Frame, app: &App, area: Rect) {
         }
         Line::from(spans)
     });
+    let titles = titles.collect::<Vec<_>>();
+    app.hits.borrow_mut().tabs = super::mouse::tab_areas(parts[0], titles.iter().map(Line::width))
+        .into_iter()
+        .zip(Tab::ALL)
+        .collect();
     frame.render_widget(
         Tabs::new(titles).select(app.tab.index()).highlight_style(
             theme::tone(Color::Cyan).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
@@ -578,14 +591,24 @@ pub(super) fn record_panes(frame: &mut Frame, app: &App, area: Rect, focused: bo
         .map(|row| ListItem::new(theme::highlighted(row.text.replace('\n', " | "), &needle)))
         .collect::<Vec<_>>();
     let mut state = ListState::default().with_selected(Some(selected.saturating_sub(view.start)));
+    let block = theme::panel("Records — Home/End select", focused);
+    let records = (block.inner(regions[0]), rows.len());
     frame.render_stateful_widget(
         List::new(rows)
-            .block(theme::panel("Records — Home/End select", focused))
+            .block(block)
             .highlight_symbol("> ")
             .highlight_style(Style::default().add_modifier(Modifier::BOLD)),
         regions[0],
         &mut state,
     );
+    {
+        let mut hits = app.hits.borrow_mut();
+        hits.records = Some(ListHit::drawn(
+            view.start,
+            (records.0, state.offset(), records.1),
+        ));
+        hits.scroll = Some(regions[1]);
+    }
     let title = format!(
         "Detail — record {} / {}",
         if count == 0 { 0 } else { selected + 1 },
