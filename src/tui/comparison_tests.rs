@@ -133,6 +133,8 @@ fn recipe_save_copy_adopts_bytes_and_requires_fresh_run() {
     let mut app = App::preview(recipe.clone(), engine::RunOptions::all(&recipe));
     input(&mut app, KeyCode::Char('r').into());
     input(&mut app, KeyCode::Char('e').into());
+    // The editor opens at the top; append at the document end.
+    input(&mut app, KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL));
     preview_edit::paste(&mut app, "\n# café\n");
     input(
         &mut app,

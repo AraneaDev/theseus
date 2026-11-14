@@ -1,7 +1,12 @@
 use crate::preview::MAX_DRAFT_BYTES;
 use anyhow::{Result, ensure};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::{Frame, layout::Rect, style::Style, text::Span};
+use ratatui::{
+    Frame,
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    text::Span,
+};
 use std::cell::{Cell, RefCell};
 
 #[cfg(test)]
@@ -44,17 +49,138 @@ struct Viewport {
     line_index: usize,
     column: usize,
     elided_display: bool,
-    rows: Vec<String>,
+    /// First visible logical line and the line-number gutter width (0 = none).
+    top: usize,
+    gutter: usize,
+    rows: Vec<Vec<(Syntax, String)>>,
     cursor: Option<(usize, usize)>,
+}
+
+/// Display-only TOML token classes; they never influence the draft bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Syntax {
+    Plain,
+    Header,
+    Key,
+    Punct,
+    Str,
+    Comment,
+}
+impl Syntax {
+    fn style(self) -> Style {
+        match self {
+            Self::Plain => Style::default(),
+            Self::Header => Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            Self::Key => Style::default().fg(Color::Yellow),
+            Self::Punct | Self::Comment => Style::default().fg(Color::DarkGray),
+            Self::Str => Style::default().fg(Color::Green),
+        }
+    }
+}
+
+/// A per-line lexer fed one grapheme at a time, so classification visits no
+/// more source than the projection already does. Multi-line strings and arrays
+/// are coloured approximately; this is a reading aid only.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lex {
+    Start,
+    Header { closed: bool },
+    Key,
+    Value,
+    Str { quote: char, escaped: bool },
+    Comment,
+}
+impl Lex {
+    fn feed(&mut self, symbol: &str) -> Syntax {
+        let c = symbol.chars().next().unwrap_or(' ');
+        match *self {
+            Self::Comment => Syntax::Comment,
+            Self::Start if c.is_whitespace() => Syntax::Plain,
+            Self::Start | Self::Value | Self::Header { closed: true } if c == '#' => {
+                *self = Self::Comment;
+                Syntax::Comment
+            }
+            Self::Start if c == '[' => {
+                *self = Self::Header { closed: false };
+                Syntax::Header
+            }
+            Self::Start | Self::Value if c == '"' || c == '\'' => {
+                *self = Self::Str {
+                    quote: c,
+                    escaped: false,
+                };
+                Syntax::Str
+            }
+            Self::Start if matches!(c, ']' | '{' | '}' | ',') => {
+                *self = Self::Value;
+                Syntax::Punct
+            }
+            Self::Start => {
+                *self = Self::Key;
+                Syntax::Key
+            }
+            Self::Header { closed } => {
+                if !closed && c == ']' {
+                    // `[[x]]` closes on its first `]`; the second stays header.
+                    *self = Self::Header { closed: true };
+                    Syntax::Header
+                } else if closed && !c.is_whitespace() && c != ']' {
+                    Syntax::Plain
+                } else {
+                    Syntax::Header
+                }
+            }
+            Self::Key if c == '=' => {
+                *self = Self::Value;
+                Syntax::Punct
+            }
+            Self::Key => Syntax::Key,
+            Self::Str { quote, escaped } => {
+                if escaped {
+                    *self = Self::Str {
+                        quote,
+                        escaped: false,
+                    };
+                } else if c == '\\' && quote == '"' {
+                    *self = Self::Str {
+                        quote,
+                        escaped: true,
+                    };
+                } else if c == quote {
+                    *self = Self::Value;
+                }
+                Syntax::Str
+            }
+            Self::Value if matches!(c, '[' | ']' | '{' | '}' | ',' | '=') => Syntax::Punct,
+            Self::Value => Syntax::Plain,
+        }
+    }
+}
+
+/// Classed row segments; adjacent pushes of the same class merge.
+struct Row {
+    segments: Vec<(Syntax, String)>,
+    bytes: usize,
+}
+impl Row {
+    fn push(&mut self, class: Syntax, text: &str) {
+        self.bytes += text.len();
+        match self.segments.last_mut() {
+            Some((last, s)) if *last == class => s.push_str(text),
+            _ => self.segments.push((class, text.to_owned())),
+        }
+    }
 }
 
 impl Editor {
     pub(super) fn new(text: String) -> Result<Self> {
         ensure!(text.len() <= MAX_DRAFT_BYTES, "draft exceeds 1 MiB");
-        let cursor = text.len();
+        // Open at the top of the document; Ctrl-End reaches the tail.
         Ok(Self {
             text,
-            cursor,
+            cursor: 0,
             preferred_column: None,
             top_line: Cell::new(0),
             left_cell: Cell::new(0),
@@ -266,14 +392,32 @@ impl Editor {
                 "CtrlT test | CtrlS save | Esc close",
             );
         }
-        for (row, projected) in view.rows.iter().enumerate() {
-            frame.buffer_mut().set_stringn(
-                area.x,
-                body_y + row as u16,
-                projected,
-                width,
-                Style::default(),
-            );
+        let current = view.line_index.checked_sub(view.top);
+        for (row, segments) in view.rows.iter().enumerate() {
+            let y = body_y + row as u16;
+            let mut x = area.x;
+            if view.gutter > 0 {
+                let number = format!("{:>w$} ", view.top + row + 1, w = view.gutter - 1);
+                let style = if current == Some(row) {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                x = frame
+                    .buffer_mut()
+                    .set_stringn(x, y, number, view.gutter, style)
+                    .0;
+            }
+            for (class, text) in segments {
+                let used = (x - area.x) as usize;
+                if used >= width {
+                    break;
+                }
+                x = frame
+                    .buffer_mut()
+                    .set_stringn(x, y, text, width - used, class.style())
+                    .0;
+            }
         }
         if let Some((x, y)) = view.cursor {
             frame.set_cursor_position((area.x + x as u16, body_y + y as u16));
@@ -293,6 +437,8 @@ impl Editor {
             line_index,
             column,
             elided_display: false,
+            top: 0,
+            gutter: 0,
             rows: Vec::new(),
             cursor: None,
         };
@@ -308,6 +454,15 @@ impl Editor {
             top
         };
         self.top_line.set(top);
+        view.top = top;
+        // A line-number gutter only where it leaves ample room for source text.
+        // It is sized from the last visible line number, not the whole draft.
+        view.gutter = if width >= 60 {
+            (top + body_height).to_string().len().max(3) + 1
+        } else {
+            0
+        };
+        let width = width - view.gutter;
         let current = &self.text[self.line_start()..self.line_end()];
         let cursor_cell = cursor_cell(current, self.cursor - self.line_start());
         let left = self.left_cell.get();
@@ -325,7 +480,7 @@ impl Editor {
             view.rows.push(row);
         }
         if cursor_cell >= left && cursor_cell - left < width {
-            view.cursor = Some((cursor_cell - left, line_index - top));
+            view.cursor = Some((view.gutter + cursor_cell - left, line_index - top));
         }
         view
     }
@@ -379,11 +534,15 @@ fn cursor_cell(line: &str, cursor: usize) -> usize {
     cells
 }
 
-fn visible_line(line: &str, left: usize, width: usize) -> (String, bool) {
+fn visible_line(line: &str, left: usize, width: usize) -> (Vec<(Syntax, String)>, bool) {
     // Fixed row allowance keeps ordinary multi-person ZWJ emoji intact even
     // in a two-cell viewport. It cannot grow with source or cluster length.
     let max_bytes = width.saturating_mul(8).saturating_add(64);
-    let mut projected = String::with_capacity(max_bytes);
+    let mut projected = Row {
+        segments: Vec::new(),
+        bytes: 0,
+    };
+    let mut lex = Lex::Start;
     let mut separated = false;
     let mut cell = 0;
     let mut written = 0;
@@ -394,6 +553,7 @@ fn visible_line(line: &str, left: usize, width: usize) -> (String, bool) {
         let symbol = grapheme.symbol;
         source_visit(symbol.len());
         let cells = grapheme_width(symbol);
+        let class = lex.feed(symbol);
         if cells == 0 {
             // Standalone zero-cell clusters cannot occupy a terminal cell.
             if cell >= left && cell <= right {
@@ -410,12 +570,12 @@ fn visible_line(line: &str, left: usize, width: usize) -> (String, bool) {
             if separated {
                 // Retain a zero-cell boundary when eliding standalone marks;
                 // otherwise adjacent emoji could become a new joined cluster.
-                projected.push('\u{200b}');
+                projected.push(class, "\u{200b}");
                 separated = false;
             }
             let start = cell.max(left) - left;
             while written < start {
-                projected.push(' ');
+                projected.push(class, " ");
                 written += 1;
             }
             let until = end.min(right) - left;
@@ -427,8 +587,8 @@ fn visible_line(line: &str, left: usize, width: usize) -> (String, bool) {
                 };
                 // Reserve a blank plus a possible three-byte zero-cell boundary
                 // per remaining cell, so later printable tails always fit.
-                if projected.len() + display.len() + 4 * (width - until) <= max_bytes {
-                    projected.push_str(display);
+                if projected.bytes + display.len() + 4 * (width - until) <= max_bytes {
+                    projected.push(class, display);
                     written = until;
                 } else {
                     elided_display = true;
@@ -437,13 +597,13 @@ fn visible_line(line: &str, left: usize, width: usize) -> (String, bool) {
             // Tabs, clipped clusters and elided clusters retain their full
             // visible cell footprint without emitting a partial grapheme.
             while written < until {
-                projected.push(' ');
+                projected.push(class, " ");
                 written += 1;
             }
         }
         cell = end;
     }
-    (projected, elided_display)
+    (projected.segments, elided_display)
 }
 
 #[cfg(test)]
@@ -548,6 +708,7 @@ mod tests {
     #[test]
     fn home_end_document_edges_and_literal_controls() {
         let mut editor = Editor::new("a\nβ".into()).unwrap();
+        editor.key(ctrl(KeyCode::End));
         editor.key(key(KeyCode::Home));
         assert_eq!(editor.cursor(), 2);
         editor.key(key(KeyCode::End));
@@ -571,6 +732,7 @@ mod tests {
     #[test]
     fn insertion_and_paste_cap_are_atomic() {
         let mut editor = Editor::new("x".repeat(MAX_DRAFT_BYTES - 2)).unwrap();
+        editor.key(ctrl(KeyCode::End));
         editor.paste("é");
         assert_eq!(editor.text().len(), MAX_DRAFT_BYTES);
         let before = editor.cursor();
@@ -583,6 +745,7 @@ mod tests {
         assert!(Editor::new("x".repeat(MAX_DRAFT_BYTES + 1)).is_err());
 
         let mut near = Editor::new("x".repeat(MAX_DRAFT_BYTES - 1)).unwrap();
+        near.key(ctrl(KeyCode::End));
         near.key(key(KeyCode::Char('界')));
         assert_eq!(near.text().len(), MAX_DRAFT_BYTES - 1);
         assert_eq!(near.cursor(), MAX_DRAFT_BYTES - 1);
@@ -605,7 +768,9 @@ mod tests {
 
     #[test]
     fn viewport_reaches_large_tail_and_handles_tiny_areas() {
-        let editor = Editor::new(format!("HEAD{}TAIL", "x".repeat(MAX_DRAFT_BYTES - 8))).unwrap();
+        let mut editor =
+            Editor::new(format!("HEAD{}TAIL", "x".repeat(MAX_DRAFT_BYTES - 8))).unwrap();
+        editor.key(ctrl(KeyCode::End));
         let (text, _) = screen(&editor, 20, 6);
         assert!(text.contains("TAIL"));
         assert!(!text.contains("HEAD"));
@@ -631,7 +796,8 @@ mod tests {
         for glyph in ["👩‍💻", "👨‍👩‍👧‍👦", "👍🏽", "🇳🇱", "1\u{fe0f}\u{20e3}", "❤\u{fe0f}"]
         {
             let raw = format!("{glyph}x");
-            let editor = Editor::new(raw.clone()).unwrap();
+            let mut editor = Editor::new(raw.clone()).unwrap();
+            editor.key(ctrl(KeyCode::End));
             let (_, mut backend) = screen(&editor, 30, 8);
             assert_eq!(backend.buffer()[(0, 3)].symbol(), glyph);
             assert_eq!(backend.buffer()[(2, 3)].symbol(), "x");
@@ -665,6 +831,7 @@ mod tests {
         for glyph in ["👩‍💻", "👨‍👩‍👧‍👦", "👍🏽", "🇳🇱", "1\u{fe0f}\u{20e3}", "❤\u{fe0f}"]
         {
             let mut editor = Editor::new(format!("{glyph}x")).unwrap();
+            editor.key(ctrl(KeyCode::End));
             let (_, mut backend) = screen(&editor, 3, 8);
             assert_eq!(backend.buffer()[(0, 3)].symbol(), " ");
             assert_eq!(backend.buffer()[(1, 3)].symbol(), "x");
@@ -687,7 +854,8 @@ mod tests {
 
     #[test]
     fn grapheme_zero_cell_separator_does_not_join_neighboring_emoji() {
-        let editor = Editor::new("👍\u{200b}🏽x".into()).unwrap();
+        let mut editor = Editor::new("👍\u{200b}🏽x".into()).unwrap();
+        editor.key(ctrl(KeyCode::End));
         let (_, mut backend) = screen(&editor, 30, 8);
         assert_eq!(backend.buffer()[(0, 3)].symbol(), "👍");
         assert_eq!(backend.buffer()[(2, 3)].symbol(), "🏽");
@@ -698,7 +866,8 @@ mod tests {
     #[test]
     fn grapheme_pathological_cluster_keeps_footprint_tail_and_bounded_allocation() {
         let raw = format!("👩{}x", "\u{200d}💻".repeat((MAX_DRAFT_BYTES - 5) / 7));
-        let editor = Editor::new(raw.clone()).unwrap();
+        let mut editor = Editor::new(raw.clone()).unwrap();
+        editor.key(ctrl(KeyCode::End));
         let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
         LARGEST_ALLOCATION.with(|largest| largest.set(0));
         TRACK_ALLOCATIONS.with(|active| active.set(true));
@@ -725,6 +894,7 @@ mod tests {
     #[test]
     fn grapheme_scalar_deletion_keeps_raw_joiners_and_modifiers_editable() {
         let mut editor = Editor::new("👩‍💻👍🏽".into()).unwrap();
+        editor.key(ctrl(KeyCode::End));
         editor.key(key(KeyCode::Backspace));
         assert_eq!(editor.text(), "👩‍💻👍");
         editor.key(ctrl(KeyCode::Home));
@@ -737,7 +907,9 @@ mod tests {
 
     #[test]
     fn repeated_large_source_draws_never_allocate_a_full_copy() {
-        let editor = Editor::new(format!("HEAD{}TAIL", "x".repeat(MAX_DRAFT_BYTES - 8))).unwrap();
+        let mut editor =
+            Editor::new(format!("HEAD{}TAIL", "x".repeat(MAX_DRAFT_BYTES - 8))).unwrap();
+        editor.key(ctrl(KeyCode::End));
         let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
         LARGEST_ALLOCATION.with(|largest| largest.set(0));
         TRACK_ALLOCATIONS.with(|active| active.set(true));
@@ -764,7 +936,9 @@ mod tests {
 
     #[test]
     fn repeated_draws_at_long_line_tail_visit_only_bounded_source() {
-        let editor = Editor::new(format!("HEAD{}TAIL", "x".repeat(MAX_DRAFT_BYTES - 8))).unwrap();
+        let mut editor =
+            Editor::new(format!("HEAD{}TAIL", "x".repeat(MAX_DRAFT_BYTES - 8))).unwrap();
+        editor.key(ctrl(KeyCode::End));
         let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
         terminal
             .draw(|frame| editor.draw(frame, Rect::new(0, 0, 40, 8), "source.toml", true))
@@ -784,7 +958,8 @@ mod tests {
 
     #[test]
     fn repeated_draws_at_many_line_tail_visit_only_bounded_source() {
-        let editor = Editor::new("x\n".repeat(MAX_DRAFT_BYTES / 2)).unwrap();
+        let mut editor = Editor::new("x\n".repeat(MAX_DRAFT_BYTES / 2)).unwrap();
+        editor.key(ctrl(KeyCode::End));
         let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
         terminal
             .draw(|frame| editor.draw(frame, Rect::new(0, 0, 40, 8), "source.toml", true))
@@ -805,6 +980,7 @@ mod tests {
     #[test]
     fn viewport_reprojects_after_navigation_edit_and_diagnostic() {
         let mut editor = Editor::new(format!("HEAD{}TAIL", "x".repeat(100))).unwrap();
+        editor.key(ctrl(KeyCode::End));
         assert!(screen(&editor, 20, 6).0.contains("TAIL"));
         editor.key(ctrl(KeyCode::Home));
         let (text, mut backend) = screen(&editor, 20, 6);
@@ -822,7 +998,8 @@ mod tests {
     #[test]
     fn huge_combining_run_elides_marks_but_keeps_printable_tail_and_cursor() {
         let raw = format!("e{}Z", "\u{301}".repeat((MAX_DRAFT_BYTES - 2) / 2));
-        let editor = Editor::new(raw.clone()).unwrap();
+        let mut editor = Editor::new(raw.clone()).unwrap();
+        editor.key(ctrl(KeyCode::End));
         let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
         terminal
             .draw(|frame| editor.draw(frame, Rect::new(0, 0, 40, 8), "source.toml", true))
@@ -854,7 +1031,8 @@ mod tests {
     #[test]
     fn leading_combining_run_elides_marks_before_printable_text() {
         let raw = format!("{}Z", "\u{301}".repeat((MAX_DRAFT_BYTES - 1) / 2));
-        let editor = Editor::new(raw.clone()).unwrap();
+        let mut editor = Editor::new(raw.clone()).unwrap();
+        editor.key(ctrl(KeyCode::End));
         let (text, mut backend) = screen(&editor, 40, 8);
         assert!(text.contains("Display elided"));
         assert!(text.contains('Z'));
@@ -876,5 +1054,59 @@ mod tests {
             .draw(|frame| editor.draw(frame, Rect::new(0, 0, 40, 8), "source.toml", true))
             .unwrap();
         assert!(SOURCE_VISITS.with(Cell::get) < 10_000);
+    }
+
+    #[test]
+    fn opens_at_document_top() {
+        let editor = Editor::new("first = 1\nsecond = 2\nlast = 3".into()).unwrap();
+        assert_eq!(editor.cursor(), 0);
+        let (text, mut backend) = screen(&editor, 40, 8);
+        assert!(text.contains("Ln 1 Col 1"));
+        assert!(text.contains("first = 1"));
+        backend.assert_cursor_position((0, 3));
+    }
+
+    #[test]
+    fn wide_viewport_adds_line_gutter_and_toml_colours_without_touching_bytes() {
+        use ratatui::style::Color;
+        let raw = "# note\n[[profiles.user.checks]]\nid = \"a\\\"b\" # tail\nkind = 'x'";
+        let mut editor = Editor::new(raw.into()).unwrap();
+        editor.key(key(KeyCode::Down));
+        editor.key(key(KeyCode::Right));
+        let (_, mut backend) = screen(&editor, 70, 10);
+        let buffer = backend.buffer().clone();
+        let row = |y: u16| {
+            (0..70)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect::<String>()
+        };
+        // A four-cell gutter: right-aligned number and a space.
+        assert!(row(3).starts_with("  1 # note"), "{}", row(3));
+        assert!(row(4).starts_with("  2 [[profiles.user.checks]]"));
+        assert!(row(5).starts_with("  3 id = \"a\\\"b\" # tail"));
+        assert_eq!(buffer[(0, 3)].fg, Color::DarkGray);
+        assert_eq!(buffer[(2, 4)].fg, Color::Yellow, "current line number");
+        assert_eq!(buffer[(4, 3)].fg, Color::DarkGray, "comment");
+        assert_eq!(buffer[(4, 4)].fg, Color::Cyan, "table header");
+        assert_eq!(buffer[(4, 5)].fg, Color::Yellow, "key");
+        assert_eq!(buffer[(7, 5)].fg, Color::DarkGray, "equals");
+        // The escaped quote stays inside the string; the comment follows it.
+        for x in 9..15 {
+            assert_eq!(buffer[(x, 5)].fg, Color::Green, "string cell {x}");
+        }
+        assert_eq!(buffer[(16, 5)].fg, Color::DarkGray, "trailing comment");
+        assert_eq!(buffer[(11, 6)].fg, Color::Green, "literal string");
+        // Caret logic is unchanged; only the gutter offsets its screen column.
+        backend.assert_cursor_position((5, 4));
+        assert!(row(0).contains("Ln 2 Col 2"));
+        assert_eq!(editor.text(), raw);
+    }
+
+    #[test]
+    fn narrow_viewport_keeps_full_width_for_source() {
+        let editor = Editor::new("[a]\nk = 1".into()).unwrap();
+        let (_, mut backend) = screen(&editor, 40, 8);
+        assert_eq!(backend.buffer()[(0, 3)].symbol(), "[");
+        backend.assert_cursor_position((0, 3));
     }
 }
