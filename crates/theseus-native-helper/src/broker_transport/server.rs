@@ -40,6 +40,30 @@ use pending::{OriginalRefusal, RetainedRuntime};
 pub(super) use pending::{
     Pending, finish_activation_check, validate_cancel_identity, with_cancel_flag,
 };
+#[cfg(target_os = "linux")]
+type QualifiedStart = (
+    LedgerStore,
+    theseus_native_helper_store::VerifiedLinuxGioBootstrap,
+    super::native_linux_factory::LinuxFactoryInitializer,
+    super::native_linux::OriginalFinalizer,
+);
+/// What `prepare_start` hands to `assemble_started`, per platform.
+#[cfg(windows)]
+type StartPrepared = (
+    MeasuredIdentity,
+    BrokerRuntime,
+    DefinitionRoots,
+    Option<theseus_host::desktop::windows::ComApartment>,
+);
+#[cfg(target_os = "linux")]
+type StartPrepared = (
+    MeasuredIdentity,
+    BrokerRuntime,
+    DefinitionRoots,
+    Option<super::native_linux_factory::LinuxNativeFactory>,
+);
+#[cfg(all(not(windows), not(target_os = "linux")))]
+type StartPrepared = (MeasuredIdentity, BrokerRuntime, DefinitionRoots);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServerPoll {
     Progress,
@@ -127,91 +151,141 @@ impl BrokerServer {
     fn start_inner(
         config: BrokerServerConfig,
         #[cfg(target_os = "linux")] scope: theseus_host::desktop::scope::DedicatedBrokerScope,
-        #[cfg(target_os = "linux")] qualified: Option<(
-            LedgerStore,
-            theseus_native_helper_store::VerifiedLinuxGioBootstrap,
-            super::native_linux_factory::LinuxFactoryInitializer,
-            super::native_linux::OriginalFinalizer,
-        )>,
+        #[cfg(target_os = "linux")] qualified: Option<QualifiedStart>,
     ) -> Result<Self, ServerStartFailure> {
-        let prepared = (|| {
+        let prepared = Self::prepare_start(
+            &config,
             #[cfg(target_os = "linux")]
-            if let Some((_, proof, _, _)) = &qualified {
-                config.validate_qualified(proof)?;
-            } else {
-                config.validate()?;
-            }
-            #[cfg(not(target_os = "linux"))]
+            qualified,
+        )
+        .map_err(|error| ServerStartFailure { error, owner: None })?;
+        let mut server = Self::assemble_started(
+            config,
+            prepared,
+            #[cfg(target_os = "linux")]
+            scope,
+        );
+        if let Err(error) = server.bind_start_channels() {
+            return Err(ServerStartFailure {
+                error,
+                owner: Some(Box::new(server)),
+            });
+        }
+        server.bind_start_listener()
+    }
+    /// Validation and store/runtime preparation; any error leaves no owner behind.
+    fn prepare_start(
+        config: &BrokerServerConfig,
+        #[cfg(target_os = "linux")] qualified: Option<QualifiedStart>,
+    ) -> io::Result<StartPrepared> {
+        #[cfg(target_os = "linux")]
+        if let Some((_, proof, _, _)) = &qualified {
+            config.validate_qualified(proof)?;
+        } else {
             config.validate()?;
-            let measurement = measure_local_identity()?;
-            let _session = launch::binding(&config, &measurement)?;
-            super::owned_entry::validate_session(
-                config.manifest.desktop_owned_entry.as_ref(),
-                &_session,
-                &config.header.os,
-            )?;
-            crate::broker::owned_lifetime::validate_backend(
-                config.manifest.desktop_owned_lifetime,
-                &_session,
-                &config.header.os,
-            )?;
-            let ledger = HostDir::open(
-                std::path::Path::new(&config.ledger_root),
-                RootPolicy::AllComponentsNoFollow,
-            )?;
-            let workspace = HostDir::open(
-                std::path::Path::new(&config.workspace_root),
-                RootPolicy::AllComponentsNoFollow,
-            )?;
-            #[cfg(target_os = "linux")]
-            let (store, native_factory) = match qualified {
-                Some((store, proof, initialize, finalize)) => {
-                    let expected_session = _session.binding().clone();
-                    let original = initialize(&proof, &config, _session)?;
-                    let factory = super::native_linux_factory::LinuxNativeFactory::new(
-                        proof,
-                        original,
-                        expected_session,
-                        finalize,
-                    )?;
-                    (store, Some(factory))
-                }
-                None => (
-                    LedgerStore::open_broker(&ledger, &workspace, &config.header)
-                        .map_err(io::Error::other)?,
-                    None,
-                ),
-            };
-            #[cfg(not(target_os = "linux"))]
-            let store = LedgerStore::open_broker(&ledger, &workspace, &config.header)
-                .map_err(io::Error::other)?;
-            let runtime = BrokerRuntime::open(store)?;
-            let roots = DefinitionRoots::open(&config)?;
-            #[cfg(windows)]
-            let apartment = if config.manifest.desktop_native.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        config.validate()?;
+        let measurement = measure_local_identity()?;
+        let _session = launch::binding(config, &measurement)?;
+        Self::validate_start_session(config, &_session)?;
+        let ledger = HostDir::open(
+            std::path::Path::new(&config.ledger_root),
+            RootPolicy::AllComponentsNoFollow,
+        )?;
+        let workspace = HostDir::open(
+            std::path::Path::new(&config.workspace_root),
+            RootPolicy::AllComponentsNoFollow,
+        )?;
+        #[cfg(target_os = "linux")]
+        let (store, native_factory) = match qualified {
+            Some((store, proof, initialize, finalize)) => {
+                Self::qualified_linux_factory(config, _session, store, proof, initialize, finalize)?
+            }
+            None => (
+                LedgerStore::open_broker(&ledger, &workspace, &config.header)
+                    .map_err(io::Error::other)?,
+                None,
+            ),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let store = LedgerStore::open_broker(&ledger, &workspace, &config.header)
+            .map_err(io::Error::other)?;
+        let runtime = BrokerRuntime::open(store)?;
+        let roots = DefinitionRoots::open(config)?;
+        #[cfg(windows)]
+        let apartment = Self::start_apartment(config)?;
+        #[cfg(windows)]
+        return Ok((measurement, runtime, roots, apartment));
+        #[cfg(target_os = "linux")]
+        return Ok((measurement, runtime, roots, native_factory));
+        #[cfg(all(not(windows), not(target_os = "linux")))]
+        Ok((measurement, runtime, roots))
+    }
+    fn validate_start_session(
+        config: &BrokerServerConfig,
+        session: &theseus_host::desktop::session::BoundSession,
+    ) -> io::Result<()> {
+        super::owned_entry::validate_session(
+            config.manifest.desktop_owned_entry.as_ref(),
+            session,
+            &config.header.os,
+        )?;
+        crate::broker::owned_lifetime::validate_backend(
+            config.manifest.desktop_owned_lifetime,
+            session,
+            &config.header.os,
+        )?;
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    fn qualified_linux_factory(
+        config: &BrokerServerConfig,
+        session: theseus_host::desktop::session::BoundSession,
+        store: LedgerStore,
+        proof: theseus_native_helper_store::VerifiedLinuxGioBootstrap,
+        initialize: super::native_linux_factory::LinuxFactoryInitializer,
+        finalize: super::native_linux::OriginalFinalizer,
+    ) -> io::Result<(
+        LedgerStore,
+        Option<super::native_linux_factory::LinuxNativeFactory>,
+    )> {
+        let expected_session = session.binding().clone();
+        let original = initialize(&proof, config, session)?;
+        let factory = super::native_linux_factory::LinuxNativeFactory::new(
+            proof,
+            original,
+            expected_session,
+            finalize,
+        )?;
+        Ok((store, Some(factory)))
+    }
+    #[cfg(windows)]
+    fn start_apartment(
+        config: &BrokerServerConfig,
+    ) -> io::Result<Option<theseus_host::desktop::windows::ComApartment>> {
+        Ok(
+            if config.manifest.desktop_native.is_some()
                 || config.manifest.desktop_owned_entry.is_some()
             {
                 Some(theseus_host::desktop::windows::ComApartment::initialize_original_thread()?)
             } else {
                 None
-            };
-            #[cfg(windows)]
-            return Ok::<_, io::Error>((measurement, runtime, roots, apartment));
-            #[cfg(target_os = "linux")]
-            return Ok::<_, io::Error>((measurement, runtime, roots, native_factory));
-            #[cfg(all(not(windows), not(target_os = "linux")))]
-            Ok::<_, io::Error>((measurement, runtime, roots))
-        })();
+            },
+        )
+    }
+    fn assemble_started(
+        config: BrokerServerConfig,
+        prepared: StartPrepared,
+        #[cfg(target_os = "linux")] scope: theseus_host::desktop::scope::DedicatedBrokerScope,
+    ) -> Self {
         #[cfg(windows)]
-        let (measurement, runtime, roots, apartment) =
-            prepared.map_err(|error| ServerStartFailure { error, owner: None })?;
+        let (measurement, runtime, roots, apartment) = prepared;
         #[cfg(target_os = "linux")]
-        let (measurement, runtime, roots, native_factory) =
-            prepared.map_err(|error| ServerStartFailure { error, owner: None })?;
+        let (measurement, runtime, roots, native_factory) = prepared;
         #[cfg(all(not(windows), not(target_os = "linux")))]
-        let (measurement, runtime, roots) =
-            prepared.map_err(|error| ServerStartFailure { error, owner: None })?;
-        let mut server = Self {
+        let (measurement, runtime, roots) = prepared;
+        Self {
             config,
             runtime: RetainedRuntime(Some(runtime)),
             listener: None,
@@ -242,52 +316,42 @@ impl BrokerServer {
             scope: Some(scope),
             #[cfg(target_os = "linux")]
             native_factory,
-        };
-        let channel_result = (|| {
-            let desktop = server
-                .config
-                .manifest
-                .desktop
-                .as_ref()
-                .ok_or_else(|| io::Error::other("desktop missing"))?;
-            server.ready_channel = Some(launch::bind_channel(
-                &server.config,
-                &desktop.ready_endpoint,
-            )?);
-            server.close_channel = Some(launch::bind_channel(
-                &server.config,
-                &desktop.close_endpoint,
-            )?);
-            Ok::<_, io::Error>(())
-        })();
-        if let Err(error) = channel_result {
-            return Err(ServerStartFailure {
-                error,
-                owner: Some(Box::new(server)),
-            });
         }
+    }
+    fn bind_start_channels(&mut self) -> io::Result<()> {
+        let desktop = self
+            .config
+            .manifest
+            .desktop
+            .as_ref()
+            .ok_or_else(|| io::Error::other("desktop missing"))?;
+        self.ready_channel = Some(launch::bind_channel(&self.config, &desktop.ready_endpoint)?);
+        self.close_channel = Some(launch::bind_channel(&self.config, &desktop.close_endpoint)?);
+        Ok(())
+    }
+    fn bind_start_listener(mut self) -> Result<Self, ServerStartFailure> {
         let local = PeerCeiling {
-            principal: principal(&server.config.header.broker_principal),
-            session_id: server.measurement.session_id,
+            principal: principal(&self.config.header.broker_principal),
+            session_id: self.measurement.session_id,
         };
         let peer = PeerCeiling {
-            principal: principal(&server.config.header.helper_principal),
+            principal: principal(&self.config.header.helper_principal),
             session_id: None,
         };
-        let endpoint = endpoint(&server.config.header.broker_endpoint)
+        let endpoint = endpoint(&self.config.header.broker_endpoint)
             .map_err(|error| ServerStartFailure { error, owner: None })?;
         match LocalListener::bind(endpoint, local, peer) {
-            Ok(listener) => server.listener = Some(Box::new(listener)),
+            Ok(listener) => self.listener = Some(Box::new(listener)),
             Err(failure) => {
                 let (error, owner) = failure.into_parts();
-                server.listener = owner;
+                self.listener = owner;
                 return Err(ServerStartFailure {
                     error,
-                    owner: Some(Box::new(server)),
+                    owner: Some(Box::new(self)),
                 });
             }
         }
-        Ok(server)
+        Ok(self)
     }
     pub fn header(&self) -> &IntegrationBrokerHeader {
         &self.config.header
