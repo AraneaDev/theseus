@@ -362,6 +362,32 @@ Docker suites before merge. None changes the supported scope.
   code moved into child modules with no logic changes. No product module is
   over 1,000 lines except `v2/json.rs`, which is one typed codec. No function is
   over 300 lines except the MCP schema table and `BrokerLedgerView::replay`.
+  The last long helper functions were split up later ([#22](https://github.com/AraneaDev/theseus/pull/22)):
+  `Worker::begin`, `Worker::advance_at` and `BrokerServer::start_inner`.
+- [x] Workbench readability ([#15](https://github.com/AraneaDev/theseus/pull/15),
+  [#16](https://github.com/AraneaDev/theseus/pull/16), [#18](https://github.com/AraneaDev/theseus/pull/18),
+  [#20](https://github.com/AraneaDev/theseus/pull/20), [#21](https://github.com/AraneaDev/theseus/pull/21)):
+  - **Views:** a labelled preview with the current selection, status glyphs,
+    evidence tab counts, a content-sized selector, and styled comparison and
+    native views.
+  - **Navigation:** a mode-aware footer, a `?` help overlay, focus on the first
+    failure, and `f`/`F` to jump between problems.
+  - **Live runs:** a spinner, the running stage and elapsed time, and a
+    `▸ running` header and rows.
+  - **Editor:** line numbers and TOML colouring.
+  - **Terminal options:** `NO_COLOR`, highlighted filter matches, opt-in
+    `--mouse`, and `y` to copy via OSC 52.
+
+  Key bindings, escaping, bounded paging and the rule that preview never
+  executes are unchanged.
+- [x] Reproducible screenshots ([#17](https://github.com/AraneaDev/theseus/pull/17),
+  [#19](https://github.com/AraneaDev/theseus/pull/19)): `scripts/screenshots.py`
+  drives the real binary in tmux and renders SVGs for the README and
+  [workbench guide](docs/guides/workbench.md). See
+  [validation](docs/contribute/validation.md#regenerating-screenshots).
+- [x] Test reliability ([#21](https://github.com/AraneaDev/theseus/pull/21)):
+  duplex heartbeat checks measure their deadline from when the check starts,
+  not from when the test began, so a slow runner can no longer fail them.
 
 ## Merged: native adapter foundations
 
