@@ -1,4 +1,5 @@
 use super::*;
+use std::ops::ControlFlow;
 /// A Run request that passed admission; carries the values `begin` threads through.
 struct RunAdmission<'r> {
     ticket: ResponseTicket,
@@ -335,11 +336,28 @@ impl Worker {
         self.advance_at(Instant::now())
     }
     pub(super) fn advance_at(&mut self, now: Instant) -> Result<(), WorkerPrimary> {
+        if self.settle_terminal_or_committed() {
+            return Ok(());
+        }
+        let (expired, cancelled) = self.observe_deadline_cancel(now);
+        if !self.active.as_ref().unwrap().attempted
+            && self.spawn_first_attempt(expired, cancelled)?.is_break()
+        {
+            return Ok(());
+        }
+        if self.handle_spawn_failure()?.is_break() {
+            return Ok(());
+        }
+        self.pump_child_io(expired, cancelled)
+    }
+    /// Terminal and committed Runs publish at most once and stop advancing; `true`
+    /// means `advance_at` returns `Ok(())`.
+    fn settle_terminal_or_committed(&mut self) -> bool {
         let a = self.active.as_mut().unwrap();
         if a.terminal {
             // CachePatch::Terminal is the sole frozen boundary publication.
             // A second event could outlive retirement and hit the next RunKey.
-            return Ok(());
+            return true;
         }
         if a.committed {
             if self.pending.is_none() {
@@ -355,8 +373,13 @@ impl Worker {
                     boundary,
                 }));
             }
-            return Ok(());
+            return true;
         }
+        false
+    }
+    /// Records the deadline/cancel reason and returns `(expired, cancelled)`.
+    fn observe_deadline_cancel(&mut self, now: Instant) -> (bool, bool) {
+        let a = self.active.as_mut().unwrap();
         let expired = now >= a.deadline;
         let cancelled = self.stopping
             || a.cancel.flag.load(Ordering::Acquire)
@@ -366,115 +389,142 @@ impl Worker {
         } else if cancelled {
             a.reason = v2::RunReason::CancelRequested;
         }
-        if !a.attempted {
+        (expired, cancelled)
+    }
+    /// The first (and only) spawn attempt. `Break` means `advance_at` returns `Ok(())`.
+    fn spawn_first_attempt(
+        &mut self,
+        expired: bool,
+        cancelled: bool,
+    ) -> Result<ControlFlow<()>, WorkerPrimary> {
+        if expired || cancelled {
+            let reason = if expired {
+                v2::NotStartedReason::Deadline
+            } else {
+                v2::NotStartedReason::CancelRequested
+            };
+            return self
+                .finish(v2::Outcome::NotStarted { reason })
+                .map(ControlFlow::Break);
+        }
+        if self.prepare_desktop_attempt()?.is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
+        let a = self.active.as_mut().unwrap();
+        if !matches!(a.start.poll(), StartState::Granted) {
+            return Ok(ControlFlow::Break(()));
+        }
+        #[cfg(feature = "test-support")]
+        if let Some(control) = self
+            .invocation
+            .as_ref()
+            .and_then(|inv| inv.fixture.as_ref())
+        {
+            control.before_spawn();
+            // A fixture gate may hold across cancellation, stop or deadline.
+            let expired = Instant::now() >= a.deadline;
+            let cancelled = self.stopping
+                || self.ports.stop.load(Ordering::Acquire)
+                || a.cancel.flag.load(Ordering::Acquire)
+                || matches!(a.start.poll(), StartState::Aborted);
             if expired || cancelled {
                 let reason = if expired {
                     v2::NotStartedReason::Deadline
                 } else {
                     v2::NotStartedReason::CancelRequested
                 };
-                return self.finish(v2::Outcome::NotStarted { reason });
-            }
-            if let Some(desktop) = &mut self.desktop {
-                let program = self.program.as_ref().ok_or_else(|| {
-                    WorkerPrimary::Io(io::Error::other("original Run program missing"))
-                })?;
-                match desktop.prepare_original_run(
-                    self.store.as_mut().unwrap(),
-                    a._accepted.as_ref().ok_or_else(|| {
-                        WorkerPrimary::Io(io::Error::other(
-                            "original Run acceptance capability missing",
-                        ))
-                    })?,
-                    program,
-                    a.deadline,
-                ) {
-                    Ok(true) => {}
-                    Ok(false) => return Ok(()),
-                    Err(error) => {
-                        desktop.fail(error);
-                        return self.finish(v2::Outcome::NotStarted {
-                            reason: v2::NotStartedReason::CancelRequested,
-                        });
-                    }
-                }
-            }
-            if !matches!(a.start.poll(), StartState::Granted) {
-                return Ok(());
-            }
-            #[cfg(feature = "test-support")]
-            if let Some(control) = self
-                .invocation
-                .as_ref()
-                .and_then(|inv| inv.fixture.as_ref())
-            {
-                control.before_spawn();
-                // A fixture gate may hold across cancellation, stop or deadline.
-                let expired = Instant::now() >= a.deadline;
-                let cancelled = self.stopping
-                    || self.ports.stop.load(Ordering::Acquire)
-                    || a.cancel.flag.load(Ordering::Acquire)
-                    || matches!(a.start.poll(), StartState::Aborted);
-                if expired || cancelled {
-                    let reason = if expired {
-                        v2::NotStartedReason::Deadline
-                    } else {
-                        v2::NotStartedReason::CancelRequested
-                    };
-                    return self.finish(v2::Outcome::NotStarted { reason });
-                }
-            }
-            a.attempted = true;
-            let command = &self
-                .invocation
-                .as_ref()
-                .unwrap()
-                .catalog
-                .iter()
-                .find(|c| Some(&c.id) == self.program.as_ref())
-                .unwrap()
-                .command;
-            #[cfg(feature = "test-support")]
-            if let Some(control) = self
-                .invocation
-                .as_ref()
-                .and_then(|inv| inv.fixture.as_ref())
-            {
-                control.mark_spawn_attempted();
-            }
-            match OwnedChild::spawn(command, InputMode::Null) {
-                Ok(child) => {
-                    a.child = Some(child);
-                    #[cfg(feature = "test-support")]
-                    if let Some(control) = self
-                        .invocation
-                        .as_ref()
-                        .and_then(|inv| inv.fixture.as_ref())
-                    {
-                        control.mark_spawn_owned();
-                        control.after_owned_spawn();
-                    }
-                }
-                Err(failure) => a.spawn_failure = Some(failure),
-            }
-            if a.child.is_some() && self.pending.is_none() {
-                let key = a.key;
-                let deadline = a.deadline;
-                let accepted_at = a.accepted_at;
-                self.publish(WorkerEvent::CacheUpdate(CachePatch::Phase {
-                    key,
-                    kind: v2::OperationKind::Run,
-                    phase: LivePhase::Running,
-                    accepted_at: Some(accepted_at),
-                    deadline: Some(deadline),
-                }));
+                return self
+                    .finish(v2::Outcome::NotStarted { reason })
+                    .map(ControlFlow::Break);
             }
         }
+        a.attempted = true;
+        let command = &self
+            .invocation
+            .as_ref()
+            .unwrap()
+            .catalog
+            .iter()
+            .find(|c| Some(&c.id) == self.program.as_ref())
+            .unwrap()
+            .command;
+        #[cfg(feature = "test-support")]
+        if let Some(control) = self
+            .invocation
+            .as_ref()
+            .and_then(|inv| inv.fixture.as_ref())
+        {
+            control.mark_spawn_attempted();
+        }
+        match OwnedChild::spawn(command, InputMode::Null) {
+            Ok(child) => {
+                a.child = Some(child);
+                #[cfg(feature = "test-support")]
+                if let Some(control) = self
+                    .invocation
+                    .as_ref()
+                    .and_then(|inv| inv.fixture.as_ref())
+                {
+                    control.mark_spawn_owned();
+                    control.after_owned_spawn();
+                }
+            }
+            Err(failure) => a.spawn_failure = Some(failure),
+        }
+        if a.child.is_some() && self.pending.is_none() {
+            let key = a.key;
+            let deadline = a.deadline;
+            let accepted_at = a.accepted_at;
+            self.publish(WorkerEvent::CacheUpdate(CachePatch::Phase {
+                key,
+                kind: v2::OperationKind::Run,
+                phase: LivePhase::Running,
+                accepted_at: Some(accepted_at),
+                deadline: Some(deadline),
+            }));
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+    /// Original desktop Run preparation before spawn. `Break` means `advance_at`
+    /// returns `Ok(())`.
+    fn prepare_desktop_attempt(&mut self) -> Result<ControlFlow<()>, WorkerPrimary> {
+        let a = self.active.as_mut().unwrap();
+        if let Some(desktop) = &mut self.desktop {
+            let program = self.program.as_ref().ok_or_else(|| {
+                WorkerPrimary::Io(io::Error::other("original Run program missing"))
+            })?;
+            match desktop.prepare_original_run(
+                self.store.as_mut().unwrap(),
+                a._accepted.as_ref().ok_or_else(|| {
+                    WorkerPrimary::Io(io::Error::other(
+                        "original Run acceptance capability missing",
+                    ))
+                })?,
+                program,
+                a.deadline,
+            ) {
+                Ok(true) => {}
+                Ok(false) => return Ok(ControlFlow::Break(())),
+                Err(error) => {
+                    desktop.fail(error);
+                    return self
+                        .finish(v2::Outcome::NotStarted {
+                            reason: v2::NotStartedReason::CancelRequested,
+                        })
+                        .map(ControlFlow::Break);
+                }
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+    /// Completes spawn-failure cleanup and finishes as `LaunchFailed`. `Break` means
+    /// `advance_at` returns `Ok(())`.
+    fn handle_spawn_failure(&mut self) -> Result<ControlFlow<()>, WorkerPrimary> {
         let a = self.active.as_mut().unwrap();
         if let Some(failure) = &mut a.spawn_failure {
             if let HostCleanup::Pending(cleanup) = &mut failure.cleanup {
                 if !cleanup.try_complete().map_err(WorkerPrimary::Io)? {
-                    return Ok(());
+                    return Ok(ControlFlow::Break(()));
                 }
                 failure.cleanup = HostCleanup::Complete;
             }
@@ -495,12 +545,18 @@ impl Worker {
                     }
                 }
             };
-            return self.finish(v2::Outcome::LaunchFailed {
-                phase,
-                code: v2::FailureCode::NativeFailure,
-                cleanup,
-            });
+            return self
+                .finish(v2::Outcome::LaunchFailed {
+                    phase,
+                    code: v2::FailureCode::NativeFailure,
+                    cleanup,
+                })
+                .map(ControlFlow::Break);
         }
+        Ok(ControlFlow::Continue(()))
+    }
+    /// Pumps child output, observes exit, and finishes the completed Run.
+    fn pump_child_io(&mut self, expired: bool, cancelled: bool) -> Result<(), WorkerPrimary> {
         let a = self.active.as_mut().unwrap();
         if let Some(child) = &mut a.child {
             read_stream(
