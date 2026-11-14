@@ -5,7 +5,7 @@ runs Linux guests through Docker; the controller runs on the native host. Start
 with this page to check prerequisites, then follow [your first
 run](first-run.md).
 
-Theseus 0.12 targets native Linux, macOS and Windows controllers with a current
+Theseus targets native Linux, macOS and Windows controllers with a current
 stable Rust toolchain:
 
 ```sh
@@ -41,7 +41,7 @@ Default push and pull-request CI requires the full application workspace on:
 Each native job asserts its compiler host and records the compiler, image and
 actual OS version/build. The Windows runner has reported build 26100; the runner
 label alone does not establish runtime acceptance. Release acceptance requires
-all three native jobs and all eight Ubuntu Docker gates on the same 0.12 source.
+all three native jobs and all eight Ubuntu Docker gates on the same source.
 Execution on Windows builds before 26100 remains unverified. Other
 architectures, network filesystems and native macOS/Windows guest environments
 are outside this initial scope.

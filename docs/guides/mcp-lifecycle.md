@@ -97,7 +97,7 @@ strict absence for every owned ID. The opt-in harness tests both eras, all
 matrix scopes, upgrades, plugin disable/enable/removal, preservation and
 deliberate registration/protocol/deadline/cancel/shutdown faults. Missing native
 inputs remain clearly ignored/unrun. Required Linux CI runs self-contained
-Docker transport acceptance without downloading native clients. The 0.12
+Docker transport acceptance without downloading native clients. The
 controller matrix is separate from native macOS/Windows guest adapters. The
 [Theseus MCP service](../agents/mcp-server.md) uses the same engine through its
 own interface and required native acceptance; these guest-client probes do not

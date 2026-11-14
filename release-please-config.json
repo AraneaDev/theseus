@@ -1,0 +1,32 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "release-type": "rust",
+  "changelog-path": "CHANGELOG.md",
+  "release-label": "release",
+  "separate-pull-requests": false,
+  "changelog-sections": [
+    { "type": "feat", "section": "Features" },
+    { "type": "fix", "section": "Bug Fixes" },
+    { "type": "perf", "section": "Performance" },
+    { "type": "refactor", "section": "Refactoring" },
+    { "type": "docs", "section": "Documentation", "hidden": true },
+    { "type": "test", "section": "Tests", "hidden": true },
+    { "type": "ci", "section": "CI", "hidden": true },
+    { "type": "chore", "section": "Chores", "hidden": true },
+    { "type": "style", "section": "Style", "hidden": true }
+  ],
+  "exclude-paths": [
+    "README.md",
+    "CHANGELOG.md",
+    "docs/",
+    "tests/",
+    ".github/"
+  ],
+  "packages": {
+    ".": {
+      "component": "theseus",
+      "include-component-in-tag": false,
+      "release-as": "0.0.1"
+    }
+  }
+}
