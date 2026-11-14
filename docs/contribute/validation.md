@@ -12,8 +12,8 @@ Rust launcher alone does not establish platform acceptance. Consult the
 [source-specific CI
 results](https://github.com/AraneaDev/theseus/actions/workflows/ci.yml).
 
-Run the shared CI checks locally before pushing, without registering a runner or
-installing a Git hook. Python 3, a native stable Rust toolchain with rustfmt and
+Run the shared CI checks locally before pushing, without registering a runner.
+The optional [commit hooks](#commit-style-and-local-hooks) do not run them. Python 3, a native stable Rust toolchain with rustfmt and
 clippy, and Node.js for the existing observer controls must be available. Use
 Python 3.12 or newer on Windows and the checked Git-for-Windows Bash for the two
 POSIX guest-script byte oracles.
@@ -181,6 +181,62 @@ would contain your home directory or user name. The report scenes use the
 git-ignored saved run `examples/interrupted-rollback/.theseus-runs/1793309242520942542-1672854`
 (or `--report-run DIR`); without it they are skipped. Converter tests run
 without tmux: `python3 tests/support/screenshots_test.py`.
+
+## Commit style and local hooks
+
+Commit subjects and pull request titles use Conventional Commits:
+`type(scope): summary`, where the type is one of `feat`, `fix`, `perf`,
+`refactor`, `docs`, `test`, `ci`, `chore` or `style`. The scope is optional and
+`!` marks a breaking change. Check a subject by hand:
+
+```sh
+scripts/check-commit-style.sh "fix(tui): keep the selector in view"
+```
+
+The `Commit style` workflow runs the same script on every pull request title and
+every commit subject in the pull request. Its job is named `title`.
+
+The repository ships two optional hooks. Enable them once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+`commit-msg` rejects a subject that does not match the style. `pre-commit` runs
+`cargo fmt --all -- --check`, so it is fast and changes nothing. The full
+validation above stays a manual step, and CI runs it on every pull request.
+
+## Releases
+
+Releases are managed by release-please (`release-please-config.json` and
+`.release-please-manifest.json`). The configuration has one package, the
+repository root, with the `rust` release type. Its strategy reads the root
+`Cargo.toml` workspace members and writes the same version into the root
+`Cargo.toml`, every member `Cargo.toml` and every workspace entry in
+`Cargo.lock`, so all six crates always share one version and `--locked` builds
+keep working. A commit under `crates/` counts toward the root release. Only the
+root creates a GitHub release and a `vX.Y.Z` tag. Do not add per-crate packages
+or the `cargo-workspace` and `linked-versions` plugins: with them a root-only
+release can bump member `Cargo.toml` files while leaving their `Cargo.lock`
+entries at the old version. `feat`, `fix`, `perf` and `refactor` commits appear
+in the changelog. The other types are hidden.
+
+The root package currently sets `"release-as": "0.0.1"` so the first release is
+`v0.0.1`. After `v0.0.1` ships, remove `release-as` from
+`release-please-config.json` in a `chore(release)` commit. If it stays,
+release-please keeps proposing 0.0.1.
+
+After a release is created, a separate `validate` job checks out the released
+commit and runs formatting, clippy, the native fixture and the root library
+tests. If it fails, use "Re-run failed jobs": it retries validation without
+creating the release again.
+
+The workflow opens release pull requests with the `RELEASE_PLEASE_TOKEN`
+repository secret, which is a fine-grained personal access token with
+contents and pull-request write access. Pull requests opened with the default
+`GITHUB_TOKEN` start no workflows. The required CI and `title` checks would then
+never run on the release pull request, and it could not be merged under branch
+protection. Without the secret the workflow falls back to `GITHUB_TOKEN`.
 
 ## Related documentation
 

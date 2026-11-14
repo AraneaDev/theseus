@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(git rev-parse --show-toplevel)
+commit_message_file=${1:?commit message file is required}
+subject=$(awk '!/^[[:space:]]*#/ && NF { print; exit }' "$commit_message_file")
+
+"$repo_root/scripts/check-commit-style.sh" "$subject"
