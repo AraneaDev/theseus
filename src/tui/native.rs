@@ -288,7 +288,7 @@ pub fn render(frame: &mut Frame, app: &App) -> bool {
         // readers and for the real-manager acceptance checks that match it.
         Some(outcome) => {
             let (glyph, color) = theme::status(outcome);
-            let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+            let style = theme::tone(color).add_modifier(Modifier::BOLD);
             vec![
                 Span::styled(format!("{glyph} "), style),
                 Span::raw("Outcome: "),
