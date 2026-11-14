@@ -5,6 +5,9 @@ pub fn input(app: &mut App, key: KeyEvent) {
     if key.kind == KeyEventKind::Release {
         return;
     }
+    if help_input(app, key) {
+        return;
+    }
     if super::native::input(app, key) {
         return;
     }
@@ -71,6 +74,7 @@ pub fn input(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Tab | KeyCode::Enter => {
+            app.navigated = true;
             app.focus = match app.focus {
                 Focus::Scenario => Focus::Stage,
                 Focus::Stage => Focus::Evidence,
@@ -79,6 +83,7 @@ pub fn input(app: &mut App, key: KeyEvent) {
             app.scroll = 0;
         }
         KeyCode::Esc => {
+            app.navigated = true;
             app.focus = match app.focus {
                 Focus::Evidence => Focus::Stage,
                 _ => Focus::Scenario,
@@ -86,6 +91,7 @@ pub fn input(app: &mut App, key: KeyEvent) {
             app.scroll = 0;
         }
         KeyCode::Left | KeyCode::Right if app.focus == Focus::Evidence => {
+            app.navigated = true;
             let delta = if key.code == KeyCode::Right { 1 } else { 4 };
             app.tab = Tab::ALL[(app.tab.index() + delta) % 5];
             app.evidence_index = 0;
@@ -107,6 +113,7 @@ pub fn input(app: &mut App, key: KeyEvent) {
                 };
                 return;
             }
+            app.navigated = true;
             let down = matches!(key.code, KeyCode::Down | KeyCode::Char('j'));
             let len = match app.focus {
                 Focus::Scenario => app.report.as_ref().map_or(0, |r| r.scenarios.len()),
@@ -140,11 +147,35 @@ pub fn input(app: &mut App, key: KeyEvent) {
     app.sync_view();
 }
 
+/// `?` toggles the key reference. While it is open no other key acts (no
+/// run, cancel or quit); it stays literal text in the editor, Save Copy name,
+/// confirmations and the `/` filter draft.
+fn help_input(app: &mut App, key: KeyEvent) -> bool {
+    if app.help {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
+            app.help = false;
+        }
+        return true;
+    }
+    if key.code == KeyCode::Char('?')
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && !app.editing_filter
+        && !super::preview_edit::modal(app)
+    {
+        app.help = true;
+        return true;
+    }
+    false
+}
+
 /// Filter edits are cheap drafts. Enter and Esc both apply the complete query.
 pub(super) fn filter_input(app: &mut App, key: KeyEvent) -> bool {
     if app.editing_filter {
         match key.code {
             KeyCode::Esc | KeyCode::Enter => {
+                app.navigated = true;
                 app.filter = std::mem::take(&mut app.filter_draft);
                 app.editing_filter = false;
                 app.viewport.borrow_mut().restart_detail();
@@ -183,6 +214,7 @@ pub(super) fn page_input(app: &mut App, key: KeyEvent) -> bool {
         }
         _ => return false,
     }
+    app.navigated = true;
     app.scroll = 0;
     app.sync_view();
     true
