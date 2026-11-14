@@ -226,6 +226,11 @@ The root package currently sets `"release-as": "0.0.1"` so the first release is
 `release-please-config.json` in a `chore(release)` commit. If it stays,
 release-please keeps proposing 0.0.1.
 
+After a release is created, a separate `validate` job checks out the released
+commit and runs formatting, clippy, the native fixture and the root library
+tests. If it fails, use "Re-run failed jobs": it retries validation without
+creating the release again.
+
 The workflow opens release pull requests with the `RELEASE_PLEASE_TOKEN`
 repository secret, which is a fine-grained personal access token with
 contents and pull-request write access. Pull requests opened with the default

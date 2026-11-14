@@ -10,9 +10,7 @@ on:
       - '.github/**'
   workflow_dispatch:
 
-permissions:
-  contents: write
-  pull-requests: write
+permissions: {}
 
 concurrency:
   group: release-please
@@ -21,6 +19,12 @@ concurrency:
 jobs:
   release-please:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      sha: ${{ steps.release.outputs.sha }}
     steps:
       - uses: googleapis/release-please-action@v4
         id: release
@@ -30,24 +34,29 @@ jobs:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+  # A separate job so "Re-run failed jobs" retries validation of the released
+  # commit; re-running release-please would not report release_created again.
+  validate:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: ${{ steps.release.outputs.release_created }}
         with:
+          ref: ${{ needs.release-please.outputs.sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-        if: ${{ steps.release.outputs.release_created }}
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
-        if: ${{ steps.release.outputs.release_created }}
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
-        if: ${{ steps.release.outputs.release_created }}
       # The library tests need the trusted native fixture; this stage builds it
       # and exports THESEUS_HOST_TEST_FIXTURE through GITHUB_ENV.
       - name: Build trusted native application fixture
-        if: ${{ steps.release.outputs.release_created }}
         run: |
           mkdir -p "$RUNNER_TEMP/theseus-release-evidence"
           python3 scripts/validate.py native --stage fixture --evidence "$RUNNER_TEMP/theseus-release-evidence"
       - run: cargo test --locked -p theseus --lib
-        if: ${{ steps.release.outputs.release_created }}
