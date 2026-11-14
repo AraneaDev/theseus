@@ -188,18 +188,21 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
     } else {
         ""
     };
-    let title = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             safe_text(&bounded(&m.name)),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::raw(safe_text(&format!(
-            " | Baseline: {} | ",
-            bounded(&m.baseline)
-        ))),
-        theme::status_word(&app.outcome().to_string(), true),
-        Span::raw(suffix),
-    ]);
+        Span::raw(safe_text(&format!(" | Baseline: {}", bounded(&m.baseline)))),
+    ];
+    // Before a report exists there is no observed outcome to show; a default
+    // "passed" in a preview would read as a result.
+    if view.report.is_some() {
+        spans.push(Span::raw(" | "));
+        spans.push(theme::status_word(&app.outcome().to_string(), true));
+    }
+    spans.push(Span::raw(suffix));
+    let title = Line::from(spans);
     frame.render_widget(
         Paragraph::new(title)
             .block(panel("Theseus comparison"))

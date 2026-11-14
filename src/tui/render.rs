@@ -102,7 +102,15 @@ fn header(app: &App, width: u16) -> Paragraph<'static> {
         }
         let mut spans = vec![
             theme::status_word(&app.outcome().to_string(), true),
-            Span::styled("  │ ", theme::dim()),
+            // The label only fits on wide terminals; narrow ones keep every count.
+            Span::styled(
+                if width >= 85 {
+                    "  │ checks  "
+                } else {
+                    "  │ "
+                },
+                theme::dim(),
+            ),
         ];
         for (i, (word, count)) in [
             ("passed", c.passed_checks),
@@ -117,13 +125,14 @@ fn header(app: &App, width: u16) -> Paragraph<'static> {
             if i > 0 {
                 spans.push(Span::raw("  "));
             }
-            let (glyph, color) = theme::status(word);
+            // The outcome already carries the glyph; counts use colour only.
+            let (_, color) = theme::status(word);
             let style = if count == 0 {
                 theme::dim()
             } else {
                 Style::default().fg(color)
             };
-            spans.push(Span::styled(format!("{glyph} {word} {count}"), style));
+            spans.push(Span::styled(format!("{word} {count}"), style));
         }
         Line::from(spans)
     } else if app.has_started() {
