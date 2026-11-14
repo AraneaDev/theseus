@@ -500,3 +500,26 @@ fn filter_highlights_matches_in_visible_rows_and_detail() {
         "escaping unchanged: {screen}"
     );
 }
+
+#[test]
+fn active_run_header_says_running_not_a_provisional_outcome() {
+    let draw = |app: &App| {
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    };
+    let mut app = App::offline(RunReport::new("live-run"), PathBuf::from("/live"));
+    app.active = true;
+    assert_eq!(live_outcome_word(&app), "running");
+    let header = draw(&app);
+    assert!(header.contains("running"), "{header}");
+    app.active = false;
+    assert_eq!(live_outcome_word(&app), app.outcome().to_string());
+    assert!(!draw(&app).contains("▸ running"));
+}

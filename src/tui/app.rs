@@ -333,6 +333,15 @@ pub(super) fn first_attention(report: &RunReport) -> Option<(usize, usize)> {
             .map(|i| (i, 0))
     })
 }
+/// Header outcome word: "running" while a run is active (its report is still
+/// partial and would otherwise read as "incomplete"), else the observed outcome.
+pub(super) fn live_outcome_word(app: &App) -> String {
+    if app.active {
+        "running".into()
+    } else {
+        app.outcome().to_string()
+    }
+}
 /// Prevent saved command output and recipe text from injecting terminal controls.
 pub fn safe_text(text: &str) -> String {
     text.chars()
