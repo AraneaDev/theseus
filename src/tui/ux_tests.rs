@@ -115,9 +115,18 @@ fn copy_sends_the_selected_record_per_tab_through_osc52() {
     let mut app = App::offline(command_report(), PathBuf::from("/saved"));
     app.tab = Tab::Commands;
     let encoded = copied(&mut app);
+    // Quoting is the platform's own (POSIX `'"'"'` vs Windows doubled quotes),
+    // so derive the expectation from the same quoting the copy uses.
+    let expected = ["/bin/sh", "-c", "echo 'hi' \u{1b}[2J"]
+        .iter()
+        .map(|a| crate::shell::path_argument(std::path::Path::new(a)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(encoded, clipboard::base64(expected.as_bytes()));
+    #[cfg(unix)]
     assert_eq!(
-        encoded,
-        clipboard::base64("/bin/sh -c 'echo '\"'\"'hi'\"'\"' \u{1b}[2J'".as_bytes())
+        expected, "/bin/sh -c 'echo '\"'\"'hi'\"'\"' \u{1b}[2J'",
+        "POSIX quoting is shell-safe"
     );
     assert!(
         app.status.starts_with("Copied command line ("),
