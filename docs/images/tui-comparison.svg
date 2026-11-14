@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="674" viewBox="0 0 1040 674" role="img" aria-label="theseus compare --suite examples/comparisons/methods.toml">
+<title>theseus compare --suite examples/comparisons/methods.toml</title>
+<style>text{font-family:ui-monospace, 'SFMono-Regular', 'DejaVu Sans Mono', Menlo, Consolas, 'Liberation Mono', monospace;font-size:14px;white-space:pre}.c0{fill:#d5d9e0}.c1{fill:#d5d9e0;font-weight:bold}.c2{fill:#e5c07b;font-weight:bold}.c3{fill:#5c6370}.c4{fill:#56b6c2;font-weight:bold}.c5{fill:#1c212b;font-weight:bold}</style>
+<rect width="1040" height="674" rx="10" fill="#11151c" stroke="#2b3240"/>
+<path d="M0 10a10 10 0 0 1 10-10h1020a10 10 0 0 1 10 10v20H0z" fill="#1b212c"/>
+<circle cx="18" cy="15" r="5" fill="#ff5f57"/><circle cx="34" cy="15" r="5" fill="#febc2e"/><circle cx="50" cy="15" r="5" fill="#28c840"/>
+<text x="520" y="20" text-anchor="middle" style="font-size:12px;fill:#8a94a6">theseus compare --suite examples/comparisons/methods.toml</text>
+<rect x="209.2" y="460" width="84" height="18" fill="#98c379"/>
+<text y="59.5"><tspan x="16" textLength="1008" class="c0">┌Theseus comparison────────────────────────────────────────────────────────────────────────────────────────────────────┐</tspan></text>
+<text y="77.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="24.4" textLength="235.2" class="c1">Same comparison-cli: methods</tspan><tspan x="268" textLength="411.6" class="c0">| Baseline: copy | Preview — no commands executed</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="95.5"><tspan x="16" textLength="1008" class="c0">└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</tspan></text>
+<text y="113.5"><tspan x="16" textLength="1008" class="c0">┌Explicit suite preview — r to start───────────────────────────────────────────────────────────────────────────────────┐</tspan></text>
+<text y="131.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="24.4" textLength="75.6" class="c1">Will run:</tspan><tspan x="116.8" textLength="462" class="c2">2 variants × 2 profiles × 1 scenario = 4 lifecycle runs</tspan><tspan x="587.2" textLength="268.8" class="c3">· 12 cells compared against copy</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="149.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="167.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="24.4" textLength="75.6" class="c4">Selection</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="185.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="41.2" textLength="75.6" class="c1">Profiles:</tspan><tspan x="133.6" textLength="100.8" class="c0">user, system</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="203.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="41.2" textLength="84" class="c1">Scenarios:</tspan><tspan x="133.6" textLength="42" class="c0">clean</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="221.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="41.2" textLength="42" class="c1">Pull:</tspan><tspan x="133.6" textLength="42" class="c0">false</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="239.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="257.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="24.4" textLength="50.4" class="c4">Stages</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="275.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="41.2" textLength="134.4" class="c0">target_installed</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="293.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="41.2" textLength="84" class="c0">configured</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="311.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="41.2" textLength="92.4" class="c0">uninstalled</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="329.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="347.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="24.4" textLength="50.4" class="c4">Scopes</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="365.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="41.2" textLength="92.4" class="c2">user-binary</tspan><tspan x="184" textLength="33.6" class="c3">user</tspan><tspan x="242.8" textLength="327.6" class="c0">/home/theseus/.local/bin/comparison-cli</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="383.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="41.2" textLength="109.2" class="c2">user-settings</tspan><tspan x="184" textLength="33.6" class="c3">user</tspan><tspan x="242.8" textLength="302.4" class="c0">/home/theseus/.config/comparison-cli</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="401.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="41.2" textLength="109.2" class="c2">system-binary</tspan><tspan x="184" textLength="50.4" class="c3">system</tspan><tspan x="242.8" textLength="243.6" class="c0">/usr/local/bin/comparison-cli</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="419.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="41.2" textLength="126" class="c2">system-settings</tspan><tspan x="184" textLength="50.4" class="c3">system</tspan><tspan x="242.8" textLength="302.4" class="c0">/home/theseus/.config/comparison-cli</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="437.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="455.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="24.4" textLength="67.2" class="c4">Variants</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="473.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="41.2" textLength="33.6" class="c2">copy</tspan><tspan x="116.8" textLength="75.6" class="c0">copy.toml</tspan><tspan x="217.6" textLength="67.2" class="c5">baseline</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="491.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="41.2" textLength="58.8" class="c2">archive</tspan><tspan x="116.8" textLength="100.8" class="c0">archive.toml</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="509.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="527.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="545.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="563.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="581.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="599.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="617.5"><tspan x="16" textLength="8.4" class="c0">│</tspan><tspan x="1015.6" textLength="8.4" class="c0">│</tspan></text>
+<text y="635.5"><tspan x="16" textLength="1008" class="c0">└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</tspan></text>
+<text y="653.5"><tspan x="16" textLength="420" class="c1">Comparison preview — r starts the declared suite |</tspan><tspan x="444.4" textLength="8.4" class="c4">r</tspan><tspan x="461.2" textLength="25.2" class="c0">run</tspan><tspan x="503.2" textLength="16.8" class="c4">↑↓</tspan><tspan x="528.4" textLength="50.4" class="c0">scroll</tspan><tspan x="595.6" textLength="8.4" class="c4">e</tspan><tspan x="612.4" textLength="109.2" class="c0">edit raw TOML</tspan><tspan x="738.4" textLength="8.4" class="c4">?</tspan><tspan x="755.2" textLength="33.6" class="c0">help</tspan><tspan x="805.6" textLength="8.4" class="c4">q</tspan><tspan x="822.4" textLength="33.6" class="c0">quit</tspan></text>
+</svg>
