@@ -267,7 +267,17 @@ pub fn render(frame: &mut Frame, app: &App) -> bool {
     let area = frame.area();
     // Header: outcome glyph once (or the preview notice), as in the run view.
     let mut header = match &outcome {
-        Some(outcome) => vec![Span::raw("Outcome: "), theme::status_word(outcome, true)],
+        // Glyph first, so the exact `Outcome: <word>` text stays intact for
+        // readers and for the real-manager acceptance checks that match it.
+        Some(outcome) => {
+            let (glyph, color) = theme::status(outcome);
+            let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+            vec![
+                Span::styled(format!("{glyph} "), style),
+                Span::raw("Outcome: "),
+                Span::styled(super::safe_text(outcome), style),
+            ]
+        }
         None => vec![Span::raw("Preview — no commands executed")],
     };
     if let Some(elapsed) = app.run_clock() {
@@ -466,7 +476,7 @@ mod tests {
         let report = crate::native::integration::view::tests::report();
         let mut app = App::integration_offline(report, "/saved-evidence".into());
         let text = draw(&app);
-        assert!(text.contains("Outcome: … incomplete"));
+        assert!(text.contains("… Outcome: incomplete"));
         assert!(text.contains("Overview │ Services │ Readiness"));
         assert!(text.contains("←→ selector") && !text.contains("r run"));
         input(&mut app, KeyCode::Right.into());
