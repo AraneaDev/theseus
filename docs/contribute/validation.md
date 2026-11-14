@@ -209,15 +209,20 @@ validation above stays a manual step, and CI runs it on every pull request.
 ## Releases
 
 Releases are managed by release-please (`release-please-config.json` and
-`.release-please-manifest.json`). All six workspace crates share one version
-through the `linked-versions` plugin. Only the root `theseus` package creates a
-GitHub release and a `vX.Y.Z` tag; the five crates under `crates/` are bumped in
-the same release pull request but skip their own GitHub release. `feat`, `fix`,
-`perf` and `refactor` commits appear in the changelog. The other types are
-hidden.
+`.release-please-manifest.json`). The configuration has one package, the
+repository root, with the `rust` release type. Its strategy reads the root
+`Cargo.toml` workspace members and writes the same version into the root
+`Cargo.toml`, every member `Cargo.toml` and every workspace entry in
+`Cargo.lock`, so all six crates always share one version and `--locked` builds
+keep working. A commit under `crates/` counts toward the root release. Only the
+root creates a GitHub release and a `vX.Y.Z` tag. Do not add per-crate packages
+or the `cargo-workspace` and `linked-versions` plugins: with them a root-only
+release can bump member `Cargo.toml` files while leaving their `Cargo.lock`
+entries at the old version. `feat`, `fix`, `perf` and `refactor` commits appear
+in the changelog. The other types are hidden.
 
-Every package currently sets `"release-as": "0.0.1"` so the first release is
-`v0.0.1`. After `v0.0.1` ships, remove `release-as` from every package in
+The root package currently sets `"release-as": "0.0.1"` so the first release is
+`v0.0.1`. After `v0.0.1` ships, remove `release-as` from
 `release-please-config.json` in a `chore(release)` commit. If it stays,
 release-please keeps proposing 0.0.1.
 

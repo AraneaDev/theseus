@@ -27,46 +27,6 @@
       "component": "theseus",
       "include-component-in-tag": false,
       "release-as": "0.0.1"
-    },
-    "crates/theseus-host": {
-      "component": "theseus-host",
-      "skip-github-release": true,
-      "release-as": "0.0.1"
-    },
-    "crates/theseus-native-protocol": {
-      "component": "theseus-native-protocol",
-      "skip-github-release": true,
-      "release-as": "0.0.1"
-    },
-    "crates/theseus-native-client": {
-      "component": "theseus-native-client",
-      "skip-github-release": true,
-      "release-as": "0.0.1"
-    },
-    "crates/theseus-native-helper": {
-      "component": "theseus-native-helper",
-      "skip-github-release": true,
-      "release-as": "0.0.1"
-    },
-    "crates/theseus-native-helper-store": {
-      "component": "theseus-native-helper-store",
-      "skip-github-release": true,
-      "release-as": "0.0.1"
     }
-  },
-  "plugins": [
-    { "type": "cargo-workspace", "merge": false },
-    {
-      "type": "linked-versions",
-      "groupName": "theseus",
-      "components": [
-        "theseus",
-        "theseus-host",
-        "theseus-native-protocol",
-        "theseus-native-client",
-        "theseus-native-helper",
-        "theseus-native-helper-store"
-      ]
-    }
-  ]
+  }
 }
