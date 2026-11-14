@@ -74,7 +74,7 @@ pub fn input(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Tab | KeyCode::Enter => {
-            app.navigated = true;
+            app.navigated |= app.report.is_some();
             app.focus = match app.focus {
                 Focus::Scenario => Focus::Stage,
                 Focus::Stage => Focus::Evidence,
@@ -83,7 +83,7 @@ pub fn input(app: &mut App, key: KeyEvent) {
             app.scroll = 0;
         }
         KeyCode::Esc => {
-            app.navigated = true;
+            app.navigated |= app.report.is_some();
             app.focus = match app.focus {
                 Focus::Evidence => Focus::Stage,
                 _ => Focus::Scenario,
@@ -91,7 +91,7 @@ pub fn input(app: &mut App, key: KeyEvent) {
             app.scroll = 0;
         }
         KeyCode::Left | KeyCode::Right if app.focus == Focus::Evidence => {
-            app.navigated = true;
+            app.navigated |= app.report.is_some();
             let delta = if key.code == KeyCode::Right { 1 } else { 4 };
             app.tab = Tab::ALL[(app.tab.index() + delta) % 5];
             app.evidence_index = 0;
@@ -113,7 +113,7 @@ pub fn input(app: &mut App, key: KeyEvent) {
                 };
                 return;
             }
-            app.navigated = true;
+            app.navigated |= app.report.is_some();
             let down = matches!(key.code, KeyCode::Down | KeyCode::Char('j'));
             let len = match app.focus {
                 Focus::Scenario => app.report.as_ref().map_or(0, |r| r.scenarios.len()),
@@ -175,7 +175,7 @@ pub(super) fn filter_input(app: &mut App, key: KeyEvent) -> bool {
     if app.editing_filter {
         match key.code {
             KeyCode::Esc | KeyCode::Enter => {
-                app.navigated = true;
+                app.navigated |= app.report.is_some();
                 app.filter = std::mem::take(&mut app.filter_draft);
                 app.editing_filter = false;
                 app.viewport.borrow_mut().restart_detail();
@@ -214,7 +214,7 @@ pub(super) fn page_input(app: &mut App, key: KeyEvent) -> bool {
         }
         _ => return false,
     }
-    app.navigated = true;
+    app.navigated |= app.report.is_some();
     app.scroll = 0;
     app.sync_view();
     true
