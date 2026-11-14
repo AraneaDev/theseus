@@ -170,7 +170,8 @@ fn heartbeat_oracle_accepts_live_growth_and_rejects_retained_dead_child() -> Res
         thread::sleep(Duration::from_millis(5));
     }
     let before = std::fs::metadata(&heartbeat)?.len();
-    let live = heartbeat_advances(&heartbeat, before, deadline)?;
+    // Own budget: readiness may consume most of `deadline` on a loaded runner.
+    let live = heartbeat_advances(&heartbeat, before, Instant::now() + Duration::from_secs(2))?;
     let expired_baseline = std::fs::metadata(&heartbeat)?.len();
     let expired = heartbeat_advances(&heartbeat, expired_baseline, Instant::now())?;
     child.terminate()?;
@@ -226,11 +227,15 @@ fn unread_stdin_is_bounded_and_aborts_before_group_cleanup() {
         },
         || {
             // The worker must have filled the pipe before the cutoff starts EOF.
+            // The child must still be alive and writing when abort is reached.
+            // Bound the observation from when it starts: a loaded runner may
+            // enter this callback late, and a deadline derived from `began`
+            // could already be past, failing without a single poll.
             let before = std::fs::metadata(&heartbeat)?.len();
             assert!(heartbeat_advances(
                 &heartbeat,
                 before,
-                began + Duration::from_millis(1850)
+                Instant::now() + Duration::from_secs(2)
             )?);
             // The fixture writes its complete PID before the first heartbeat.
             leader = std::fs::read_to_string(&pid_file)?.parse::<u32>()?;
