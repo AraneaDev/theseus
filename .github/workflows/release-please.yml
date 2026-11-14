@@ -1,0 +1,44 @@
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'tests/**'
+      - '.github/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ steps.release.outputs.release_created }}
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ steps.release.outputs.release_created }}
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+        if: ${{ steps.release.outputs.release_created }}
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        if: ${{ steps.release.outputs.release_created }}
+      - run: cargo test --locked -p theseus --lib
+        if: ${{ steps.release.outputs.release_created }}
