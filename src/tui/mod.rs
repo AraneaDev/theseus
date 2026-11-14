@@ -44,6 +44,7 @@ impl Default for AnimationOptions {
 
 pub fn run_with_options(mut app: App, options: AnimationOptions) -> Result<i32> {
     terminal::require_tty()?;
+    theme::init_color();
     let runtime = tokio::runtime::Runtime::new()?;
     let cancel = CancellationToken::default();
     let terminate = CancellationToken::default();
@@ -178,6 +179,9 @@ pub fn run_with_options(mut app: App, options: AnimationOptions) -> Result<i32> 
                     animation::draw(f, index, direction);
                 } else {
                     render(f, &app);
+                }
+                if theme::no_color() {
+                    theme::strip_colour(f.buffer_mut());
                 }
             })?;
         }
@@ -580,6 +584,12 @@ fn complete_work(app: &mut App, result: Result<WorkResult>) -> Result<()> {
         Ok(WorkResult::Run(result)) => {
             let root = result.report_path.parent().unwrap().to_path_buf();
             app.set_report(result.report, root);
+            // Browsing during the run keeps the user's place; otherwise open
+            // on the first failure as an offline report would.
+            if !app.navigated {
+                app.select_attention();
+                app.refresh_logs();
+            }
             app.status = format!("Finished | {}", result.report_path.display());
         }
         Ok(WorkResult::Suite(result)) => {

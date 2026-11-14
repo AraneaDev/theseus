@@ -1,15 +1,66 @@
 use super::{
     App, Focus, Tab, safe_text,
-    theme::{self, Hint, REQUIRED, hint},
+    theme::{self, Group, HELP, HELP_ONLY, Hint, REQUIRED, hint},
 };
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
 pub fn render(frame: &mut Frame, app: &App) {
+    mode(frame, app);
+    if app.help {
+        theme::help(frame, &help_hints(app));
+    }
+}
+/// Every binding of the current mode: the footer's hints plus help-only ones.
+fn help_hints(app: &App) -> Vec<Hint> {
+    if let Some(view) = &app.native {
+        super::native::hints(app, view)
+    } else if let Some(view) = &app.comparison {
+        super::comparison::hints(app, view)
+    } else {
+        hints(app)
+    }
+}
+/// Bindings shared by every mode that can open help.
+pub(super) fn common_hints(hints: &mut Vec<Hint>, app: &App) {
+    if app.active {
+        hints.push(hint(Group::Run, "c", "cancel", REQUIRED));
+    }
+    hints.push(HELP);
+    hints.push(hint(Group::Run, "q", "quit", REQUIRED));
+    hints.push(hint(Group::Run, "Ctrl-C", "exit immediately", HELP_ONLY));
+}
+/// Dirty-draft preview keys, shared by recipe and suite previews.
+pub(super) fn draft_hints() -> Vec<Hint> {
+    vec![
+        hint(Group::Editing, "e", "edit", REQUIRED),
+        hint(Group::Editing, "d", "discard", REQUIRED),
+        hint(Group::Run, "q", "discard/quit", REQUIRED),
+        hint(
+            Group::Run,
+            "r/p/s",
+            "disabled until Save Copy or discard",
+            1,
+        ),
+        HELP,
+    ]
+}
+/// Editor keys, listed in help only: `?` is literal text inside the editor.
+pub(super) fn editor_hints(hints: &mut Vec<Hint>) {
+    hints.push(hint(Group::Editing, "e", "edit raw TOML", 2));
+    for (key, label) in [
+        ("Ctrl-T", "validate draft (in editor)"),
+        ("Ctrl-S", "Save Copy (in editor)"),
+        ("Esc", "close editor, keep draft"),
+    ] {
+        hints.push(hint(Group::Editing, key, label, HELP_ONLY));
+    }
+}
+fn mode(frame: &mut Frame, app: &App) {
     if super::native::render(frame, app) {
         return;
     }
@@ -155,9 +206,7 @@ fn header(app: &App, width: u16) -> Paragraph<'static> {
     } else if super::preview_edit::dirty(app) {
         vec![Line::styled(
             "Theseus | UNSAVED draft — accepted preview below; no commands executed",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            theme::tone(Color::Yellow).add_modifier(Modifier::BOLD),
         )]
     } else {
         vec![Line::raw("Theseus | Preview — no commands executed")]
@@ -215,7 +264,7 @@ fn run_activity(app: &App) -> Vec<Span<'static>> {
     };
     let mut spans = vec![Span::styled("  │ ", theme::dim())];
     if app.active {
-        let accent = Style::default().fg(Color::Cyan);
+        let accent = theme::tone(Color::Cyan);
         spans.push(Span::styled(format!("{} ", spinner(elapsed)), accent));
         match running_stage(app) {
             Some((scenario, Some(stage))) => {
@@ -253,14 +302,11 @@ fn footer_status(app: &App) -> String {
     }
 }
 /// Only keys that act in the current mode and focus.
-fn hints(app: &App) -> Vec<Hint> {
+/// Help-only entries (`HELP_ONLY`) complete the `?` overlay from the same list.
+pub(super) fn hints(app: &App) -> Vec<Hint> {
+    use Group::*;
     if super::preview_edit::dirty(app) {
-        return vec![
-            hint("e", "edit", REQUIRED),
-            hint("d", "discard", REQUIRED),
-            hint("q", "discard/quit", REQUIRED),
-            hint("r/p/s", "disabled until Save Copy or discard", 1),
-        ];
+        return draft_hints();
     }
     if app.editing_filter {
         return vec![];
@@ -273,41 +319,64 @@ fn hints(app: &App) -> Vec<Hint> {
     if app.report.is_none() {
         if !app.has_started() {
             if app.recipe.is_some() && !app.work_consumed {
-                hints.push(hint("r", "run", REQUIRED));
-                hints.push(hint("p", "profiles", REQUIRED));
-                hints.push(hint("s", "scenarios", REQUIRED));
+                hints.push(hint(Run, "r", "run", REQUIRED));
+                hints.push(hint(Run, "p", "profiles", REQUIRED));
+                hints.push(hint(Run, "s", "scenarios", REQUIRED));
             }
-            hints.push(hint("↑↓/PgUp/Dn", "scroll", 3));
+            hints.push(hint(Navigate, "↑↓/PgUp/Dn", "scroll", 3));
+            hints.push(hint(Navigate, "j/k", "scroll a line", HELP_ONLY));
             if super::preview_edit::eligible(app) {
-                hints.push(hint("e", "edit", 2));
+                editor_hints(&mut hints);
             }
         } else {
-            hints.push(hint("PgUp/Dn", "scroll", 3));
+            hints.push(hint(Navigate, "PgUp/Dn", "scroll", 3));
         }
     } else {
-        hints.push(hint("Tab/Enter", "focus", REQUIRED));
+        hints.push(hint(Navigate, "Tab/Enter", "focus", REQUIRED));
         if app.focus != Focus::Scenario {
-            hints.push(hint("Esc", "back", 5));
+            hints.push(hint(Navigate, "Esc", "back", 5));
         }
         if app.focus == Focus::Evidence {
-            hints.push(hint("←→", "tabs", 1));
+            hints.push(hint(Evidence, "←→", "tabs", 1));
+        } else {
+            hints.push(hint(Evidence, "←→", "tabs (evidence focus)", HELP_ONLY));
         }
-        hints.push(hint("↑↓", "select", 2));
-        hints.push(hint("/", "filter", 3));
+        hints.push(hint(Navigate, "↑↓", "select", 2));
+        hints.push(hint(Navigate, "j/k", "select", HELP_ONLY));
+        hints.push(hint(Navigate, "Home/End", "first/last row", HELP_ONLY));
+        hints.push(hint(Evidence, "/", "filter", 3));
         let view = app.viewport.borrow();
-        if view.has_chunks() {
-            hints.push(hint("[ ]", "chunks", 2));
-        }
-        hints.push(hint("PgUp/Dn", "scroll", 4));
-        if app.tab == Tab::Logs && view.selected_log {
-            hints.push(hint("m", "metadata", 3));
-            hints.push(hint("^Home/End", "log", 6));
-        }
+        let chunks = view.has_chunks();
+        hints.push(hint(
+            Evidence,
+            "[ ]",
+            if chunks {
+                "chunks"
+            } else {
+                "previous/next chunk"
+            },
+            if chunks { 2 } else { HELP_ONLY },
+        ));
+        hints.push(hint(Evidence, "PgUp/Dn", "scroll", 4));
+        let log = app.tab == Tab::Logs && view.selected_log;
+        hints.push(hint(
+            Logs,
+            "m",
+            if log {
+                "metadata"
+            } else {
+                "raw/metadata (selected log)"
+            },
+            if log { 3 } else { HELP_ONLY },
+        ));
+        hints.push(hint(
+            Logs,
+            "^Home/End",
+            if log { "log" } else { "first/last log chunk" },
+            if log { 6 } else { HELP_ONLY },
+        ));
     }
-    if app.active {
-        hints.push(hint("c", "cancel", REQUIRED));
-    }
-    hints.push(hint("q", "quit", REQUIRED));
+    common_hints(&mut hints, app);
     hints
 }
 /// Bounded (<= 64 each) scenario and stage rows with their status words, plus
@@ -472,9 +541,7 @@ fn evidence(frame: &mut Frame, app: &App, area: Rect) {
     });
     frame.render_widget(
         Tabs::new(titles).select(app.tab.index()).highlight_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            theme::tone(Color::Cyan).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         ),
         parts[0],
     );
@@ -501,10 +568,12 @@ pub(super) fn record_panes(frame: &mut Frame, app: &App, area: Rect, focused: bo
     .split(area);
     // Flattening is restricted to <=64 already bounded projections. The selected
     // detail retains every newline and is separately chunked without elision.
+    // Highlighting scans only these bounded rows and the one visible chunk.
+    let needle = theme::needle(&app.filter);
     let rows = view
         .rows
         .iter()
-        .map(|row| ListItem::new(row.text.replace('\n', " | ")))
+        .map(|row| ListItem::new(theme::highlighted(row.text.replace('\n', " | "), &needle)))
         .collect::<Vec<_>>();
     let mut state = ListState::default().with_selected(Some(selected.saturating_sub(view.start)));
     frame.render_stateful_widget(
@@ -520,7 +589,18 @@ pub(super) fn record_panes(frame: &mut Frame, app: &App, area: Rect, focused: bo
         if count == 0 { 0 } else { selected + 1 },
         count
     );
-    let detail = Paragraph::new(view.body.as_str())
+    // Same line split as `Text::from(&str)`, so wrapping and scroll bounds match.
+    let body = if needle.is_empty() {
+        Text::from(view.body.as_str())
+    } else {
+        Text::from(
+            view.body
+                .lines()
+                .map(|line| theme::highlighted(line.to_owned(), &needle))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let detail = Paragraph::new(body)
         .block(theme::plain_panel(&title, focused))
         .wrap(Wrap { trim: false });
     let inner = theme::plain_panel(&title, focused).inner(regions[1]);
