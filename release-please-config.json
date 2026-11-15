@@ -3,7 +3,6 @@
   "release-type": "rust",
   "changelog-path": "CHANGELOG.md",
   "release-label": "release",
-  "separate-pull-requests": false,
   "changelog-sections": [
     { "type": "feat", "section": "Features" },
     { "type": "fix", "section": "Bug Fixes" },
@@ -25,8 +24,7 @@
   "packages": {
     ".": {
       "component": "theseus",
-      "include-component-in-tag": false,
-      "release-as": "0.0.1"
+      "include-component-in-tag": false
     }
   }
 }
