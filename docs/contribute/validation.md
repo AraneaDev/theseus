@@ -221,10 +221,10 @@ release can bump member `Cargo.toml` files while leaving their `Cargo.lock`
 entries at the old version. `feat`, `fix`, `perf` and `refactor` commits appear
 in the changelog. The other types are hidden.
 
-The root package currently sets `"release-as": "0.0.1"` so the first release is
-`v0.0.1`. After `v0.0.1` ships, remove `release-as` from
-`release-please-config.json` in a `chore(release)` commit. If it stays,
-release-please keeps proposing 0.0.1.
+Leave `separate-pull-requests` at its default. Setting it to `false` routes the
+single package through the merge plugin, which names the release branch without
+the `theseus` component, and release-please then refuses to tag the merged
+release pull request.
 
 After a release is created, a separate `validate` job checks out the released
 commit and runs formatting, clippy, the native fixture and the root library
