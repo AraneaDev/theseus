@@ -345,6 +345,16 @@ pub(super) fn build(app: &App) -> Doc {
             ),
         )
         .plain("\n");
+    if !r.requires.is_empty() {
+        doc.plain("\n").heading("Requires");
+        doc.dim("  probed in the guest before the first step; an unmet one skips the lifecycle\n");
+        for requirement in &r.requires {
+            doc.push(Tone::Name, &format!("  {}", requirement.id))
+                .dim(&format!("  {}s\n", requirement.timeout_seconds));
+            environment(&mut doc, "    ", &requirement.env, &[]);
+            doc.plain(&indent(&requirement.script, "    ")).plain("\n");
+        }
+    }
     for name in &options.profiles {
         if let Some(profile) = r.profiles.get(name) {
             doc.plain("\n").heading(&format!("[{name}]"));

@@ -52,6 +52,37 @@ pub struct Recipe {
     pub observe: Vec<String>,
     #[serde(default)]
     pub limits: Limits,
+    /// Schema 9: guest prerequisites probed once per scenario, before any lifecycle step.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<Requirement>,
+}
+pub const MAX_REQUIREMENTS: usize = 32;
+/// One guest prerequisite: a probe run as the runtime identity that must exit 0.
+/// Theseus installs nothing in a guest, so an unmet requirement is the image's
+/// to supply; the lifecycle is skipped instead of failing inside an installer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Requirement {
+    pub id: String,
+    pub script: String,
+    #[serde(default = "default_timeout")]
+    pub timeout_seconds: u64,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+impl Requirement {
+    /// The command phase recorded for this probe.
+    pub fn phase(&self) -> String {
+        format!("requires:{}", self.id)
+    }
+    pub fn command(&self) -> CommandSpec {
+        CommandSpec {
+            script: self.script.clone(),
+            timeout_seconds: self.timeout_seconds,
+            env: self.env.clone(),
+            pass_env: Vec::new(),
+        }
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

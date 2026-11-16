@@ -513,6 +513,17 @@ impl ScenarioReport {
     pub fn recompute_outcome(&mut self) {
         self.outcome = self.aggregate_outcome();
     }
+    /// IDs of declared guest requirements whose probe did not succeed, from the
+    /// `prerequisites` stage's command evidence.
+    pub fn unmet_requirements(&self) -> Vec<&str> {
+        self.stages
+            .iter()
+            .filter(|stage| stage.name == "prerequisites" && stage.step.is_none())
+            .flat_map(|stage| &stage.commands)
+            .filter(|command| command.outcome != CommandOutcome::Succeeded)
+            .filter_map(|command| command.phase.strip_prefix("requires:"))
+            .collect()
+    }
     pub fn aggregate_outcome(&self) -> RunOutcome {
         let mut outcomes = self
             .stages

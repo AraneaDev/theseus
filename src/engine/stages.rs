@@ -40,6 +40,9 @@ pub(super) struct State {
     pub(super) before_upgrade: Option<Vec<Snapshot>>,
     pub(super) before_attempt: Option<Vec<Snapshot>>,
     pub(super) rollback_backup_authorized: bool,
+    /// Declared guest requirements whose probe did not succeed. Nothing was
+    /// installed, so every step is skipped, the uninstall tail included.
+    pub(super) unmet_requirements: Vec<String>,
 }
 impl State {
     /// A freshly created, running owned resource with verified (empty) observations.
@@ -59,6 +62,7 @@ impl State {
             before_upgrade: None,
             before_attempt: None,
             rollback_backup_authorized: false,
+            unmet_requirements: vec![],
         }
     }
 }
@@ -247,6 +251,51 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
         stage.commands.push(executed.record.clone());
         executed
     }
+    /// Probe the recipe's declared guest requirements, once, before any step.
+    /// Each probe is ordinary command evidence in one `prerequisites` stage. An
+    /// unmet requirement fails that stage and skips the whole lifecycle: the
+    /// guest lacks something the image has to supply, which says nothing about
+    /// the installer.
+    pub(super) fn prerequisites(&mut self, state: &mut State) -> Result<()> {
+        let requires = self.recipe.recipe.requires.clone();
+        if requires.is_empty() {
+            return Ok(());
+        }
+        let mut stage = StageReport::new("prerequisites");
+        if self.cancel.is_cancelled() {
+            state.availability = Availability::Unavailable;
+            self.report.cancelled = true;
+        }
+        if state.availability != Availability::Running {
+            stage.outcome = StageOutcome::Skipped;
+            stage.skip_reason = Some("container stopped after timeout/cancellation".into());
+            return self.finish(stage);
+        }
+        self.start(&stage)?;
+        for requirement in &requires {
+            if state.availability != Availability::Running {
+                break;
+            }
+            let spec = requirement.command();
+            let request = self.request(
+                state,
+                requirement.phase(),
+                &spec,
+                ExecutionIdentity::runtime(),
+                vec!["/bin/sh".into(), "-c".into(), spec.script.clone()],
+                0,
+            );
+            let executed = self.execute(state, request, &mut stage);
+            if executed.record.outcome != CommandOutcome::Succeeded {
+                state.unmet_requirements.push(requirement.id.clone());
+            }
+            self.update(&stage)?;
+        }
+        state.forward &= state.unmet_requirements.is_empty();
+        self.capture(state, &mut stage);
+        Self::outcome(&mut stage);
+        self.update(&stage)
+    }
     pub(super) fn step(&mut self, state: &mut State, step: StepName) -> Result<()> {
         self.step_named(state, step, &step.to_string())
     }
@@ -261,6 +310,14 @@ impl<E: Environment, F: FnMut(EngineEvent)> ScenarioContext<'_, E, F> {
         if self.cancel.is_cancelled() {
             state.availability = Availability::Unavailable;
             self.report.cancelled = true;
+        }
+        if state.availability == Availability::Running && !state.unmet_requirements.is_empty() {
+            stage.outcome = StageOutcome::Skipped;
+            stage.skip_reason = Some(format!(
+                "guest requirement not met: {}",
+                state.unmet_requirements.join(", ")
+            ));
+            return self.finish(stage);
         }
         if state.availability != Availability::Running
             || (step == StepName::CleanupBackup && !state.rollback_backup_authorized)

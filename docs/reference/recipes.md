@@ -94,6 +94,48 @@ original; known-good and restored reader scripts may differ. Ordinary and
 interrupted rollback can coexist with different modes/check IDs; each entry gets
 its own owned container and independent authorization.
 
+Schema 9 adds `requires`: guest prerequisites that the image has to supply.
+Theseus installs nothing in a guest, so a tool that needs a runtime declares it
+instead of failing inside its installer:
+
+```toml
+schema_version = 9
+scenarios = ["clean", "upgrade"]
+
+[[requires]]
+id = "php-8.3"
+script = "php -r 'exit(PHP_VERSION_ID >= 80300 ? 0 : 1);'"
+
+[[requires]]
+id = "git"
+script = "git --version"
+```
+
+Each requirement is a probe: a `/bin/sh -c` script that is met when it exits 0,
+so a minimum version is whatever the script tests. It takes an `id` of 1 to 64
+characters from `A-Z a-z 0-9 . _ -`, unique in the recipe, a `script`, and
+optional `timeout_seconds` and literal `env`; there is no `pass_env`. A recipe
+declares at most 32. Schemas 1 through 8 reject `requires`. Requirements apply
+to every profile and scenario of the recipe. A recipe that declares
+`plugin_lifecycle` cannot declare them, and an MCP lifecycle contract stays
+schema 8, because both bind an exact stage sequence.
+
+Probes run once per matrix entry, in a `prerequisites` stage directly after
+the baseline snapshot and before the first step, as UID/GID 10001:10001 in
+both profiles. Every probe runs even after one fails, so one run names
+everything the image lacks. Each is ordinary command evidence with phase
+`requires:<id>`, its exit status and its logs, and the stage is observed like
+any other, so a probe that writes into an observed root shows up in its diff.
+
+When any requirement is unmet, the `prerequisites` stage fails and the run
+fails. No lifecycle step runs, the uninstall tail included, since nothing was
+installed: each step is skipped with `guest requirement not met: <ids>`, and
+checkpoint checks are skipped as dependent. Only the `prerequisites` stage
+carries the failure, which separates "this image cannot host the tool" from
+"the installer failed". The headless summary names the unmet IDs per matrix
+entry. A met requirement establishes that its probe exited 0 in that
+container at that moment, not that the tool will find the runtime usable.
+
 ## Inputs and execution
 
 Both `user` and `system` profiles run configure/exercise/checks as UID/GID
@@ -136,6 +178,9 @@ native controller tests have the separate [installation and controller
 scope](../get-started/installation.md#native-controllers-and-release-qualification).
 
 ## Lifecycle ordering
+
+With schema 9 `requires`, every ordering below gains a `prerequisites` stage
+between the baseline and its first step.
 
 Clean executes install_target → target_installed checks → configure → configured
 checks → exercise → uninstall → uninstalled checks. Upgrade executes
