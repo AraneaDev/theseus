@@ -56,8 +56,10 @@ pub struct Recipe {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requires: Vec<Requirement>,
     /// Schema 10: a private Docker daemon beside the guest, for tools that run containers.
+    /// Boxed: a recipe is carried by value in enums whose variants clippy
+    /// holds to similar sizes, and Windows path types are larger.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub docker: Option<GuestDocker>,
+    pub docker: Option<Box<GuestDocker>>,
 }
 /// Where the guest reaches its private daemon. The guest shares the daemon
 /// container's network namespace, so loopback is the whole exposure.
