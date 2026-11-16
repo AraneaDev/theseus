@@ -263,6 +263,34 @@ jobs:
           # Retained run directories (.theseus-runs) hold the native reports.
           include-hidden-files: true
 
+  docker-sidecar:
+    # The private Docker daemon of recipe schema 10 against a real, privileged
+    # docker:dind sidecar: the example recipe's tool starts containers on it,
+    # and the test checks that nothing is left on the runner's daemon.
+    name: docker sidecar
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Pull the guest, daemon and loaded images
+        timeout-minutes: 5
+        run: |
+          for image in docker:28-cli docker:28-dind ubuntu:24.04; do
+            docker pull --quiet "$image"
+          done
+      - name: Real private daemon
+        run: cargo test --locked --test docker_sidecar -- --ignored
+      - name: Nothing left on the runner's daemon
+        if: ${{ always() }}
+        run: |
+          left=$(docker ps --all --quiet --filter label=io.theseus.run)
+          volumes=$(docker volume ls --quiet --filter dangling=true)
+          docker ps --all --filter label=io.theseus.run
+          test -z "$left" && test -z "$volumes"
+
   docker:
     name: docker (all eight required suites)
     runs-on: ubuntu-24.04

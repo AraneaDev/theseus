@@ -324,7 +324,7 @@ fn the_docker_block_parses_with_defaults_and_validates() {
 /// containers on its private daemon, an inner container writes through a bind
 /// mount of a guest path, and nothing is left on the host.
 #[test]
-#[ignore = "requires Docker with privileged containers, and docker:28-cli, docker:28-dind and ubuntu:24.04 locally"]
+#[ignore = "requires Docker with privileged containers, and docker:28-cli, docker:28-dind and ubuntu:24.04 locally; CI runs it in the docker sidecar job"]
 fn real_private_daemon_runs_containers_for_the_guest_and_leaves_nothing() {
     use std::process::Command;
     let recipe = load(
