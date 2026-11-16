@@ -17,7 +17,9 @@ default or explicit `bridge`), artifacts, profiles, and nonoverlapping absolute
 observation roots. Inputs resolve inside the recipe project, are materialized
 and hashed, then copied into `/inputs/base` and `/inputs/target`. There are no
 writable host source mounts, host home/socket mounts, host namespaces,
-privileged mode, or forwarded ports.
+privileged mode, or forwarded ports. The one exception is declared: a schema 10
+`[docker]` block adds a privileged sidecar that runs a private Docker daemon;
+the guest itself stays unprivileged and still never reaches the host's daemon.
 
 ## Schema versions and scenario selection
 
@@ -135,6 +137,57 @@ carries the failure, which separates "this image cannot host the tool" from
 "the installer failed". The headless summary names the unmet IDs per matrix
 entry. A met requirement establishes that its probe exited 0 in that
 container at that moment, not that the tool will find the runtime usable.
+
+Schema 10 adds `[docker]`: a private Docker daemon for a tool that starts
+containers, such as an installer with a container mode.
+
+```toml
+schema_version = 10
+scenarios = ["clean"]
+image = "docker:28-cli"          # the guest needs a Docker client
+
+[docker]
+image = "docker:28-dind"         # the daemon, a Docker-in-Docker image
+load = ["ubuntu:24.04"]          # host images copied into it
+share = ["/home/theseus", "/workspace"]   # the default
+```
+
+For each matrix entry Theseus creates a second container, the daemon, before
+the guest, and removes it after the guest. It is journaled like the guest, so
+`theseus cleanup` recovers it after a crash, and it carries the ownership
+labels plus `io.theseus.role=docker-daemon`. The guest joins the daemon's
+network namespace and reaches it at `tcp://127.0.0.1:2375`; every step, check
+and requirement probe gets `DOCKER_HOST` set to that address unless its own
+`env` sets another. Nothing the guest starts runs on the host's daemon:
+containers, images and networks a step creates live in the sidecar and go with
+it.
+
+The daemon takes the recipe's `network`. With `none` it has no route to a
+registry, so a step can run only images named in `load`, which are saved from
+the host's daemon and loaded before the first step. Like the guest image, the
+daemon image and every loaded image must be local unless `run --pull` is
+given. At most 16 images are loaded. Only the guest's image ID is recorded in
+the report; the daemon image and the loaded images are not.
+
+`share` lists 1 to 8 nonoverlapping guest paths the daemon sees at the same
+path, so a bind mount a step asks for (`--volume /home/theseus/data:/data`)
+resolves to the guest's files and not to an empty directory in the sidecar.
+Each is a volume both containers mount; it hides whatever the guest image
+holds at that path, and it is removed with the daemon. `/`, `/proc`, `/sys`,
+`/dev` and `/inputs` cannot be shared. Observation, snapshots and checks read
+shared paths like any other.
+
+The daemon container runs **privileged**, as a nested daemon has to. That is
+the one privileged container Theseus creates; the guest is created exactly as
+without `[docker]`. A recipe is maintainer-controlled input, and a privileged
+sidecar widens what a hostile recipe could do to the host, so declare it only
+for tools you would run on the host anyway. The image must start `dockerd` the
+way the official `docker:dind` images do; a daemon that does not answer within
+90 seconds fails the scenario. Schemas 1 through 9 reject `[docker]`, a
+`plugin_lifecycle` recipe cannot declare it, and an MCP lifecycle contract
+stays schema 8. Declare the client with `requires` (`docker --version`): the
+guest image supplies it. See the [docker-sidecar
+example](../../examples/docker-sidecar/theseus.toml).
 
 ## Inputs and execution
 

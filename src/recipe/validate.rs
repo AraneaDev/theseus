@@ -283,6 +283,7 @@ pub fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<ValidatedRecipe> {
     let (plugin_declared, interrupted_rollback_declared, rollback_declared, downgrade_declared) =
         validate_schema_scenarios(&recipe)?;
     validate_recipe_basics(&mut recipe)?;
+    validate_guest_docker(&mut recipe, plugin_declared)?;
     let rules = RecipeRules {
         schema_version: recipe.schema_version,
         network: recipe.network,
@@ -357,9 +358,9 @@ fn validate_schema_scenarios(recipe: &Recipe) -> Result<(bool, bool, bool, bool)
             recipe.scenarios.is_none(),
             "scenarios requires recipe schema version 2"
         ),
-        2..=9 => {
+        2..=10 => {
             let scenarios = recipe.scenarios.as_ref().context(
-                "recipe schema version 2/3/4/5/6/7/8/9 requires an explicit scenarios list",
+                "recipe schema version 2/3/4/5/6/7/8/9/10 requires an explicit scenarios list",
             )?;
             ensure!(!scenarios.is_empty(), "declare at least one scenario");
             let mut seen = BTreeSet::new();
@@ -463,6 +464,70 @@ fn validate_requirements(recipe: &Recipe, plugin_declared: bool) -> Result<()> {
             &[],
         )
         .with_context(|| format!("requirement {id}"))?;
+    }
+    Ok(())
+}
+
+/// An image reference handed to the Docker CLI as one argument.
+fn validate_image_reference(reference: &str, what: &str) -> Result<()> {
+    ensure!(
+        (1..=255).contains(&reference.len())
+            && !reference.starts_with('-')
+            && reference
+                .bytes()
+                .all(|b| b.is_ascii_graphic() && !matches!(b, b'"' | b'\'' | b'\\')),
+        "{what} must be an image reference of 1 to 255 printable characters that does not start with '-': {reference}"
+    );
+    Ok(())
+}
+
+/// Schema 10 guest Docker daemon. The sidecar changes no stage sequence, but
+/// plugin and MCP lifecycles are not rehearsed with one, so they declare none.
+fn validate_guest_docker(recipe: &mut Recipe, plugin_declared: bool) -> Result<()> {
+    let Some(docker) = &mut recipe.docker else {
+        return Ok(());
+    };
+    ensure!(
+        recipe.schema_version >= 10,
+        "docker needs recipe schema version 10"
+    );
+    ensure!(
+        !plugin_declared,
+        "docker is not available with plugin_lifecycle"
+    );
+    validate_image_reference(&docker.image, "docker.image")?;
+    ensure!(
+        docker.load.len() <= super::MAX_LOADED_IMAGES,
+        "at most {} images can be loaded",
+        super::MAX_LOADED_IMAGES
+    );
+    let mut loaded = BTreeSet::new();
+    for image in &docker.load {
+        validate_image_reference(image, "docker.load")?;
+        ensure!(loaded.insert(image), "duplicate docker.load image {image}");
+    }
+    ensure!(
+        (1..=super::MAX_SHARED_PATHS).contains(&docker.share.len()),
+        "docker.share lists 1 to {} guest paths",
+        super::MAX_SHARED_PATHS
+    );
+    for path in &mut docker.share {
+        *path = normalize_container_path(path)?;
+        ensure!(path != "/", "sharing the entire filesystem is forbidden");
+        ensure!(
+            !["/proc", "/sys", "/dev", "/inputs"]
+                .iter()
+                .any(|p| contained(path, p) || contained(p, path)),
+            "unsupported docker.share path {path}"
+        );
+    }
+    for (index, path) in docker.share.iter().enumerate() {
+        for other in &docker.share[..index] {
+            ensure!(
+                !contained(path, other) && !contained(other, path),
+                "overlapping docker.share paths: {other} and {path}"
+            );
+        }
     }
     Ok(())
 }

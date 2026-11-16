@@ -108,7 +108,11 @@ impl Docker {
             .inspect_owned_until(resource, deadline, &cancel)?
             .is_some()
         {
-            self.owned_transition(&["rm", "-f", &resource.container_id], deadline, &cancel)?;
+            self.owned_transition(
+                &["rm", "-f", "-v", &resource.container_id],
+                deadline,
+                &cancel,
+            )?;
         }
         ensure!(
             self.inspect_owned_until(resource, deadline, &cancel)?

@@ -345,6 +345,24 @@ pub(super) fn build(app: &App) -> Doc {
             ),
         )
         .plain("\n");
+    if let Some(docker) = &r.docker {
+        doc.plain("\n").heading("Private Docker daemon");
+        doc.dim(
+            "  a privileged sidecar the scenario owns; the guest never reaches the host's daemon\n",
+        );
+        for (label, value) in [
+            ("image", docker.image.clone()),
+            ("DOCKER_HOST", crate::recipe::GUEST_DOCKER_HOST.to_string()),
+            ("shared", docker.share.join(", ")),
+            ("loaded", docker.load.join(", ")),
+        ] {
+            if !value.is_empty() {
+                doc.push(Tone::Label, &format!("  {label}  "))
+                    .plain(&value)
+                    .plain("\n");
+            }
+        }
+    }
     if !r.requires.is_empty() {
         doc.plain("\n").heading("Requires");
         doc.dim("  probed in the guest before the first step; an unmet one skips the lifecycle\n");

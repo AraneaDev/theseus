@@ -342,7 +342,7 @@ fn requirements_parse_with_defaults_and_validate() {
         .collect();
     assert!(error(SCHEMA_9, &many).contains("at most 32 requirements"));
     assert!(
-        error("schema_version=10\nscenarios=['clean']", "")
-            .contains("unsupported recipe schema version 10")
+        error("schema_version=11\nscenarios=['clean']", "")
+            .contains("unsupported recipe schema version 11")
     );
 }
