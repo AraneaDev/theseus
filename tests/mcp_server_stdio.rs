@@ -70,6 +70,79 @@ fn serve_roots_preserve_non_unicode_native_paths() {
     assert!(Cli::try_parse_from(args).is_ok());
 }
 
+/// The stdio a libuv launcher (Node, and the MCP clients built on it) hands a
+/// child: one end of an `AF_UNIX` stream socket pair per stream, or a socket
+/// for stdin with a pipe for stdout. The production binary serves both.
+#[cfg(unix)]
+#[test]
+fn production_binary_serves_inherited_local_stream_sockets() {
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        os::unix::net::UnixStream,
+        process::{Command, Stdio},
+        time::Duration,
+    };
+    const INITIALIZE: &[u8] = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"socket-launcher","version":"1"}}}
+"#;
+    for stdout_is_socket in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (mut to_child, child_input) = UnixStream::pair().unwrap();
+        let mut command = Command::new(production_binary());
+        command
+            .args(["serve", "--project-root"])
+            .arg(&root)
+            .arg("--output-root")
+            .arg(root.join("output"))
+            .stdin(Stdio::from(std::os::fd::OwnedFd::from(child_input)))
+            .stderr(Stdio::piped());
+        let (mut child, mut from_child): (_, Box<dyn Read>) = if stdout_is_socket {
+            let (from_child, child_output) = UnixStream::pair().unwrap();
+            from_child
+                .set_read_timeout(Some(Duration::from_secs(15)))
+                .unwrap();
+            command.stdout(Stdio::from(std::os::fd::OwnedFd::from(child_output)));
+            // The command keeps the child's ends; drop it once spawned so the
+            // server's exit is end of file here.
+            let child = command.spawn().unwrap();
+            drop(command);
+            (child, Box::new(from_child))
+        } else {
+            command.stdout(Stdio::piped());
+            let mut child = command.spawn().unwrap();
+            drop(command);
+            let stdout = child.stdout.take().unwrap();
+            (child, Box::new(stdout))
+        };
+        to_child.write_all(INITIALIZE).unwrap();
+        let mut reader = BufReader::new(&mut from_child);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let reply: serde_json::Value = serde_json::from_str(&line)
+            .unwrap_or_else(|error| panic!("no initialize reply ({error}): {line:?}"));
+        assert_eq!(reply["id"], 1);
+        assert_eq!(reply["result"]["serverInfo"]["name"], "theseus");
+        // Closing the launcher's end is end of input: an orderly exit.
+        drop(to_child);
+        let mut rest = String::new();
+        reader.read_to_string(&mut rest).unwrap();
+        assert_eq!(rest, "", "nothing follows the reply");
+        let status = child.wait().unwrap();
+        let mut diagnostics = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut diagnostics)
+            .unwrap();
+        assert!(
+            status.success(),
+            "stdout socket {stdout_is_socket}: {status}"
+        );
+        assert_eq!(diagnostics, "", "serve writes no diagnostics");
+    }
+}
+
 fn production_binary() -> std::path::PathBuf {
     std::env::var_os("THESEUS_MCP_BINARY")
         .map(Into::into)
