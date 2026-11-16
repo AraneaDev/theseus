@@ -30,6 +30,7 @@ pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
     c.capture(&mut state, &mut stage);
     state.baseline = stage.snapshots.clone();
     c.finish(stage)?;
+    c.prerequisites(&mut state)?;
     let kind = c.report.scenarios[c.index].scenario;
     match kind {
         ScenarioKind::PluginLifecycle => super::plugin::run(c, &mut state)?,

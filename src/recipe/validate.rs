@@ -357,9 +357,9 @@ fn validate_schema_scenarios(recipe: &Recipe) -> Result<(bool, bool, bool, bool)
             recipe.scenarios.is_none(),
             "scenarios requires recipe schema version 2"
         ),
-        2..=8 => {
+        2..=9 => {
             let scenarios = recipe.scenarios.as_ref().context(
-                "recipe schema version 2/3/4/5/6/7/8 requires an explicit scenarios list",
+                "recipe schema version 2/3/4/5/6/7/8/9 requires an explicit scenarios list",
             )?;
             ensure!(!scenarios.is_empty(), "declare at least one scenario");
             let mut seen = BTreeSet::new();
@@ -381,6 +381,7 @@ fn validate_schema_scenarios(recipe: &Recipe) -> Result<(bool, bool, bool, bool)
         !plugin_declared || recipe.network == Network::None,
         "plugin_lifecycle requires network none"
     );
+    validate_requirements(recipe, plugin_declared)?;
     let interrupted_rollback_declared = recipe
         .scenarios
         .as_ref()
@@ -423,6 +424,47 @@ fn validate_schema_scenarios(recipe: &Recipe) -> Result<(bool, bool, bool, bool)
         rollback_declared,
         downgrade_declared,
     ))
+}
+
+/// Schema 9 guest prerequisites. Plugin and MCP lifecycles bind an exact stage
+/// sequence, so they declare none; an MCP contract is schema 8 only.
+fn validate_requirements(recipe: &Recipe, plugin_declared: bool) -> Result<()> {
+    if recipe.requires.is_empty() {
+        return Ok(());
+    }
+    ensure!(
+        recipe.schema_version >= 9,
+        "requires needs recipe schema version 9"
+    );
+    ensure!(
+        !plugin_declared,
+        "requires is not available with plugin_lifecycle"
+    );
+    ensure!(
+        recipe.requires.len() <= super::MAX_REQUIREMENTS,
+        "at most {} requirements can be declared",
+        super::MAX_REQUIREMENTS
+    );
+    let mut ids = BTreeSet::new();
+    for requirement in &recipe.requires {
+        let id = &requirement.id;
+        ensure!(
+            (1..=64).contains(&id.len())
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')),
+            "requirement ID must be 1 to 64 characters of A-Z, a-z, 0-9, '.', '_' or '-': {id}"
+        );
+        ensure!(ids.insert(id), "duplicate requirement ID {id}");
+        validate_command(
+            &requirement.script,
+            requirement.timeout_seconds,
+            &requirement.env,
+            &[],
+        )
+        .with_context(|| format!("requirement {id}"))?;
+    }
+    Ok(())
 }
 
 fn validate_recipe_basics(recipe: &mut Recipe) -> Result<()> {

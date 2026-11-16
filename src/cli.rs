@@ -486,6 +486,16 @@ fn handle_run(
         counts.incomplete_checks,
         counts.skipped_checks
     );
+    for scenario in &result.report.scenarios {
+        let unmet = scenario.unmet_requirements();
+        if !unmet.is_empty() {
+            println!(
+                "{}: guest requirement not met, lifecycle skipped: {}",
+                scenario.id,
+                unmet.join(", ")
+            );
+        }
+    }
     for error in &result.report.errors {
         eprintln!("{error}");
     }
