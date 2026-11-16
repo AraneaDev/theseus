@@ -1,0 +1,85 @@
+# Run: theseus run --headless --pull --recipe examples/docker-sidecar/theseus.toml
+#
+# A tool that starts containers, rehearsed with a private Docker daemon. The
+# guest never reaches the host's daemon: the daemon runs in a sidecar that the
+# scenario owns, and what a step starts is removed with it.
+schema_version = 10
+scenarios = ["clean"]
+name = "sample-runner with a private Docker daemon"
+image = "docker:28-cli"
+network = "none"
+observe = ["/home/theseus"]
+
+[docker]
+image = "docker:28-dind"
+load = ["ubuntu:24.04"]
+
+[artifacts]
+target = "target"
+
+[[requires]]
+id = "docker-cli"
+script = "docker --version"
+
+[[requires]]
+id = "docker-daemon"
+script = "docker version --format '{{.Server.Version}}'"
+
+[profiles.user.steps.install_target]
+script = "cp /inputs/target/sample-runner /home/theseus/.local/bin/sample-runner && chmod 0755 /home/theseus/.local/bin/sample-runner"
+
+[profiles.user.steps.configure]
+script = "sample-runner run"
+
+[profiles.user.steps.exercise]
+script = "sample-runner start && docker ps --filter label=sample-runner=1 --format '{{.Names}}'"
+
+[profiles.user.steps.uninstall]
+script = "sample-runner stop && rm -f /home/theseus/.local/bin/sample-runner"
+
+[[profiles.user.checks]]
+id = "version"
+checkpoint = "target_installed"
+kind = "executable"
+name = "sample-runner"
+resolved_path = "/home/theseus/.local/bin/sample-runner"
+args = ["--version"]
+expected_exit = 0
+stdout_contains = "sample-runner 2.0.0"
+
+# The inner container wrote through a bind mount of a guest path.
+[[profiles.user.checks]]
+id = "container-wrote-guest-file"
+checkpoint = "configured"
+kind = "command"
+script = "cat /home/theseus/.local/share/sample-runner/result"
+expected_exit = 0
+stdout_contains = "written inside the container"
+
+# The uninstaller stops what the tool started.
+[[profiles.user.checks]]
+id = "no-containers-left"
+checkpoint = "uninstalled"
+kind = "command"
+script = "test -z \"$(docker ps --all --quiet --filter label=sample-runner=1)\" && echo none"
+expected_exit = 0
+stdout_contains = "none"
+
+[[profiles.user.checks]]
+id = "binary-removed"
+checkpoint = "uninstalled"
+kind = "absent"
+path = "/home/theseus/.local/bin/sample-runner"
+
+[[profiles.user.checks]]
+id = "result-retained"
+checkpoint = "uninstalled"
+kind = "preserved"
+path = "/home/theseus/.local/share/sample-runner/result"
+
+[[profiles.user.checks]]
+id = "data-directory-retained"
+checkpoint = "uninstalled"
+kind = "present"
+path = "/home/theseus/.local/share/sample-runner"
+expected_kind = "directory"

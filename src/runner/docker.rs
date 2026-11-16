@@ -22,12 +22,21 @@ use std::{
 pub const OWNER_LABEL: &str = "io.theseus.owner";
 pub const RUN_LABEL: &str = "io.theseus.run";
 pub const SCENARIO_LABEL: &str = "io.theseus.scenario";
+/// Set on a companion of the scenario's guest, never on the guest itself.
+pub const ROLE_LABEL: &str = "io.theseus.role";
+const DAEMON_ROLE: &str = "docker-daemon";
 
 pub struct Docker {
     executable: std::ffi::OsString,
     inputs: Option<Inputs>,
     image_id: Option<String>,
     observed_roots: Vec<String>,
+    /// The resolved image of the recipe's private Docker daemon.
+    daemon_image_id: Option<String>,
+    /// The daemon created for the guest that is created next.
+    pending_daemon: Option<OwnedResource>,
+    /// Guest container ID to its private daemon.
+    daemons: BTreeMap<String, OwnedResource>,
 }
 impl Default for Docker {
     fn default() -> Self {
@@ -36,6 +45,9 @@ impl Default for Docker {
             inputs: None,
             image_id: None,
             observed_roots: Vec::new(),
+            daemon_image_id: None,
+            pending_daemon: None,
+            daemons: BTreeMap::new(),
         }
     }
 }
@@ -171,15 +183,20 @@ impl Docker {
         }
         let mut errors = vec![];
         let mut native_cleanup = process::CleanupFailures::default();
-        for resource in &mut journal.resources {
-            if resource.removed {
-                continue;
-            }
-            match self.remove(resource) {
-                Ok(()) => resource.removed = true,
-                Err(error) => {
-                    native_cleanup.retain(&error);
-                    errors.push(format!("{error:#}"));
+        // Guests first, then their companions: a private daemon goes after the
+        // guest that shares its network namespace and volumes, so the volumes
+        // are released when the daemon takes them with it.
+        for companions in [false, true] {
+            for resource in &mut journal.resources {
+                if resource.removed || resource.labels.contains_key(ROLE_LABEL) != companions {
+                    continue;
+                }
+                match self.remove(resource) {
+                    Ok(()) => resource.removed = true,
+                    Err(error) => {
+                        native_cleanup.retain(&error);
+                        errors.push(format!("{error:#}"));
+                    }
                 }
             }
         }
@@ -226,6 +243,140 @@ impl Docker {
         )
     }
 }
+impl Docker {
+    /// The immutable ID of a local image, pulled first only when asked.
+    fn resolve_image(
+        &self,
+        reference: &str,
+        pull: bool,
+        cancel: &CancellationToken,
+    ) -> Result<String> {
+        ensure!(
+            !reference.starts_with('-'),
+            "image reference cannot start with '-'"
+        );
+        let inspect = ["image", "inspect", "--format", "{{.Id}}", reference];
+        let image_id = match self.utility(&inspect, cancel) {
+            Ok(id) => id,
+            Err(error) if pull => {
+                let mut retained = process::CleanupFailures::default();
+                retained.retain(&error);
+                retained.finish()?;
+                self.utility(&["pull", reference], cancel)?;
+                self.utility(&inspect, cancel)
+                    .with_context(|| format!("inspect pulled image: {error:#}"))?
+            }
+            Err(error) => {
+                return Err(error.context(format!(
+                    "image {reference} is unavailable locally; use --pull to acquire it"
+                )));
+            }
+        };
+        let image_id = image_id.trim().to_string();
+        ensure!(
+            image_id.starts_with("sha256:")
+                && image_id.len() == 71
+                && image_id[7..].bytes().all(|b| b.is_ascii_hexdigit()),
+            "Docker returned invalid image ID"
+        );
+        Ok(image_id)
+    }
+    /// Start the guest's private daemon, wait until it answers, and copy the
+    /// recipe's images into it. The daemon has no route to a registry unless
+    /// the recipe's network is bridge, so what a step runs is what was loaded.
+    fn start_daemon(
+        &self,
+        daemon: &OwnedResource,
+        recipe: &ValidatedRecipe,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        use crate::recipe::GUEST_DOCKER_HOST;
+        let config = recipe
+            .recipe
+            .docker
+            .as_ref()
+            .context("recipe declares no private Docker daemon")?;
+        self.utility(&["start", &daemon.container_id], cancel)
+            .context("start the private Docker daemon")?;
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let answered = self.utility(
+                &[
+                    "exec",
+                    &daemon.container_id,
+                    "docker",
+                    "--host",
+                    GUEST_DOCKER_HOST,
+                    "version",
+                    "--format",
+                    "{{.Server.Version}}",
+                ],
+                cancel,
+            );
+            match answered {
+                Ok(_) => break,
+                Err(error) => {
+                    ensure!(
+                        !cancel.is_cancelled(),
+                        "private Docker daemon start cancelled"
+                    );
+                    if Instant::now() >= deadline {
+                        return Err(error.context(
+                            "the private Docker daemon did not answer within 90 seconds; docker.image must be a Docker-in-Docker image",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }
+        }
+        if config.load.is_empty() {
+            return Ok(());
+        }
+        let staging = tempfile::tempdir().context("stage images for the private Docker daemon")?;
+        let archive = staging.path().join("image.tar");
+        for image in &config.load {
+            let mut save = self.command();
+            save.args(["image", "save", "--output"])
+                .arg(&archive)
+                .arg(image);
+            process::utility(&mut save, cancel)
+                .with_context(|| format!("save image {image} for the private Docker daemon"))?;
+            let mut copy = self.command();
+            copy.arg("cp")
+                .arg(&archive)
+                .arg(format!("{}:/theseus-image.tar", daemon.container_id));
+            process::utility(&mut copy, cancel)
+                .with_context(|| format!("copy image {image} into the private Docker daemon"))?;
+            self.utility(
+                &[
+                    "exec",
+                    &daemon.container_id,
+                    "docker",
+                    "--host",
+                    GUEST_DOCKER_HOST,
+                    "image",
+                    "load",
+                    "--quiet",
+                    "--input",
+                    "/theseus-image.tar",
+                ],
+                cancel,
+            )
+            .with_context(|| format!("load image {image} into the private Docker daemon"))?;
+            self.utility(
+                &[
+                    "exec",
+                    &daemon.container_id,
+                    "rm",
+                    "-f",
+                    "/theseus-image.tar",
+                ],
+                cancel,
+            )?;
+        }
+        Ok(())
+    }
+}
 fn fresh_nonce() -> Result<String> {
     let mut bytes = [0; 16];
     theseus_host::random_bytes(&mut bytes)?;
@@ -240,53 +391,18 @@ impl Environment for Docker {
     ) -> Result<PreparedEnvironment> {
         self.utility(&["version", "--format", "{{.Server.Version}}"], cancel)
             .context("Docker daemon prerequisite; verify Docker is installed and reachable")?;
-        ensure!(
-            !recipe.recipe.image.starts_with('-'),
-            "image reference cannot start with '-'"
-        );
-        let inspected = self.utility(
-            &[
-                "image",
-                "inspect",
-                "--format",
-                "{{.Id}}",
-                &recipe.recipe.image,
-            ],
-            cancel,
-        );
-        let image_id = match inspected {
-            Ok(id) => id,
-            Err(error) if pull => {
-                let mut retained = process::CleanupFailures::default();
-                retained.retain(&error);
-                retained.finish()?;
-                self.utility(&["pull", &recipe.recipe.image], cancel)?;
-                self.utility(
-                    &[
-                        "image",
-                        "inspect",
-                        "--format",
-                        "{{.Id}}",
-                        &recipe.recipe.image,
-                    ],
-                    cancel,
-                )
-                .with_context(|| format!("inspect pulled image: {error:#}"))?
+        let image_id = self.resolve_image(&recipe.recipe.image, pull, cancel)?;
+        self.daemon_image_id = None;
+        if let Some(docker) = &recipe.recipe.docker {
+            self.daemon_image_id = Some(
+                self.resolve_image(&docker.image, pull, cancel)
+                    .context("docker.image, the private Docker daemon")?,
+            );
+            for image in &docker.load {
+                self.resolve_image(image, pull, cancel)
+                    .with_context(|| format!("docker.load image {image}"))?;
             }
-            Err(error) => {
-                return Err(error.context(format!(
-                    "image {} is unavailable locally; use --pull to acquire it",
-                    recipe.recipe.image
-                )));
-            }
-        };
-        let image_id = image_id.trim().to_string();
-        ensure!(
-            image_id.starts_with("sha256:")
-                && image_id.len() == 71
-                && image_id[7..].bytes().all(|b| b.is_ascii_hexdigit()),
-            "Docker returned invalid image ID"
-        );
+        }
         let volumes = self.utility(
             &[
                 "image",
@@ -313,6 +429,70 @@ impl Environment for Docker {
             artifacts,
         })
     }
+    fn create_companion(
+        &mut self,
+        run_id: &str,
+        scenario_id: &str,
+        recipe: &ValidatedRecipe,
+    ) -> Result<Option<OwnedResource>> {
+        self.pending_daemon = None;
+        let Some(config) = &recipe.recipe.docker else {
+            return Ok(None);
+        };
+        let labels = BTreeMap::from([
+            (OWNER_LABEL.into(), "v1".into()),
+            (RUN_LABEL.into(), run_id.into()),
+            (SCENARIO_LABEL.into(), scenario_id.into()),
+            (ROLE_LABEL.into(), DAEMON_ROLE.into()),
+        ]);
+        let mut command = self.command();
+        // Privileged, as a nested daemon has to be; nothing else Theseus
+        // creates is. It takes the recipe's network policy, and the guest
+        // joins its network namespace instead of getting one of its own.
+        command.args([
+            "create",
+            "--privileged",
+            "--network",
+            if recipe.recipe.network == Network::None {
+                "none"
+            } else {
+                "bridge"
+            },
+            "--env",
+            "DOCKER_TLS_CERTDIR=",
+        ]);
+        for (key, value) in &labels {
+            command.args(["--label", &format!("{key}={value}")]);
+        }
+        // Anonymous volumes the guest takes over with --volumes-from: both see
+        // the same files at the same path, and removing the daemon with its
+        // volumes removes them.
+        for path in &config.share {
+            command.args(["--volume", path]);
+        }
+        command
+            .arg(
+                self.daemon_image_id
+                    .as_ref()
+                    .context("private Docker daemon image not prepared")?,
+            )
+            .args([
+                "dockerd",
+                &format!("--host={}", crate::recipe::GUEST_DOCKER_HOST),
+                "--tls=false",
+            ]);
+        let id = process::utility(&mut command, &CancellationToken::default())?
+            .trim()
+            .to_string();
+        let resource = OwnedResource {
+            container_id: id,
+            labels,
+            removed: false,
+        };
+        Self::validate_resource(&resource)?;
+        self.pending_daemon = Some(resource.clone());
+        Ok(Some(resource))
+    }
     fn create(
         &mut self,
         run_id: &str,
@@ -324,20 +504,25 @@ impl Environment for Docker {
             (RUN_LABEL.into(), run_id.into()),
             (SCENARIO_LABEL.into(), scenario_id.into()),
         ]);
+        let daemon = self.pending_daemon.take();
+        let network = match &daemon {
+            Some(daemon) => format!("container:{}", daemon.container_id),
+            None if recipe.recipe.network == Network::None => "none".into(),
+            None => "bridge".into(),
+        };
         let mut command = self.command();
         command.args([
             "create",
             "--network",
-            if recipe.recipe.network == Network::None {
-                "none"
-            } else {
-                "bridge"
-            },
+            &network,
             "--user",
             "0:0",
             "--entrypoint",
             "/bin/sh",
         ]);
+        if let Some(daemon) = &daemon {
+            command.args(["--volumes-from", &daemon.container_id]);
+        }
         for (key, value) in &labels {
             command.args(["--label", &format!("{key}={value}")]);
         }
@@ -353,14 +538,21 @@ impl Environment for Docker {
             removed: false,
         };
         Self::validate_resource(&resource)?;
+        if let Some(daemon) = daemon {
+            self.daemons.insert(resource.container_id.clone(), daemon);
+        }
         Ok(resource)
     }
     fn setup(
         &mut self,
         resource: &OwnedResource,
-        _: &ValidatedRecipe,
+        recipe: &ValidatedRecipe,
         cancel: &CancellationToken,
     ) -> Result<()> {
+        // The guest joins the daemon's network namespace, so the daemon runs first.
+        if let Some(daemon) = self.daemons.get(&resource.container_id) {
+            self.start_daemon(daemon, recipe, cancel)?;
+        }
         self.utility(&["start", &resource.container_id], cancel)?;
         self.root_exec(resource, r#"set -eu
 for tool in /bin/sh /usr/bin/env sleep mkdir chown chmod tar cp rm cat id awk; do command -v "$tool" >/dev/null || { echo "required tool missing: $tool" >&2; exit 1; }; done
@@ -483,11 +675,14 @@ chmod 755 /home/theseus /workspace /inputs
     }
     fn remove(&mut self, resource: &OwnedResource) -> Result<()> {
         if self.verified_exists(resource)? {
+            // With its anonymous volumes: a private daemon's image store and
+            // the paths it shares with its guest. A guest image declares none.
             self.utility(
-                &["rm", "-f", &resource.container_id],
+                &["rm", "-f", "-v", &resource.container_id],
                 &CancellationToken::default(),
             )?;
         }
+        self.daemons.remove(&resource.container_id);
         Ok(())
     }
 }

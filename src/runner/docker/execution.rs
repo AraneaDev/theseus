@@ -64,6 +64,14 @@ impl Docker {
         outer_deadline: Option<Instant>,
     ) -> Result<(CommandRecord, Launch)> {
         let mut public = request.identity.public_environment();
+        // A guest with a private daemon is pointed at it; the recipe's own
+        // env still wins.
+        if self.daemons.contains_key(&resource.container_id) {
+            public.insert(
+                "DOCKER_HOST".into(),
+                crate::recipe::GUEST_DOCKER_HOST.into(),
+            );
+        }
         public.extend(request.env.clone());
         let mut actual: BTreeMap<std::ffi::OsString, std::ffi::OsString> =
             public.iter().map(|(k, v)| (k.into(), v.into())).collect();

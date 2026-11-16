@@ -17,6 +17,14 @@ pub(super) fn scenario<E: Environment, F: FnMut(EngineEvent)>(
         c.report.cancelled = true;
         return Ok(());
     }
+    if let Some(companion) = c.environment.create_companion(
+        &c.report.run_id,
+        &c.report.scenarios[c.index].id,
+        c.recipe,
+    )? {
+        c.journal.resources.push(companion);
+        c.store.save_journal(c.journal)?;
+    }
     let resource =
         c.environment
             .create(&c.report.run_id, &c.report.scenarios[c.index].id, c.recipe)?;

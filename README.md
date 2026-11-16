@@ -58,6 +58,8 @@ or a listening network service.
   with a fresh owned container for each matrix entry.
 - **Declare what the guest must supply:** list required runtimes as probes;
   an image that lacks one skips the lifecycle instead of failing in an installer.
+- **Rehearse tools that start containers:** give the guest a private Docker
+  daemon in an owned sidecar; nothing it starts touches the host's daemon.
 - **Inspect before running:** preview the commands and public environment in
   the workbench; edit a validated copy and press `r` explicitly to execute it.
 - **Check what changed:** inspect file fingerprints, metadata, command outcomes,

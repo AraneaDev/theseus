@@ -10,7 +10,14 @@ use crate::{
     snapshot::Snapshot,
 };
 use anyhow::Result;
-pub use docker::Docker;
+pub use docker::{Docker, ROLE_LABEL, SCENARIO_LABEL};
+
+/// Whether a journaled resource is a companion of the scenario: owned beside
+/// its guest (a private Docker daemon), and removed after it.
+pub(crate) fn is_companion(resource: &OwnedResource, scenario_id: &str) -> bool {
+    resource.labels.contains_key(ROLE_LABEL)
+        && resource.labels.get(SCENARIO_LABEL).map(String::as_str) == Some(scenario_id)
+}
 use std::collections::BTreeMap;
 
 pub struct PreparedEnvironment {
@@ -56,6 +63,17 @@ pub trait Environment {
         pull: bool,
         cancel: &CancellationToken,
     ) -> Result<PreparedEnvironment>;
+    /// Creation only, before the guest's own. A companion is owned beside the
+    /// scenario's guest (a private Docker daemon the recipe declares); the
+    /// engine journals it before the guest is created and removes it after it.
+    fn create_companion(
+        &mut self,
+        _run_id: &str,
+        _scenario_id: &str,
+        _recipe: &ValidatedRecipe,
+    ) -> Result<Option<OwnedResource>> {
+        Ok(None)
+    }
     /// Creation only. The engine journals this resource before setup/start/copy.
     fn create(
         &mut self,

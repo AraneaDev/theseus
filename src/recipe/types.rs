@@ -55,6 +55,33 @@ pub struct Recipe {
     /// Schema 9: guest prerequisites probed once per scenario, before any lifecycle step.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requires: Vec<Requirement>,
+    /// Schema 10: a private Docker daemon beside the guest, for tools that run containers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker: Option<GuestDocker>,
+}
+/// Where the guest reaches its private daemon. The guest shares the daemon
+/// container's network namespace, so loopback is the whole exposure.
+pub const GUEST_DOCKER_HOST: &str = "tcp://127.0.0.1:2375";
+pub const MAX_LOADED_IMAGES: usize = 16;
+pub const MAX_SHARED_PATHS: usize = 8;
+/// A Docker daemon owned by the scenario, in a sidecar container of its own.
+/// The guest never reaches the host's daemon: what a step starts lives in the
+/// sidecar and is removed with it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuestDocker {
+    /// A Docker-in-Docker image, such as `docker:28-dind`. It runs privileged.
+    pub image: String,
+    /// Host images copied into the private daemon before the first step.
+    #[serde(default)]
+    pub load: Vec<String>,
+    /// Guest paths the daemon sees at the same path, so a bind mount a step
+    /// asks for resolves to the guest's files.
+    #[serde(default = "default_shared_paths")]
+    pub share: Vec<String>,
+}
+fn default_shared_paths() -> Vec<String> {
+    vec!["/home/theseus".into(), "/workspace".into()]
 }
 pub const MAX_REQUIREMENTS: usize = 32;
 /// One guest prerequisite: a probe run as the runtime identity that must exit 0.

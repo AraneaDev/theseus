@@ -294,6 +294,35 @@ pub(crate) fn run_with_parent(
                         } else if report.scenarios[index].container_id.is_none() {
                             report.scenarios[index].teardown = TeardownStatus::Complete;
                         }
+                        // Companions go after their guest, and also when the
+                        // guest was never created.
+                        let scenario_id = report.scenarios[index].id.clone();
+                        for companion in journal.resources.iter_mut().filter(|resource| {
+                            !resource.removed && crate::runner::is_companion(resource, &scenario_id)
+                        }) {
+                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                environment.remove(companion)
+                            })) {
+                                Ok(Ok(())) => companion.removed = true,
+                                Ok(Err(error)) => {
+                                    cleanup.retain(&error);
+                                    let reason = format!("{error:#}");
+                                    journal.cleanup_errors.push(reason.clone());
+                                    report.scenarios[index].teardown =
+                                        TeardownStatus::Failed { reason };
+                                }
+                                Err(original) => {
+                                    cleanup.retain_panic(original.as_ref());
+                                    if panic.is_none() {
+                                        panic = Some(original);
+                                    }
+                                    let reason = "owned companion teardown panicked".to_string();
+                                    journal.cleanup_errors.push(reason.clone());
+                                    report.scenarios[index].teardown =
+                                        TeardownStatus::Failed { reason };
+                                }
+                            }
+                        }
                         if let Err(error) = store.save_journal(&journal) {
                             report
                                 .errors

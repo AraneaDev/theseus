@@ -62,6 +62,7 @@ repository root unless they explicitly change directory.
 | Task | Recipe or walkthrough |
 | --- | --- |
 | Clean installation and upgrade | [Standalone recipe](../examples/standalone/theseus.toml) |
+| A tool that starts containers, with a private Docker daemon | [Docker sidecar recipe](../examples/docker-sidecar/theseus.toml) |
 | Reinstall the same artifact | [Reinstall recipe](../examples/reinstall/theseus.toml) |
 | Interrupt and explicitly recover | [Interruption recipe](../examples/interruption/theseus.toml) |
 | Downgrade compatibility or rejection | [Compatible recipe](../examples/downgrade/compatible.toml), [rejection recipe](../examples/downgrade/rejection.toml) |

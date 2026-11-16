@@ -1,0 +1,16 @@
+#!/bin/sh
+# A tool that does its work in a container, the way a container-mode install does.
+set -eu
+data=/home/theseus/.local/share/sample-runner
+case ${1-} in
+    --version) echo 'sample-runner 2.0.0' ;;
+    run)
+        mkdir -p "$data"
+        docker run --rm --network none --user "$(id -u):$(id -g)" --volume "$data:/data" \
+            --label sample-runner=1 ubuntu:24.04 sh -c 'echo "written inside the container" > /data/result'
+        cat "$data/result"
+        ;;
+    start) docker run --detach --name sample-runner-worker --network none --label sample-runner=1 ubuntu:24.04 sleep 3600 >/dev/null ;;
+    stop) docker rm --force sample-runner-worker >/dev/null 2>&1 || true ;;
+    *) exit 2 ;;
+esac
