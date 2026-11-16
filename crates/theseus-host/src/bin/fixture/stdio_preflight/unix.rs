@@ -222,8 +222,11 @@ pub(super) fn control(case: &str, candidate: &str, evidence: &mut Evidence) -> i
             label: "stdin",
             saved: None,
         }),
+        // A local stream socket qualifies in production (a libuv launcher
+        // inherits one in place of a pipe), so the socket that must still be
+        // refused is one that is not a byte stream.
         "socket" => {
-            let (first, second) = std::os::unix::net::UnixStream::pair()?;
+            let (first, second) = std::os::unix::net::UnixDatagram::pair()?;
             keepers.push(second.into());
             Some(Endpoint {
                 fd: first.into(),

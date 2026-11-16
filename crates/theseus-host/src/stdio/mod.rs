@@ -5,6 +5,9 @@
 //! synchronous worker per direction, not the process module's OVERLAPPED pipes.
 //! Only local, synchronous byte pipes in wait mode qualify. Equal bounded pipe
 //! names are conservatively rejected, including ambiguous separate instances.
+//! On Unix a local stream socket (`AF_UNIX`, `SOCK_STREAM`) qualifies as well:
+//! it is what a libuv launcher inherits to a child in place of a pipe. One
+//! socket inherited as both ends is rejected like one pipe.
 //! The serving binary must install its quiet panic hook before acquisition;
 //! catch_unwind retains worker payloads but does not suppress the global hook.
 //! Callers must retain this owner (including acquisition failures) until stopped

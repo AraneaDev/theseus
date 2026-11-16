@@ -17,6 +17,11 @@ results](https://github.com/AraneaDev/theseus/actions/workflows/ci.yml).
 
 `theseus serve` exposes the same lifecycle engine and outcomes over ordinary
 stdin/stdout pipes. It has no model dependency or listening network service.
+On Linux and macOS an inherited local stream socket (`AF_UNIX`, `SOCK_STREAM`)
+serves as well as a pipe: that is what Node-based MCP clients hand a child, so
+they launch the server directly, with no wrapper. A network or datagram
+socket, a terminal or a file is refused, and so is one pipe or one socket
+inherited as both stdin and stdout; the server then exits 2 without output.
 Launch it with explicit native filesystem roots:
 
 ```sh
