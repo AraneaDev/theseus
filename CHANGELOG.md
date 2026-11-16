@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.0](https://github.com/AraneaDev/theseus/compare/v0.0.1...v0.1.0) (2026-11-16)
+
+
+### Features
+
+* **recipe:** declare guest prerequisites with a schema 9 requires block ([#29](https://github.com/AraneaDev/theseus/issues/29)) ([4a08e71](https://github.com/AraneaDev/theseus/commit/4a08e7166be21f81072cae62da7873eab23bf2ba))
+* **recipe:** give the guest a private Docker daemon with a schema 10 docker block ([#31](https://github.com/AraneaDev/theseus/issues/31)) ([899f6aa](https://github.com/AraneaDev/theseus/commit/899f6aa54c995679ac585e972da186830b410a83))
+
+
+### Bug Fixes
+
+* **serve:** accept an inherited local stream socket as stdio ([#28](https://github.com/AraneaDev/theseus/issues/28)) ([282ce42](https://github.com/AraneaDev/theseus/commit/282ce42cc9e4dc53f65e0bd9804b999ad3fdc458))
+
 ## 0.0.1 (2026-11-15)
 
 
