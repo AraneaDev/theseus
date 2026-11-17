@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.0.0](https://github.com/AraneaDev/theseus/compare/v0.1.0...v1.0.0) (2026-11-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* schema 10 recipes with [docker] need --allow-privileged-daemon.
+
+### Features
+
+* require --allow-privileged-daemon for a recipe with a docker block ([#33](https://github.com/AraneaDev/theseus/issues/33)) ([19eba8b](https://github.com/AraneaDev/theseus/commit/19eba8ba9b668d3c5da94f5b64289b2c250a72a1))
+
 ## [0.1.0](https://github.com/AraneaDev/theseus/compare/v0.0.1...v0.1.0) (2026-11-16)
 
 
