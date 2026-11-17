@@ -310,9 +310,17 @@ pub(crate) fn validate_selected_start(
         return Err(super::roots::error(ErrorCode::RecipeChanged));
     }
     match &selected {
-        SelectedRecipe::Docker(recipe) => recipe
-            .validate_selection(&args.profiles, &args.scenarios)
-            .map_err(|e| QueryError::new(ErrorCode::RecipeInvalid, e))?,
+        SelectedRecipe::Docker(recipe) => {
+            if recipe.recipe.docker.is_some() && !roots.allow_privileged_daemon {
+                return Err(QueryError::new(
+                    ErrorCode::RecipeInvalid,
+                    anyhow::anyhow!(crate::engine::PRIVILEGED_DAEMON_REFUSAL),
+                ));
+            }
+            recipe
+                .validate_selection(&args.profiles, &args.scenarios)
+                .map_err(|e| QueryError::new(ErrorCode::RecipeInvalid, e))?
+        }
         SelectedRecipe::Native(recipe) => {
             if !args.profiles.is_empty() || args.pull || roots.native_target.is_none() {
                 return Err(super::roots::error(ErrorCode::InvalidArguments));

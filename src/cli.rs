@@ -40,6 +40,9 @@ pub enum Action {
         native_target: Option<PathBuf>,
         #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u64).range(1..=86400))]
         max_run_seconds: u64,
+        /// Let run_start start a recipe whose [docker] block runs a privileged daemon, which gives the guest root-equivalent access to this host.
+        #[arg(long)]
+        allow_privileged_daemon: bool,
     },
     Init,
     Validate {
@@ -140,10 +143,12 @@ fn execute_inner(
             output_root,
             native_target,
             max_run_seconds,
+            allow_privileged_daemon,
         }) => Ok(serve(
             &project_root,
             &output_root,
             max_run_seconds,
+            allow_privileged_daemon,
             native_target.as_deref(),
             loader,
         )),
@@ -675,6 +680,7 @@ fn serve(
     project_root: &Path,
     output_root: &Path,
     max_run_seconds: u64,
+    allow_privileged_daemon: bool,
     native_target: Option<&Path>,
     loader: &dyn crate::target_authority::TargetAuthorityLoader,
 ) -> i32 {
@@ -698,6 +704,7 @@ fn serve(
         return 2;
     };
     let roots = Roots::open(project_root, output_root).and_then(|mut roots| {
+        roots.allow_privileged_daemon = allow_privileged_daemon;
         roots.native_target = native_target
             .map(|path| crate::target_authority::load(path, loader))
             .transpose()

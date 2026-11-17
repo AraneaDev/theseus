@@ -141,10 +141,13 @@ impl<T: Transport> ServerRuntime<T> {
                 return;
             };
             let token = run.token.clone();
+            let mut options = run.options;
+            // The engine's preflight repeats run_start's check.
+            options.allow_privileged_daemon = roots.allow_privileged_daemon;
             match EngineWorker::spawn(
                 run.handle.clone(),
                 run.recipe,
-                run.options,
+                options,
                 run.token,
                 roots.output.clone(),
             ) {
