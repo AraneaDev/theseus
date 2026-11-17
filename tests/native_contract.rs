@@ -222,6 +222,7 @@ fn strict_native_recipe_requires_reader_and_data_checks_and_current_role_selecti
         output_root: "unused".into(),
         pull: false,
         log_limit: 1,
+        allow_privileged_daemon: false,
     });
     assert!(compile(&native, &docker).is_err());
     for mutation in ["checks", "scenario", "shell", "limit"] {
@@ -470,6 +471,7 @@ fn selected_native_missing_authority_and_backend_mismatch_have_no_store_effect()
         output_root: output.clone(),
         pull: false,
         log_limit: 1,
+        allow_privileged_daemon: false,
     });
     assert!(
         run_selected(
