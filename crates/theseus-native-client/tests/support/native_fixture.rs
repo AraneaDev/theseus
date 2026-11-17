@@ -164,10 +164,9 @@ impl Fixture {
             .expect("whole postjoin ledger and binding validation")
     }
     pub fn checked_records(&self) -> Result<Vec<ledger::Entry>, ledger::LedgerError> {
-        let bytes = bounded_file(
-            &self.root.path().join("ledger/ledger.bin"),
-            ledger::MAX_LEDGER_BYTES as u64,
-        );
+        let path = self.root.path().join("ledger/ledger.bin");
+        assert_no_live_helper(&path);
+        let bytes = bounded_file(&path, ledger::MAX_LEDGER_BYTES as u64);
         let mut decoder = ledger::Decoder::new();
         let mut offset = 0;
         let mut records = vec![];
@@ -276,6 +275,22 @@ fn try_bounded_file(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
         .read_to_end(&mut data)?;
     assert!(data.len() <= limit as usize, "bounded artifact exceeded");
     Ok(data)
+}
+/// A live helper holds the ledger's exclusive lock, and Windows refuses other
+/// processes' reads under it (ERROR_LOCK_VIOLATION). Refuse such a read on
+/// every host, so a test that reads before settling fails everywhere.
+fn assert_no_live_helper(ledger: &Path) {
+    const LIVE: &str = "ledger read while a live helper holds its lock; settle the client first";
+    let file = match std::fs::File::open(ledger) {
+        Ok(file) => file,
+        Err(error) if transiently_locked(&error) => panic!("{LIVE}"),
+        Err(error) => panic!("open ledger: {error}"),
+    };
+    match file.try_lock_shared() {
+        Ok(()) => (),
+        Err(std::fs::TryLockError::WouldBlock) => panic!("{LIVE}"),
+        Err(std::fs::TryLockError::Error(error)) => panic!("probe ledger lock: {error}"),
+    }
 }
 /// Windows reports a writer's byte-range lock or sharing mode on the file
 /// being rewritten as ERROR_LOCK_VIOLATION (33) or ERROR_SHARING_VIOLATION

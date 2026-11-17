@@ -812,6 +812,7 @@ class ValidationTests(unittest.TestCase):
                   'native_client_reconnect_ids_and_partial_failure_owners_are_safe',
                   'native_client_transport_join_does_not_claim_remote_cleanup',
                   'native_client_file_roundtrip_empty_bounded_ranges_and_run',
+                  'native_client_ledger_read_refuses_a_live_helpers_lock',
                   'native_client_file_connection_loss_queries_original_without_second_create']
         for system in ('Linux', 'Darwin', 'Windows'):
             with self.subTest(system=system), tempfile.TemporaryDirectory() as temp:
