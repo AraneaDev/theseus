@@ -572,6 +572,24 @@ fn native_client_file_roundtrip_empty_bounded_ranges_and_run() {
 }
 
 #[test]
+fn native_client_ledger_read_refuses_a_live_helpers_lock() {
+    // Windows enforces the helper's ledger lock against other processes'
+    // reads; the fixture refuses such a read on every host, so a test that
+    // forgets to settle first fails everywhere, not only on Windows.
+    let fixture = Fixture::new("success");
+    let mut client = fixture.start(None);
+    client.acquire(&fixture);
+    let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fixture.records()));
+    client.settle();
+    let message = read
+        .err()
+        .and_then(|payload| payload.downcast::<String>().ok())
+        .expect("a ledger read while the helper is live must fail");
+    assert!(message.contains("settle the client first"), "{message}");
+    assert!(!fixture.records().is_empty(), "settled ledger is readable");
+}
+
+#[test]
 fn native_client_file_connection_loss_queries_original_without_second_create() {
     let fixture = Fixture::new("success");
     let mut client = fixture.start(None);
@@ -639,6 +657,8 @@ fn native_client_file_connection_loss_queries_original_without_second_create() {
         ..
     } = &reply
     {
+        // The reconnected helper holds the ledger lock until it is settled.
+        client.settle();
         assert!(fixture.records().iter().any(|e| matches!(
             e,
             ledger::Entry::OperationFinished { operation: op, outcome: found, .. }
