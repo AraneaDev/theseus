@@ -143,10 +143,19 @@ fn parse(head: &str, docker: &str) -> Result<(tempfile::TempDir, ValidatedRecipe
 }
 const SCHEMA_10: &str = "schema_version=10\nscenarios=['clean','upgrade']";
 
-fn run(docker: &str, mut boundary: Boundary) -> (Boundary, engine::RunResult, RunJournal) {
-    let (temp, recipe) = parse(SCHEMA_10, docker).unwrap();
+fn run(docker: &str, boundary: Boundary) -> (Boundary, engine::RunResult, RunJournal) {
+    run_as(SCHEMA_10, docker, true, boundary)
+}
+fn run_as(
+    head: &str,
+    docker: &str,
+    allow_privileged_daemon: bool,
+    mut boundary: Boundary,
+) -> (Boundary, engine::RunResult, RunJournal) {
+    let (temp, recipe) = parse(head, docker).unwrap();
     let options = RunOptions {
         output_root: temp.path().join("runs"),
+        allow_privileged_daemon,
         ..RunOptions::all(&recipe)
     };
     let result = engine::run_with(
@@ -195,6 +204,54 @@ fn the_daemon_is_journaled_before_its_guest_and_removed_after_it() {
                 .starts_with("guest-")
         );
     }
+}
+
+#[test]
+fn engine_refuses_docker_recipe_without_opt_in() {
+    let (temp, recipe) = parse(SCHEMA_10, DOCKER).unwrap();
+    let options = RunOptions {
+        output_root: temp.path().join("runs"),
+        ..RunOptions::all(&recipe)
+    };
+    let mut boundary = Boundary::default();
+    let error = engine::run_with(
+        &recipe,
+        options,
+        CancellationToken::default(),
+        &mut boundary,
+        |_| {},
+    )
+    .err()
+    .expect("refused");
+    assert!(
+        format!("{error:#}").contains(engine::PRIVILEGED_DAEMON_REFUSAL),
+        "{error:#}"
+    );
+    // Refused before the run directory or any container exists.
+    assert!(boundary.events.is_empty(), "{:?}", boundary.events);
+    assert!(!temp.path().join("runs").exists());
+}
+
+#[test]
+fn the_default_options_do_not_opt_in() {
+    let (_, recipe) = parse(SCHEMA_10, DOCKER).unwrap();
+    assert!(!RunOptions::all(&recipe).allow_privileged_daemon);
+}
+
+#[test]
+fn recipe_without_docker_needs_no_opt_in() {
+    let (boundary, result, _) = run_as(
+        "schema_version=9\nscenarios=['clean']",
+        "",
+        false,
+        Boundary::default(),
+    );
+    assert_eq!(result.report.outcome, RunOutcome::Passed);
+    assert!(result.report.errors.is_empty());
+    assert_eq!(
+        boundary.events,
+        ["create guest user-clean", "remove guest user-clean"]
+    );
 }
 
 #[test]
@@ -335,6 +392,7 @@ fn real_private_daemon_runs_containers_for_the_guest_and_leaves_nothing() {
     let temp = tempfile::tempdir().unwrap();
     let options = RunOptions {
         output_root: temp.path().join("runs"),
+        allow_privileged_daemon: true,
         ..RunOptions::all(&recipe)
     };
     let result = engine::run(&recipe, options, CancellationToken::default(), |_| {}).unwrap();
@@ -371,4 +429,71 @@ fn real_private_daemon_runs_containers_for_the_guest_and_leaves_nothing() {
         .unwrap();
     assert!(left.status.success());
     assert_eq!(String::from_utf8_lossy(&left.stdout).trim(), "");
+}
+
+#[test]
+fn the_preview_warns_that_the_daemon_is_root_equivalent() {
+    let (_temp, recipe) = parse(SCHEMA_10, DOCKER).unwrap();
+    let options = RunOptions::all(&recipe);
+    let text = theseus::tui::App::preview(recipe, options).preview_text();
+    assert!(
+        text.contains("root-equivalent access to this host"),
+        "{text}"
+    );
+    assert!(text.contains("--allow-privileged-daemon"), "{text}");
+}
+
+fn theseus(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_theseus"))
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+// Break caught: the CLI creating a run directory, journal and report for a
+// recipe it is about to refuse.
+#[test]
+fn run_without_opt_in_is_refused_before_anything_is_created() {
+    let (temp, _) = parse(SCHEMA_10, DOCKER).unwrap();
+    let out = theseus(
+        temp.path(),
+        &["run", "--headless", "--recipe", "theseus.toml"],
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(engine::PRIVILEGED_DAEMON_REFUSAL),
+        "{stderr}"
+    );
+    assert!(!temp.path().join(".theseus-runs").exists());
+}
+
+// Break caught: a mixed suite running its plain variant, containers and all,
+// before refusing the one with [docker].
+#[test]
+fn compare_without_opt_in_refuses_a_docker_variant_before_any_variant_runs() {
+    let (temp, _) = parse(SCHEMA_10, DOCKER).unwrap();
+    std::fs::write(
+        temp.path().join("plain.toml"),
+        source("schema_version=9\nscenarios=['clean']", ""),
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("comparison.toml"),
+        "schema_version=1\nname='mixed'\nbaseline='plain'\nprofiles=['user']\nscenarios=['clean']\nstages=['configured']\n[[variants]]\nid='plain'\nrecipe='plain.toml'\n[[variants]]\nid='daemon'\nrecipe='theseus.toml'\n[[scopes]]\nid='home'\nprofile='user'\npath='/home/theseus'\n",
+    )
+    .unwrap();
+    let out = theseus(
+        temp.path(),
+        &["compare", "--headless", "--suite", "comparison.toml"],
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(engine::PRIVILEGED_DAEMON_REFUSAL),
+        "{stderr}"
+    );
+    assert!(stderr.contains("daemon"), "{stderr}");
+    assert!(!temp.path().join(".theseus-comparisons").exists());
 }

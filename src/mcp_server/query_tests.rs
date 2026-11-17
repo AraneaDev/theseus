@@ -716,3 +716,59 @@ fn capture_display_panic_is_fatal_and_retains_original_native_and_panic_owners()
         "a capture-time diagnostic panic must stop the query worker and mark its completion fatal"
     );
 }
+
+/// A schema 10 recipe with a `[docker]` block, under a server that did or did
+/// not opt in to the privileged daemon.
+fn docker_fixture(allow_privileged_daemon: bool) -> (tempfile::TempDir, Roots, String) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    std::fs::create_dir(root.join("target")).unwrap();
+    let recipe = include_str!("../../tests/fixtures/recipes/v2_clean.toml")
+        .replace("schema_version = 2", "schema_version = 10")
+        .replace(
+            "[artifacts]",
+            "[docker]\nimage = \"docker:28-dind\"\n\n[artifacts]",
+        );
+    std::fs::write(root.join("recipe.toml"), recipe).unwrap();
+    let mut roots = Roots::open(&root, &root.join("output")).unwrap();
+    roots.allow_privileged_daemon = allow_privileged_daemon;
+    let digest = match super::super::roots::read_selected_recipe(&roots, "recipe.toml").unwrap() {
+        crate::engine::domain::SelectedRecipe::Docker(recipe) => recipe.digest,
+        _ => panic!("not a Docker recipe"),
+    };
+    (temp, roots, digest)
+}
+// Break caught: run_start of a [docker] recipe on a server without the opt-in.
+#[test]
+fn run_start_refuses_docker_recipe_without_opt_in() {
+    let (_temp, roots, digest) = docker_fixture(false);
+    let error = validate_selected_start(&roots, &start(&digest)).unwrap_err();
+    assert_eq!(error.code, ErrorCode::RecipeInvalid);
+    assert!(
+        format!("{:#}", error.source).contains(crate::engine::PRIVILEGED_DAEMON_REFUSAL),
+        "{:#}",
+        error.source
+    );
+}
+#[test]
+fn run_start_accepts_docker_recipe_with_opt_in() {
+    let (_temp, roots, digest) = docker_fixture(true);
+    assert!(validate_selected_start(&roots, &start(&digest)).is_ok());
+}
+#[test]
+fn roots_do_not_opt_in_by_default() {
+    let (_temp, roots) = fixture();
+    assert!(!roots.allow_privileged_daemon);
+}
+#[test]
+fn recipe_inspect_of_docker_recipe_needs_no_opt_in() {
+    let (_temp, roots, _) = docker_fixture(false);
+    let args = InspectArgs {
+        recipe_path: "recipe.toml".into(),
+        recipe_digest: None,
+        selector: InspectSelector::Overview,
+        limit: None,
+        cursor: None,
+    };
+    assert!(super::super::inspection::inspect(&roots, &args, 30, &reply()).is_ok());
+}

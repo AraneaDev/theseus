@@ -350,6 +350,8 @@ pub(super) fn build(app: &App) -> Doc {
         doc.dim(
             "  a privileged sidecar the scenario owns; the guest never reaches the host's daemon\n",
         );
+        doc.dim("  the guest controls it, so it has root-equivalent access to this host;\n")
+            .dim("  it runs only under --allow-privileged-daemon\n");
         for (label, value) in [
             ("image", docker.image.clone()),
             ("DOCKER_HOST", crate::recipe::GUEST_DOCKER_HOST.to_string()),

@@ -10,6 +10,8 @@ use theseus_host::fs::{HostDir, RelativePath, RootPolicy, fingerprint};
 
 pub(crate) struct Roots {
     pub native_target: Option<Arc<crate::native::launch::LaunchAuthority>>,
+    /// The server was started with --allow-privileged-daemon.
+    pub allow_privileged_daemon: bool,
     pub project: Arc<HostDir>,
     pub output: Arc<ReportStore>,
     pub project_path: PathBuf,
@@ -69,6 +71,7 @@ impl Roots {
         );
         Ok(Self {
             native_target: None,
+            allow_privileged_daemon: false,
             project,
             output,
             project_path: canonical,

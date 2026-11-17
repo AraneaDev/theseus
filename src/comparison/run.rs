@@ -15,6 +15,8 @@ use std::{
 pub struct SuiteRunOptions {
     pub output_root: PathBuf,
     pub pull: bool,
+    /// Passed to every variant run; see `RunOptions::allow_privileged_daemon`.
+    pub allow_privileged_daemon: bool,
 }
 #[derive(Debug, Clone)]
 pub struct ComparisonEvent {
@@ -55,6 +57,13 @@ pub fn run_with(
         variant
             .recipe
             .validate_selection(&suite.manifest.profiles, &suite.manifest.scenarios)?;
+        // Refuse the whole suite before any variant runs.
+        ensure!(
+            variant.recipe.recipe.docker.is_none() || options.allow_privileged_daemon,
+            "variant {}: {}",
+            variant.id,
+            engine::PRIVILEGED_DAEMON_REFUSAL
+        );
     }
     let id = format!(
         "{}-{}",
@@ -113,6 +122,7 @@ pub fn run_with(
                 output_root: variant_store.root().to_path_buf(),
                 pull: options.pull,
                 log_limit: crate::recipe::DEFAULT_LOG_LIMIT,
+                allow_privileged_daemon: options.allow_privileged_daemon,
             },
             cancel.clone(),
             &mut tracked,

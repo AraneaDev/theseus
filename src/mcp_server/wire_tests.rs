@@ -612,3 +612,19 @@ fn first_frame_modern_initialize_is_unknown_method_with_exact_id() {
     }
     assert_eq!(state.selected, Some(Era::Modern));
 }
+
+// Break caught: recipe_inspect declaring fewer recipe schemas than the loader
+// accepts, so an overview of a schema 9 or 10 recipe broke its own schema.
+#[test]
+fn overview_declares_every_recipe_schema_the_loader_accepts() {
+    let list = super::super::schema::schemas();
+    let inspect = list["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "recipe_inspect")
+        .unwrap();
+    let version = &inspect["outputSchema"]["$defs"]["OverviewData"]["properties"]["schema_version"];
+    assert_eq!(version["minimum"], 1);
+    assert_eq!(version["maximum"], 10);
+}

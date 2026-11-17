@@ -18,8 +18,10 @@ observation roots. Inputs resolve inside the recipe project, are materialized
 and hashed, then copied into `/inputs/base` and `/inputs/target`. There are no
 writable host source mounts, host home/socket mounts, host namespaces,
 privileged mode, or forwarded ports. The one exception is declared: a schema 10
-`[docker]` block adds a privileged sidecar that runs a private Docker daemon;
-the guest itself stays unprivileged and still never reaches the host's daemon.
+`[docker]` block adds a privileged sidecar that runs a private Docker daemon.
+The guest never reaches the host's daemon, but it controls a privileged one,
+so it has root-equivalent access to the host: Theseus runs such a recipe only
+under `--allow-privileged-daemon`.
 
 ## Schema versions and scenario selection
 
@@ -179,9 +181,16 @@ shared paths like any other.
 
 The daemon container runs **privileged**, as a nested daemon has to. That is
 the one privileged container Theseus creates; the guest is created exactly as
-without `[docker]`. A recipe is maintainer-controlled input, and a privileged
-sidecar widens what a hostile recipe could do to the host, so declare it only
-for tools you would run on the host anyway. The image must start `dockerd` the
+without `[docker]`. But the guest holds the daemon's API, and through it can
+start privileged containers of its own and reach the host's devices: a recipe
+with `[docker]` has **root-equivalent access to the host**. So `theseus run`,
+`theseus compare` and `theseus serve` refuse it unless they are given
+`--allow-privileged-daemon`; the refusal comes before a run directory, journal
+or container is created, and a comparison suite with such a variant is
+refused before any of its variants runs.
+`--preview`, `recipe_inspect` and `theseus cleanup` never need the flag. Pass
+it only for recipes you would run as root on this host, such as on a
+disposable CI runner. The image must start `dockerd` the
 way the official `docker:dind` images do; a daemon that does not answer within
 90 seconds fails the scenario. Schemas 1 through 9 reject `[docker]`, a
 `plugin_lifecycle` recipe cannot declare it, and an MCP lifecycle contract

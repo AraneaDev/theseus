@@ -1,8 +1,10 @@
-# Run: theseus run --headless --pull --recipe examples/docker-sidecar/theseus.toml
+# Run: theseus run --headless --pull --allow-privileged-daemon --recipe examples/docker-sidecar/theseus.toml
 #
 # A tool that starts containers, rehearsed with a private Docker daemon. The
 # guest never reaches the host's daemon: the daemon runs in a sidecar that the
-# scenario owns, and what a step starts is removed with it.
+# scenario owns, and what a step starts is removed with it. The guest controls
+# a privileged daemon, so it has root-equivalent access to the host: Theseus
+# runs this recipe only under --allow-privileged-daemon.
 schema_version = 10
 scenarios = ["clean"]
 name = "sample-runner with a private Docker daemon"

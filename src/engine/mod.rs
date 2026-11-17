@@ -64,7 +64,12 @@ pub struct RunOptions {
     pub output_root: PathBuf,
     pub pull: bool,
     pub log_limit: u64,
+    /// Let a recipe's `[docker]` block start its privileged daemon. The guest
+    /// controls that daemon, so this grants it root-equivalent host access.
+    pub allow_privileged_daemon: bool,
 }
+/// Why a recipe with a `[docker]` block was not run.
+pub const PRIVILEGED_DAEMON_REFUSAL: &str = "recipe declares [docker], whose privileged daemon gives the guest root-equivalent access to this host; pass --allow-privileged-daemon to run it";
 impl RunOptions {
     pub fn all(recipe: &ValidatedRecipe) -> Self {
         Self {
@@ -73,6 +78,7 @@ impl RunOptions {
             output_root: recipe.project_root.join(".theseus-runs"),
             pull: false,
             log_limit: crate::recipe::DEFAULT_LOG_LIMIT,
+            allow_privileged_daemon: false,
         }
     }
 }
@@ -123,6 +129,11 @@ pub(crate) fn run_with_parent(
     parent: Option<&report::ReportStore>,
     mut emit: impl FnMut(EngineEvent),
 ) -> Result<RunResult> {
+    // Before the run directory, the journal or any container exists.
+    ensure!(
+        recipe.recipe.docker.is_none() || options.allow_privileged_daemon,
+        PRIVILEGED_DAEMON_REFUSAL
+    );
     recipe.validate_selection(&options.profiles, &options.scenarios)?;
     ensure!(
         options

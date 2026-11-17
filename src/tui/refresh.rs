@@ -348,6 +348,7 @@ mod tests {
                 crate::comparison::SuiteRunOptions {
                     output_root: temp.path().join("output"),
                     pull: false,
+                    allow_privileged_daemon: false,
                 },
             ),
         ] {

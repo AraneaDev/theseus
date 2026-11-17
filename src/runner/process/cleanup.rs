@@ -607,6 +607,7 @@ pub(crate) mod native_tests {
             crate::comparison::SuiteRunOptions {
                 output_root: temp.path().join("runs"),
                 pull: false,
+                allow_privileged_daemon: false,
             },
             CancellationToken::default(),
             &mut environment,

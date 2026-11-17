@@ -30,6 +30,7 @@ fn suite_start_is_consumed_once_and_original_preview_matrix_is_unchanged() {
         SuiteRunOptions {
             output_root: t.path().join("output"),
             pull: true,
+            allow_privileged_daemon: false,
         },
     );
     for k in ['p', 's', 'r', 'r'] {
@@ -212,6 +213,7 @@ fn suite_save_copy_adopts_manifest_and_paste_outside_editor_is_inert() {
         SuiteRunOptions {
             output_root: t.path().join("out"),
             pull: true,
+            allow_privileged_daemon: false,
         },
     );
     preview_edit::paste(&mut app, "rq\n");
@@ -385,6 +387,7 @@ fn suite_without_first_saved_report_cannot_launch_a_second_engine() {
         SuiteRunOptions {
             output_root: t.path().join("output"),
             pull: false,
+            allow_privileged_daemon: false,
         },
     );
     app.start_requested = true;
@@ -517,6 +520,7 @@ fn suite_startup_paste_cannot_start_and_live_event_retains_validated_recovery_co
         SuiteRunOptions {
             output_root: t.path().join("output"),
             pull: false,
+            allow_privileged_daemon: false,
         },
     );
     let mut presentation = Presentation::new(true, Duration::ZERO);
@@ -572,6 +576,7 @@ fn preview_states_planned_cells_from_the_manifest_alone() {
         SuiteRunOptions {
             output_root: t.path().join("out"),
             pull: false,
+            allow_privileged_daemon: false,
         },
     );
     let text = screen(&app);

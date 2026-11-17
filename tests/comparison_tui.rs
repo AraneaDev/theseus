@@ -86,6 +86,7 @@ fn preview_shows_explicit_manifest_and_quit_does_not_run_or_edit_it() {
         SuiteRunOptions {
             output_root: t.path().join("output"),
             pull: true,
+            allow_privileged_daemon: false,
         },
     );
     let text = screen(&app, 140, 42);
