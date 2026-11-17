@@ -419,3 +419,15 @@ fn real_private_daemon_runs_containers_for_the_guest_and_leaves_nothing() {
     assert!(left.status.success());
     assert_eq!(String::from_utf8_lossy(&left.stdout).trim(), "");
 }
+
+#[test]
+fn the_preview_warns_that_the_daemon_is_root_equivalent() {
+    let (_temp, recipe) = parse(SCHEMA_10, DOCKER).unwrap();
+    let options = RunOptions::all(&recipe);
+    let text = theseus::tui::App::preview(recipe, options).preview_text();
+    assert!(
+        text.contains("root-equivalent access to this host"),
+        "{text}"
+    );
+    assert!(text.contains("--allow-privileged-daemon"), "{text}");
+}
