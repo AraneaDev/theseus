@@ -30,6 +30,8 @@ struct Fake {
     execute_error: bool,
     require_reference: Option<std::path::PathBuf>,
     swap: Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)>,
+    /// The io.theseus.role label of each resource removed, None for a guest.
+    removed_roles: Vec<Option<String>>,
 }
 impl Environment for Fake {
     fn prepare(
@@ -154,8 +156,10 @@ impl Environment for Fake {
     fn stop(&mut self, _: &OwnedResource) -> Result<()> {
         Ok(())
     }
-    fn remove(&mut self, _: &OwnedResource) -> Result<()> {
+    fn remove(&mut self, resource: &OwnedResource) -> Result<()> {
         self.removes += 1;
+        self.removed_roles
+            .push(resource.labels.get("io.theseus.role").cloned());
         if self.cleanup_failure {
             anyhow::bail!("cleanup transport failed");
         }
@@ -605,6 +609,45 @@ fn unfinished_cleanup_uses_pinned_journals_and_validates_all_ownership_before_re
             .resources[0]
             .removed
     );
+}
+
+#[test]
+fn cleanup_removes_a_journaled_private_daemon_without_the_opt_in() {
+    // Cleanup takes no run options, so a suite left unfinished by a run that
+    // opted in is cleaned up by one that cannot.
+    let (_t, suite, options) = fixture();
+    assert!(!options.allow_privileged_daemon);
+    let r = comparison::run_with(
+        &suite,
+        options,
+        CancellationToken::default(),
+        &mut Fake::default(),
+        |_| {},
+    )
+    .unwrap();
+    let mut artifact: serde_json::Value =
+        serde_json::from_slice(&fs::read(&r.report_path).unwrap()).unwrap();
+    artifact["finished"] = false.into();
+    let root = r.report_path.parent().unwrap();
+    let source = root.join(artifact["sources"][0]["path"].as_str().unwrap());
+    let mut journal = theseus::report::load_journal(&source).unwrap();
+    let mut daemon = journal.resources[0].clone();
+    daemon.container_id = "d".repeat(64);
+    daemon
+        .labels
+        .insert("io.theseus.role".into(), "docker-daemon".into());
+    daemon.removed = false;
+    journal.resources.push(daemon);
+    theseus::report::open_existing(&source)
+        .unwrap()
+        .save_journal(&journal)
+        .unwrap();
+    fs::write(&r.report_path, serde_json::to_vec(&artifact).unwrap()).unwrap();
+    let mut cleaner = Fake::default();
+    comparison::cleanup_with(root, &mut cleaner).unwrap();
+    assert_eq!(cleaner.removed_roles, [Some("docker-daemon".to_owned())]);
+    let journal = theseus::report::load_journal(&source).unwrap();
+    assert!(journal.resources.last().unwrap().removed);
 }
 
 // This executable replaces only the Docker CLI transport. Preparation, artifact
