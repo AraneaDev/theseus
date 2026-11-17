@@ -272,15 +272,25 @@ impl Session {
             trace("reserved-exit-observed");
             self.finish(false)?;
         }
-        let modes = self.native.modes()?;
-        let mut capture = self.capture.lock().unwrap();
-        if let Some(error) = &capture.error {
-            return Err(io::Error::other(error.clone()));
-        }
-        let bytes = std::mem::take(&mut capture.bytes);
+        let capture = &self.capture;
+        let native = &self.native;
+        let ((bytes, eof, total), modes) = observe(
+            || {
+                let mut capture = capture.lock().unwrap();
+                if let Some(error) = &capture.error {
+                    return Err(io::Error::other(error.clone()));
+                }
+                Ok((
+                    std::mem::take(&mut capture.bytes),
+                    capture.eof,
+                    capture.total,
+                ))
+            },
+            || native.modes(),
+        )?;
         trace("first-poll-complete");
         Ok(
-            serde_json::json!({"bytes":bytes,"status":self.status,"modes":modes,"eof":capture.eof,"total":capture.total}),
+            serde_json::json!({"bytes":bytes,"status":self.status,"modes":modes,"eof":eof,"total":total}),
         )
     }
     pub fn finish(&mut self, terminate: bool) -> io::Result<()> {
@@ -346,4 +356,68 @@ pub fn run_legacy_client(
     arguments: &[std::ffi::OsString],
 ) -> Result<i32, Box<dyn std::error::Error>> {
     platform::run_legacy_client(arguments)
+}
+
+/// One poll's output and console modes: the output first, then the modes, so
+/// the modes a poll reports are never older than the output it returns.
+///
+/// Sampled the other way round, a client that switches modes and then draws
+/// between the two halves gets its drawing reported with the modes from
+/// before the switch. On Windows the sample is a round trip to the telemetry
+/// process, so that window is wide enough to hit.
+fn observe<B, M>(
+    take_output: impl FnOnce() -> io::Result<B>,
+    sample_modes: impl FnOnce() -> io::Result<M>,
+) -> io::Result<(B, M)> {
+    let output = take_output()?;
+    let modes = sample_modes()?;
+    Ok((output, modes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::observe;
+    use std::cell::RefCell;
+
+    /// The client switches to raw mode before it draws anything. A response
+    /// that carries the drawing must therefore report raw mode, wherever the
+    /// switch falls between the two halves of a poll.
+    #[test]
+    fn a_poll_never_reports_output_with_older_modes() {
+        #[derive(Default)]
+        struct Client {
+            raw: bool,
+            drawn: Vec<u8>,
+        }
+        let client = RefCell::new(Client::default());
+        // The client switches and draws right after the first half runs.
+        let act = || {
+            let mut client = client.borrow_mut();
+            client.raw = true;
+            client.drawn.extend_from_slice(b"Preview");
+        };
+        let first = RefCell::new(true);
+        let after = |step: &dyn Fn()| {
+            if first.replace(false) {
+                step();
+            }
+        };
+        let (output, raw) = observe(
+            || {
+                let output = std::mem::take(&mut client.borrow_mut().drawn);
+                after(&act);
+                Ok(output)
+            },
+            || {
+                let raw = client.borrow().raw;
+                after(&act);
+                Ok(raw)
+            },
+        )
+        .unwrap();
+        assert!(
+            output.is_empty() || raw,
+            "output {output:?} reported with raw={raw}"
+        );
+    }
 }
