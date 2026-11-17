@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1](https://github.com/AraneaDev/theseus/compare/v1.0.0...v1.0.1) (2026-11-17)
+
+
+### Bug Fixes
+
+* **host:** sample terminal modes after taking a poll's output ([#36](https://github.com/AraneaDev/theseus/issues/36)) ([23e3a91](https://github.com/AraneaDev/theseus/commit/23e3a91804e7c62f070b4f7ec5d69a49b419d374))
+
 ## [1.0.0](https://github.com/AraneaDev/theseus/compare/v0.1.0...v1.0.0) (2026-11-17)
 
 
