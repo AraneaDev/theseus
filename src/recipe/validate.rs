@@ -358,10 +358,13 @@ fn validate_schema_scenarios(recipe: &Recipe) -> Result<(bool, bool, bool, bool)
             recipe.scenarios.is_none(),
             "scenarios requires recipe schema version 2"
         ),
-        2..=10 => {
-            let scenarios = recipe.scenarios.as_ref().context(
-                "recipe schema version 2/3/4/5/6/7/8/9/10 requires an explicit scenarios list",
-            )?;
+        2..=super::MAX_SCHEMA_VERSION => {
+            let scenarios = recipe.scenarios.as_ref().with_context(|| {
+                format!(
+                    "recipe schema version {} requires an explicit scenarios list",
+                    recipe.schema_version
+                )
+            })?;
             ensure!(!scenarios.is_empty(), "declare at least one scenario");
             let mut seen = BTreeSet::new();
             for scenario in scenarios {
