@@ -185,7 +185,9 @@ without `[docker]`. But the guest holds the daemon's API, and through it can
 start privileged containers of its own and reach the host's devices: a recipe
 with `[docker]` has **root-equivalent access to the host**. So `theseus run`,
 `theseus compare` and `theseus serve` refuse it unless they are given
-`--allow-privileged-daemon`; the refusal comes before anything is created.
+`--allow-privileged-daemon`; the refusal comes before a run directory, journal
+or container is created, and a comparison suite with such a variant is
+refused before any of its variants runs.
 `--preview`, `recipe_inspect` and `theseus cleanup` never need the flag. Pass
 it only for recipes you would run as root on this host, such as on a
 disposable CI runner. The image must start `dockerd` the

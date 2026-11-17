@@ -198,17 +198,26 @@ fn comparison_refuses_docker_variant_without_opt_in() {
         );
     fs::write(t.path().join("recipe.toml"), recipe).unwrap();
     let suite = comparison::load(&t.path().join("comparison.toml")).unwrap();
+    let output_root = options.output_root.clone();
     let mut fake = Fake::default();
-    let result = comparison::run_with(
+    let error = comparison::run_with(
         &suite,
         options,
         CancellationToken::default(),
         &mut fake,
         |_| {},
     )
-    .unwrap();
-    assert_ne!(result.report.outcome, RunOutcome::Passed);
-    assert_eq!(fake.creates, 0);
+    .err()
+    .expect("refused");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains(theseus::engine::PRIVILEGED_DAEMON_REFUSAL),
+        "{message}"
+    );
+    assert!(message.contains("variant copy"), "{message}");
+    // No variant ran, and the suite left no evidence directory.
+    assert_eq!((fake.prepares, fake.creates), (0, 0));
+    assert!(!output_root.exists());
 }
 #[test]
 fn shared_engine_runs_fresh_sources_and_persists_private_portable_evidence() {

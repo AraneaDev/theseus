@@ -129,6 +129,11 @@ pub(crate) fn run_with_parent(
     parent: Option<&report::ReportStore>,
     mut emit: impl FnMut(EngineEvent),
 ) -> Result<RunResult> {
+    // Before the run directory, the journal or any container exists.
+    ensure!(
+        recipe.recipe.docker.is_none() || options.allow_privileged_daemon,
+        PRIVILEGED_DAEMON_REFUSAL
+    );
     recipe.validate_selection(&options.profiles, &options.scenarios)?;
     ensure!(
         options
@@ -376,10 +381,6 @@ pub(crate) fn run_with_parent(
     }
 }
 fn preflight_env(recipe: &ValidatedRecipe, options: &RunOptions) -> Result<()> {
-    ensure!(
-        recipe.recipe.docker.is_none() || options.allow_privileged_daemon,
-        PRIVILEGED_DAEMON_REFUSAL
-    );
     for name in &options.profiles {
         let profile = &recipe.recipe.profiles[name];
         if let Some(p) = &profile.mcp {

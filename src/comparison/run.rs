@@ -57,6 +57,13 @@ pub fn run_with(
         variant
             .recipe
             .validate_selection(&suite.manifest.profiles, &suite.manifest.scenarios)?;
+        // Refuse the whole suite before any variant runs.
+        ensure!(
+            variant.recipe.recipe.docker.is_none() || options.allow_privileged_daemon,
+            "variant {}: {}",
+            variant.id,
+            engine::PRIVILEGED_DAEMON_REFUSAL
+        );
     }
     let id = format!(
         "{}-{}",

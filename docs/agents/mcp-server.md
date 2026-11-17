@@ -42,7 +42,9 @@ host. The server refuses to start one unless it was launched with
 `--allow-privileged-daemon`: `run_start` returns `recipe_invalid` before any
 container exists, so an agent cannot get a privileged daemon by writing a
 recipe. `recipe_inspect` reads such recipes either way. Leave the flag off
-unless every recipe under the project root is one you would run as root. Startup may create the output root. Inspection, discovery, listing,
+unless every recipe under the project root is one you would run as root.
+
+Startup may create the output root. Inspection, discovery, listing,
 status and evidence reads never prepare Docker, pull an image or execute a
 recipe.
 

@@ -208,17 +208,28 @@ fn the_daemon_is_journaled_before_its_guest_and_removed_after_it() {
 
 #[test]
 fn engine_refuses_docker_recipe_without_opt_in() {
-    let (boundary, result, journal) = run_as(SCHEMA_10, DOCKER, false, Boundary::default());
-    assert_ne!(result.report.outcome, RunOutcome::Passed);
-    assert_eq!(result.report.errors.len(), 1, "{:?}", result.report.errors);
+    let (temp, recipe) = parse(SCHEMA_10, DOCKER).unwrap();
+    let options = RunOptions {
+        output_root: temp.path().join("runs"),
+        ..RunOptions::all(&recipe)
+    };
+    let mut boundary = Boundary::default();
+    let error = engine::run_with(
+        &recipe,
+        options,
+        CancellationToken::default(),
+        &mut boundary,
+        |_| {},
+    )
+    .err()
+    .expect("refused");
     assert!(
-        result.report.errors[0].contains(engine::PRIVILEGED_DAEMON_REFUSAL),
-        "{}",
-        result.report.errors[0]
+        format!("{error:#}").contains(engine::PRIVILEGED_DAEMON_REFUSAL),
+        "{error:#}"
     );
-    // Refused before anything was created.
+    // Refused before the run directory or any container exists.
     assert!(boundary.events.is_empty(), "{:?}", boundary.events);
-    assert!(journal.resources.is_empty());
+    assert!(!temp.path().join("runs").exists());
 }
 
 #[test]
@@ -430,4 +441,59 @@ fn the_preview_warns_that_the_daemon_is_root_equivalent() {
         "{text}"
     );
     assert!(text.contains("--allow-privileged-daemon"), "{text}");
+}
+
+fn theseus(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_theseus"))
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+// Break caught: the CLI creating a run directory, journal and report for a
+// recipe it is about to refuse.
+#[test]
+fn run_without_opt_in_is_refused_before_anything_is_created() {
+    let (temp, _) = parse(SCHEMA_10, DOCKER).unwrap();
+    let out = theseus(
+        temp.path(),
+        &["run", "--headless", "--recipe", "theseus.toml"],
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(engine::PRIVILEGED_DAEMON_REFUSAL),
+        "{stderr}"
+    );
+    assert!(!temp.path().join(".theseus-runs").exists());
+}
+
+// Break caught: a mixed suite running its plain variant, containers and all,
+// before refusing the one with [docker].
+#[test]
+fn compare_without_opt_in_refuses_a_docker_variant_before_any_variant_runs() {
+    let (temp, _) = parse(SCHEMA_10, DOCKER).unwrap();
+    std::fs::write(
+        temp.path().join("plain.toml"),
+        source("schema_version=9\nscenarios=['clean']", ""),
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("comparison.toml"),
+        "schema_version=1\nname='mixed'\nbaseline='plain'\nprofiles=['user']\nscenarios=['clean']\nstages=['configured']\n[[variants]]\nid='plain'\nrecipe='plain.toml'\n[[variants]]\nid='daemon'\nrecipe='theseus.toml'\n[[scopes]]\nid='home'\nprofile='user'\npath='/home/theseus'\n",
+    )
+    .unwrap();
+    let out = theseus(
+        temp.path(),
+        &["compare", "--headless", "--suite", "comparison.toml"],
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(engine::PRIVILEGED_DAEMON_REFUSAL),
+        "{stderr}"
+    );
+    assert!(stderr.contains("daemon"), "{stderr}");
+    assert!(!temp.path().join(".theseus-comparisons").exists());
 }
