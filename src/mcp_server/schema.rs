@@ -364,7 +364,7 @@ fn definitions() -> BTreeMap<String, Value> {
             ("kind", json!({"const":"overview"})),
             ("recipe_path", r("Path")),
             ("recipe_digest", r("Digest")),
-            ("schema_version", bounded(1, 8)),
+            ("schema_version", bounded(1, 10)),
             ("name", r("TextPreview")),
             ("image", r("TextPreview")),
             ("network", enumeration(&["none", "bridge"])),
