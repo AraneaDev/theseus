@@ -626,5 +626,5 @@ fn overview_declares_every_recipe_schema_the_loader_accepts() {
         .unwrap();
     let version = &inspect["outputSchema"]["$defs"]["OverviewData"]["properties"]["schema_version"];
     assert_eq!(version["minimum"], 1);
-    assert_eq!(version["maximum"], 10);
+    assert_eq!(version["maximum"], crate::recipe::MAX_SCHEMA_VERSION);
 }

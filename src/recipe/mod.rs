@@ -20,6 +20,10 @@ pub use interrupted_rollback::{
 pub use types::*;
 pub use validate::{ValidatedRecipe, load, normalize_container_path, parse_bytes};
 
+/// The highest recipe schema version the loader accepts. The MCP schema
+/// publishes the same bound.
+pub const MAX_SCHEMA_VERSION: u32 = 10;
+
 pub use rollback::{
     BackupScope, ExpectedFailureContract, RestorationPolicy, RollbackContract,
     RollbackRecoveryContract, validate_rollback_contract, validate_rollback_recovery,

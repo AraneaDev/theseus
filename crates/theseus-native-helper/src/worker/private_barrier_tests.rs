@@ -45,6 +45,75 @@ fn fixture() -> (
     let (ports, wp, controls, tokens) = channels();
     (tmp, Worker::new(wp, tokens), ports, controls, invocation)
 }
+/// Initialize, waiting out brief contention for the ledger lock.
+///
+/// The lock is an flock, which belongs to the open file description. A child
+/// that another test thread forks shares this process's descriptors until it
+/// execs, so for that moment it holds every ledger lock this process holds.
+/// A test that drops a ledger and reopens it in that window gets WouldBlock.
+/// A helper process never reopens its ledger, so this is a test-only race,
+/// and only WouldBlock is retried.
+fn initialize_waiting(worker: &mut Worker, inv: Invocation) -> Result<(), WorkerPrimary> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match worker.initialize(copy_invocation(&inv)) {
+            Err(WorkerPrimary::Store(theseus_native_helper_store::StoreError::Io(error)))
+                if error.kind() == io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            result => return result,
+        }
+    }
+}
+fn copy_invocation(inv: &Invocation) -> Invocation {
+    Invocation {
+        integration: inv.integration.clone(),
+        #[cfg(feature = "test-support")]
+        fixture: inv.fixture.clone(),
+        ledger_root: inv.ledger_root.clone(),
+        workspace_root: inv.workspace_root.clone(),
+        expected: StoreBinding {
+            binding: inv.expected.binding,
+            manifest_digest: inv.expected.manifest_digest,
+            workspace_marker: inv.expected.workspace_marker,
+            os: inv.expected.os,
+        },
+        profile: inv.profile,
+        artifact_commitment: inv.artifact_commitment,
+        catalog: inv
+            .catalog
+            .iter()
+            .map(|entry| crate::CatalogEntry {
+                id: entry.id.clone(),
+                command: entry.command.clone(),
+            })
+            .collect(),
+    }
+}
+#[test]
+fn initialize_waits_out_a_brief_holder_of_the_ledger_lock() {
+    let (_tmp, mut worker, ports, _permits, inv) = fixture();
+    // Stands in for a child another test thread forked: until it execs, it
+    // holds a copy of the descriptor, and so the lock.
+    let holder = HostDir::open(&inv.ledger_root, RootPolicy::LeafNoFollow)
+        .unwrap()
+        .open_locked_ledger(std::ffi::OsStr::new("ledger.bin"))
+        .unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(holder);
+    });
+    let started = std::time::Instant::now();
+    assert!(
+        initialize_waiting(&mut worker, inv).is_ok(),
+        "reopen after the holder lets go"
+    );
+    assert!(started.elapsed() >= std::time::Duration::from_millis(50));
+    ports.events.try_recv().ok().unwrap();
+    release.join().unwrap();
+}
 fn accepted_file(
     cancelled: bool,
 ) -> (
@@ -60,9 +129,7 @@ fn accepted_file(
         binding: inv.expected.binding,
         manifest_digest: inv.expected.manifest_digest,
     };
-    worker
-        .initialize(inv)
-        .unwrap_or_else(|_| panic!("initialize"));
+    initialize_waiting(&mut worker, inv).unwrap_or_else(|_| panic!("initialize"));
     ports.events.try_recv().unwrap();
     worker
         .acquire(
@@ -137,9 +204,7 @@ fn native_prefix_rename_replacement_removal_permanently_blocks_all_catalog_effec
             binding: inv.expected.binding,
             manifest_digest: inv.expected.manifest_digest,
         };
-        worker
-            .initialize(inv)
-            .unwrap_or_else(|_| panic!("native initialize"));
+        initialize_waiting(&mut worker, inv).unwrap_or_else(|_| panic!("native initialize"));
         ports.events.try_recv().unwrap();
         worker
             .acquire(
@@ -475,7 +540,7 @@ fn observation_requires_exact_held_lease_and_busy_never_opens() {
         let (_tmp, mut worker, ports, [p0, p1], inv) = fixture();
         let binding = inv.expected.binding;
         let manifest_digest = inv.expected.manifest_digest;
-        worker.initialize(inv).unwrap_or_else(|_| panic!("init"));
+        initialize_waiting(&mut worker, inv).unwrap_or_else(|_| panic!("init"));
         ports.events.try_recv().unwrap();
         worker
             .acquire(
@@ -736,7 +801,7 @@ fn completion_retains_original_spawn_beside_later_primary() {
             let (_tmp, mut worker, ports, [p0, p1], inv) = fixture();
             let binding = inv.expected.binding;
             let manifest_digest = inv.expected.manifest_digest;
-            worker.initialize(inv).unwrap_or_else(|_| panic!("init"));
+            initialize_waiting(&mut worker, inv).unwrap_or_else(|_| panic!("init"));
             ports.events.try_recv().ok().unwrap();
             worker
                 .acquire(
@@ -881,7 +946,7 @@ fn integrated_admitted(
     let (tmp, mut worker, ports, controls, inv) = fixture();
     let binding = inv.expected.binding;
     let manifest_digest = inv.expected.manifest_digest;
-    worker.initialize(inv).unwrap_or_else(|_| panic!("init"));
+    initialize_waiting(&mut worker, inv).unwrap_or_else(|_| panic!("init"));
     let mut d = crate::dispatcher::Dispatcher::new(ports, controls);
     d.event_quantum().unwrap();
     dispatch_input(
@@ -1341,7 +1406,7 @@ fn closed_history_replays_before_effect_admission() {
             let (_tmp, mut worker, ports, [p0, p1], inv) = fixture();
             let binding = inv.expected.binding;
             let manifest_digest = inv.expected.manifest_digest;
-            worker.initialize(inv).unwrap_or_else(|_| panic!("init"));
+            initialize_waiting(&mut worker, inv).unwrap_or_else(|_| panic!("init"));
             ports.events.try_recv().ok().unwrap();
             worker
                 .acquire(
@@ -1393,7 +1458,7 @@ fn closed_history_replays_before_effect_admission() {
             let inv = worker.invocation.take().unwrap();
             worker.store.take();
             worker.lease = None;
-            worker.initialize(inv).unwrap_or_else(|_| panic!("reopen"));
+            initialize_waiting(&mut worker, inv).unwrap_or_else(|_| panic!("reopen"));
             ports.events.try_recv().ok().unwrap();
             let expected = worker
                 .store
@@ -1489,9 +1554,7 @@ fn cancel_and_deadline_before_attempt_commit_through_saturated_events() {
         let (_tmp, mut worker, ports, [p0, p1], inv) = fixture();
         let binding = inv.expected.binding;
         let manifest_digest = inv.expected.manifest_digest;
-        worker
-            .initialize(inv)
-            .unwrap_or_else(|_| panic!("fixture init"));
+        initialize_waiting(&mut worker, inv).unwrap_or_else(|_| panic!("fixture init"));
         let intent = v2::IntentId::from_bytes([3; 16]);
         worker
             .acquire(
