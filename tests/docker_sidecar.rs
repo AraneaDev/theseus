@@ -143,10 +143,19 @@ fn parse(head: &str, docker: &str) -> Result<(tempfile::TempDir, ValidatedRecipe
 }
 const SCHEMA_10: &str = "schema_version=10\nscenarios=['clean','upgrade']";
 
-fn run(docker: &str, mut boundary: Boundary) -> (Boundary, engine::RunResult, RunJournal) {
-    let (temp, recipe) = parse(SCHEMA_10, docker).unwrap();
+fn run(docker: &str, boundary: Boundary) -> (Boundary, engine::RunResult, RunJournal) {
+    run_as(SCHEMA_10, docker, true, boundary)
+}
+fn run_as(
+    head: &str,
+    docker: &str,
+    allow_privileged_daemon: bool,
+    mut boundary: Boundary,
+) -> (Boundary, engine::RunResult, RunJournal) {
+    let (temp, recipe) = parse(head, docker).unwrap();
     let options = RunOptions {
         output_root: temp.path().join("runs"),
+        allow_privileged_daemon,
         ..RunOptions::all(&recipe)
     };
     let result = engine::run_with(
@@ -195,6 +204,43 @@ fn the_daemon_is_journaled_before_its_guest_and_removed_after_it() {
                 .starts_with("guest-")
         );
     }
+}
+
+#[test]
+fn engine_refuses_docker_recipe_without_opt_in() {
+    let (boundary, result, journal) = run_as(SCHEMA_10, DOCKER, false, Boundary::default());
+    assert_ne!(result.report.outcome, RunOutcome::Passed);
+    assert_eq!(result.report.errors.len(), 1, "{:?}", result.report.errors);
+    assert!(
+        result.report.errors[0].contains(engine::PRIVILEGED_DAEMON_REFUSAL),
+        "{}",
+        result.report.errors[0]
+    );
+    // Refused before anything was created.
+    assert!(boundary.events.is_empty(), "{:?}", boundary.events);
+    assert!(journal.resources.is_empty());
+}
+
+#[test]
+fn the_default_options_do_not_opt_in() {
+    let (_, recipe) = parse(SCHEMA_10, DOCKER).unwrap();
+    assert!(!RunOptions::all(&recipe).allow_privileged_daemon);
+}
+
+#[test]
+fn recipe_without_docker_needs_no_opt_in() {
+    let (boundary, result, _) = run_as(
+        "schema_version=9\nscenarios=['clean']",
+        "",
+        false,
+        Boundary::default(),
+    );
+    assert_eq!(result.report.outcome, RunOutcome::Passed);
+    assert!(result.report.errors.is_empty());
+    assert_eq!(
+        boundary.events,
+        ["create guest user-clean", "remove guest user-clean"]
+    );
 }
 
 #[test]
@@ -335,6 +381,7 @@ fn real_private_daemon_runs_containers_for_the_guest_and_leaves_nothing() {
     let temp = tempfile::tempdir().unwrap();
     let options = RunOptions {
         output_root: temp.path().join("runs"),
+        allow_privileged_daemon: true,
         ..RunOptions::all(&recipe)
     };
     let result = engine::run(&recipe, options, CancellationToken::default(), |_| {}).unwrap();

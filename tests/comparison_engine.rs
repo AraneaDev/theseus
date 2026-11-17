@@ -183,8 +183,32 @@ fn fixture() -> (
     let options = SuiteRunOptions {
         output_root: t.path().join("runs"),
         pull: true,
+        allow_privileged_daemon: false,
     };
     (t, suite, options)
+}
+#[test]
+fn comparison_refuses_docker_variant_without_opt_in() {
+    let (t, _, options) = fixture();
+    let recipe = include_str!("fixtures/recipes/v2_clean.toml")
+        .replace("schema_version = 2", "schema_version = 10")
+        .replace(
+            "[artifacts]",
+            "[docker]\nimage = \"docker:28-dind\"\n\n[artifacts]",
+        );
+    fs::write(t.path().join("recipe.toml"), recipe).unwrap();
+    let suite = comparison::load(&t.path().join("comparison.toml")).unwrap();
+    let mut fake = Fake::default();
+    let result = comparison::run_with(
+        &suite,
+        options,
+        CancellationToken::default(),
+        &mut fake,
+        |_| {},
+    )
+    .unwrap();
+    assert_ne!(result.report.outcome, RunOutcome::Passed);
+    assert_eq!(fake.creates, 0);
 }
 #[test]
 fn shared_engine_runs_fresh_sources_and_persists_private_portable_evidence() {

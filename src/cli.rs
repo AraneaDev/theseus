@@ -63,6 +63,9 @@ pub enum Action {
         scenario: ScenarioSelection,
         #[arg(long)]
         pull: bool,
+        /// Let a recipe's [docker] block start its privileged daemon, which gives the guest root-equivalent access to this host.
+        #[arg(long)]
+        allow_privileged_daemon: bool,
     },
     Compare {
         #[arg(long)]
@@ -71,6 +74,9 @@ pub enum Action {
         headless: bool,
         #[arg(long)]
         pull: bool,
+        /// Let a recipe's [docker] block start its privileged daemon, which gives the guest root-equivalent access to this host.
+        #[arg(long)]
+        allow_privileged_daemon: bool,
     },
     Comparison {
         suite_directory: PathBuf,
@@ -162,7 +168,8 @@ fn execute_inner(
             suite,
             headless,
             pull,
-        }) => handle_compare(&suite, headless, pull, animation),
+            allow_privileged_daemon,
+        }) => handle_compare(&suite, headless, pull, allow_privileged_daemon, animation),
         Some(Action::Cleanup {
             run_directory,
             native_target,
@@ -173,6 +180,7 @@ fn execute_inner(
             profile,
             scenario,
             pull,
+            allow_privileged_daemon,
             native_target,
             preview,
         }) => handle_run(
@@ -181,6 +189,7 @@ fn execute_inner(
             profile,
             scenario,
             pull,
+            allow_privileged_daemon,
             native_target,
             preview,
             animation,
@@ -297,6 +306,7 @@ fn handle_compare(
     suite: &Path,
     headless: bool,
     pull: bool,
+    allow_privileged_daemon: bool,
     animation: crate::tui::AnimationOptions,
 ) -> Result<i32> {
     if !headless {
@@ -306,6 +316,7 @@ fn handle_compare(
     let options = comparison::SuiteRunOptions {
         output_root: suite.project_root.join(".theseus-comparisons"),
         pull,
+        allow_privileged_daemon,
     };
     if !headless {
         return crate::tui::run_with_options(
@@ -409,6 +420,7 @@ fn handle_run(
     profile: Option<ProfileSelection>,
     scenario: ScenarioSelection,
     pull: bool,
+    allow_privileged_daemon: bool,
     native_target: Option<PathBuf>,
     preview: bool,
     animation: crate::tui::AnimationOptions,
@@ -443,6 +455,7 @@ fn handle_run(
     );
     let mut options = RunOptions::all(&recipe);
     options.pull = pull;
+    options.allow_privileged_daemon = allow_privileged_daemon;
     options.profiles = match profile.unwrap_or(ProfileSelection::All) {
         ProfileSelection::User => vec![ProfileName::User],
         ProfileSelection::System => vec![ProfileName::System],
